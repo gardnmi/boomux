@@ -22,7 +22,6 @@ const DISTRIBUTION: Option<&str> = option_env!("BOOMUX_DISTRIBUTION");
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SMOKE_OUTPUT_BYTES: usize = 4096;
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_PROC_ENTRIES: usize = 65_536;
 const MAX_PROC_CMDLINE_BYTES: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -814,15 +813,7 @@ fn daemon_disposition(target: &Path) -> io::Result<DaemonDisposition> {
             "running daemon uses a different Boomux executable or executable inode",
         ));
     }
-    let pid = daemon
-        .daemon_peer_credentials()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("running daemon identity changed during inspection: {error}"),
-            )
-        })?
-        .pid;
+    let pid = executable.pid;
     Ok(DaemonDisposition::SameExecutable {
         client: daemon,
         pid,
@@ -840,13 +831,14 @@ fn reserve_daemon_absence(socket: &Path) -> io::Result<client::DaemonLockReserva
 
 #[cfg(target_os = "linux")]
 struct DaemonExecutable {
+    pid: u32,
     path: PathBuf,
     fingerprint: FileFingerprint,
 }
 
 #[cfg(target_os = "linux")]
 fn daemon_executable(daemon: &client::Client) -> Option<DaemonExecutable> {
-    let credentials = daemon.daemon_peer_credentials().ok()?;
+    let credentials = daemon.daemon_process_credentials().ok()?;
     if credentials.uid != unsafe { libc::geteuid() } {
         return None;
     }
@@ -861,11 +853,20 @@ fn daemon_executable(daemon: &client::Client) -> Option<DaemonExecutable> {
     let bytes = bytes.strip_suffix(b" (deleted)").unwrap_or(bytes);
     let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
     let fingerprint = fingerprint_following(&process_executable).ok()?;
-    Some(DaemonExecutable { path, fingerprint })
+    let confirmed = daemon.daemon_process_credentials().ok()?;
+    if confirmed != credentials {
+        return None;
+    }
+    Some(DaemonExecutable {
+        pid: credentials.pid,
+        path,
+        fingerprint,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
 struct DaemonExecutable {
+    pid: u32,
     path: PathBuf,
     fingerprint: FileFingerprint,
 }
@@ -895,8 +896,8 @@ fn finish_daemon_handoff(
                 .restart()
                 .map_err(|error| io::Error::other(error.to_string()))?;
             let installed = verify_installed_candidate(target, candidate)?;
-            let executable =
-                replacement_daemon_executable(target, candidate, *pid).ok_or_else(|| {
+            let executable = replacement_daemon_executable(client, target, candidate, *pid)
+                .ok_or_else(|| {
                     io::Error::other("replacement daemon executable could not be verified")
                 })?;
             if executable.path != target
@@ -937,54 +938,25 @@ fn recover_daemon_after_rollback(disposition: &DaemonDisposition) -> io::Result<
 
 #[cfg(target_os = "linux")]
 fn replacement_daemon_executable(
+    daemon: &client::Client,
     target: &Path,
     candidate: &FileFingerprint,
     old_pid: u32,
 ) -> Option<DaemonExecutable> {
     let deadline = Instant::now() + SMOKE_TIMEOUT;
     loop {
-        let mut matches = Vec::new();
-        let mut entries = fs::read_dir("/proc").ok()?;
-        for _ in 0..MAX_PROC_ENTRIES {
-            let Some(entry) = entries.next() else {
-                break;
-            };
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let Some(_pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|value| value.parse::<u32>().ok())
-                .filter(|pid| *pid != old_pid)
-            else {
-                continue;
-            };
-            let process_directory = entry.path();
-            match fs::metadata(&process_directory) {
-                Ok(metadata)
-                    if metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() } => {}
-                _ => continue,
-            }
-            match read_proc_cmdline(&process_directory.join("cmdline")) {
-                Ok(cmdline) if is_replacement_daemon_cmdline(&cmdline, target) => {}
-                _ => continue,
-            }
-            let process_executable = process_directory.join("exe");
-            let path = match fs::read_link(&process_executable) {
-                Ok(path) if path == target => path,
-                _ => continue,
-            };
-            let fingerprint = match fingerprint_following(&process_executable) {
-                Ok(fingerprint) if same_candidate(&fingerprint, candidate) => fingerprint,
-                _ => continue,
-            };
-            matches.push(DaemonExecutable { path, fingerprint });
-        }
-        if entries.next().is_some() || matches.len() > 1 {
-            return None;
-        }
-        if let Some(executable) = matches.pop() {
+        if let Some(executable) = daemon_executable(daemon).filter(|executable| {
+            executable.pid != old_pid
+                && executable.path == target
+                && same_candidate(&executable.fingerprint, candidate)
+                && read_proc_cmdline(
+                    &PathBuf::from(format!("/proc/{}", executable.pid)).join("cmdline"),
+                )
+                .is_ok_and(|cmdline| is_replacement_daemon_cmdline(&cmdline, target))
+                && daemon.daemon_process_credentials().is_ok_and(|confirmed| {
+                    confirmed.pid == executable.pid && confirmed.uid == unsafe { libc::geteuid() }
+                })
+        }) {
             return Some(executable);
         }
         if Instant::now() >= deadline {
@@ -1025,6 +997,7 @@ fn is_replacement_daemon_cmdline(cmdline: &[u8], target: &Path) -> bool {
 
 #[cfg(not(target_os = "linux"))]
 fn replacement_daemon_executable(
+    _daemon: &client::Client,
     _target: &Path,
     _candidate: &FileFingerprint,
     _old_pid: u32,

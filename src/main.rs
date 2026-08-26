@@ -2999,7 +2999,7 @@ struct DaemonProcessIdentity {
 #[cfg(target_os = "linux")]
 fn daemon_process_identity(client: &client::Client) -> Option<DaemonProcessIdentity> {
     let socket_before = fs::metadata(client.socket_path()).ok()?;
-    let credentials = match client.daemon_peer_credentials() {
+    let credentials = match client.daemon_process_credentials() {
         Ok(credentials) if credentials.uid == unsafe { libc::geteuid() } => credentials,
         _ => return None,
     };
@@ -3016,6 +3016,10 @@ fn daemon_process_identity(client: &client::Client) -> Option<DaemonProcessIdent
     let executable = fs::read_link(process_directory.join("exe"))
         .ok()
         .and_then(|executable| normalize_daemon_executable(executable.as_os_str().as_bytes()));
+    let confirmed = client.daemon_process_credentials().ok()?;
+    if confirmed != credentials {
+        return None;
+    }
     Some(DaemonProcessIdentity {
         pid: credentials.pid,
         protocol_version: credentials.protocol_version,

@@ -284,14 +284,16 @@ that executable and starts the rollback watchdog without replacing the discovere
 destination. The uploaded current binary then runs `daemon status --json` as a
 client of the existing daemon; status does not start a missing daemon. This lets
 an old released installed helper participate even when its own CLI predates the
-additive process-identity fields. On Linux, the provisional client obtains the
-socket peer PID with `SO_PEERCRED`, validates same-user `/proc` ownership,
-resolves the bounded absolute `/proc/<pid>/exe` path after normalizing the
-kernel's ` (deleted)` suffix, and records the socket device and inode. Automatic
-upgrade requires that proven process executable to equal the install destination
-exactly. Immediately before rename, the provisional binary opens one negotiated
-daemon connection and binds activation to the exact PID, executable, protocol,
-and socket device/inode fingerprint while that connection remains open.
+additive process-identity fields. On Linux, the provisional client maps the bound
+listener to one unique same-user holder through bounded kernel Unix-socket and
+`/proc` descriptor views, validates same-user `/proc` ownership, resolves the
+bounded absolute `/proc/<pid>/exe` path after normalizing the kernel's
+` (deleted)` suffix, and records the socket device and inode. This does not trust
+listener `SO_PEERCRED` retained from an earlier handoff process. Automatic upgrade
+requires that proven process executable to equal the install destination exactly.
+Immediately before rename, the provisional binary opens one negotiated daemon
+connection and binds activation to the exact current holder PID, executable,
+protocol, and socket device/inode fingerprint at the activation boundary.
 Candidate equality or an earlier unbound status result is not evidence. Missing,
 changed, malformed, macOS, or otherwise unprovable identity returns
 `upgrade_required` without activating the upload.
