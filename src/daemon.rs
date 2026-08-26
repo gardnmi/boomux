@@ -6810,20 +6810,21 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
                 return;
             }
         };
-        let admitted = service
+        let Some(admission_epoch) = service
             .node_registrations()
             .and_then(|registrations| {
                 registrations
-                    .admit(&registration)
+                    .observe(&registration)
                     .map_err(node_registration_error)
             })
-            .unwrap_or(false);
-        if !admitted {
+            .ok()
+            .flatten()
+        else {
             if interruptible_node_sleep(&service, &node_id, Duration::from_millis(100)) {
                 return;
             }
             continue;
-        }
+        };
         let attempt_at_ms = unix_time_ms();
         let result = fetch_node_projection(&registration, after);
         let mut published_generation = None;
@@ -6832,7 +6833,7 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
             Ok((sync, capabilities, observed_helper_version)) => {
                 let commit = service.node_registrations().and_then(|registrations| {
                     registrations
-                        .with_current(&registration, || {
+                        .with_observation(&registration, admission_epoch, || {
                             service
                                 .node_projection_cache
                                 .as_ref()
@@ -6869,7 +6870,7 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
                             .collect::<Vec<_>>();
                         let claimed = service.node_registrations().and_then(|registrations| {
                             registrations
-                                .with_current(&registration, || {
+                                .with_observation(&registration, admission_epoch, || {
                                     service
                                         .node_projection_cache
                                         .as_ref()
@@ -6915,7 +6916,7 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
                     .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
                 let commit = service.node_registrations().and_then(|registrations| {
                     registrations
-                        .with_current(&registration, || {
+                        .with_observation(&registration, admission_epoch, || {
                             service
                                 .node_projection_cache
                                 .as_ref()
@@ -6945,10 +6946,6 @@ fn node_projection_worker(service: Weak<DaemonService>, node_id: String) {
                 }
             }
         }
-        service
-            .node_registrations()
-            .map(|registrations| registrations.release(&registration))
-            .ok();
         if let Some(cache_generation) = published_generation {
             let _ = service.events.publish_runtime_batch(vec![
                 DaemonEventKind::NodeProjectionChanged {

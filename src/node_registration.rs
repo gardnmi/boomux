@@ -42,6 +42,7 @@ struct RegistrationState {
 struct Registration {
     snapshot: NodeRegistrationSnapshot,
     admission_open: bool,
+    admission_epoch: u64,
     admitted: usize,
     maintenance: Option<MaintenanceLease>,
 }
@@ -152,6 +153,54 @@ impl NodeRegistrationManager {
         operation().map(Some)
     }
 
+    pub(crate) fn observe(&self, expected: &NodeRegistrationSnapshot) -> io::Result<Option<u64>> {
+        let mut state = self.lock_state()?;
+        let state = available_mut(&mut state)?;
+        expire_maintenance(state);
+        let Some(registration) = state
+            .registrations
+            .iter()
+            .find(|registration| registration.snapshot.node_id == expected.node_id)
+        else {
+            return Ok(None);
+        };
+        if registration.snapshot.revision != expected.revision
+            || registration.snapshot.tombstone_epoch != expected.tombstone_epoch
+            || registration.snapshot.target != expected.target
+            || !registration.admission_open
+        {
+            return Ok(None);
+        }
+        Ok(Some(registration.admission_epoch))
+    }
+
+    pub(crate) fn with_observation<T>(
+        &self,
+        expected: &NodeRegistrationSnapshot,
+        admission_epoch: u64,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        let mut state = self.lock_state()?;
+        let state = available_mut(&mut state)?;
+        expire_maintenance(state);
+        let Some(registration) = state
+            .registrations
+            .iter()
+            .find(|registration| registration.snapshot.node_id == expected.node_id)
+        else {
+            return Ok(None);
+        };
+        if registration.snapshot.revision != expected.revision
+            || registration.snapshot.tombstone_epoch != expected.tombstone_epoch
+            || registration.snapshot.target != expected.target
+            || !registration.admission_open
+            || registration.admission_epoch != admission_epoch
+        {
+            return Ok(None);
+        }
+        operation().map(Some)
+    }
+
     pub(crate) fn admit(&self, expected: &NodeRegistrationSnapshot) -> io::Result<bool> {
         let mut state = self.lock_state()?;
         let state = available_mut(&mut state)?;
@@ -243,6 +292,7 @@ impl NodeRegistrationManager {
         replacement.registrations.push(Registration {
             snapshot: snapshot.clone(),
             admission_open: true,
+            admission_epoch: 0,
             admitted: 0,
             maintenance: None,
         });
@@ -375,6 +425,10 @@ impl NodeRegistrationManager {
                 "Node registration change is already in progress",
             ));
         }
+        current.registrations[index].admission_epoch = next(
+            current.registrations[index].admission_epoch,
+            "registration admission epoch",
+        )?;
         current.registrations[index].admission_open = false;
         let token = Uuid::new_v4().to_string();
         current.registrations[index].maintenance = Some(MaintenanceLease {
@@ -506,6 +560,10 @@ impl NodeRegistrationManager {
                 "Node registration change is already in progress",
             ));
         }
+        current.registrations[index].admission_epoch = next(
+            current.registrations[index].admission_epoch,
+            "registration admission epoch",
+        )?;
         current.registrations[index].admission_open = false;
         let deadline = Instant::now() + timeout;
         loop {
@@ -789,6 +847,7 @@ fn validate_persisted(persisted: PersistedRegistrations) -> io::Result<Registrat
         registrations.push(Registration {
             snapshot,
             admission_open: true,
+            admission_epoch: 0,
             admitted: 0,
             maintenance: None,
         });
@@ -1048,6 +1107,43 @@ mod tests {
         manager
             .finish_upgrade_maintenance(&registration.node_id, &token)
             .unwrap();
+        fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn maintenance_invalidates_observations_after_admission_reopens() {
+        let path = path();
+        let manager = NodeRegistrationManager::load_at(path.clone());
+        let registration = manager
+            .add("work".into(), "old".into(), node_id(2), &node_id(1))
+            .unwrap();
+        let stale_epoch = manager.observe(&registration).unwrap().unwrap();
+        let (_, token) = manager
+            .begin_upgrade_maintenance_if(
+                "work",
+                registration.revision,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                || true,
+            )
+            .unwrap();
+        manager
+            .finish_upgrade_maintenance(&registration.node_id, &token)
+            .unwrap();
+
+        assert!(
+            manager
+                .with_observation(&registration, stale_epoch, || Ok(()))
+                .unwrap()
+                .is_none()
+        );
+        let current_epoch = manager.observe(&registration).unwrap().unwrap();
+        assert!(
+            manager
+                .with_observation(&registration, current_epoch, || Ok(()))
+                .unwrap()
+                .is_some()
+        );
         fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 
