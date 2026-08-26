@@ -14,7 +14,7 @@ use crate::protocol::{
 };
 use crate::state_store::{effective_uid, secure_state_dir, state_directory_from_environment};
 
-const COORDINATOR_WORKSPACE_VERSION: u32 = 6;
+const COORDINATOR_WORKSPACE_VERSION: u32 = 7;
 const MAX_STORE_BYTES: u64 = 1024 * 1024;
 const MAX_WORKSPACES: usize = 1_024;
 const MAX_PLACEMENTS: usize = 128;
@@ -51,7 +51,6 @@ struct PersistedGlobalWorkspaces {
 pub(crate) enum PendingResourceKind {
     Shell,
     Launcher,
-    AgentSchedule,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +119,7 @@ impl GlobalWorkspaceStore {
 
     fn load_at(path: PathBuf) -> io::Result<Self> {
         let (state, migrated) = match load(&path) {
-            Ok(mut state) if (1..COORDINATOR_WORKSPACE_VERSION).contains(&state.version) => {
+            Ok(mut state) if (1..6).contains(&state.version) => {
                 for pending in &mut state.pending_resources {
                     if pending.operation_id.is_empty() {
                         pending.operation_id.clone_from(&pending.resource_id);
@@ -1544,7 +1543,6 @@ fn validate(state: &PersistedGlobalWorkspaces) -> io::Result<()> {
         let resource_workspace_id = match &operation.resource {
             RoutedOperationResult::Shell { shell } => &shell.workspace_id,
             RoutedOperationResult::Launcher { launcher } => &launcher.workspace_id,
-            RoutedOperationResult::AgentSchedule { schedule } => &schedule.workspace_id,
             _ => {
                 return Err(invalid(
                     "completed Workspace operation has an invalid result",
@@ -1637,9 +1635,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{
-        SchedulerHealth, SchedulerState, ShellOwner, ShellSnapshot, ShellStatus,
-    };
+    use crate::protocol::{ShellSnapshot, ShellStatus};
     use std::os::unix::fs::PermissionsExt;
 
     fn snapshot(id: &str, name: &str, revision: u64) -> WorkspaceSnapshot {
@@ -1651,7 +1647,6 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
         }
     }
 
@@ -1659,11 +1654,6 @@ mod tests {
         Snapshot {
             workspaces,
             focused_terminal: None,
-            scheduler: Some(SchedulerHealth {
-                state: SchedulerState::Active,
-                max_concurrent: 4,
-                active_executions: 0,
-            }),
         }
     }
 
@@ -1680,7 +1670,6 @@ mod tests {
                 name: "shell".into(),
                 cwd: "/owner/project".into(),
                 command: Vec::new(),
-                owner: ShellOwner::User,
                 status: ShellStatus::Pending,
                 run: None,
                 recovered_agent_id: None,
@@ -1719,6 +1708,27 @@ mod tests {
                 .len(),
             1
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_six_is_rejected_instead_of_reinterpreted() {
+        let root = std::env::temp_dir().join(format!("boomux-global-v6-{}", Uuid::new_v4()));
+        let path = root.join("boomux/global_workspaces.json");
+        let store = GlobalWorkspaceStore::load_at(path.clone()).unwrap();
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy["version"] = 6.into();
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let error = match GlobalWorkspaceStore::load_at(path) {
+            Ok(_) => panic!("schema 6 must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1842,7 +1852,7 @@ mod tests {
         assert_eq!(workspace.placements[0].owner_workspace_name, None);
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 6);
+        assert_eq!(persisted["version"], 7);
         assert_eq!(persisted["pending_resources"], serde_json::json!([]));
         assert_eq!(persisted["completed_operations"], serde_json::json!([]));
         fs::remove_dir_all(root).unwrap();
@@ -1891,7 +1901,7 @@ mod tests {
         assert!(!pending[0].creates_workspace);
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 6);
+        assert_eq!(persisted["version"], 7);
         assert_eq!(
             persisted["pending_resources"][0]["operation_id"],
             resource_id
@@ -1947,7 +1957,7 @@ mod tests {
         assert!(pending.owner_attempted);
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 6);
+        assert_eq!(persisted["version"], 7);
         assert_eq!(persisted["completed_operations"], serde_json::json!([]));
         fs::remove_dir_all(root).unwrap();
     }
@@ -2893,7 +2903,7 @@ mod tests {
             .unwrap();
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 6);
+        assert_eq!(persisted["version"], 7);
         assert!(
             persisted["pending_resources"][0]["completion_reservation"]
                 .as_str()
@@ -2943,7 +2953,7 @@ mod tests {
         assert!(migrated.pending_resources().unwrap()[0].owner_attempted);
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 6);
+        assert_eq!(persisted["version"], 7);
         assert_eq!(persisted["pending_resources"][0]["owner_attempted"], true);
         fs::remove_dir_all(root).unwrap();
     }
@@ -3122,7 +3132,6 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
         };
         store
             .complete_resource(
@@ -3145,7 +3154,6 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
         };
         let completed = store
             .complete_resource(

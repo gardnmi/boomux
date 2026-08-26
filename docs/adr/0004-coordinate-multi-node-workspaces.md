@@ -2,8 +2,8 @@
 
 Status: Accepted; implemented
 
-A Workspace is the coordinator-owned place where a user organizes Shells,
-Agent Instances, launchers, and Agent Schedules across one or more Nodes. The
+A Workspace is the coordinator-owned place where a user organizes Shells, Agent
+Instances, and launchers across one or more Nodes. The
 coordinator owns Workspace identity, name, membership, and operation progress,
 but is not an execution placement and does not imply a default Node. Every
 runtime resource remains authoritative on exactly one explicitly selected Node.

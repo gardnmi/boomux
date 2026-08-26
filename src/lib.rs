@@ -23,7 +23,6 @@ mod node_identity;
 mod node_projection;
 mod node_registration;
 pub mod protocol;
-pub mod scheduling;
 mod session_projection;
 pub mod ssh_bootstrap;
 mod state_store;

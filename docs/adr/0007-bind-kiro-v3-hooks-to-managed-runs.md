@@ -10,7 +10,7 @@ the managed launcher for its exact PID/start identity and current ShellRun.
 
 After the dedicated global Boomux hook asset is installed, an eligible bare
 `kiro-cli` invocation in a managed Shell launches the v3 harness. Explicit
-leading `--v3` invocations, scheduled dispatch, and cold recovery use the same
+leading `--v3` invocations and cold recovery use the same
 launcher without duplicating the flag. Kiro v2, unrelated commands, absolute
 paths, modified PATHs, and missing or modified hook assets run unchanged and
 untracked. The launcher preserves an exact configured executable through
@@ -52,13 +52,11 @@ Rejected alternatives were:
   more than one child process and Kiro provides no authoritative switch event.
 - Bind only to ShellRun identity, because concurrent Kiro processes in one run
   need distinct authority and independently observed exit.
-- Add trust-all flags to scheduled work, because Kiro's permission policy belongs
-  to the user and host configuration.
 - Guess a Kiro Web route from a Session ID, because no exact handoff contract is
   documented.
 
 Protocol 45 adds closed holder acquire, hook report, and release operations.
-Handoff generation 7 transfers only live exact process holders and their bounded
+Handoff generation 7 originally transferred only live exact process holders and their bounded
 Session/Agent associations. Cold recovery inherits none. The design adds no
 durable-state representation and does not change `STATE_VERSION`.
 The daemon bounds this state to 256 holders and 16 Sessions per holder and reaps

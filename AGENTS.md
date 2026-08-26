@@ -8,8 +8,8 @@ Use repository documentation in this order:
    semantics when names in code are less precise.
 2. `docs/architecture.md` describes the current implementation boundaries and
    cross-cutting invariants.
-3. Contract documents such as `docs/cli-json.md`, `docs/event-stream.md`,
-   `docs/live-pty-handoff.md`, and `docs/scheduled-agent-work.md` govern their
+3. Contract documents such as `docs/cli-json.md`, `docs/event-stream.md`, and
+   `docs/live-pty-handoff.md` govern their
    named interfaces and guarantees.
 4. `docs/adr/` records accepted decisions and rationale.
 5. `docs/lifecycle-validation.md` records compatibility evidence from specific

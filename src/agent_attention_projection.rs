@@ -165,7 +165,6 @@ mod tests {
             name: "project".into(),
             default_cwd: None,
             shells: vec![boomux::protocol::ShellSnapshot {
-                owner: boomux::protocol::ShellOwner::User,
                 id: "s1".into(),
                 revision: 1,
                 workspace_id: "w1".into(),
@@ -186,7 +185,6 @@ mod tests {
                 foreground_process: None,
             }],
             launchers: Vec::<WorkspaceLauncherSnapshot>::new(),
-            schedules: Vec::new(),
             agents,
         }
     }

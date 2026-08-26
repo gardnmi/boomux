@@ -2119,7 +2119,6 @@ mod tests {
     #[test]
     fn runtime_status_requires_exact_current_run_registration() {
         let shell = ShellSnapshot {
-            owner: boomux::protocol::ShellOwner::User,
             id: "s1".into(),
             revision: 1,
             workspace_id: "w1".into(),
@@ -2146,13 +2145,11 @@ mod tests {
             default_cwd: None,
             shells: vec![shell],
             launchers: Vec::new(),
-            schedules: Vec::new(),
             agents: Vec::new(),
         };
         let snapshot = Snapshot {
             workspaces: vec![workspace.clone()],
             focused_terminal: None,
-            scheduler: None,
         };
         assert_eq!(
             inspect_runtime(IntegrationId::Opencode.spec(), Some(&snapshot)).state,
@@ -2183,7 +2180,6 @@ mod tests {
         let snapshot = Snapshot {
             workspaces: vec![workspace.clone()],
             focused_terminal: None,
-            scheduler: None,
         };
         assert_eq!(
             verification_targets(&snapshot, IntegrationId::Opencode, None),
@@ -2212,7 +2208,6 @@ mod tests {
         let snapshot = Snapshot {
             workspaces: vec![workspace],
             focused_terminal: None,
-            scheduler: None,
         };
         assert_eq!(
             inspect_runtime(IntegrationId::Opencode.spec(), Some(&snapshot)).state,

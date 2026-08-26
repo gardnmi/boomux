@@ -59,7 +59,7 @@ pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::
             format!("invalid Claude hook input: {error}"),
         )
     })?;
-    boomux::scheduling::validate_external_session_id(&input.session_id).map_err(|error| {
+    boomux::integrations::validate_external_session_id(&input.session_id).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid Claude session identity: {error}"),
@@ -251,7 +251,7 @@ mod tests {
             read_update(
                 format!(
                     r#"{{"session_id":"{}","hook_event_name":"SessionStart"}}"#,
-                    "x".repeat(boomux::scheduling::MAX_EXTERNAL_SESSION_ID_BYTES + 1)
+                    "x".repeat(boomux::integrations::MAX_EXTERNAL_SESSION_ID_BYTES + 1)
                 )
                 .as_bytes()
             )

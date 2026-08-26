@@ -75,8 +75,8 @@ remote projections. Legacy resource lists remain local-only.
 Protocol 34 advertises `typed_exact_node_routing` and
 `guarded_remote_management`. Dashboard effects carry structured Node-qualified
 identities, freshly inspect the owner before destructive confirmation, and use
-the resource revision, membership generation, run ID, Schedule/execution
-revision, observation revision, or dispatch key required by the operation.
+the resource revision, membership generation, run ID, or observation revision
+required by the operation.
 Stale Nodes and Nodes without the capability remain non-actionable.
 
 Protocol 35 advertises `remote_pty_attachment` and
@@ -93,12 +93,6 @@ resolve one registered Node and require its live verified protocol-36 service;
 unsupported owners fail visibly and are never emulated against local PATH,
 configuration, catalogs, or filesystems. Responses are live and transient and do
 not update the cached Node projection.
-
-Protocol 37 advertises `remote_agent_schedule_management` and
-`remote_scheduled_execution_observation`. Schedule and execution commands accept
-`--node SELECTOR`; their JSON adds exact `node_id`. Remote Schedule list is the
-prompt-free reduced projection and includes Node freshness, health, observation
-time, and scheduler health. Exact reads and all mutations are live owner-routed.
 
 `capabilities` advertises only what the installed local CLI can speak and never
 reports negotiated state for a registered Node. `node.list` and `node.inspect`
@@ -128,9 +122,9 @@ require workspace context, precedence is explicit workspace, managed-shell or
 launcher `BOOMUX_WORKSPACE_ID`, then the selected Workspace. Shell and launcher
 name resolution continues to derive the exact current Shell's Workspace before
 using the broader environment value. The selection allows workspace omission
-for shell, launcher, and Schedule creation but never selects a Node. It does not
-change unscoped `agent.list`, `attention.list`, `session.list`, `schedule.list`,
-or `execution.list` result sets. Exact resource IDs continue to bypass workspace
+for shell and launcher creation but never selects a Node. It does not change
+unscoped `agent.list`, `attention.list`, or `session.list` result sets. Exact
+resource IDs continue to bypass workspace
 context. This is a CLI-only behavior and does not change the wire protocol or
 the `boomux.cli/v1` envelope.
 
@@ -219,8 +213,8 @@ local daemon restart or stop returns `busy` until release or expiry.
 Successful commit releases it immediately; a failed or ambiguous upgrade keeps
 it closed through bounded expiry so remote watchdog rollback cannot race routing.
 Per-Node observed capabilities must distinguish passive combined projection from
-process-starting, destructive, integration-management, Schedule, and
-exact-attachment support. The full compatibility and privacy rules are defined
+process-starting, destructive, integration-management, and exact-attachment
+support. The full compatibility and privacy rules are defined
 in [`remote-nodes.md`](remote-nodes.md).
 
 `boomux node rekey` is an implemented local identity-administration command. It
@@ -263,18 +257,6 @@ The following commands support `--json`:
 - `boomux attention acknowledge`
 - `boomux session list`
 - `boomux session inspect`
-- `boomux schedule create`
-- `boomux schedule list`
-- `boomux schedule inspect`
-- `boomux schedule pause`
-- `boomux schedule resume`
-- `boomux schedule remove`
-- `boomux schedule run`
-- `boomux execution list`
-- `boomux execution inspect`
-- `boomux execution wait`
-- `boomux execution open`
-- `boomux execution cancel`
 - `boomux integration list`
 - `boomux integration status [opencode|pi|claude|codex]`
 - `boomux integration install <opencode|pi|claude|codex>`
@@ -288,9 +270,7 @@ The following commands support `--json`:
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow. Node registration add, rename, retarget,
-and forget; Agent register, ensure, and report;
-attention acknowledgment; schedule create, pause, resume, remove, and run;
-execution open and cancellation; and
+and forget; Agent register, ensure, and report; attention acknowledgment; and
 integration install and uninstall support the contract. Other mutation commands
 retain human output. Passing `--json` to an unsupported command fails with
 `invalid_argument` before performing the operation.
@@ -344,7 +324,7 @@ Command payloads are:
   `alias`, `local`, nullable `route`, nullable `registration_revision`, `health`,
   `current`, `stale`, `observed_at_ms`, nullable
   `observed_protocol_version`, nullable `observed_helper_version`,
-  `observed_capabilities`, `scheduler`, and nullable
+  `observed_capabilities`, and nullable
   `workspace_owner_eligible`, nullable `workspace_owner_unavailable_reason`,
   `local_snapshot`, and `remote_projection` payloads. Every resource `id` and
   relationship ID in those payloads is `{ "node_id": "...", "inner_id":
@@ -378,31 +358,6 @@ Command payloads are:
   by exact workspace name or ID.
 - `session.inspect`: one projected `session` object selected only by exact
   opaque session ID.
-- `schedule.create`, `schedule.pause`, and `schedule.resume`: one prompt-free
-  `schedule` summary. New schedules default to `fresh` and `paused`; resume
-  changes state to `enabled`.
-- `schedule.list`: a prompt-free `schedules` array, globally or limited by
-  `--workspace`.
-- `schedule.inspect`: one exact `schedule` detail and the only schedule command
-  that includes its `prompt`.
-- `schedule.remove`: `removed: true` plus the removed prompt-free `schedule`
-  summary.
-- `schedule.run`: one prompt-free `execution`. The CLI generates a UUID
-  `dispatch_key` before the request unless `--idempotency-key` supplies one.
-- `execution.list`: newest-first prompt-free `executions`, `limit`, `truncated`,
-  `schedule_limit`, `schedules_truncated`, and schedule-keyed `schedules`
-  next-occurrence projections, optionally filtered by `--workspace` and
-  `--schedule`.
-- `execution.inspect`: one prompt-free `execution` selected only by exact
-  execution ID plus its separate nullable `next_occurrence` projection.
-- `execution.open`: the exact prompt-free `execution` plus `target`, either
-  `run` for a starting or active exact-run attachment or `session` for an
-  external resume of the execution's exact linked Agent Session. It never
-  restarts the reusable Schedule runner shell or substitutes a later run.
-- `execution.cancel`: one prompt-free `execution` selected only by exact
-  execution ID.
-- `execution.wait`: `changed` plus one prompt-free exact `execution` after a
-  revision-aware conditional read.
 - `integration.list`: an `integrations` array containing bundled integration
   names, display names, packages, and validated host versions.
 - `integration.status`: an `integrations` array containing independent `host`,
@@ -434,14 +389,10 @@ Command payloads are:
 - `events`: stream identity, reconnect cursor, optional baseline snapshot, and a
   bounded event array.
 - `daemon.status`: `status`, `protocol_version`, `socket_path`, nullable `pid`,
-  `executable`, `socket_device`, and `socket_inode`, and nullable `scheduler`. On Linux, these identity fields
+  `executable`, `socket_device`, and `socket_inode`. On Linux, these identity fields
   are populated only after same-user `SO_PEERCRED` and bounded absolute
   `/proc/<pid>/exe` validation; the executable has a kernel ` (deleted)` suffix
-  removed. Other platforms or failed proof return null. Scheduler data contains
-  `state`, `max_concurrent`, and
-  `active_executions`. State is `active` only for a running worker whose latest
-  evaluation and next-occurrence projection succeeded; otherwise it is
-  `offline`.
+  removed. Other platforms or failed proof return null.
 
 ## Project Data
 
@@ -469,21 +420,8 @@ Integration arrays are ordered `opencode`, then `pi`, then `claude`, then
 `codex`. List entries contain `name`, `display_name`, `package`, and
 `validated_version`.
 
-Protocol 22 advertises `protocol_22`, `agent_schedule_management`, and
-`durable_agent_schedules`. Protocol 23 adds `protocol_23`,
-`scheduled_execution_dispatch`, `scheduled_execution_cancellation`, and
-`schedule_owned_shells`. Protocol 24 adds `protocol_24`,
-`timed_schedule_dispatch`, `scheduler_health`, and
-`bounded_scheduled_execution_concurrency`.
-Protocol 25 adds `protocol_25`, `revision_aware_scheduled_execution_wait`,
-`bounded_scheduled_execution_history`, and
-`scheduled_execution_notifications`.
 Protocol 26 adds `protocol_26` and `exact_run_attachment` for the internal
-additive expected-run attachment handshake used by Scheduled Execution opens.
-Protocol 27 adds `protocol_27` and `agent_schedule_editing` for paused,
-revision-conditional schedule-definition updates. Update responses and events
-remain prompt-free; exact inspection is still the only response that discloses
-the current prompt.
+additive expected-run attachment handshake.
 Protocol 32 adds `protocol_32`, `node_projection_sync`, and
 `bounded_remote_node_projections`. Protocol 33 adds `protocol_33`,
 `combined_node_snapshot`, and `node_qualified_dashboard`.
@@ -495,8 +433,6 @@ Protocol 36 adds `protocol_36`, `typed_node_host_services`,
 `remote_project_discovery`, `remote_launcher_invocation`,
 `remote_integration_management`, `remote_agent_session_catalog`, and
 `remote_exact_session_resume`.
-Protocol 37 adds `protocol_37`, `remote_agent_schedule_management`, and
-`remote_scheduled_execution_observation`.
 Protocol 38 adds `protocol_38`, `global_workspaces`,
 `multi_node_workspace_placements`, `guarded_workspace_adoption`, and
 `resumable_workspace_close`.
@@ -517,17 +453,21 @@ projection field.
 Protocol 45 adds `protocol_45` and `kiro_exact_launch_holders`. Holder acquire,
 hook report, and release are private local protocol messages and add no public
 CLI JSON field, snapshot field, event, or remote Node projection field.
-Protocol 46 adds `protocol_46` and `kiro_stop_idle`. The Kiro hook report wire
-shape is unchanged; new clients report Stop as Unknown to protocol-45 daemons
-and Idle to protocol-46 daemons. No public CLI JSON shape changes.
+Protocol 46 added `protocol_46` and `kiro_stop_idle`; its Kiro hook report wire
+shape was unchanged. Protocol 47 advertises `protocol_47` and is both the current
+and minimum supported protocol, so the historical protocol-45/46 downgrade path
+is no longer negotiated.
+Protocol 47 also removes Agent Schedule and Scheduled Execution commands, JSON
+payloads, capabilities, snapshot fields, and event types. Historical schedule
+request shapes are not part of the protocol-47 wire contract.
 
 Protocol-38 `workspace create` creates empty coordinator metadata without a
-default Node or cwd. First global `shell create`, `launcher create`, or
-`schedule create` resolves `--node` against eligible owners. If exactly one
+default Node or cwd. First global `shell create` or `launcher create` resolves
+`--node` against eligible owners. If exactly one
 owner is eligible it may be used without `--node`; zero or multiple eligible
 owners return a typed selection error listing disabled health reasons. The
-owner-local cwd is resolved on that Node. Exact argv arrays and private Schedule
-prompts are unchanged by coordination. `workspace open`, `close`, `rename`,
+owner-local cwd is resolved on that Node. Exact argv arrays are unchanged by
+coordination. `workspace open`, `close`, `rename`,
 `list`, and `inspect` resolve global IDs or names before considering external
 local records.
 `workspace adopt TARGET --node NODE`, `workspace link GLOBAL OWNER --node NODE`,
@@ -559,70 +499,12 @@ Node snapshot health is `unobserved`, `online`, `reconnecting`, `stale`,
 `unreachable`, `authentication_required`, `identity_changed`,
 `identity_conflict`, or `unsupported`. `current` is true only for a live
 identity-verified observation. Cached rows remain visible when stale, but cached
-state never authorizes terminal reads, private inspection, Schedule controls, or
-mutation. Scheduler health is reported independently for every Node.
+state never authorizes terminal reads, private inspection, or mutation.
 The dashboard may dismiss a stale cached Shell from local presentation. This
 also hides reduced Agent rows linked to that Shell, persists across daemon
 restart and reconnect, and does not close or mutate the owner resource. The
 Nodes-tab restore action makes retained projections visible again; authoritative
 owner absence removes the corresponding dismissal tombstone.
-
-## Execution Data
-
-Schedule objects include nullable `next_occurrence`, containing
-`trigger_revision` and `scheduled_at_ms`. Execution objects contain `id`,
-`workspace_id`, `schedule_id`, positive durable `revision`, `state`,
-`dispatch_kind`, `dispatch_key`, exact `schedule_revision`, `prompt_revision`,
-and `trigger_revision`, `requested_at_ms`, nullable `scheduled_at_ms`, nullable
-`coalesced_through_ms`, start/end timestamps, snapshotted `cwd`,
-`integration`, and `session`, nullable typed `reason` and `outcome`, and nullable
-`shell_id`, `run_id`, `agent_id`, and discovered `external_session_id` links.
-They never contain the retained prompt or environment.
-
-`execution list --limit` defaults to 100 and accepts 1 through 1,000. The daemon
-applies the bound after all filters and orders by `requested_at_ms` newest first,
-then execution ID descending. `truncated` is true when more matching retained
-records exist. Protocol-23 and protocol-24 peers retain their existing manual,
-timed, and skipped visibility rules; a protocol-25 client locally bounds a list
-returned by an older daemon.
-
-On the daemon wire, `ListScheduledExecutions.limit` is optional. Protocol 25
-defaults an absent value to 100 and clamps supplied values to 1 through 1,000.
-Protocol-23 and protocol-24 requests ignore the field and remain uncapped; their
-timed/skipped compatibility filter runs before any list operation. The
-protocol-25 list response includes `schedules`, an array of `schedule_id` and
-nullable `next_occurrence` projections for the complete selected schedule scope,
-including schedules with no history and schedules absent from the execution
-page. The array is sorted by schedule ID and independently capped at 100;
-`schedule_limit` is 100 and `schedules_truncated` reports omitted schedules.
-Exact inspection carries `next_occurrence` beside `execution`. These projections
-are current scheduler calculations, not durable execution fields or execution
-revision changes, and responses below protocol 25 omit them and return zero/false
-projection metadata defaults. A current client connected to protocol 23 or 24
-locally applies the caller's execution limit to the old unbounded response and
-computes `truncated` from the received matching records.
-
-`execution wait` requires protocol 25, an exact execution ID, and
-`--after-revision`. A newer current revision returns immediately with `changed:
-true`; an equal revision waits up to `--wait-ms` and returns the unchanged record
-with `changed: false`; a future revision fails with `revision_ahead`. Revision
-zero returns every existing execution immediately. Equal terminal process state
-does not return early because later canonical Agent linkage may advance the
-revision. Replacement wakes the request with `daemon_stopping`; reconnect and
-repeat the same revision. Waits do not consume event cursors. `wait_ms` remains a
-hard deadline while persistence or pending storage is blocked; timeout returns
-the last committed exact snapshot and never an unpublished revision.
-
-State is `skipped`, `claimed`, `starting`, `active`, `dispatch_failed`, `exited`,
-`cancelled`, or `interrupted`; dispatch kind is `manual` or `timed`. Reasons are
-stable safe values `overlap`, `active_session`, `workspace_capacity`,
-`global_capacity`, `missed`, `paused_race`, `invalid_target`,
-`runner_start_failed`, `host_spawn_failed`,
-`cancelled_by_user`, `cold_daemon_recovery`, or
-`runner_exited_without_report`; explicit daemon shutdown uses `daemon_shutdown`.
-Exit outcomes are tagged
-`exit_code` with `code` or `signal` with `signal`. These are process-orchestration
-outcomes and never imply Agent `working`, `idle`, `blocked`, or `done`.
 
 Status entries contain those four fields plus `host`, `asset`, `runtime`, and
 `recommended_action`.
@@ -662,9 +544,7 @@ requires `--force`, while unsafe paths fail before any removal.
 ## Shell Data
 
 Shell objects use stable scalar fields: `id`, `workspace_id`, `workspace_name`,
-`name`, `cwd`, `owner`, `owner_schedule_id`, `status`, `exit_code`, and `run`.
-Owner is `user` or `schedule`; only the latter has a non-null schedule ID and is
-protected from direct rename, close, restart, and inactive open. Missing values are JSON `null`,
+`name`, `cwd`, `status`, `exit_code`, and `run`. Missing values are JSON `null`,
 not omitted or represented as human placeholders. `status` is `pending`,
 `running`, or `exited`.
 
@@ -847,56 +727,6 @@ All session commands require a negotiated daemon protocol of at least 12 and ret
 `node_id`. Resume opens a local native terminal but resolves the opaque ID and
 executes the integration argv only on the owner; it creates no ordinary
 Workspace or Shell.
-
-## Schedule Data
-
-Schedule summaries contain `id`, `workspace_id`, nullable `workspace_name`,
-`name`, `cwd`, `integration`, `session_mode`, nullable `external_session_id`,
-`cron`, `timezone`, `state`, `overlap_policy`, `revision`, `prompt_revision`,
-`trigger_revision`, `created_at_ms`, `updated_at_ms`,
-`evaluation_frontier_ms`, nullable `execution_shell_id`, and nullable
-`next_occurrence`. A non-null `next_occurrence` contains `trigger_revision` and
-`scheduled_at_ms`. Optional values are JSON `null`; paused schedules have a null
-next occurrence, while an accepted enabled schedule has a non-null next
-occurrence. State is `paused` or `enabled`; session mode is `fresh` or `continue`;
-the initial overlap policy is always `skip`.
-Schedule management commands require negotiated daemon protocol 22. `schedule
-run` and every `execution` command require protocol 23. Unsupported commands
-return `unsupported_version` rather than presenting empty data.
-`execution wait` specifically requires protocol 25.
-Node-qualified Schedule and execution commands require protocol 37 on the local
-coordinator and owner. Remote JSON responses add exact `node_id`; remote list
-presentation also reports Node freshness and per-Node scheduler health. Remote
-create reads prompt files locally once, validates cwd and continuation Session on
-the owner, and never stores the prompt in the presenting Node's projection.
-
-Only `schedule.inspect` adds `prompt`. Prompts are intentionally absent from
-list, create, pause, resume, remove, run, execution records, capabilities,
-events, and errors. Inspection
-is an explicit private-content disclosure. A prompt file is read once at create
-time as exact UTF-8, including a trailing newline; later file changes do not
-alter the persisted prompt revision. Files must be regular and prompts are
-bounded to 65,536 UTF-8 bytes.
-
-Create requires explicit `--workspace`, `--cwd`, and `--integration`, exactly
-one of `--prompt` or `--prompt-file`, and exactly one trigger source. `--cron`
-accepts the canonical numeric five-field subset. `--every Nm|Nh`, `--daily
-HH:MM`, `--weekdays HH:MM`, and `--weekly DAY@HH:MM` compile to that canonical
-cron representation. `--timezone` accepts an IANA timezone; omission snapshots
-the current system IANA timezone or fails if it cannot be resolved. `--fresh`
-conflicts with `--continue`, and `--paused` conflicts with `--enabled`.
-
-`--continue` accepts only an exact opaque projected session ID resolved in the
-selected workspace. The projection must have a canonical external session ID
-and its integration must equal `--integration`; descriptions, external IDs,
-latest-session selection, and names are never substitutes.
-
-Exact Schedule IDs resolve globally only within the selected Node for inspect,
-pause, resume, and remove. Schedule names resolve only with explicit
-`--workspace` or the exact current `BOOMUX_WORKSPACE_ID`. List covers the
-selected Node unless `--workspace` narrows it. Removing a Schedule removes its
-persisted prompt. Closing a Workspace removes all owned Schedules and persisted
-prompts along with the Workspace.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text

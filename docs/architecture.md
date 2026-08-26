@@ -31,14 +31,13 @@
 | `src/mobile_web.rs`, `src/web_terminal.rs`, `assets/mobile-web/` | Loopback-only HTTP gateway, Node-qualified Agent projection, exact local attention dismissal, native harness handoff, integration-independent exact-run terminal control, and embedded installable web assets |
 | `src/tailscale_serve.rs` | Explicit Tailscale Serve preflight, conflict detection, exact route mutation, and ephemeral ownership cleanup for `boomux web --tailscale` |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
-| `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, schedule-dispatch, and foreground capabilities |
+| `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
 | `src/update.rs` | Local release discovery, installation classification, interactive self-update authorization, atomic executable replacement, and daemon handoff verification |
 | `src/claude_hooks.rs`, `src/codex_hooks.rs`, `src/kiro_hooks.rs` | Bounded Claude Code, Codex, and Kiro hook decoding and lifecycle reduction |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
-| `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
 | `src/config.rs` | Layered configuration resolution, bounded validation, and transactional active-layer editing |
 | `src/workspace_selection.rs` | Owner-only local CLI Workspace selection, validation, locking, and atomic persistence |
 | `src/projects.rs`, `src/git.rs` | Bounded project discovery and asynchronous Git metadata |
@@ -65,9 +64,6 @@
 - **Local update ownership:** [`local-update.md`](local-update.md) defines the
   official-release eligibility, package-manager refusal, no-downgrade rule,
   atomic replacement, and graceful daemon handoff boundary.
-- **Scheduled Agent authority:** [`scheduled-agent-work.md`](scheduled-agent-work.md)
-  defines the boundary between manual and timed dispatch, concurrency policy,
-  process outcome, and authoritative Agent lifecycle.
 - **Remote Node authority:** [`remote-nodes.md`](remote-nodes.md) defines the
   accepted federation boundary: one owning Node remains authoritative, SSH is a
   route, and local cached projections never authorize mutation or lifecycle
@@ -133,8 +129,6 @@ Protocol 35 adds Node-qualified native-terminal attachment and owner-environment
 startup for remote pending and exited Shells.
 Protocol 36 adds closed typed Node host services and owner-executed exact Agent
 Session resume.
-Protocol 37 adds Node-qualified remote Agent Schedule creation and bounded
-Scheduled Execution observation without adding local scheduler authority.
 Protocol 38 adds coordinator-owned Workspace identity and explicit Node-owned
 placements. Coordinator metadata is stored independently from Node-local runtime
 state; equal names never establish membership, and adoption and linking require
@@ -188,8 +182,8 @@ Protocol 45 adds `kiro_exact_launch_holders`. A supervised exact-argv Kiro
 launcher acquires one bounded ephemeral capability tied to its PID/start identity
 and exact current ShellRun. Kiro hooks can ensure and report canonical Sessions
 only through that live holder. Final-holder exit records Inactive at lifecycle
-integration authority without reporting Done. Handoff generation 7 accepts
-generation 6 and transfers live holders and their exact Session/Agent
+integration authority without reporting Done. That release introduced handoff
+generation 7, which accepted generation 6 and transferred live holders and their exact Session/Agent
 associations; cold recovery starts with none. Capacity is 256 holders with 16
 Sessions per holder, whose maximal handoff encoding remains below the control
 frame bound.
@@ -197,6 +191,24 @@ Protocol 46 adds `kiro_stop_idle`. Kiro v3 Stop hooks report Idle turn
 completion. Protocol-46 clients downgrade Stop to Unknown when connected to a
 protocol-45 daemon, preserving the original holder-report admission contract.
 The wire shape, durable state, events, and handoff generation are unchanged.
+Protocol 47 removes Agent Schedules and Scheduled Executions. Their historical
+wire shapes and capabilities are absent from the current protocol. State schema
+14 contains no schedule definitions, execution records, private prompts, runner
+capabilities, or schedule-owned Shells. Because this is an alpha breaking
+change, state schemas 9 through 13 are rejected rather than migrated.
+Coordinator Workspace schema 7 likewise rejects schema 6, and disposable Node
+cache schemas 3 and 4 are rejected so their projections are rebuilt. Cold
+recovery cannot recreate removed scheduled work.
+Protocol 47 is also the minimum supported core protocol and advertises
+`protocol_47`; protocol-46 clients, daemons, and Nodes are rejected instead of
+receiving schedule-free payloads in historical wire shapes. Handoff generation 8
+uses `BOOMUXH8` and accepts only generation 8, making the same incompatibility
+explicit before descriptor transfer. v0.32/state schema 13 therefore requires a
+cold upgrade: stop the old daemon (terminating every managed process), reset the
+incompatible runtime, coordinator, journal, selection, and projection state,
+remove the old scheduling and scheduled-notification config keys, then install
+and start the new binary. [`local-update.md`](local-update.md) defines the exact
+operator sequence.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -253,12 +265,6 @@ Workspace identities:
   exactly one shell run. It owns no process or PTY. Its latest explicit
   observation records state, reporting authority, evidence, confidence,
   revision, and time; completion is terminal and durable.
-- An Agent Schedule is a durable recurring-work definition owned by one
-  Workspace. It owns its trigger and prompt revisions but no process or Agent
-  lifecycle state.
-- A Scheduled Execution is one durable manual or timed decision bound to exact
-  Schedule revisions. It can later link a ShellRun and Agent Instance without
-  merging those identities.
 
 There are no separate tab, pane, and terminal identity layers.
 
@@ -310,9 +316,9 @@ remotely routable mutation.
 The Node-local `claude.remote_control` launch policy defaults on and is sampled
 at daemon start. The owning daemon adds `--remote-control` only to an exact
 one-element user Shell command whose executable basename is `claude`; its
-private login-Shell shim applies the same rule only to a zero-argument
-interactive invocation. Stored argv remains unchanged. Schedule-owned work,
-launchers, explicit Claude arguments, and recovery or Session resume vectors
+    private login-Shell shim applies the same rule only to a zero-argument
+    interactive invocation. Stored argv remains unchanged. Launchers, explicit
+    Claude arguments, and recovery or Session resume vectors
 never receive the flag, and a coordinator's setting cannot govern a remote
 owner's launch.
 
@@ -481,13 +487,6 @@ satisfied, so retained history does not extend PTY-writer lock hold time.
 boomux __attach <shell-id> --takeover --restart-exited
 ```
 
-Scheduled Execution opens instead launch `__attach` with the selected exact run
-ID and without `--restart-exited`. Protocol 26 carries that expected run through
-the attachment handshake. While holding the ordinary attachment mutation and
-shell lifecycle boundary, the daemon returns `run_changed` unless the shell is
-currently running that exact run. It cannot restart or take over a later run.
-Ordinary shell attachments retain their existing restart behavior.
-
 `shell create --open` prepares and spawns the terminal before the coordinated
 creation request so window presentation overlaps durable coordinator work. The
 hidden attachment waits on an owner-only runtime socket and receives success
@@ -500,8 +499,8 @@ hidden `__attach` command carries the exact owner Node ID and unchanged inner
 Shell ID. The local daemon opens one identity-verified SSH helper channel and
 relays bounded `AttachFrame` values; the remote daemon retains PTY, controller,
 focus, takeover, resize, reconstruction, and exact-run authority. Remote
-transport loss closes only the local attachment and does not synthesize Shell,
-Agent, or Scheduled Execution completion. Protocol 39 also records a relayed
+transport loss closes only the local attachment and does not synthesize Shell or
+Agent completion. Protocol 39 also records a relayed
 focus gain as ephemeral presentation state on the local daemon after forwarding
 it to the owner. The presentation identity is the exact owner Node and Shell;
 it does not transfer focus authority or enter the remote projection cache.
@@ -518,8 +517,8 @@ ID. The local desktop layer defaults to `hyprland-special`; an explicit
 `desktop.workspace_layer = "disabled"` opts out. When enabled, the local
 client decorates initial titles for coordinated Workspace opens, desktop-layer
 presentation, and coordinated create-and-open with exact Node and Shell
-identity. Direct Shell, dashboard Shell/item, path, Session, and Scheduled
-Execution opens retain baseline launch behavior. `src/hyprland.rs` queries
+identity. Direct Shell, dashboard Shell/item, path, and Session opens retain
+baseline launch behavior. `src/hyprland.rs` queries
 bounded `hyprctl` JSON, reuses matching adapter-opened windows, and moves current
 ephemeral window addresses to a special workspace derived from the immutable
 coordinator Workspace ID. It invokes `hyprctl` and
@@ -604,20 +603,7 @@ still collected independently from item directories and cached. Paths do not
 create Workspace-level Git identity, and mixed-directory Workspaces remain valid.
 
 The dashboard establishes an atomic event-stream baseline and treats later
-events as invalidation signals for authoritative snapshot reprojection. It also
-preserves complete Scheduled Execution event payloads in one client-side cache
-bounded to 1,000 records. The cache is seeded once with a protocol-25 global
-page only when Scheduled Execution Observation is supported. Protocol-23 and
-protocol-24 dashboards render scheduling as unsupported and never request their
-uncapped execution history. Complete execution-created and execution-changed
-records replace cached records only at a higher durable revision; stale and
-duplicate revisions are ignored, and schedule removal clears all matching
-records. Cursor expiration, stream replacement, and explicit refresh reseed
-once. A failed reseed preserves the prior cache, keeps a retry requirement, and
-retries before the next event check. Idle checks and unrelated events never
-list executions. Selecting an unscoped schedule automatically replaces that
-schedule's cache entries with one bounded exact-scope page and retains its
-truncation metadata; a scoped selection does not repeat the read. Idle
+events as invalidation signals for authoritative snapshot reprojection. Idle
 checks advance only the event cursor. Once per second, event-stream dashboards
 refresh one authoritative snapshot while retaining the advanced cursor. This
 keeps ephemeral focus and foreground-process hints current without serial
@@ -670,45 +656,6 @@ Command previews expose argv and run metadata without reading terminal output.
 Launcher previews never imply retained invocation state because launcher
 processes remain ephemeral.
 
-Schedules have a specialized fourth top-level view and a typed definition row in
-their owning workspace. The workspace row has `KIND schedule`, counts as an item
-but not a process, and navigates to the exact specialized schedule; it never
-represents or opens an execution shell. Typed schedule and execution projections
-show friendly triggers, next occurrences, last outcomes, state, scheduler health,
-and bounded history. Schedule-owned execution shells are excluded from ordinary
-workspace and shell presentation, process counts, restore, and actions. Their
-exact linked Agents remain selectable in the Agents view but
-expose no ordinary shell actions. The schedule view retains a selected execution
-ID across refresh and reorder and always renders it in a selected-containing
-focusable history pane. Open and cancellation
-actions use that exact selection. Executions are omitted from the
-command palette; actionable schedule notices navigate to their exact selection.
-The schedule and history panes are side by side at normal widths and stack
-vertically below the responsive breakpoint; there is no separate metadata panel.
-Protocol-27 dashboards open a private built-in editor only after exact schedule
-inspection. It edits name, prompt, trigger preset or custom cron, and timezone;
-the timezone control searches the bundled IANA database and can select only a
-valid name. Saves carry the inspected revision, failures retain the unsaved private
-buffer, and save or cancel drops it from dashboard state. Ordinary projections,
-messages, palette entries, events, and diagnostics remain prompt-free.
-Opening a Starting or Active record requires exact shell and run IDs, re-fetches
-and validates the execution and ownership before terminal launch, then uses the
-protocol-26 exact-run attachment handshake to close the post-launch race.
-Opening a terminal record freshly resolves its opaque canonical Agent Session
-ID, constructs the integration's exact interactive resume argv, and launches it
-in an unmanaged native terminal at the retained working directory. It does not
-create an ordinary workspace shell, restart the shared schedule-owned shell, or
-accept current managed or permanently Done sessions.
-Protocol-25 dashboards retain schedule controls and bounded history but disable
-exact terminal Open with upgrade-and-restart guidance.
-Cancellation requires confirmation and re-fetches the exact execution before
-mutation. Active blocked work attaches to its exact run; terminal work resumes
-only its exact canonical session. Canonical session links are derived from exact
-Agent occurrences, never latest or nearby identities. Boomux does not read or
-project host transcript and tool content.
-Protocol 25 has no skip-next action, and the dashboard does not emulate one by
-pausing and resuming.
-
 ### Mobile Web Dashboard
 
 `boomux web` is a separate presentation client in the CLI process, not a daemon
@@ -741,7 +688,7 @@ and Boomux never resets unrelated Serve configuration. Tailscale remains
 responsible for certificates, tailnet identity, grants, and ACL policy.
 
 Agent visibility follows the Omarchy presentation contract rather than exposing
-the complete durable registry. Schedule-owned Agents are excluded. For each
+the complete durable registry. For each
 exact current `(node_id, shell_id, run_id)`, the newest non-inactive and non-done
 Agent observation is shown; historical, inactive, and done Agents remain only
 while they carry outstanding durable attention. A gateway-owned background
@@ -902,412 +849,6 @@ requiring a daemon. Protocol 6 error responses carry an additive optional code;
 clients expose it as `ClientError::Remote(RemoteError)`, while mixed-version
 peers retain message compatibility.
 
-### Scheduled Agent Work
-
-Protocol 22 and state schema 9 implement the Agent Schedule identity without
-changing ShellRun, Agent Instance, or projected Agent Session semantics. A
-schedule belongs to exactly one workspace and snapshots a bounded prompt
-revision, explicit working directory, integration, session policy, canonical
-five-field cron expression, IANA timezone, and overlap policy. Create, list,
-exact inspect, pause, resume, remove, cold recovery, graceful handoff, workspace
-closure, and prompt-free events are available. Exact inspection is the only
-management response that contains prompt content; protocol-21 and older peers
-omit schedule summaries and events while their cursors still advance.
-
-Protocol 23 and state schema 10 add manual Scheduled Execution dispatch. A
-prompt-free public record retains one durable claim against exact schedule,
-prompt, and trigger revisions, while its exact prompt snapshot remains private
-durable dispatch input. The first execution lazily creates one schedule-owned
-durable shell; later executions reuse it with distinct ShellRuns. Ordinary shell
-or workspace open never starts or restarts that shell, but an active run remains
-attachable. Rename, close, and restart are rejected outside schedule or workspace
-ownership. State schema 10 explicitly migrates schema-9 shells to user ownership
-and schedules to empty execution histories.
-
-The shell stores only the Boomux executable, hidden runner command, and exact
-schedule ID. The runner resolves the exact schedule, `BOOMUX_SHELL_ID`, and
-`BOOMUX_RUN_ID` claim using a private per-execution capability and invokes
-integration-owned argv builders without shell interpretation. The capability is
-persisted with private dispatch input, supplied only to that runner's ephemeral
-environment, removed before the external host is spawned, and required for claim
-resolution and outcome reports. OpenCode uses `opencode run [--session exact-id]
--- prompt`. Kiro uses `kiro-cli --v3 chat --no-interactive [--resume-id exact-id]
-prompt`; both expose the prompt as one exact argv element. Pi uses `pi [--session
-exact-full-id] --print`, while Claude Code uses `claude --print [--resume
-exact-id]`; Pi, Claude Code, and Codex receive exact prompt bytes on stdin and
-close stdin. Host stdout and stderr remain on the PTY. The runner
-retries daemon connections through handoff without starting a daemon.
-
-Scheduling is process orchestration, not lifecycle observation. Spawn failure,
-process exit, cancellation, and cold-daemon interruption are Scheduled Execution
-outcomes and never imply Agent `working`, `idle`, `blocked`, or `done`. Existing
-Agent attention remains the authority when a linked Agent reports `blocked`.
-The scheduler does not parse terminal output, answer guarded prompts, inject
-input into an active session, or infer a canonical external session.
-
-Fresh is the default session mode and starts a new external Agent Session for
-each dispatched execution. Continuation schedules pin one exact existing
-integration and external session identity; they never select the latest session
-or fall back to fresh work. Manual and timed decisions atomically enforce one
-nonterminal execution per schedule and workspace, the configured daemon-wide
-bound, and exact continuation leases. Policy refusals are durable skipped
-decisions rather than queued work.
-
-New schedules are paused by default, and manual run-now remains available while
-paused. Protocol 24 evaluates canonical cron triggers in their stored IANA
-timezone and exposes deterministic next occurrences, scheduler health, timed
-and skipped decisions, and `[scheduling] max_concurrent`. There is no automatic retry or timeout: an
-execution remains active until its process exits, the user cancels it, or runner
-or cold-daemon loss interrupts it. Scheduled starts use the daemon's
-startup environment as ephemeral input; it is never persisted, and environment
-changes require daemon restart. Scheduled-work support extends graceful restart
-so the invoking client's validated environment becomes the replacement daemon's
-startup environment without entering durable state or the handoff manifest.
-Host exit and host-spawn-failure reports are staged on the nonterminal execution;
-the exact runner ShellRun EOF publishes `run_exited` before committing the
-terminal execution transition. This prevents a later dispatch from observing a
-terminal execution while the reusable runner shell is still live.
-These limitations and scheduler health must be visible to clients. See
-[`scheduled-agent-work.md`](scheduled-agent-work.md) and [ADR 0002](adr/0002-separate-agent-schedules-from-runtime-identity.md).
-
-Protocol 25 and state schema 12 add revision-exact Scheduled Execution
-observation. Every retained execution has a positive durable revision; the
-schema-12 migration assigns schema-11 records revision 1 without changing any
-other field. Exact waits use the event condition variable only for wakeup and
-read an event-frontier-owned committed execution map rather than mutable durable
-state. The map is replaced from the complete retained execution set only when
-successful persistence is published. Persistence in flight, pending durable
-batches, and lifecycle event reservations therefore cannot expose revisions that
-may roll back. A deadline still returns the last committed exact snapshot without
-waiting for blocked storage, and equal terminal process revisions continue
-waiting because a canonical Agent link may arrive later.
-Protocol 26 adds additive exact-run attachment. `Attach.expected_run_id`
-is optional and defaults absent for older clients. When present it requires the
-`exact_run_attachment` capability and disables exited-shell restart.
-Protocol 27 adds optimistic Agent Schedule definition editing. One atomic request
-replaces name, exact prompt, and canonical trigger only while paused and only at
-the caller's expected schedule revision. A changed prompt or trigger advances its
-component revision; any change advances the schedule revision once. Trigger
-changes reset the evaluation frontier to commit time. Exact no-ops do not persist
-or publish, active executions retain captured revisions, and update events remain
-prompt-free. Protocol-26 peers filter update events without rewinding cursors.
-The durable representation is unchanged, so state schema remains 12.
-Protocol 32 adds owner projection synchronization. One transition-frontier cut
-returns an explicitly reduced snapshot, scheduler health, at most 1,000 newest
-executions (all nonterminal records first), a remote stream cursor, and at most
-256 reduced resumable transitions. Expired, replaced, or overlong cursors return
-a baseline with no historical transition evidence. Protocol-31 and older event
-readers filter local `node_projection_changed` invalidations while retaining the
-unfiltered cursor. The authoritative state schema remains 12.
-Protocol 33 adds one local-daemon combined snapshot request. It returns the rich
-authoritative local snapshot and bounded reduced registered-Node projections
-with alias, ownership, stable health, freshness, observation time, observed
-protocol capabilities, and per-Node scheduler health. Dashboard model identity
-and effects use `(node_id, inner_id)`; remote rows never enter local Git, host
-catalog, path, preview, or mutation paths. Protocol-32 and older clients cannot
-request this response and retain local-only behavior.
-Protocol 34 and state schema 13 add typed exact-Node routing. Workspace, Shell,
-and launcher snapshots carry positive durable revisions, and Workspace revision
-also guards membership. Schema 12 migrates explicitly by assigning revision 1.
-The routed operation union contains only fresh private exact reads, guarded
-rename/close/restart/remove, guarded Schedule pause/resume/update/remove,
-idempotent run-now, revision-guarded execution cancellation, and exact attention
-acknowledgment. Registration admission is revision-pinned across lock-free SSH
-I/O, identity and protocol are verified before owner request bytes, and routed
-responses never mutate projection cache. Only read-only operations and mutations
-with an owner-side durable idempotency key are retried; every other transport
-ambiguity performs an authoritative postcondition read and otherwise returns
-`outcome_unknown`.
-Protocol 35 adds `AttachNode` as a separate Node-qualified streaming request and
-adds the inner `Attach.owner_environment` mode. The mode is incompatible with an
-arbitrary `UnixEnvironment`; old wire values default it off. Remote handoff
-`Reconnect` frames pass through unchanged. Local handoff reconnects the local
-attachment and drops the old SSH bridge; the replacement discovers and verifies
-a fresh helper channel. No SSH child, remote PTY descriptor, process, cursor, or
-reconstruction state enters the handoff manifest.
-Protocol 36 adds `HostServiceOperation`, `RouteNodeHostService`, and separate
-streamed Agent Session resume requests. The closed union contains bounded project
-discovery, owner-side directory resolution, Shell name suggestion, exact stored
-launcher invocation, integration status and preview-bound mutation, verification,
-and bounded Agent Session list/inspect/resolve. It cannot represent arbitrary
-command execution. Remote integration previews are transient owner memory: commit
-consumes one opaque token only while its Node-local action, force policy, paths,
-and observed asset states still match. Exact Session resume resolves the opaque
-projected ID and constructs cwd/argv on the owner, then relays bounded attachment
-frames to a local native terminal without creating a Workspace or Shell. Host
-service responses do not update Node projection cache or publish events.
-Protocol 37 extends the closed routed operation union with owner-side Schedule
-creation and bounded execution list/wait reads. Remote creation resolves the
-Workspace through a fresh owner read, validates cwd and any continuation Session
-through protocol-36 owner host services, and sends the prompt only in the
-transient owner mutation request. Creation is not retried after channel loss;
-run-now remains the only Schedule write retried, using the unchanged dispatch
-key. Exact-ID Schedule creation canonicalizes cron whitespace and timezone before
-comparing an existing definition, so a normalizable wire replay is unchanged.
-The local scheduler never evaluates, dispatches, or retries remote work.
-Protocol 38 adds an independently versioned owner-only
-`global_workspaces.json` coordinator store. Schema 6 records global Workspace
-identity, name, revision, explicit `(node_id, workspace_id)` placements,
-owner-local Workspace names, durable close progress, and prompt-free prepared
-resource operations keyed by exact caller-generated operation UUID. It separates
-the caller-requested owner UUID from the canonical owner UUID selected for a
-shared first placement. Schema 6 also retains prompt-free SHA-256 request
-fingerprints and completed success snapshots for the newest 256 operations,
-subject to the file's 1 MiB total bound. Each pending operation physically
-reserves a conservative upper bound for its completed outcome; preparation
-evicts oldest completed outcomes as needed and rejects insufficient capacity
-before owner mutation. Preparing a distinct placement atomically expands every
-related pending reservation for the additional possible placement, preserving
-concurrent shared-revision creation without under-reserving either completion.
-Schema 6 adds a durable `owner_attempted` dispatch boundary. Creating a resource
-in an existing Workspace persists it in the same prepared-state replacement,
-after owner preflight and immediately before owner mutation. Retried schema-6
-records that still carry `owner_attempted = false` cross that boundary before
-dispatch. The retained compound first-Workspace-and-Shell primitive keeps its
-separate preparation and attempted replacements so a proven pre-dispatch failure
-can still remove newly reserved Workspace metadata. Schemas 1
-through 5 migrate explicitly to schema 6;
-unknown legacy owner names are learned from a fresh owner read,
-schema-2 pending resource UUIDs become their operation identities, and a
-schema-3 pending operation binds its previously unavailable fingerprint on its
-first structurally matching retry. A schema-4 pending operation acquires its
-completion reservation before its next owner dispatch. The Node-local `state.json` schema remains 13 and is the
-sole authority for Shells, launchers, Agent Instances, Agent Schedules, paths,
-and process lifecycle. On first coordinator-store creation, existing local
-Workspaces are initialized once as global Workspaces with one local placement. Later
-unlinked local or projected remote Workspaces remain external until an explicit
-revision-guarded adoption or link; names are display metadata and never infer
-membership. Creating a Workspace writes only empty coordinator metadata; Node
-and path selection begins when creating its first Node-hosted resource.
-
-The combined Node snapshot adds global and external Workspace arrays only for
-protocol-38 peers. Placement availability is projected from current Node health;
-stale or unavailable projections never authorize owner mutations. Global close
-first persists `close_pending` for every placement, then performs fresh
-owner-revision-guarded closes. Confirmed and already-absent owners are removed
-from coordinator metadata individually. Unreachable or ambiguous outcomes remain
-persisted for explicit retry, and the global record is removed only after every
-owner is confirmed. A Workspace with no placements completes close immediately.
-Remote owner creation and non-Shell resource creation first persist a prompt-free
-prepared-and-attempted operation containing
-stable operation, requested and effective owner Workspace, and resource UUIDs,
-plus a hash of the complete request. Concurrent operations retain separate
-pending records; cancellation and completion target only the exact operation
-identity. Concurrent first resources on one Node may request distinct owner
-UUIDs but share the canonical prepared owner Workspace identity without sharing
-resource identity. Exact-operation handlers, including background reconciliation,
-serialize in coordinator memory, while durable completion and cancellation are
-idempotent against the terminal outcome.
-The owner atomically creates the Node-local placement and Shell, launcher, or
-Schedule, treats an exact replay as unchanged, and rejects conflicting ID reuse.
-This makes exact recovery retryable after transport ambiguity without
-name matching, shell interpolation, or duplicated runtime resources.
-The coordinator exposes one transaction for each Shell, launcher, and Schedule.
-It validates the selected Node against the current combined snapshot, persists
-the prepared operation, creates or exactly reads back the owner-local Workspace
-and resource, then atomically records the placement observation and converts the
-prepared operation to a completed outcome before acknowledging success. A failure between owner
-persistence and coordinator completion leaves the prepared UUIDs durable; the
-next request reads the exact owner resource and completes metadata without blind
-replay or a duplicate resource. An owner `not_found` observation is not proof of
-failure because it may race the in-flight owner mutation; reconciliation retains
-the pending record until an exact request retries or the exact resource is
-observed. A definitive synchronous owner rejection may cancel only its serialized
-operation. Schedule
-prompts remain only in the transient owner request, and launcher and Shell argv
-remain arrays throughout routing.
-
-When the coordinator and selected owner are the same Node, ordinary coordinated
-Shell creation uses the independently versioned
-`local_shell_transactions.log` as its cross-owner commit authority. The daemon
-stages the exact owner Workspace/Shell and coordinator completion under the
-mutation, persistence, event, and global-store lock order, appends one
-checksummed bounded creation record to the pre-created owner-only journal, and
-calls `fdatasync` before installing either staged result or publishing creation
-events. If immediate attachment starts that still-journaled Shell, a contiguous
-run-start record is likewise synchronized before `RunStarted` publication or
-attachment success; cold replay records that untransferred run as interrupted.
-`state.json` and `global_workspaces.json` are asynchronous checkpoints for that
-committed record. A delayed worker checkpoints and clears committed records; any
-later ordinary request establishes the same replay frontier before applying new
-semantics. Protocol negotiation, snapshots, event reads, and a combined snapshot
-with no pending coordinator reconciliation may proceed without checkpointing, so
-an immediate fresh attachment can consume the run-start journal path despite
-dashboard or web projection reads. Graceful restart establishes the frontier
-before handoff. Cold startup
-validates and replays exact records into both checkpoints before one-time local Workspace
-migration and before accepting requests, then clears the journal without
-publishing historical creation events. A torn unterminated final append is
-discarded, while a malformed, unsupported, insecure, oversized, or
-checksum-invalid committed record fails startup closed. Remote owner creation
-retains the prepared coordinator and exact owner readback protocol because no
-local journal can commit another Node's authority.
-Protocol 39 adds an optional Node-qualified focused Shell and presentation
-revision to the combined Node snapshot. Protocol-38 responses omit the field.
-The value is live daemon memory, is returned only while the selected combined
-view still contains that exact Shell, and adds no durable projection field. A
-payload-free focus-presentation invalidation wakes protocol-39 clients without
-placing identity in the event stream; protocol-38 responses filter it while
-advancing their cursor.
-The retained internal compound first-placement request prepares new global
-Workspace metadata and its first Shell in one coordinator-store replacement. It
-is a wire/recovery primitive, not a public CLI or dashboard creation flow. An exact retry returns its stored success
-even after the original global revision becomes stale. A new project request by
-the same name resumes or replays only when Node, cwd, and Shell definition have
-the same semantic fingerprint; its newly requested UUIDs map to the canonical
-prepared or completed identities. Definitive owner rejection removes only that
-pending operation and removes still-empty global metadata only when no related
-operation remains.
-Before creating compound first-placement metadata, the coordinator performs cached eligibility
-and fresh live capability preflight for the selected Node. Missing, ineligible,
-or runtime-capability-disabled owners therefore leave no empty global record. A
-definitive pre-owner failure on an existing exact preparation atomically cancels
-that operation and removes metadata only when it is still empty, unshared, and
-durably proven never dispatched. Every migrated pending operation is treated as
-attempted because an older schema cannot prove otherwise. Once attempted, later
-admission, capability, identity, synchronous owner error, or exact `not_found`
-cannot free the name or remove pending state; absence after a transport ambiguity
-does not prove the mutation was never attempted. Exact readback or an idempotent
-retry remains required. Network, timeout, persistence, and unknown outcomes also
-retain recovery state.
-
-Completed replay is guaranteed only while the operation remains in the bounded
-ledger: at most the newest 256 successful operations and potentially fewer when
-needed to keep the complete coordinator file within 1 MiB. Eviction is oldest
-first. After eviction there is no idempotency guarantee; the request is evaluated
-as new and ordinary identity and revision guards apply. Completed entries retain
-only response snapshots and request hashes, never Schedule prompts or attachment
-environments.
-
-Eligible placement owners are current, non-stale Nodes whose live daemon
-advertises protocol-38 global Workspace support. A daemon whose coordinator
-store did not load suppresses the capability and local eligibility. One eligible Node may be selected directly. Zero or
-multiple eligible Nodes require an explicit selector; no candidate is selected
-by default, and unavailable Nodes remain visible with their stable health and
-reason. Existing placement default cwd values are retained per owner. A new
-placement resolves its requested cwd on the selected owner and stores only that
-owner-local value.
-Adoption and linking use cached eligibility only as an initial presentation
-guard. Under one route admission reservation, they fetch a fresh protocol-38
-combined local snapshot, require its runtime `global_workspaces` capability and
-eligibility, read the exact owner revision from that same snapshot, and commit
-coordinator membership before releasing admission. A live downgrade or disabled
-coordinator store therefore fails even while protocol-38 eligibility remains in
-the projection cache.
-
-The dashboard groups resources only through persisted placement pairs. One
-global Workspace row aggregates qualified resources from all placements while
-each item retains its exact owner Node and owner Workspace ID. Unlinked owner
-Workspaces remain external singleton rows even when names match. External rows
-offer explicit revision-guarded adopt-as-new and link-to-existing actions. The
-Nodes tab is not a filter: it exposes inspection plus interactive pinned-route
-reauthentication, revision-pinned alias rename and verified retarget, confirmed
-route forget, and projection refresh. Reauthentication accepts prompts only in
-its native terminal, requires an existing compatible helper and exact pinned
-identity, mutates no registration or remote installation, and then wakes the
-existing prompt-free projection observer.
-Refresh wakes that Node's existing projection worker; it never starts an
-overlapping observer.
-Resource tables place `NODE` after task identity columns rather than making Node
-the primary organizing column.
-
-Protocol-25 lists are daemon-bounded, newest-first pages with explicit limit and
-truncation. The request limit is optional on the wire; protocol 25 defaults it to
-100 and clamps it to 1 through 1,000, while protocol-23 and protocol-24 requests
-remain uncapped. List responses carry schedule-keyed next-occurrence projections
-for the complete selected schedule scope, independent of the execution page.
-Projections are sorted by schedule ID, bounded to 100, and report
-`schedule_limit` and `schedules_truncated`. Exact inspection carries its
-projection separately from durable execution state; all projection shapes and
-metadata are removed when responding below protocol 25.
-Each schedule retains all nonterminal records and 100 terminal records, pruned by
-ascending requested time and execution ID during ordinary terminalization, cold
-recovery, and shutdown. The durable dispatch-key filter remains authoritative
-after pruning.
-
-Execution events carry the complete prompt-free revision and remain in the
-ordinary 8,192-event journal with 256-event pages. Protocol-23 and protocol-24
-visibility filtering is unchanged and filtered events still advance cursors.
-Opt-in dispatch-failure and cold-interruption notification categories use the
-same bounded fail-open sink as Agent notifications, but deduplicate independently
-by execution, revision, and reason. Cold interruption is persisted before sink
-setup and delivered only for records newly changed by that recovery.
-Dispatch-failure notifications are derived when their durable event batch is
-actually published, including after a failed first write and later pending flush.
-The prior committed execution snapshot must be nonqualifying, so late Agent links
-and other revisions that retain the same terminal state and reason do not notify
-again.
-
-Registered remote Nodes use the same local desktop/sound sink only as presentation.
-After a protocol-32 projection and cursor are atomically persisted, the coordinator
-matches reduced Agent and execution transitions to exact revisions in that same
-cut. While continuously online, qualifying blocked/Done attention and enabled
-dispatch-failure/interruption categories enqueue individual requests with local
-Node alias and stable Node ID context. After a disconnect with a resumable cursor,
-all rows update but qualifying transitions become one bounded per-Node digest.
-Baseline reseeds never notify. Node-cache schema 2 persists at most 512 individual
-and 128 digest claims per Node before enqueue; crash and graceful replacement keep
-those frontiers but create a fresh notifier worker. Delivery, queue saturation,
-and sound/desktop failures remain fail-open and never acknowledge owner attention
-or infer lifecycle from transport, process, or output state.
-
-Node-cache schema 3 retains bounded presentation-only Shell dismissals across
-daemon restart and successful baseline replacement. Views suppress each
-dismissed Shell and every reduced Agent linked to it. Dismissal is accepted only
-while the cached Node is stale or otherwise offline; an online Shell continues
-to require owner-authoritative close. Restore clears the Node's dismissal set,
-and an authoritative projection that omits a dismissed Shell prunes its
-tombstone. Cache replacement preserves the current dismissal set under the cache
-lock; remote generation compare-and-swap remains scoped to synchronization and
-health observations.
-
-Protocol 7 adds a bounded in-memory daemon event journal and atomic output-state
-reads. Clients reconnect through stream UUID/event-ID cursors and recover from
-retention or cold-restart expiry by requesting a fresh snapshot baseline.
-Graceful handoff version 4 transfers retained events before publishing a
-`handoff_completed` boundary and resuming PTY readers. See
-[`event-stream.md`](event-stream.md).
-
-Protocol 8 adds durable workspace launcher definitions. Protocol-7 clients can
-still read workspace snapshots because launcher lists are additive; launcher
-events are filtered from protocol-7 event pages while their cursors continue to
-advance.
-
-Protocol 9 adds agent instances to workspace and event snapshots and adds exact
-ID get, register, and report requests. Protocol-8 and older responses omit agent
-snapshot fields and filter agent events while preserving the unfiltered cursor.
-The daemon owns agent IDs, observation revisions, timestamps, completion, and
-durable storage. External lifecycle integrations own the meaning and evidence
-of their reports; this slice does not discover processes, parse terminal output,
-wait for agents, or control them.
-
-Protocol 10 adds `EnsureAgent`. Its durable identity key is integration,
-external session ID, shell ID, and run ID; the external session ID is mandatory
-for ensure. A unique existing match is returned without changing its name,
-observation, revision, timestamps, persistence, or event stream. This lets an
-integration reload and reacquire the daemon-owned agent ID. A different run is a
-different identity. Multiple matching legacy records are accepted only when
-exactly one is active; otherwise ensure fails rather than guessing.
-
-Protocol 11 adds an explicit exited-shell restart request. Opening one shell or
-restoring a workspace first moves each exited durable shell back to pending, so
-its stored argument vector starts as a new run on attachment while preserving
-the shell identity and incrementing the run generation. Plain attachment to an
-exited run remains non-mutating and can replay its retained terminal state.
-
-External observation authority is ordered lifecycle integration, process
-adapter, then terminal heuristic. Lower-authority reports are successful no-ops.
-At equal authority an exact duplicate is also a no-op, but a changed report is
-accepted, so a source can advance its own state and evidence. The exception is a
-same-authority, same-confidence `working` report: evidence-only changes are
-successful no-ops because they do not change lifecycle meaning and would put
-high-frequency tool activity on the durable persistence path. Higher-authority
-reports replace lower-authority observations. `daemon_lifecycle` is a wire and
-snapshot value reserved for daemon-originated observations and is not exposed
-by the public mutation CLI. Exact retries of an accepted `done` report return
-the completed snapshot without another revision, write, or event; conflicting
-reports after completion are rejected.
-
 ### Explicit Process-Adapter Supervisor
 
 `src/process_adapter.rs` implements the first process-adapter foundation behind:
@@ -1402,16 +943,13 @@ Working; PermissionRequest reports Blocked; Stop reports Idle; and SessionEnd
 reports Inactive. Codex hooks never report Done. Input, identity, and reporting
 are bounded and fail open for the host.
 
-Exact resume uses `codex resume <thread-id>`. Scheduled fresh and continuation
-work use `codex exec -` and `codex exec resume <thread-id> -`, respectively,
-with exact prompt bytes on stdin; the internal launcher supplies hook enablement
-without changing the persisted descriptor argv. The experimental catalog
+Exact resume uses `codex resume <thread-id>`. The experimental catalog
 adapter starts bounded `codex app-server --stdio`, completes `initialize` and
 `initialized`, then requests `thread/list` for the exact normalized workspace
 directory. It filters ephemeral or invalid threads, sanitizes name or preview
 titles, bounds output, count, and runtime, and fails open without changing Agent
-authority. These additions reuse existing protocol Agent, schedule, session,
-and capability shapes, so they require no protocol or durable-state version
+authority. These additions reuse existing protocol Agent, session, and capability
+shapes, so they require no protocol or durable-state version
 change. Boomux exposes no Codex Remote handoff because Codex documents no exact
 thread-specific Remote URL; it does not reinterpret `codex://threads/ID` as a
 phone-accessible Remote destination.
@@ -1455,17 +993,15 @@ Boomux and remain fail-open to Kiro. If one Kiro process switches canonical
 Sessions without ending the old one, both histories remain truthful and cold
 recovery refuses the resulting ambiguity rather than guessing.
 
-Exact resume uses `kiro-cli --v3 chat --resume-id <session-id>`. Scheduled work
-uses `kiro-cli --v3 chat --no-interactive --` with the exact prompt as one argv
-element and an optional exact `--resume-id`; Boomux adds no trust override.
-Scheduled and cold-recovery launches use the run-scoped launcher. Kiro title and
-cloud catalogs are not projected. Although Kiro cloud sessions can be viewed in
+Exact resume uses `kiro-cli --v3 chat --resume-id <session-id>`. Cold-recovery
+launches use the run-scoped launcher. Kiro title and cloud catalogs are not
+projected. Although Kiro cloud sessions can be viewed in
 Kiro Web and Mobile, Kiro documents no exact browser URL derivable from a local
 CLI Session ID, and cloud hooks execute in Kiro's sandbox rather than under the
 local ShellRun. Boomux therefore exposes no Kiro native web handoff or cloud
 lifecycle authority. Protocol 45 carries holder acquire, hook report, and release
 operations. Holders remain absent from durable state, snapshots, projections, and
-events, so `STATE_VERSION` is unchanged. Graceful handoff generation 7 transfers
+events, so `STATE_VERSION` is unchanged. Current graceful handoff generation 8 transfers
 only holders whose exact process identity remains live; cold recovery inherits no
 holder authority.
 
@@ -1523,11 +1059,9 @@ collisions, and never persists, event-publishes, or projects the value to anothe
 Node. A graceful handoff revalidates and transfers bindings after importing the
 surviving ShellRuns; cold startup has none.
 
-The descriptor recognizes the exact `claude` executable and foreground process,
-resumes an exact canonical Session with `claude --resume ID`, and dispatches
-fresh and continuation schedules as `claude --print` and `claude --print
---resume ID`, respectively, with the prompt on stdin. It advertises no title or
-catalog capability.
+The descriptor recognizes the exact `claude` executable and foreground process
+and resumes an exact canonical Session with `claude --resume ID`. It advertises
+no title or catalog capability.
 
 ### OpenCode Lifecycle Plugins
 
@@ -1641,39 +1175,6 @@ Protocol 21 adds a targeted focused-terminal read so event-driven dashboards can
 refresh non-durable focus without rebuilding the complete registry. Protocols
 7-20 use the event stream with a one-second snapshot fallback for ephemeral
 fields; protocol 6 retains one-second snapshot refreshes.
-Protocol 22 adds workspace-owned Agent Schedule definitions and prompt-free
-schedule events. Schedule requests require protocol 22. Older snapshots omit the
-additive schedule summaries, and older event readers filter schedule events
-without rewinding their cursor. State schema 9 explicitly migrates schema 8
-workspaces with empty schedule collections rather than reinterpreting missing
-durable fields.
-Protocol 23 adds manual Scheduled Execution dispatch, cancellation, prompt-free
-execution events, and durable schedule-owned shell identity. Protocol-22 peers
-omit execution events, schedule-owned shells, and execution-shell links. State schema 10
-explicitly migrates schema 9: existing shells become user-owned and schedules
-receive empty execution histories.
-Protocol 24 adds timezone-aware timed dispatch, skipped policy outcomes,
-deterministic next occurrences, scheduler health, and bounded schedule/workspace/
-daemon concurrency. Protocol-23 peers omit scheduler and next-occurrence fields
-and filter timed or skipped execution records and events while preserving event
-cursors. State schema 11 adds the trigger-revision-qualified durable evaluation
-frontier and timed occurrence metadata; its explicit schema-10 migration retains
-manual execution history without reinterpreting it as timed work.
-
-Protocol 25 adds positive Scheduled Execution revisions, exact revision-aware
-wait, bounded execution list metadata, and independently configured execution
-notifications. Protocol-23 and protocol-24 execution visibility remains
-unchanged. State schema 12 explicitly assigns revision 1 to every schema-11
-execution while retaining all prior fields and data.
-
-Protocol 26 adds the optional exact-run attachment expectation used by Scheduled
-Execution terminal opens. Protocol-25 peers retain all observation, history,
-and non-Open schedule dashboard behavior.
-
-Protocol 27 adds paused, revision-conditional schedule definition updates and
-prompt-free `agent_schedule_updated` events. Protocol-26 peers filter those
-events while advancing their cursor. State schema remains 12.
-
 Protocol 28 and Node identity schema 1 establish the stable local Node ID used by
 federation. The daemon creates owner-only `node.json` independently from
 authoritative `state.json`, preserves malformed or future identity files while
@@ -1712,24 +1213,9 @@ registry remains available. State schema remains 12, and the federation
 handshake continues to describe its transport as `ad_hoc` without assigning that
 field durable registration semantics.
 
-Cron day matching preserves syntactic wildcard origin: `*/n` is wildcard-origin,
-while numeric lists and ranges remain restricted even when they cover the full
-field. Trigger acceptance proves at least one occurrence across a Gregorian
-400-year cycle. Enabled snapshot projection propagates evaluator failures rather
-than presenting them as a normal absent next occurrence. State schema 11 also
-requires durable schedule timestamps to fit Chrono and validates timed IDs,
-frontiers, scheduled/requested ordering, and coalescing reason/state combinations.
-
-The scheduler reports active health only while its worker is running after a
-successful evaluation and next-occurrence projection. Failure marks it offline
-and uses an interruptible 50 ms through 5 second exponential retry delay without
-acknowledging deterministic test ticks. Graceful restart transfers active work
-even when a newly sampled lower limit is already exceeded; the truthful active
-count is reported and admission remains blocked until enough terminal releases.
-
 Opt-in desktop and sound notifications are a daemon-owned projection of committed
 Agent state transitions, not durable queue state. A transition from any other
-state into `blocked` or `done`, or from `working` into `idle`, schedules one
+state into `blocked` or `done`, or from `working` into `idle`, queues one
 asynchronous delivery request after persistence and event publication locks are
 released. The `working` to `idle` signal represents a completed unit of work but
 does not create durable completed attention or make the Agent terminal. Enabled
@@ -1753,11 +1239,6 @@ daemon's inherited `XDG_CONFIG_HOME` or `BOOMUX_CONFIG` from overriding the
 configuration intentionally selected by the restart caller. A protocol-16
 daemon is first upgraded with a compatibility handoff, followed by a protocol-17
 handoff that applies the settings.
-The same two-stage rule applies when a protocol-16, protocol-22, or protocol-23
-daemon is upgraded for protocol-24 scheduling settings: after the compatibility
-handoff the client renegotiates, then sends complete notification, recovery,
-environment, and `max_concurrent` values to the replacement.
-
 ### Transition Coordinator
 
 `EventStream` serializes observable runtime transitions through its transition

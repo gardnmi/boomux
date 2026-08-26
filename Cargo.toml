@@ -6,12 +6,9 @@ license = "MIT"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
-chrono = "0.4"
-chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 futures-util = "0.3"
-iana-time-zone = "0.1"
 libc = "0.2"
 nix = { version = "0.28", default-features = false, features = ["socket", "uio"] }
 portable-pty = "0.9"

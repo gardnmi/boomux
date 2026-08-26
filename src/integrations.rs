@@ -1,5 +1,19 @@
 use std::path::Path;
 
+pub const MAX_EXTERNAL_SESSION_ID_BYTES: usize = 256;
+
+pub fn validate_external_session_id(value: &str) -> Result<(), &'static str> {
+    if value.is_empty()
+        || value.len() > MAX_EXTERNAL_SESSION_ID_BYTES
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        Err("external session ID is invalid")
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallTargetKind {
     OpenCode,
@@ -37,63 +51,6 @@ pub struct TitleCapability {
 pub struct ResumeCapability {
     pub executable: &'static str,
     pub arguments_before_session: &'static [&'static str],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PromptTransport {
-    Argument,
-    Stdin,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScheduleArgument {
-    Literal(&'static str),
-    ExternalSessionId,
-    Prompt,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScheduleDispatchCapability {
-    pub executable: &'static str,
-    pub fresh: Option<&'static [ScheduleArgument]>,
-    pub continuation: Option<&'static [ScheduleArgument]>,
-    pub prompt_transport: PromptTransport,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScheduleDispatchCommand {
-    pub argv: Vec<String>,
-    pub stdin: Option<Vec<u8>>,
-}
-
-impl ScheduleDispatchCapability {
-    pub fn command(
-        self,
-        session: &crate::protocol::AgentScheduleSession,
-        prompt: &str,
-    ) -> Option<ScheduleDispatchCommand> {
-        use crate::protocol::AgentScheduleSession;
-
-        let (template, external_session_id) = match session {
-            AgentScheduleSession::Fresh => (self.fresh?, None),
-            AgentScheduleSession::Continue {
-                external_session_id,
-            } => (self.continuation?, Some(external_session_id.as_str())),
-        };
-        let mut argv = vec![self.executable.to_owned()];
-        for argument in template {
-            argv.push(match argument {
-                ScheduleArgument::Literal(value) => (*value).to_owned(),
-                ScheduleArgument::ExternalSessionId => external_session_id?.to_owned(),
-                ScheduleArgument::Prompt => prompt.to_owned(),
-            });
-        }
-        Some(ScheduleDispatchCommand {
-            argv,
-            stdin: (self.prompt_transport == PromptTransport::Stdin)
-                .then(|| prompt.as_bytes().to_vec()),
-        })
-    }
 }
 
 impl ResumeCapability {
@@ -143,7 +100,6 @@ pub struct IntegrationDescriptor {
     pub installation: Option<InstallationCapability>,
     pub titles: Option<TitleCapability>,
     pub resume: Option<ResumeCapability>,
-    pub schedule_dispatch: Option<ScheduleDispatchCapability>,
     pub foreground: Option<ForegroundCapability>,
     pub run_scoped_launcher: Option<RunScopedLauncher>,
 }
@@ -167,22 +123,6 @@ pub const OPENCODE: IntegrationDescriptor = IntegrationDescriptor {
     resume: Some(ResumeCapability {
         executable: "opencode",
         arguments_before_session: &["--session"],
-    }),
-    schedule_dispatch: Some(ScheduleDispatchCapability {
-        executable: "opencode",
-        fresh: Some(&[
-            ScheduleArgument::Literal("run"),
-            ScheduleArgument::Literal("--"),
-            ScheduleArgument::Prompt,
-        ]),
-        continuation: Some(&[
-            ScheduleArgument::Literal("run"),
-            ScheduleArgument::Literal("--session"),
-            ScheduleArgument::ExternalSessionId,
-            ScheduleArgument::Literal("--"),
-            ScheduleArgument::Prompt,
-        ]),
-        prompt_transport: PromptTransport::Argument,
     }),
     foreground: Some(ForegroundCapability {
         process_name: "opencode",
@@ -210,16 +150,6 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
         executable: "pi",
         arguments_before_session: &["--session"],
     }),
-    schedule_dispatch: Some(ScheduleDispatchCapability {
-        executable: "pi",
-        fresh: Some(&[ScheduleArgument::Literal("--print")]),
-        continuation: Some(&[
-            ScheduleArgument::Literal("--session"),
-            ScheduleArgument::ExternalSessionId,
-            ScheduleArgument::Literal("--print"),
-        ]),
-        prompt_transport: PromptTransport::Stdin,
-    }),
     foreground: Some(ForegroundCapability { process_name: "pi" }),
     run_scoped_launcher: None,
 };
@@ -240,16 +170,6 @@ pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
     resume: Some(ResumeCapability {
         executable: "claude",
         arguments_before_session: &["--resume"],
-    }),
-    schedule_dispatch: Some(ScheduleDispatchCapability {
-        executable: "claude",
-        fresh: Some(&[ScheduleArgument::Literal("--print")]),
-        continuation: Some(&[
-            ScheduleArgument::Literal("--print"),
-            ScheduleArgument::Literal("--resume"),
-            ScheduleArgument::ExternalSessionId,
-        ]),
-        prompt_transport: PromptTransport::Stdin,
     }),
     foreground: Some(ForegroundCapability {
         process_name: "claude",
@@ -277,20 +197,6 @@ pub const CODEX: IntegrationDescriptor = IntegrationDescriptor {
         executable: "codex",
         arguments_before_session: &["resume"],
     }),
-    schedule_dispatch: Some(ScheduleDispatchCapability {
-        executable: "codex",
-        fresh: Some(&[
-            ScheduleArgument::Literal("exec"),
-            ScheduleArgument::Literal("-"),
-        ]),
-        continuation: Some(&[
-            ScheduleArgument::Literal("exec"),
-            ScheduleArgument::Literal("resume"),
-            ScheduleArgument::ExternalSessionId,
-            ScheduleArgument::Literal("-"),
-        ]),
-        prompt_transport: PromptTransport::Stdin,
-    }),
     foreground: Some(ForegroundCapability {
         process_name: "codex",
     }),
@@ -313,26 +219,6 @@ pub const KIRO: IntegrationDescriptor = IntegrationDescriptor {
     resume: Some(ResumeCapability {
         executable: "kiro-cli",
         arguments_before_session: &["--v3", "chat", "--resume-id"],
-    }),
-    schedule_dispatch: Some(ScheduleDispatchCapability {
-        executable: "kiro-cli",
-        fresh: Some(&[
-            ScheduleArgument::Literal("--v3"),
-            ScheduleArgument::Literal("chat"),
-            ScheduleArgument::Literal("--no-interactive"),
-            ScheduleArgument::Literal("--"),
-            ScheduleArgument::Prompt,
-        ]),
-        continuation: Some(&[
-            ScheduleArgument::Literal("--v3"),
-            ScheduleArgument::Literal("chat"),
-            ScheduleArgument::Literal("--no-interactive"),
-            ScheduleArgument::Literal("--resume-id"),
-            ScheduleArgument::ExternalSessionId,
-            ScheduleArgument::Literal("--"),
-            ScheduleArgument::Prompt,
-        ]),
-        prompt_transport: PromptTransport::Argument,
     }),
     foreground: Some(ForegroundCapability {
         process_name: "kiro-cli",
@@ -399,7 +285,6 @@ mod tests {
                 provides_catalog: false,
             }),
             resume: None,
-            schedule_dispatch: None,
             foreground: Some(ForegroundCapability {
                 process_name: "partial-agent",
             }),
@@ -412,7 +297,6 @@ mod tests {
         assert!(descriptor.installation.is_none());
         assert!(descriptor.titles.is_some());
         assert!(descriptor.resume.is_none());
-        assert!(descriptor.schedule_dispatch.is_none());
         assert_eq!(
             descriptor
                 .foreground
@@ -455,30 +339,7 @@ mod tests {
         for descriptor in ALL {
             assert_eq!(by_key(descriptor.key), Some(descriptor));
             assert_eq!(display_name(descriptor.key), descriptor.display_name);
-            let dispatch = descriptor.schedule_dispatch.expect("dispatch capability");
-            assert!(dispatch.fresh.is_some());
-            assert!(dispatch.continuation.is_some());
         }
-    }
-
-    #[test]
-    fn resume_capability_does_not_imply_schedule_dispatch() {
-        const RESUME_ONLY: IntegrationDescriptor = IntegrationDescriptor {
-            key: "resume-only",
-            display_name: "Resume Only",
-            installation: None,
-            titles: None,
-            resume: Some(ResumeCapability {
-                executable: "resume-only",
-                arguments_before_session: &["--session"],
-            }),
-            schedule_dispatch: None,
-            foreground: None,
-            run_scoped_launcher: None,
-        };
-
-        assert!(RESUME_ONLY.resume.is_some());
-        assert!(RESUME_ONLY.schedule_dispatch.is_none());
     }
 
     #[test]
@@ -518,122 +379,6 @@ mod tests {
                 "--resume-id".into(),
                 "session-3".into()
             ])
-        );
-    }
-
-    #[test]
-    fn scheduled_dispatch_builds_exact_host_argv_and_private_transport() {
-        use crate::protocol::AgentScheduleSession;
-
-        let prompt = "-private @prompt";
-        assert_eq!(
-            OPENCODE
-                .schedule_dispatch
-                .unwrap()
-                .command(&AgentScheduleSession::Fresh, prompt)
-                .unwrap(),
-            ScheduleDispatchCommand {
-                argv: vec!["opencode".into(), "run".into(), "--".into(), prompt.into()],
-                stdin: None,
-            }
-        );
-        assert_eq!(
-            PI.schedule_dispatch
-                .unwrap()
-                .command(
-                    &AgentScheduleSession::Continue {
-                        external_session_id: "exact-full-id".into(),
-                    },
-                    prompt,
-                )
-                .unwrap(),
-            ScheduleDispatchCommand {
-                argv: vec![
-                    "pi".into(),
-                    "--session".into(),
-                    "exact-full-id".into(),
-                    "--print".into(),
-                ],
-                stdin: Some(prompt.as_bytes().to_vec()),
-            }
-        );
-        assert_eq!(
-            CLAUDE
-                .schedule_dispatch
-                .unwrap()
-                .command(
-                    &AgentScheduleSession::Continue {
-                        external_session_id: "exact-id".into(),
-                    },
-                    prompt,
-                )
-                .unwrap(),
-            ScheduleDispatchCommand {
-                argv: vec![
-                    "claude".into(),
-                    "--print".into(),
-                    "--resume".into(),
-                    "exact-id".into(),
-                ],
-                stdin: Some(prompt.as_bytes().to_vec()),
-            }
-        );
-        assert_eq!(
-            CODEX
-                .schedule_dispatch
-                .unwrap()
-                .command(
-                    &AgentScheduleSession::Continue {
-                        external_session_id: "thread; literal".into(),
-                    },
-                    prompt,
-                )
-                .unwrap(),
-            ScheduleDispatchCommand {
-                argv: vec![
-                    "codex".into(),
-                    "exec".into(),
-                    "resume".into(),
-                    "thread; literal".into(),
-                    "-".into(),
-                ],
-                stdin: Some(prompt.as_bytes().to_vec()),
-            }
-        );
-        assert_eq!(
-            CLAUDE
-                .schedule_dispatch
-                .unwrap()
-                .command(&AgentScheduleSession::Fresh, prompt)
-                .unwrap(),
-            ScheduleDispatchCommand {
-                argv: vec!["claude".into(), "--print".into()],
-                stdin: Some(prompt.as_bytes().to_vec()),
-            }
-        );
-        assert_eq!(
-            KIRO.schedule_dispatch
-                .unwrap()
-                .command(
-                    &AgentScheduleSession::Continue {
-                        external_session_id: "session literal".into(),
-                    },
-                    prompt,
-                )
-                .unwrap(),
-            ScheduleDispatchCommand {
-                argv: vec![
-                    "kiro-cli".into(),
-                    "--v3".into(),
-                    "chat".into(),
-                    "--no-interactive".into(),
-                    "--resume-id".into(),
-                    "session literal".into(),
-                    "--".into(),
-                    prompt.into(),
-                ],
-                stdin: None,
-            }
         );
     }
 }

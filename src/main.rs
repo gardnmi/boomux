@@ -1,10 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+#![allow(dead_code)]
+
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Read};
+use std::io::{self, BufRead, IsTerminal};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -15,16 +17,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::error::ErrorKind as ClapErrorKind;
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use boomux::protocol::{
-    AgentAuthority, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport,
-    AgentScheduleOverlapPolicy, AgentScheduleSession, AgentScheduleSnapshot, AgentScheduleSpec,
-    AgentScheduleState, AgentScheduleTrigger, AgentScheduleUpdate, AgentState, EventCursor,
-    ScheduledExecutionOutcome, ScheduledExecutionSnapshot, ScheduledRunnerResult, ShellSnapshot,
-    ShellSpec, ShellStatus, Snapshot, WorkspaceLauncherSnapshot, WorkspaceLauncherSpec,
-    WorkspaceSnapshot,
+    AgentAuthority, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentState,
+    EventCursor, ShellSnapshot, ShellSpec, ShellStatus, Snapshot, WorkspaceLauncherSnapshot,
+    WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use boomux::{attach, client, daemon, federation, protocol, ssh_bootstrap};
 
@@ -59,44 +58,20 @@ mod web_terminal;
 mod workspace_selection;
 
 const DASHBOARD_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const DASHBOARD_EXECUTION_CACHE_LIMIT: u16 = 1_000;
-
 struct DashboardRefresh {
     watch: client::SnapshotWatch,
     last_snapshot_at: Instant,
-    executions: BTreeMap<String, ScheduledExecutionSnapshot>,
-    history_truncated: bool,
-    scoped_history: BTreeMap<String, bool>,
     negotiated_protocol: u32,
-    needs_reseed: bool,
-    reseed_stream_changed: bool,
 }
 
 impl DashboardRefresh {
     fn baseline(client: &client::Client) -> client::Result<Self> {
         let watch = client::SnapshotWatch::baseline(client)?;
         let negotiated_protocol = client.protocol_version()?;
-        let page = if protocol::ProtocolFeature::ScheduledExecutionObservation
-            .is_supported_by(negotiated_protocol)
-        {
-            Some(client.scheduled_execution_page(None, None, DASHBOARD_EXECUTION_CACHE_LIMIT)?)
-        } else {
-            None
-        };
         Ok(Self {
             watch,
             last_snapshot_at: Instant::now(),
-            executions: page
-                .as_ref()
-                .into_iter()
-                .flat_map(|page| page.executions.iter().cloned())
-                .map(|execution| (execution.id.clone(), execution))
-                .collect(),
-            history_truncated: page.as_ref().is_some_and(|page| page.truncated),
-            scoped_history: BTreeMap::new(),
             negotiated_protocol,
-            needs_reseed: false,
-            reseed_stream_changed: false,
         })
     }
 
@@ -105,12 +80,6 @@ impl DashboardRefresh {
     }
 
     fn check(&mut self, client: &client::Client) -> client::Result<Option<(Snapshot, bool)>> {
-        if self.needs_reseed {
-            let stream_changed = self.reseed_stream_changed;
-            self.reseed_executions(client)?;
-            self.last_snapshot_at = Instant::now();
-            return Ok(Some((self.watch.snapshot().clone(), stream_changed)));
-        }
         match self.watch.poll(client) {
             Ok(poll) => {
                 let handoff_completed = poll.events.iter().any(|event| {
@@ -123,13 +92,6 @@ impl DashboardRefresh {
                     false
                 };
                 if poll.changed {
-                    if poll.stream_changed || poll.baseline_replaced {
-                        self.needs_reseed = true;
-                        self.reseed_stream_changed |= poll.stream_changed;
-                        self.reseed_executions(client)?;
-                    } else {
-                        self.apply_events(&poll.events);
-                    }
                     self.last_snapshot_at = Instant::now();
                     return Ok(Some((
                         self.watch.snapshot().clone(),
@@ -158,118 +120,6 @@ impl DashboardRefresh {
             self.watch.snapshot().clone(),
             self.watch.stream_id() != stream_id.as_deref(),
         ))
-    }
-
-    fn executions(&self) -> Vec<ScheduledExecutionSnapshot> {
-        let mut executions = self.executions.values().cloned().collect::<Vec<_>>();
-        executions.sort_by(|left, right| {
-            right
-                .requested_at_ms
-                .cmp(&left.requested_at_ms)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        executions
-    }
-
-    fn load_schedule_history(
-        &mut self,
-        client: &client::Client,
-        schedule_id: &str,
-        limit: u16,
-    ) -> client::Result<(Vec<ScheduledExecutionSnapshot>, bool)> {
-        let page = client.scheduled_execution_page(None, Some(schedule_id.to_owned()), limit)?;
-        self.executions
-            .retain(|_, execution| execution.schedule_id != schedule_id);
-        for execution in &page.executions {
-            self.executions
-                .insert(execution.id.clone(), execution.clone());
-        }
-        self.scoped_history.clear();
-        self.scoped_history
-            .insert(schedule_id.to_owned(), page.truncated);
-        self.bound_execution_cache();
-        Ok((page.executions, page.truncated))
-    }
-
-    fn reseed_executions(&mut self, client: &client::Client) -> client::Result<()> {
-        if !protocol::ProtocolFeature::ScheduledExecutionObservation
-            .is_supported_by(self.negotiated_protocol)
-        {
-            self.executions.clear();
-            self.scoped_history.clear();
-            self.history_truncated = false;
-            self.needs_reseed = false;
-            self.reseed_stream_changed = false;
-            return Ok(());
-        }
-        let page = client.scheduled_execution_page(None, None, DASHBOARD_EXECUTION_CACHE_LIMIT)?;
-        let executions = page
-            .executions
-            .into_iter()
-            .map(|execution| (execution.id.clone(), execution))
-            .collect();
-        self.executions = executions;
-        self.scoped_history.clear();
-        self.history_truncated = page.truncated;
-        self.needs_reseed = false;
-        self.reseed_stream_changed = false;
-        Ok(())
-    }
-
-    fn apply_events(&mut self, events: &[protocol::DaemonEvent]) {
-        for event in events {
-            match &event.kind {
-                protocol::DaemonEventKind::ScheduledExecutionCreated { execution, .. }
-                | protocol::DaemonEventKind::ScheduledExecutionChanged { execution, .. } => {
-                    let should_replace = self
-                        .executions
-                        .get(&execution.id)
-                        .is_none_or(|current| execution.revision > current.revision);
-                    if should_replace {
-                        self.executions
-                            .insert(execution.id.clone(), execution.clone());
-                    }
-                }
-                protocol::DaemonEventKind::AgentScheduleRemoved { schedule_id, .. } => {
-                    self.executions
-                        .retain(|_, execution| execution.schedule_id != *schedule_id);
-                    self.scoped_history.remove(schedule_id);
-                }
-                _ => {}
-            }
-        }
-        self.bound_execution_cache();
-    }
-
-    fn bound_execution_cache(&mut self) {
-        while self.executions.len() > usize::from(DASHBOARD_EXECUTION_CACHE_LIMIT) {
-            let oldest_terminal = self
-                .executions
-                .values()
-                .filter(|execution| {
-                    execution.state.is_terminal()
-                        && !self.scoped_history.contains_key(&execution.schedule_id)
-                })
-                .min_by(|left, right| {
-                    left.requested_at_ms
-                        .cmp(&right.requested_at_ms)
-                        .then_with(|| left.id.cmp(&right.id))
-                })
-                .map(|execution| execution.id.clone())
-                .or_else(|| {
-                    self.executions
-                        .values()
-                        .filter(|execution| execution.state.is_terminal())
-                        .min_by(|left, right| {
-                            left.requested_at_ms
-                                .cmp(&right.requested_at_ms)
-                                .then_with(|| left.id.cmp(&right.id))
-                        })
-                        .map(|execution| execution.id.clone())
-                });
-            let Some(id) = oldest_terminal else { break };
-            self.executions.remove(&id);
-        }
     }
 }
 
@@ -508,16 +358,6 @@ enum Commands {
         #[command(subcommand)]
         command: SessionCommands,
     },
-    /// Manage recurring Agent work definitions
-    Schedule {
-        #[command(subcommand)]
-        command: ScheduleCommands,
-    },
-    /// Inspect and cancel scheduled execution records
-    Execution {
-        #[command(subcommand)]
-        command: ExecutionCommands,
-    },
     /// Inspect and install supported harness integrations
     Integration {
         #[command(subcommand)]
@@ -598,8 +438,6 @@ enum Commands {
         #[arg(long)]
         node: Option<String>,
     },
-    #[command(name = "__scheduled-runner", hide = true)]
-    ScheduledRunner { schedule_id: String },
     #[command(name = "__resume-session", hide = true)]
     ResumeSession {
         session_id: String,
@@ -1013,218 +851,6 @@ enum SessionCommands {
     },
 }
 
-#[derive(Subcommand)]
-enum ScheduleCommands {
-    /// Create a durable schedule definition
-    Create(Box<ScheduleCreateArgs>),
-    /// List schedule definitions without disclosing prompts
-    List {
-        #[arg(long, value_name = "NAME_OR_ID")]
-        workspace: Option<String>,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-    /// Inspect a schedule, including its private prompt
-    Inspect {
-        target: String,
-        #[arg(long, value_name = "NAME_OR_ID")]
-        workspace: Option<String>,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-    /// Mark a schedule paused in durable management state
-    Pause {
-        target: String,
-        #[arg(long, value_name = "NAME_OR_ID")]
-        workspace: Option<String>,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-    /// Enable future timed dispatch; run-now is independent
-    Resume {
-        target: String,
-        #[arg(long, value_name = "NAME_OR_ID")]
-        workspace: Option<String>,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-    /// Remove an inactive schedule and its persisted prompt
-    Remove {
-        target: String,
-        #[arg(long, value_name = "NAME_OR_ID")]
-        workspace: Option<String>,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-    /// Dispatch one execution now, including while paused
-    Run {
-        target: String,
-        #[arg(long, value_name = "NAME_OR_ID")]
-        workspace: Option<String>,
-        #[arg(long, value_name = "UUID")]
-        idempotency_key: Option<Uuid>,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-}
-
-impl ScheduleCommands {
-    fn node(&self) -> Option<&str> {
-        match self {
-            Self::Create(arguments) => arguments.node.as_deref(),
-            Self::List { node, .. }
-            | Self::Inspect { node, .. }
-            | Self::Pause { node, .. }
-            | Self::Resume { node, .. }
-            | Self::Remove { node, .. }
-            | Self::Run { node, .. } => node.as_deref(),
-        }
-    }
-}
-
-#[derive(Subcommand)]
-enum ExecutionCommands {
-    /// List prompt-free execution records
-    List {
-        #[arg(long, value_name = "NAME_OR_ID")]
-        workspace: Option<String>,
-        #[arg(long, value_name = "SCHEDULE_NAME_OR_ID")]
-        schedule: Option<String>,
-        #[arg(
-            long,
-            default_value_t = protocol::DEFAULT_SCHEDULED_EXECUTION_LIST_LIMIT,
-            value_parser = clap::value_parser!(u16).range(1..=protocol::MAX_SCHEDULED_EXECUTION_LIST_LIMIT as i64)
-        )]
-        limit: u16,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-    /// Inspect one execution by exact ID
-    Inspect {
-        execution_id: String,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-    /// Wait for an exact execution revision to advance
-    Wait {
-        execution_id: String,
-        #[arg(long)]
-        after_revision: u64,
-        #[arg(long, default_value_t = 30_000)]
-        wait_ms: u32,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-    /// Open an execution's exact active run or linked Agent Session
-    Open {
-        execution_id: String,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-    /// Cancel one nonterminal execution by exact ID
-    Cancel {
-        execution_id: String,
-        /// Exact registered Node alias or Node ID
-        #[arg(long)]
-        node: Option<String>,
-    },
-}
-
-impl ExecutionCommands {
-    fn node(&self) -> Option<&str> {
-        match self {
-            Self::List { node, .. }
-            | Self::Inspect { node, .. }
-            | Self::Wait { node, .. }
-            | Self::Open { node, .. }
-            | Self::Cancel { node, .. } => node.as_deref(),
-        }
-    }
-}
-
-#[derive(Args)]
-#[command(group(
-    ArgGroup::new("prompt_source")
-        .required(true)
-        .multiple(false)
-        .args(["prompt", "prompt_file"])
-), group(
-    ArgGroup::new("trigger_source")
-        .required(true)
-        .multiple(false)
-        .args(["cron", "every", "daily", "weekdays", "weekly"])
-), group(
-    ArgGroup::new("session_mode")
-        .multiple(false)
-        .args(["fresh", "continue_session"])
-), group(
-    ArgGroup::new("initial_state")
-        .multiple(false)
-        .args(["paused", "enabled"])
-))]
-struct ScheduleCreateArgs {
-    /// Workspace-unique schedule name
-    name: String,
-    /// Owning workspace name or ID
-    #[arg(long, value_name = "NAME_OR_ID")]
-    workspace: Option<String>,
-    /// Existing working directory to snapshot
-    #[arg(long, value_name = "PATH")]
-    cwd: PathBuf,
-    /// Integration accepted for future scheduled execution
-    #[arg(long)]
-    integration: String,
-    /// Exact inline prompt to persist
-    #[arg(long)]
-    prompt: Option<String>,
-    /// Regular UTF-8 file to snapshot as the prompt
-    #[arg(long, value_name = "PATH")]
-    prompt_file: Option<PathBuf>,
-    /// Canonical five-field cron expression
-    #[arg(long)]
-    cron: Option<String>,
-    /// Minute or hour interval, such as 15m or 6h
-    #[arg(long, value_name = "Nm|Nh")]
-    every: Option<String>,
-    /// Store a daily trigger at this local time
-    #[arg(long, value_name = "HH:MM")]
-    daily: Option<String>,
-    /// Store a weekday trigger at this local time
-    #[arg(long, value_name = "HH:MM")]
-    weekdays: Option<String>,
-    /// Store a weekly trigger for this English day and local time
-    #[arg(long, value_name = "DAY@HH:MM")]
-    weekly: Option<String>,
-    /// IANA timezone; defaults to the resolved system timezone
-    #[arg(long, value_name = "IANA_TIMEZONE")]
-    timezone: Option<String>,
-    /// Plan a new external Agent Session for every future execution
-    #[arg(long)]
-    fresh: bool,
-    /// Pin one exact projected Agent Session
-    #[arg(long = "continue", value_name = "PROJECTED_SESSION_ID")]
-    continue_session: Option<String>,
-    /// Create paused, which is the default
-    #[arg(long)]
-    paused: bool,
-    /// Record consent for future timed dispatch
-    #[arg(long)]
-    enabled: bool,
-    /// Exact registered Node alias or Node ID
-    #[arg(long)]
-    node: Option<String>,
-}
-
 #[derive(Args)]
 struct AgentSuperviseArgs {
     name: Option<String>,
@@ -1586,18 +1212,6 @@ command_keys! {
     SessionList => ("session.list", Json),
     SessionInspect => ("session.inspect", Json),
     SessionResume => ("session.resume", HumanOnly),
-    ScheduleCreate => ("schedule.create", Json),
-    ScheduleList => ("schedule.list", Json),
-    ScheduleInspect => ("schedule.inspect", Json),
-    SchedulePause => ("schedule.pause", Json),
-    ScheduleResume => ("schedule.resume", Json),
-    ScheduleRemove => ("schedule.remove", Json),
-    ScheduleRun => ("schedule.run", Json),
-    ExecutionList => ("execution.list", Json),
-    ExecutionInspect => ("execution.inspect", Json),
-    ExecutionWait => ("execution.wait", Json),
-    ExecutionOpen => ("execution.open", Json),
-    ExecutionCancel => ("execution.cancel", Json),
     Skill => ("skill", HumanOnly),
     Opencode => ("opencode", HumanOnly),
     OpencodeClaimEnsure => ("opencode.claim.ensure", PrivateJson),
@@ -1745,42 +1359,6 @@ impl Cli {
             Some(Commands::Session {
                 command: SessionCommands::Resume { .. },
             }) => CommandKey::SessionResume,
-            Some(Commands::Schedule {
-                command: ScheduleCommands::Create(..),
-            }) => CommandKey::ScheduleCreate,
-            Some(Commands::Schedule {
-                command: ScheduleCommands::List { .. },
-            }) => CommandKey::ScheduleList,
-            Some(Commands::Schedule {
-                command: ScheduleCommands::Inspect { .. },
-            }) => CommandKey::ScheduleInspect,
-            Some(Commands::Schedule {
-                command: ScheduleCommands::Pause { .. },
-            }) => CommandKey::SchedulePause,
-            Some(Commands::Schedule {
-                command: ScheduleCommands::Resume { .. },
-            }) => CommandKey::ScheduleResume,
-            Some(Commands::Schedule {
-                command: ScheduleCommands::Remove { .. },
-            }) => CommandKey::ScheduleRemove,
-            Some(Commands::Schedule {
-                command: ScheduleCommands::Run { .. },
-            }) => CommandKey::ScheduleRun,
-            Some(Commands::Execution {
-                command: ExecutionCommands::List { .. },
-            }) => CommandKey::ExecutionList,
-            Some(Commands::Execution {
-                command: ExecutionCommands::Inspect { .. },
-            }) => CommandKey::ExecutionInspect,
-            Some(Commands::Execution {
-                command: ExecutionCommands::Wait { .. },
-            }) => CommandKey::ExecutionWait,
-            Some(Commands::Execution {
-                command: ExecutionCommands::Open { .. },
-            }) => CommandKey::ExecutionOpen,
-            Some(Commands::Execution {
-                command: ExecutionCommands::Cancel { .. },
-            }) => CommandKey::ExecutionCancel,
             Some(Commands::Integration {
                 command: IntegrationCommands::List,
             }) => CommandKey::IntegrationList,
@@ -1883,7 +1461,6 @@ impl Cli {
             Some(Commands::Prompt) => CommandKey::Prompt,
             Some(Commands::Attach { .. } | Commands::AwaitAttach { .. }) => CommandKey::Attach,
             Some(Commands::ResumeSession { .. }) => CommandKey::ResumeSessionInternal,
-            Some(Commands::ScheduledRunner { .. }) => CommandKey::Attach,
             Some(Commands::FederationStdio) => CommandKey::Attach,
             Some(Commands::GuidedNodeAdd) => CommandKey::NodeAdd,
             Some(Commands::GuidedNodeUpgrade { .. }) => CommandKey::NodeUpgrade,
@@ -2111,9 +1688,6 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             attach::run(shell_id, node.as_deref(), false, true, None)?;
             return Ok(CliExit::Success);
         }
-        Some(Commands::ScheduledRunner { schedule_id }) => {
-            return scheduled_runner(schedule_id).map(CliExit::Child);
-        }
         Some(Commands::ResumeSession { session_id, node }) => {
             attach::run_agent_session(session_id, node.as_deref())?;
             return Ok(CliExit::Success);
@@ -2255,10 +1829,6 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             command: NotificationCommands::Test { reason },
         }) => test_notification(reason),
         Some(Commands::Session { command }) => session_command(command, cli.json),
-        Some(Commands::Schedule { command }) => schedule_command(command, cli.json),
-        Some(Commands::Execution { command }) => {
-            execution_command(command, cli.json, cli.terminal.as_deref())
-        }
         Some(Commands::Integration { command }) => integration_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
@@ -2326,7 +1896,6 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Daemon { command }) => daemon_control(command, cli.json),
         Some(Commands::Attach { .. } | Commands::AwaitAttach { .. }) => unreachable!(),
         Some(Commands::ResumeSession { .. }) => unreachable!(),
-        Some(Commands::ScheduledRunner { .. }) => unreachable!(),
         Some(Commands::FederationStdio) => unreachable!(),
         Some(Commands::GuidedNodeAdd) => unreachable!(),
         Some(Commands::GuidedNodeUpgrade { .. }) => unreachable!(),
@@ -2408,12 +1977,7 @@ fn verified_remote_connection(
             println!("Install source: {}", plan.source.description());
             println!("Install destination: {}", plan.destination.as_str());
             println!(
-                "Process impact: {}",
-                if plan.reason == ssh_bootstrap::RemoteInstallReason::Upgrade {
-                    "the pinned binary is uploaded privately first; activation occurs only if that provisional client proves the running daemon executable is this destination, then the previous executable is retained for rollback and an incompatible daemon is gracefully restarted"
-                } else {
-                    "the pinned binary is uploaded privately first; the runtime socket must remain absent through guarded activation, and rollback removes only a destination activated by this transaction"
-                }
+                "Process impact: the pinned binary is uploaded privately first; the runtime socket must remain absent through guarded activation, and rollback removes only a destination activated by this transaction"
             );
             if !confirm_setup("Install Boomux on this remote target?")? {
                 return Err(io::Error::new(
@@ -2470,7 +2034,7 @@ fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
     println!("Install source: {}", plan.source.description());
     println!("Install destination: {}", plan.destination.as_str());
     println!(
-        "Process impact: the pinned binary is uploaded privately first; activation requires proof that the running daemon uses this destination, then the previous executable is retained for rollback and the daemon is gracefully restarted with its managed processes"
+        "Process impact: this workflow requires an already protocol-compatible helper; the pinned binary is uploaded privately first, activation requires proof that the running daemon uses this destination, the previous executable is retained for rollback, and any present compatible daemon is restarted"
     );
     if !confirm_setup("Upgrade Boomux on this registered Node?")? {
         return Err(io::Error::new(
@@ -2719,7 +2283,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                     }),
                 )
             } else {
-                println!("ALIAS\tOWNERSHIP\tHEALTH\tCURRENT\tOBSERVED\tWORKSPACES\tSCHEDULER");
+                println!("ALIAS\tOWNERSHIP\tHEALTH\tCURRENT\tOBSERVED\tWORKSPACES");
                 for node in snapshot.nodes {
                     let workspace_count = node
                         .local_snapshot
@@ -2732,16 +2296,13 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                         })
                         .unwrap_or(0);
                     println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{} {}/{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}",
                         node.alias,
                         if node.local { "local" } else { "remote" },
                         format!("{:?}", node.health).to_ascii_lowercase(),
                         node.current,
                         node.observed_at_ms,
                         workspace_count,
-                        format!("{:?}", node.scheduler.state).to_ascii_lowercase(),
-                        node.scheduler.active_executions,
-                        node.scheduler.max_concurrent,
                     );
                 }
                 println!("\nGLOBAL WORKSPACES");
@@ -3114,7 +2675,6 @@ fn node_snapshot_json(node: protocol::CombinedNode) -> Result<serde_json::Value,
         observed_helper_version,
         workspace_owner_eligible,
         workspace_owner_unavailable_reason,
-        scheduler,
         local_snapshot,
         remote_projection,
         ..
@@ -3135,7 +2695,6 @@ fn node_snapshot_json(node: protocol::CombinedNode) -> Result<serde_json::Value,
         "observed_capabilities": observed_capabilities,
         "workspace_owner_eligible": workspace_owner_eligible,
         "workspace_owner_unavailable_reason": workspace_owner_unavailable_reason,
-        "scheduler": scheduler,
         "local_snapshot": local_snapshot.map(serde_json::to_value).transpose()?.map(qualify),
         "remote_projection": remote_projection.map(serde_json::to_value).transpose()?.map(qualify),
     }))
@@ -3149,9 +2708,6 @@ fn qualify_resource_identities(mut value: serde_json::Value, node_id: &str) -> s
         "run_id",
         "launcher_id",
         "agent_id",
-        "schedule_id",
-        "execution_id",
-        "owner_schedule_id",
     ];
     match &mut value {
         serde_json::Value::Array(values) => {
@@ -3393,7 +2949,6 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
     let client = client::connect()?;
     match command {
         DaemonCommands::Status if json => {
-            let scheduler = client.snapshot()?.scheduler;
             let identity = daemon_process_identity(&client);
             let protocol_version = identity.as_ref().map_or_else(
                 || client.protocol_version(),
@@ -3409,35 +2964,15 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
                     "executable": identity.as_ref().and_then(|identity| identity.executable.as_deref()),
                     "socket_device": identity.as_ref().map(|identity| identity.socket_device),
                     "socket_inode": identity.as_ref().map(|identity| identity.socket_inode),
-                    "scheduler": scheduler.map(|health| serde_json::json!({
-                        "state": match health.state {
-                            protocol::SchedulerState::Active => "active",
-                            protocol::SchedulerState::Offline => "offline",
-                        },
-                        "max_concurrent": health.max_concurrent,
-                        "active_executions": health.active_executions,
-                    })),
                 }),
             )?
         }
         DaemonCommands::Status => {
-            let scheduler = client.snapshot()?.scheduler;
             println!(
                 "running (protocol {}, {})",
                 client.protocol_version()?,
                 client.socket_path().display()
             );
-            if let Some(scheduler) = scheduler {
-                println!(
-                    "scheduler {} ({}/{} active executions)",
-                    match scheduler.state {
-                        protocol::SchedulerState::Active => "active",
-                        protocol::SchedulerState::Offline => "offline",
-                    },
-                    scheduler.active_executions,
-                    scheduler.max_concurrent
-                );
-            }
         }
         DaemonCommands::Restart => {
             client
@@ -3924,9 +3459,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                                 },
                             )?;
                         }
-                        Ok(format!(
-                            "Closed {name}, its launchers, shells, schedules, and persisted prompts"
-                        ))
+                        Ok(format!("Closed {name}, its launchers, and shells"))
                     }
                     tui::CloseTarget::Shell(shell_id) => {
                         let shell = routed_dashboard_shell(&client, shell_id, &local_node_id)?;
@@ -3974,12 +3507,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                             )?;
                         }
                         Ok(format!("Removed launcher {name}"))
-                    }
-                    tui::CloseTarget::Schedule(_) => {
-                        unreachable!("schedule removal has a typed effect")
-                    }
-                    tui::CloseTarget::Execution(_) => {
-                        unreachable!("execution cancellation has a typed effect")
                     }
                 })();
                 tui::DashboardEvent::OperationCompleted(result)
@@ -4227,297 +3754,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 })();
                 tui::DashboardEvent::RefreshCompleted(result)
             }
-            tui::DashboardEffect::RunSchedule(schedule_id) => {
-                let result =
-                    if schedule_id.node_id == local_node_id || schedule_id.node_id.is_empty() {
-                        run_dashboard_schedule(&client, &schedule_id.inner_id)
-                    } else {
-                        (|| {
-                            routed_dashboard_schedule(&client, &schedule_id, &local_node_id)?;
-                            let dispatch_key = Uuid::new_v4().to_string();
-                            match routed_dashboard_operation(
-                                &client,
-                                &schedule_id,
-                                &local_node_id,
-                                protocol::RoutedOperation::RunAgentSchedule {
-                                    schedule_id: schedule_id.inner_id.clone(),
-                                    dispatch_key,
-                                },
-                            )? {
-                                protocol::RoutedOperationResult::ScheduledExecution {
-                                    execution,
-                                    ..
-                                } => Ok(format!("Started scheduled execution {}", execution.id)),
-                                _ => {
-                                    Err("remote Node returned an unexpected schedule run response"
-                                        .into())
-                                }
-                            }
-                        })()
-                    };
-                tui::DashboardEvent::OperationCompleted(result)
-            }
-            tui::DashboardEffect::PauseSchedule(schedule_id) => {
-                let result = (|| {
-                    let inspection =
-                        routed_dashboard_schedule(&client, &schedule_id, &local_node_id)?;
-                    let schedule = if schedule_id.node_id == local_node_id
-                        || schedule_id.node_id.is_empty()
-                    {
-                        client
-                            .pause_agent_schedule(&schedule_id.inner_id)
-                            .map_err(|error| error.to_string())?
-                    } else {
-                        match routed_dashboard_operation(
-                            &client,
-                            &schedule_id,
-                            &local_node_id,
-                            protocol::RoutedOperation::PauseAgentSchedule {
-                                schedule_id: schedule_id.inner_id.clone(),
-                                expected_revision: inspection.schedule.revision,
-                            },
-                        )? {
-                            protocol::RoutedOperationResult::AgentSchedule { schedule } => schedule,
-                            _ => {
-                                return Err(
-                                    "remote Node returned an unexpected pause response".into()
-                                );
-                            }
-                        }
-                    };
-                    Ok(format!("Paused schedule {}", schedule.name))
-                })();
-                tui::DashboardEvent::OperationCompleted(result)
-            }
-            tui::DashboardEffect::ResumeSchedule(schedule_id) => {
-                let result = (|| {
-                    let inspection =
-                        routed_dashboard_schedule(&client, &schedule_id, &local_node_id)?;
-                    let schedule = if schedule_id.node_id == local_node_id
-                        || schedule_id.node_id.is_empty()
-                    {
-                        client
-                            .resume_agent_schedule(&schedule_id.inner_id)
-                            .map_err(|error| error.to_string())?
-                    } else {
-                        match routed_dashboard_operation(
-                            &client,
-                            &schedule_id,
-                            &local_node_id,
-                            protocol::RoutedOperation::ResumeAgentSchedule {
-                                schedule_id: schedule_id.inner_id.clone(),
-                                expected_revision: inspection.schedule.revision,
-                            },
-                        )? {
-                            protocol::RoutedOperationResult::AgentSchedule { schedule } => schedule,
-                            _ => {
-                                return Err(
-                                    "remote Node returned an unexpected resume response".into()
-                                );
-                            }
-                        }
-                    };
-                    Ok(format!(
-                        "Enabled schedule {} for future timed dispatch",
-                        schedule.name
-                    ))
-                })();
-                tui::DashboardEvent::OperationCompleted(result)
-            }
-            tui::DashboardEffect::LoadScheduleEditor { schedule_id } => {
-                let result = routed_dashboard_schedule(&client, &schedule_id, &local_node_id).map(
-                    |inspection| tui::ScheduleEditInspection {
-                        schedule_id: schedule_id.clone(),
-                        name: inspection.schedule.name,
-                        cron: inspection.schedule.trigger.cron,
-                        timezone: inspection.schedule.trigger.timezone,
-                        prompt: inspection.prompt,
-                        revision: inspection.schedule.revision,
-                        paused: inspection.schedule.state == AgentScheduleState::Paused,
-                    },
-                );
-                tui::DashboardEvent::ScheduleEditorLoaded {
-                    schedule_id,
-                    result,
-                }
-            }
-            tui::DashboardEffect::UpdateSchedule {
-                schedule_id,
-                expected_revision,
-                update,
-            } => {
-                let definition = AgentScheduleUpdate {
-                    name: update.name,
-                    prompt: update.prompt,
-                    trigger: AgentScheduleTrigger {
-                        cron: update.cron,
-                        timezone: update.timezone,
-                    },
-                };
-                let result = if schedule_id.node_id == local_node_id
-                    || schedule_id.node_id.is_empty()
-                {
-                    client
-                        .update_agent_schedule(&schedule_id.inner_id, expected_revision, definition)
-                        .map(|schedule| format!("Updated schedule {}", schedule.name))
-                        .map_err(|error| error.to_string())
-                } else {
-                    routed_dashboard_operation(
-                        &client,
-                        &schedule_id,
-                        &local_node_id,
-                        protocol::RoutedOperation::UpdateAgentSchedule {
-                            schedule_id: schedule_id.inner_id.clone(),
-                            expected_revision,
-                            update: definition,
-                        },
-                    )
-                    .and_then(|result| match result {
-                        protocol::RoutedOperationResult::AgentSchedule { schedule } => {
-                            Ok(format!("Updated schedule {}", schedule.name))
-                        }
-                        _ => Err(
-                            "remote Node returned an unexpected schedule update response".into(),
-                        ),
-                    })
-                };
-                tui::DashboardEvent::ScheduleEditorSaved {
-                    schedule_id,
-                    result,
-                }
-            }
-            tui::DashboardEffect::CancelExecution(execution_id) => {
-                let result =
-                    if execution_id.node_id == local_node_id || execution_id.node_id.is_empty() {
-                        cancel_dashboard_execution(&client, &execution_id.inner_id)
-                    } else {
-                        (|| {
-                            let execution =
-                                routed_dashboard_execution(&client, &execution_id, &local_node_id)?;
-                            match routed_dashboard_operation(
-                                &client,
-                                &execution_id,
-                                &local_node_id,
-                                protocol::RoutedOperation::CancelScheduledExecution {
-                                    execution_id: execution_id.inner_id.clone(),
-                                    expected_revision: execution.revision,
-                                },
-                            )? {
-                                protocol::RoutedOperationResult::ScheduledExecution {
-                                    execution,
-                                    ..
-                                } => Ok(format!("Cancelled scheduled execution {}", execution.id)),
-                                _ => {
-                                    Err("remote Node returned an unexpected cancellation response"
-                                        .into())
-                                }
-                            }
-                        })()
-                    };
-                tui::DashboardEvent::OperationCompleted(result)
-            }
-            tui::DashboardEffect::OpenScheduledExecution { execution_id } => {
-                let result = if execution_id.node_id == local_node_id
-                    || execution_id.node_id.is_empty()
-                {
-                    open_scheduled_execution(&client, &execution_id.inner_id, terminal.as_deref())
-                        .map(|opened| opened.message)
-                        .map_err(|error| error.to_string())
-                } else {
-                    open_remote_scheduled_execution(&client, &execution_id, terminal.as_deref())
-                        .map(|opened| opened.message)
-                        .map_err(|error| error.to_string())
-                };
-                tui::DashboardEvent::OperationCompleted(result)
-            }
-            tui::DashboardEffect::RemoveSchedule(schedule_id) => {
-                let schedule_inner = local_dashboard_inner(&schedule_id, &local_node_id);
-                let name = refresh
-                    .snapshot()
-                    .workspaces
-                    .iter()
-                    .flat_map(|workspace| &workspace.schedules)
-                    .find(|schedule| schedule_inner.as_ref().is_ok_and(|id| schedule.id == **id))
-                    .map_or_else(|| "schedule".into(), |schedule| schedule.name.clone());
-                let result = if schedule_id.node_id == local_node_id
-                    || schedule_id.node_id.is_empty()
-                {
-                    schedule_inner.and_then(|id| {
-                        client
-                            .remove_agent_schedule(id)
-                            .map_err(|error| error.to_string())
-                    })
-                } else {
-                    (|| {
-                        let inspection =
-                            routed_dashboard_schedule(&client, &schedule_id, &local_node_id)?;
-                        routed_dashboard_operation(
-                            &client,
-                            &schedule_id,
-                            &local_node_id,
-                            protocol::RoutedOperation::RemoveAgentSchedule {
-                                schedule_id: schedule_id.inner_id.clone(),
-                                expected_revision: inspection.schedule.revision,
-                            },
-                        )?;
-                        Ok(())
-                    })()
-                }
-                .map(|()| {
-                    format!("Removed schedule {name}, its persisted prompt, and retained history")
-                });
-                tui::DashboardEvent::OperationCompleted(result)
-            }
-            tui::DashboardEffect::LoadScheduleHistory { schedule_id, limit } => {
-                let result =
-                    if schedule_id.node_id == local_node_id || schedule_id.node_id.is_empty() {
-                        refresh
-                            .load_schedule_history(&client, &schedule_id.inner_id, limit)
-                            .map(|(_, truncated)| {
-                                let schedules = dashboard_projection::project_schedules(
-                                    refresh.snapshot(),
-                                    &refresh.executions(),
-                                    refresh.history_truncated,
-                                    &refresh.scoped_history,
-                                );
-                                let executions = schedules
-                                    .into_iter()
-                                    .find(|schedule| schedule.id == schedule_id.inner_id)
-                                    .map_or_else(Vec::new, |schedule| schedule.executions);
-                                (executions, truncated)
-                            })
-                            .map_err(|error| error.to_string())
-                    } else {
-                        client
-                            .route_node_operation(
-                                &schedule_id.node_id,
-                                protocol::RoutedOperation::ListScheduledExecutions {
-                                    workspace_id: None,
-                                    schedule_id: Some(schedule_id.inner_id.clone()),
-                                    limit,
-                                },
-                            )
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| match result {
-                                protocol::RoutedOperationResult::ScheduledExecutions {
-                                    executions,
-                                    truncated,
-                                    ..
-                                } => Ok((
-                                    dashboard_projection::project_remote_executions(&executions),
-                                    truncated,
-                                )),
-                                _ => Err(
-                                    "remote Node returned an unexpected execution history response"
-                                        .into(),
-                                ),
-                            })
-                    };
-                tui::DashboardEvent::ScheduleHistoryCompleted {
-                    schedule_id,
-                    result,
-                }
-            }
             tui::DashboardEffect::ReadTerminalPreview {
                 shell_id,
                 run_id,
@@ -4548,51 +3784,8 @@ fn dashboard_state(
     let qualified_focused_terminal = combined
         .as_ref()
         .and_then(|snapshot| snapshot.focused_terminal.clone());
-    let schedules_supported = protocol::ProtocolFeature::ScheduledExecutionObservation
-        .is_supported_by(refresh.negotiated_protocol);
     let mut workspaces = dashboard_views_with_catalog(&snapshot.workspaces, git_cache, title_cache);
-    if !schedules_supported {
-        for workspace in &mut workspaces {
-            workspace
-                .items
-                .retain(|item| !matches!(item, tui::WorkspaceItemView::Schedule(_)));
-        }
-    }
     enrich_session_titles(&mut workspaces, title_cache);
-    let scheduling = if !schedules_supported {
-        tui::SchedulingView::Unsupported {
-            required_protocol: protocol::ProtocolFeature::ScheduledExecutionObservation
-                .minimum_version(),
-            negotiated: refresh.negotiated_protocol,
-        }
-    } else {
-        match snapshot.scheduler.as_ref() {
-            Some(health) => match health.state {
-                protocol::SchedulerState::Active => tui::SchedulingView::Active {
-                    active: health.active_executions,
-                    maximum: health.max_concurrent,
-                },
-                protocol::SchedulerState::Offline => tui::SchedulingView::Offline {
-                    active: health.active_executions,
-                    maximum: health.max_concurrent,
-                },
-            },
-            None => tui::SchedulingView::Offline {
-                active: 0,
-                maximum: 0,
-            },
-        }
-    };
-    let mut schedules = if schedules_supported {
-        dashboard_projection::project_schedules(
-            &snapshot,
-            &refresh.executions(),
-            refresh.history_truncated,
-            &refresh.scoped_history,
-        )
-    } else {
-        Vec::new()
-    };
     let mut nodes = Vec::new();
     if let Some(combined) = combined {
         let global_workspaces = combined.workspaces;
@@ -4613,32 +3806,14 @@ fn dashboard_state(
                 observed_capabilities: node.observed_capabilities.clone(),
                 workspace_owner_eligible: node.workspace_owner_eligible,
                 workspace_owner_unavailable_reason: node.workspace_owner_unavailable_reason.clone(),
-                scheduler: node.scheduler.clone(),
             };
             if node.local {
                 assign_local_workspace_node(&mut workspaces, &node_view);
-                for schedule in &mut schedules {
-                    schedule.node_id = node.node_id.clone();
-                    schedule.node_alias = node.alias.clone();
-                    schedule.actionable = node.current && !node.stale;
-                }
             } else {
-                let (mut remote_workspaces, mut remote_schedules) =
-                    dashboard_projection::project_remote_node(&node);
+                let mut remote_workspaces = dashboard_projection::project_remote_node(&node);
                 workspaces.append(&mut remote_workspaces);
-                schedules.append(&mut remote_schedules);
             }
             nodes.push(node_view);
-        }
-        for schedule in &mut schedules {
-            if let Some(global) = global_workspaces.iter().find(|workspace| {
-                workspace.placements.iter().any(|placement| {
-                    placement.node_id == schedule.node_id
-                        && placement.workspace_id == schedule.workspace_id
-                })
-            }) {
-                schedule.workspace = global.name.clone();
-            }
         }
         workspaces =
             group_dashboard_workspaces(workspaces, &nodes, global_workspaces, external_workspaces);
@@ -4652,22 +3827,9 @@ fn dashboard_state(
         );
     }
     sort_dashboard_workspaces(&mut workspaces);
-    schedules.sort_by(|left, right| {
-        left.node_alias
-            .cmp(&right.node_alias)
-            .then_with(|| left.workspace.cmp(&right.workspace))
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.id.cmp(&right.id))
-    });
     tui::DashboardState {
         nodes,
         workspaces,
-        schedules,
-        scheduling,
-        exact_run_attachment: protocol::ProtocolFeature::ExactRunAttachment
-            .is_supported_by(refresh.negotiated_protocol),
-        schedule_editing: protocol::ProtocolFeature::AgentScheduleEditing
-            .is_supported_by(refresh.negotiated_protocol),
         cached_projection_dismissal: protocol::ProtocolFeature::CachedProjectionDismissal
             .is_supported_by(refresh.negotiated_protocol),
         node_reauthentication: protocol::ProtocolFeature::GlobalWorkspaces
@@ -4863,11 +4025,6 @@ fn unavailable_placement_node(node_id: &str) -> tui::NodeView {
         observed_capabilities: Vec::new(),
         workspace_owner_eligible: false,
         workspace_owner_unavailable_reason: Some("Node is not registered".into()),
-        scheduler: protocol::SchedulerHealth {
-            state: protocol::SchedulerState::Offline,
-            max_concurrent: 0,
-            active_executions: 0,
-        },
     }
 }
 
@@ -5013,54 +4170,6 @@ fn routed_dashboard_launcher(
     }
 }
 
-fn routed_dashboard_schedule(
-    client: &client::Client,
-    identity: &protocol::QualifiedIdentity,
-    local_node_id: &str,
-) -> Result<protocol::AgentScheduleInspection, String> {
-    if identity.node_id == local_node_id || identity.node_id.is_empty() {
-        return client
-            .get_agent_schedule(&identity.inner_id)
-            .map_err(|error| error.to_string());
-    }
-    match client
-        .route_node_operation(
-            &identity.node_id,
-            protocol::RoutedOperation::GetAgentSchedule {
-                schedule_id: identity.inner_id.clone(),
-            },
-        )
-        .map_err(|error| error.to_string())?
-    {
-        protocol::RoutedOperationResult::AgentScheduleInspection { inspection } => Ok(inspection),
-        _ => Err("remote Node returned an unexpected schedule response".into()),
-    }
-}
-
-fn routed_dashboard_execution(
-    client: &client::Client,
-    identity: &protocol::QualifiedIdentity,
-    local_node_id: &str,
-) -> Result<protocol::ScheduledExecutionSnapshot, String> {
-    if identity.node_id == local_node_id || identity.node_id.is_empty() {
-        return client
-            .get_scheduled_execution(&identity.inner_id)
-            .map_err(|error| error.to_string());
-    }
-    match client
-        .route_node_operation(
-            &identity.node_id,
-            protocol::RoutedOperation::GetScheduledExecution {
-                execution_id: identity.inner_id.clone(),
-            },
-        )
-        .map_err(|error| error.to_string())?
-    {
-        protocol::RoutedOperationResult::ScheduledExecution { execution, .. } => Ok(execution),
-        _ => Err("remote Node returned an unexpected execution response".into()),
-    }
-}
-
 fn routed_dashboard_operation(
     client: &client::Client,
     identity: &protocol::QualifiedIdentity,
@@ -5073,267 +4182,6 @@ fn routed_dashboard_operation(
     client
         .route_node_operation(&identity.node_id, operation)
         .map_err(|error| error.to_string())
-}
-
-fn run_dashboard_schedule(client: &client::Client, schedule_id: &str) -> Result<String, String> {
-    client
-        .run_agent_schedule(schedule_id, Uuid::new_v4().to_string())
-        .map(|execution| format!("Started scheduled execution {}", execution.id))
-        .map_err(|error| error.to_string())
-}
-
-fn cancel_dashboard_execution(
-    client: &client::Client,
-    execution_id: &str,
-) -> Result<String, String> {
-    let execution = client
-        .get_scheduled_execution(execution_id)
-        .map_err(|error| error.to_string())?;
-    if !matches!(
-        execution.state,
-        protocol::ScheduledExecutionState::Claimed
-            | protocol::ScheduledExecutionState::Starting
-            | protocol::ScheduledExecutionState::Active
-    ) {
-        return Err(format!(
-            "execution {} is no longer active; refresh before cancelling",
-            execution.id
-        ));
-    }
-    client
-        .cancel_scheduled_execution(execution_id)
-        .map(|execution| format!("Cancelled exact execution {}", execution.id))
-        .map_err(|error| error.to_string())
-}
-
-struct OpenedScheduledExecution {
-    execution: ScheduledExecutionSnapshot,
-    target: &'static str,
-    message: String,
-}
-
-#[derive(Debug)]
-enum ScheduledExecutionOpenTarget<'a> {
-    Run { shell_id: &'a str, run_id: &'a str },
-    Session { agent_id: &'a str },
-}
-
-fn scheduled_execution_open_target(
-    execution: &ScheduledExecutionSnapshot,
-) -> Result<ScheduledExecutionOpenTarget<'_>, (&'static str, &'static str)> {
-    if matches!(
-        execution.state,
-        protocol::ScheduledExecutionState::Starting | protocol::ScheduledExecutionState::Active
-    ) {
-        let shell_id = execution
-            .shell_id
-            .as_deref()
-            .ok_or(("busy", "scheduled execution has no exact retained shell"))?;
-        let run_id = execution
-            .run_id
-            .as_deref()
-            .ok_or(("busy", "scheduled execution has no exact retained run"))?;
-        return Ok(ScheduledExecutionOpenTarget::Run { shell_id, run_id });
-    }
-    execution
-        .agent_id
-        .as_deref()
-        .map(|agent_id| ScheduledExecutionOpenTarget::Session { agent_id })
-        .ok_or((
-            "not_found",
-            "scheduled execution has no exact linked Agent Session to open",
-        ))
-}
-
-fn open_scheduled_execution(
-    client: &client::Client,
-    execution_id: &str,
-    terminal: Option<&str>,
-) -> Result<OpenedScheduledExecution, Box<dyn Error>> {
-    let execution = client.get_scheduled_execution(execution_id)?;
-    let target = scheduled_execution_open_target(&execution)
-        .map_err(|(code, message)| cli_output::failure(code, message))?;
-    if let ScheduledExecutionOpenTarget::Run { shell_id, run_id } = target {
-        if !client.supports(protocol::ProtocolFeature::ExactRunAttachment)? {
-            return Err(cli_output::failure(
-                "unsupported_version",
-                "opening exact Scheduled Execution runs requires daemon protocol 26; upgrade and restart Boomux",
-            ));
-        }
-        let shell = client.get_shell(shell_id)?;
-        validate_dashboard_execution_open(&execution, &shell, shell_id, run_id)
-            .map_err(|message| cli_output::failure("busy", message))?;
-        let workspace = client.get_workspace(&execution.workspace_id)?;
-        terminal::open_exact_run(
-            terminal,
-            shell_id,
-            run_id,
-            &format!("{} - {}", workspace.name, shell.name),
-            true,
-        )?;
-        return Ok(OpenedScheduledExecution {
-            message: format!(
-                "Opened exact execution {} from schedule {}",
-                execution.id, execution.schedule_id
-            ),
-            execution,
-            target: "run",
-        });
-    }
-
-    let ScheduledExecutionOpenTarget::Session { agent_id } = target else {
-        unreachable!("run targets return after opening")
-    };
-    let snapshot = client.snapshot()?;
-    let catalog = discover_host_catalog(&snapshot.workspaces);
-    let sessions = session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
-    let session = sessions
-        .iter()
-        .find(|session| {
-            session.workspace_id == execution.workspace_id
-                && session
-                    .occurrences
-                    .iter()
-                    .any(|occurrence| occurrence.agent_id == agent_id)
-        })
-        .ok_or_else(|| {
-            cli_output::failure(
-                "not_found",
-                "scheduled execution's exact linked Agent Session is no longer available",
-            )
-        })?;
-    let (cwd, command) = dashboard_session_resume_plan(session)
-        .map_err(|message| cli_output::failure("invalid_argument", message))?;
-    terminal::open_command(
-        terminal,
-        &cwd,
-        &format!(
-            "{} - {} session",
-            session.workspace_name, session.integration
-        ),
-        &command,
-    )?;
-    Ok(OpenedScheduledExecution {
-        message: format!(
-            "Opened exact {} Agent Session for execution {}",
-            session.integration, execution.id
-        ),
-        execution,
-        target: "session",
-    })
-}
-
-fn open_remote_scheduled_execution(
-    client: &client::Client,
-    execution_id: &protocol::QualifiedIdentity,
-    terminal: Option<&str>,
-) -> Result<OpenedScheduledExecution, Box<dyn Error>> {
-    let execution =
-        routed_dashboard_execution(client, execution_id, "").map_err(io::Error::other)?;
-    let target = scheduled_execution_open_target(&execution)
-        .map_err(|(code, message)| cli_output::failure(code, message))?;
-    if let ScheduledExecutionOpenTarget::Session { agent_id } = target {
-        let result = client.route_node_host_service(
-            &execution_id.node_id,
-            protocol::HostServiceOperation::ResolveAgentSession {
-                workspace_id: execution.workspace_id.clone(),
-                agent_id: agent_id.to_owned(),
-            },
-        )?;
-        let protocol::HostServiceResult::ResolvedAgentSession { session } = result else {
-            return Err("remote Node returned an unexpected Agent Session response".into());
-        };
-        let registration = client.node_registration(&execution_id.node_id)?;
-        terminal::open_agent_session(
-            terminal,
-            Some(&execution_id.node_id),
-            &session.id,
-            &format!(
-                "[{}] {} - {} session",
-                registration.alias, session.workspace_name, session.integration,
-            ),
-        )?;
-        return Ok(OpenedScheduledExecution {
-            message: format!(
-                "Opened exact {} Agent Session for execution {} on Node {}",
-                session.integration, execution.id, registration.alias,
-            ),
-            execution,
-            target: "session",
-        });
-    }
-    let ScheduledExecutionOpenTarget::Run { shell_id, run_id } = target else {
-        unreachable!("session targets return after opening")
-    };
-    let shell_identity = protocol::QualifiedIdentity::new(&execution_id.node_id, shell_id);
-    let shell = routed_dashboard_shell(client, &shell_identity, "").map_err(io::Error::other)?;
-    validate_dashboard_execution_open(&execution, &shell, shell_id, run_id)
-        .map_err(|message| cli_output::failure("busy", message))?;
-    let workspace = match client.route_node_operation(
-        &execution_id.node_id,
-        protocol::RoutedOperation::GetWorkspace {
-            workspace_id: execution.workspace_id.clone(),
-        },
-    )? {
-        protocol::RoutedOperationResult::Workspace { workspace } => workspace,
-        _ => return Err("remote Node returned an unexpected workspace response".into()),
-    };
-    let registration = client.node_registration(&execution_id.node_id)?;
-    terminal::open_remote_exact_run(
-        terminal,
-        &execution_id.node_id,
-        shell_id,
-        run_id,
-        &format!(
-            "[{}] {} - {}",
-            registration.alias, workspace.name, shell.name
-        ),
-        true,
-    )?;
-    Ok(OpenedScheduledExecution {
-        message: format!(
-            "Opened exact execution {} from schedule {} on Node {}",
-            execution.id, execution.schedule_id, registration.alias
-        ),
-        execution,
-        target: "run",
-    })
-}
-
-fn validate_dashboard_execution_open(
-    execution: &ScheduledExecutionSnapshot,
-    shell: &ShellSnapshot,
-    shell_id: &str,
-    run_id: &str,
-) -> Result<(), String> {
-    if !matches!(
-        execution.state,
-        protocol::ScheduledExecutionState::Starting | protocol::ScheduledExecutionState::Active
-    ) {
-        return Err("selected scheduled execution is no longer openable".into());
-    }
-    if execution.shell_id.as_deref() != Some(shell_id)
-        || execution.run_id.as_deref() != Some(run_id)
-    {
-        return Err("scheduled execution links changed; refresh before opening".into());
-    }
-    if shell.id != shell_id
-        || shell.workspace_id != execution.workspace_id
-        || shell.owner
-            != (protocol::ShellOwner::Schedule {
-                schedule_id: execution.schedule_id.clone(),
-            })
-    {
-        return Err("scheduled execution shell ownership no longer matches".into());
-    }
-    if shell.status != ShellStatus::Running
-        || shell.run.as_ref().map(|run| run.id.as_str()) != Some(run_id)
-    {
-        return Err(
-            "scheduled execution shell has moved to a different run; refresh before opening".into(),
-        );
-    }
-    Ok(())
 }
 
 fn dashboard_session_resume_plan(
@@ -7515,11 +6363,7 @@ fn attempt_open_coordinated_workspace(
                 }
             }
         }
-        for shell in owner
-            .shells
-            .iter()
-            .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
-        {
+        for shell in &owner.shells {
             let opened = if desktop_placement {
                 terminal::open_remote_placed(
                     terminal.as_deref(),
@@ -8011,7 +6855,6 @@ fn workspace_command(
                             name: workspace.name.clone(),
                             shell_count: workspace.shells.len(),
                             launcher_count: workspace.launchers.len(),
-                            schedule_count: workspace.schedules.len(),
                             agent_count: workspace.agents.len(),
                             agent_state_counts: summary.states,
                             attention_count: summary.attention_count,
@@ -8023,18 +6866,15 @@ fn workspace_command(
                     serde_json::json!({ "workspaces": workspaces }),
                 );
             }
-            println!(
-                "NAME\tWORKSPACE ID\tSHELLS\tLAUNCHERS\tSCHEDULES\tAGENTS\tBLOCKED\tDONE\tATTENTION"
-            );
+            println!("NAME\tWORKSPACE ID\tSHELLS\tLAUNCHERS\tAGENTS\tBLOCKED\tDONE\tATTENTION");
             for workspace in workspaces {
                 let summary = agent_attention_projection::summarize_workspace(&workspace);
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     sanitize_table_cell(&workspace.name),
                     workspace.id,
                     workspace.shells.len(),
                     workspace.launchers.len(),
-                    workspace.schedules.len(),
                     workspace.agents.len(),
                     summary.states.blocked,
                     summary.states.done,
@@ -8136,11 +6976,7 @@ fn workspace_command(
                         failures.push(format!("launcher {}: {error}", launcher.name));
                     }
                 }
-                for shell in workspace
-                    .shells
-                    .iter()
-                    .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
-                {
+                for shell in &workspace.shells {
                     if let Err(error) = terminal::open_remote(
                         terminal.as_deref(),
                         &registration.node_id,
@@ -8268,9 +7104,6 @@ fn workspace_command(
                             "launchers": workspace.launchers.iter()
                                 .map(|launcher| cli_output::launcher(launcher, Some(&workspace.name)))
                                 .collect::<Vec<_>>(),
-                            "schedules": workspace.schedules.iter()
-                                .map(|schedule| cli_output::schedule(schedule, Some(&workspace.name)))
-                                .collect::<Vec<_>>(),
                             "agents": workspace.agents.iter()
                                 .map(|agent| cli_output::agent(agent, Some(&workspace.name)))
                                 .collect::<Vec<_>>(),
@@ -8291,7 +7124,6 @@ fn workspace_command(
             );
             println!("SHELLS\t{}", workspace.shells.len());
             println!("LAUNCHERS\t{}", workspace.launchers.len());
-            println!("SCHEDULES\t{}", workspace.schedules.len());
             println!("AGENTS\t{}", workspace.agents.len());
             println!("BLOCKED AGENTS\t{}", agent_summary.states.blocked);
             println!("COMPLETED AGENTS\t{}", agent_summary.states.done);
@@ -8318,20 +7150,6 @@ fn workspace_command(
                         launcher.id,
                         launcher.cwd.display(),
                         launcher.command.join(" ")
-                    );
-                }
-            }
-            if !workspace.schedules.is_empty() {
-                println!("\nNAME\tSCHEDULE ID\tSTATE\tINTEGRATION\tCRON\tTIMEZONE");
-                for schedule in &workspace.schedules {
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}",
-                        sanitize_table_cell(&schedule.name),
-                        sanitize_table_cell(&schedule.id),
-                        cli_output::schedule_state(schedule.state),
-                        sanitize_table_cell(&schedule.integration),
-                        sanitize_table_cell(&schedule.trigger.cron),
-                        sanitize_table_cell(&schedule.trigger.timezone),
                     );
                 }
             }
@@ -8513,10 +7331,7 @@ fn workspace_command(
                 );
             }
             client.close_workspace(&workspace.id)?;
-            println!(
-                "Closed workspace {}; its schedules and persisted prompts were removed",
-                workspace.name
-            );
+            println!("Closed workspace {}", workspace.name);
         }
         WorkspaceCommands::Retry { target } => {
             require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
@@ -9458,244 +8273,6 @@ fn remote_session_command(
     Ok(())
 }
 
-fn schedule_command(mut command: ScheduleCommands, json: bool) -> Result<(), Box<dyn Error>> {
-    let client = client::connect_or_start()?;
-    let creation_context = if matches!(&command, ScheduleCommands::Create(_)) {
-        Some(WorkspaceCreationContext::load(&client)?)
-    } else {
-        None
-    };
-    if let ScheduleCommands::Create(arguments) = &mut command {
-        arguments.workspace = Some(
-            creation_context
-                .as_ref()
-                .expect("create context was loaded")
-                .required_target(
-                    &client,
-                    arguments.workspace.as_deref(),
-                    arguments.node.is_some(),
-                )?,
-        );
-    }
-    if let ScheduleCommands::Create(arguments) = &command
-        && let Some(selection) = creation_context
-            .as_ref()
-            .expect("create context was loaded")
-            .coordinated_owner(
-                arguments
-                    .workspace
-                    .as_deref()
-                    .expect("create workspace was resolved"),
-                arguments.node.as_deref(),
-            )?
-    {
-        let ScheduleCommands::Create(arguments) = command else {
-            unreachable!()
-        };
-        return create_coordinated_schedule(&client, *arguments, selection, json);
-    }
-    if let Some(node) = command.node().map(str::to_owned) {
-        return remote_schedule_command(&client, command, &node, json);
-    }
-    validate_schedule_protocol(client.protocol_version()?)?;
-    match command {
-        ScheduleCommands::Create(arguments) => create_schedule(&client, *arguments, json),
-        ScheduleCommands::List { workspace, .. } => {
-            let snapshot = client.snapshot()?;
-            let selected = workspace
-                .as_deref()
-                .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
-                .transpose()?;
-            let schedules = snapshot
-                .workspaces
-                .iter()
-                .filter(|candidate| selected.is_none_or(|selected| candidate.id == selected.id))
-                .flat_map(|workspace| {
-                    workspace
-                        .schedules
-                        .iter()
-                        .map(move |schedule| (schedule, workspace.name.as_str()))
-                })
-                .collect::<Vec<_>>();
-            if json {
-                let schedules = schedules
-                    .iter()
-                    .map(|(schedule, workspace_name)| {
-                        cli_output::schedule(schedule, Some(workspace_name))
-                    })
-                    .collect::<Vec<_>>();
-                return print_json(
-                    CommandKey::ScheduleList,
-                    serde_json::json!({ "schedules": schedules }),
-                );
-            }
-            println!(
-                "WORKSPACE\tNAME\tSCHEDULE ID\tSTATE\tINTEGRATION\tTRIGGER\tTIMEZONE\tSESSION\tNEXT OCCURRENCE MS"
-            );
-            for (schedule, workspace_name) in schedules {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    sanitize_table_cell(workspace_name),
-                    sanitize_table_cell(&schedule.name),
-                    sanitize_table_cell(&schedule.id),
-                    cli_output::schedule_state(schedule.state),
-                    sanitize_table_cell(&schedule.integration),
-                    sanitize_table_cell(&schedule.trigger.cron),
-                    sanitize_table_cell(&schedule.trigger.timezone),
-                    sanitize_table_cell(&schedule_session_label(&schedule.session)),
-                    schedule
-                        .next_occurrence
-                        .as_ref()
-                        .map(|occurrence| occurrence.scheduled_at_ms.to_string())
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-            }
-            if snapshot
-                .scheduler
-                .as_ref()
-                .is_some_and(|scheduler| scheduler.state == protocol::SchedulerState::Offline)
-            {
-                eprintln!(
-                    "Scheduler is offline: next occurrences are projections only. Run `boomux daemon status` and `boomux doctor`; fix configuration or environment and run `boomux daemon restart` before relying on timed dispatch."
-                );
-            }
-            Ok(())
-        }
-        ScheduleCommands::Inspect {
-            target, workspace, ..
-        } => {
-            let snapshot = client.snapshot()?;
-            let workspace = resource_workspace_argument(
-                &client,
-                workspace.as_deref(),
-                find_schedule(&snapshot, &target).is_some(),
-            )?;
-            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
-            let workspace_name = schedule_workspace_name(&snapshot, schedule);
-            let inspection = client.get_agent_schedule(&schedule.id)?;
-            if json {
-                return print_json(
-                    CommandKey::ScheduleInspect,
-                    serde_json::json!({
-                        "schedule": cli_output::schedule_inspection(
-                            &inspection.schedule,
-                            workspace_name,
-                            &inspection.prompt,
-                        ),
-                    }),
-                );
-            }
-            print_schedule_inspection(&inspection.schedule, workspace_name, &inspection.prompt);
-            Ok(())
-        }
-        ScheduleCommands::Pause {
-            target, workspace, ..
-        } => {
-            let snapshot = client.snapshot()?;
-            let workspace = resource_workspace_argument(
-                &client,
-                workspace.as_deref(),
-                find_schedule(&snapshot, &target).is_some(),
-            )?;
-            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
-            let workspace_name = schedule_workspace_name(&snapshot, schedule).map(str::to_owned);
-            let schedule = client.pause_agent_schedule(&schedule.id)?;
-            print_schedule_mutation(
-                CommandKey::SchedulePause,
-                &schedule,
-                workspace_name.as_deref(),
-                json,
-            )?;
-            if !json {
-                println!("Paused schedule {}", sanitize_table_cell(&schedule.name));
-            }
-            Ok(())
-        }
-        ScheduleCommands::Resume {
-            target, workspace, ..
-        } => {
-            let snapshot = client.snapshot()?;
-            let workspace = resource_workspace_argument(
-                &client,
-                workspace.as_deref(),
-                find_schedule(&snapshot, &target).is_some(),
-            )?;
-            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
-            let workspace_name = schedule_workspace_name(&snapshot, schedule).map(str::to_owned);
-            let schedule = client.resume_agent_schedule(&schedule.id)?;
-            print_schedule_mutation(
-                CommandKey::ScheduleResume,
-                &schedule,
-                workspace_name.as_deref(),
-                json,
-            )?;
-            if !json {
-                println!(
-                    "Enabled schedule {} for future timed dispatch; use schedule run for explicit run-now work",
-                    sanitize_table_cell(&schedule.name)
-                );
-            }
-            Ok(())
-        }
-        ScheduleCommands::Remove {
-            target, workspace, ..
-        } => {
-            let snapshot = client.snapshot()?;
-            let workspace = resource_workspace_argument(
-                &client,
-                workspace.as_deref(),
-                find_schedule(&snapshot, &target).is_some(),
-            )?;
-            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
-            let removed =
-                cli_output::schedule(schedule, schedule_workspace_name(&snapshot, schedule));
-            let name = schedule.name.clone();
-            client.remove_agent_schedule(&schedule.id)?;
-            if json {
-                return print_json(
-                    CommandKey::ScheduleRemove,
-                    serde_json::json!({ "removed": true, "schedule": removed }),
-                );
-            }
-            println!(
-                "Removed schedule {} and its persisted prompt",
-                sanitize_table_cell(&name)
-            );
-            Ok(())
-        }
-        ScheduleCommands::Run {
-            target,
-            workspace,
-            idempotency_key,
-            ..
-        } => {
-            let feature = protocol::ProtocolFeature::ScheduledExecutions;
-            if !feature.is_supported_by(client.protocol_version()?) {
-                return Err(cli_output::failure(
-                    "unsupported_version",
-                    format!(
-                        "scheduled execution dispatch requires daemon protocol {}",
-                        feature.minimum_version()
-                    ),
-                ));
-            }
-            let snapshot = client.snapshot()?;
-            let workspace = resource_workspace_argument(
-                &client,
-                workspace.as_deref(),
-                find_schedule(&snapshot, &target).is_some(),
-            )?;
-            let schedule = resolve_cli_schedule(&snapshot, &target, workspace.as_deref())?;
-            let execution = client.run_agent_schedule(
-                &schedule.id,
-                idempotency_key.unwrap_or_else(Uuid::new_v4).to_string(),
-            )?;
-            print_execution(CommandKey::ScheduleRun, &execution, json)
-        }
-    }
-}
-
 fn remote_node_projection(
     client: &client::Client,
     selector: &str,
@@ -9747,1004 +8324,6 @@ fn remote_workspace_from_projection(
     }
 }
 
-fn remote_schedule_inspection(
-    client: &client::Client,
-    node: &protocol::CombinedNode,
-    target: &str,
-    workspace: Option<&str>,
-) -> Result<protocol::AgentScheduleInspection, Box<dyn Error>> {
-    let schedule_id = if uuid::Uuid::parse_str(target).is_ok() {
-        target.to_owned()
-    } else {
-        let selected_workspace = if workspace.is_none() {
-            owner_workspace_context_for_node(client, &node.node_id)?
-        } else {
-            None
-        };
-        let workspace = workspace.or(selected_workspace.as_deref()).ok_or_else(|| {
-            cli_output::failure(
-                "context_required",
-                "remote schedule names require --workspace or a selected Workspace placement; exact schedule IDs do not",
-            )
-        })?;
-        let workspace = remote_workspace_from_projection(client, node, workspace)?;
-        let matches = workspace
-            .schedules
-            .iter()
-            .filter(|schedule| schedule.name == target)
-            .collect::<Vec<_>>();
-        let [schedule] = matches.as_slice() else {
-            return Err(cli_output::failure(
-                if matches.is_empty() {
-                    "not_found"
-                } else {
-                    "ambiguous_target"
-                },
-                format!("remote schedule target did not resolve uniquely: {target}"),
-            ));
-        };
-        schedule.id.clone()
-    };
-    match client.route_node_operation(
-        &node.node_id,
-        protocol::RoutedOperation::GetAgentSchedule { schedule_id },
-    )? {
-        protocol::RoutedOperationResult::AgentScheduleInspection { inspection } => Ok(inspection),
-        _ => Err("remote Node returned an unexpected schedule response".into()),
-    }
-}
-
-fn remote_schedule_command(
-    client: &client::Client,
-    command: ScheduleCommands,
-    selector: &str,
-    json: bool,
-) -> Result<(), Box<dyn Error>> {
-    let feature = protocol::ProtocolFeature::RemoteSchedules;
-    if !client.supports(feature)? {
-        return Err(cli_output::failure(
-            "unsupported_version",
-            format!(
-                "remote Schedule management requires local daemon protocol {}",
-                feature.minimum_version()
-            ),
-        ));
-    }
-    let (registration, node) = remote_node_projection(client, selector)?;
-    match command {
-        ScheduleCommands::List { workspace, .. } => {
-            let projection = node.remote_projection.as_ref().ok_or_else(|| {
-                cli_output::failure("not_found", "remote Node has no projected Schedule state")
-            })?;
-            let workspace_id = workspace
-                .as_deref()
-                .map(|target| remote_workspace_from_projection(client, &node, target))
-                .transpose()?
-                .map(|workspace| workspace.id);
-            let schedules = projection
-                .schedules
-                .iter()
-                .filter(|schedule| {
-                    workspace_id
-                        .as_deref()
-                        .is_none_or(|workspace_id| schedule.workspace_id == workspace_id)
-                })
-                .map(|schedule| {
-                    let workspace_name = projection
-                        .workspaces
-                        .iter()
-                        .find(|workspace| workspace.id == schedule.workspace_id)
-                        .map(|workspace| workspace.name.as_str());
-                    serde_json::json!({
-                        "node_id": node.node_id,
-                        "id": schedule.id,
-                        "workspace_id": schedule.workspace_id,
-                        "workspace_name": workspace_name,
-                        "name": schedule.name,
-                        "integration": schedule.integration,
-                        "cron": schedule.trigger.cron,
-                        "timezone": schedule.trigger.timezone,
-                        "state": cli_output::schedule_state(schedule.state),
-                        "revision": schedule.revision,
-                        "prompt_revision": schedule.prompt_revision,
-                        "trigger_revision": schedule.trigger_revision,
-                        "created_at_ms": schedule.created_at_ms,
-                        "updated_at_ms": schedule.updated_at_ms,
-                        "next_occurrence": schedule.next_occurrence,
-                    })
-                })
-                .collect::<Vec<_>>();
-            if json {
-                return print_json(
-                    CommandKey::ScheduleList,
-                    serde_json::json!({
-                        "node_id": registration.node_id,
-                        "node_alias": registration.alias,
-                        "health": node.health,
-                        "current": node.current,
-                        "stale": node.stale,
-                        "observed_at_ms": node.observed_at_ms,
-                        "scheduler": node.scheduler,
-                        "schedules": schedules,
-                    }),
-                );
-            }
-            println!(
-                "NODE\tWORKSPACE\tNAME\tSCHEDULE ID\tSTATE\tINTEGRATION\tTRIGGER\tTIMEZONE\tNEXT OCCURRENCE MS"
-            );
-            for schedule in &projection.schedules {
-                if workspace_id
-                    .as_deref()
-                    .is_some_and(|workspace_id| schedule.workspace_id != workspace_id)
-                {
-                    continue;
-                }
-                let workspace_name = projection
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.id == schedule.workspace_id)
-                    .map_or("unknown", |workspace| workspace.name.as_str());
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    registration.alias,
-                    workspace_name,
-                    schedule.name,
-                    schedule.id,
-                    cli_output::schedule_state(schedule.state),
-                    schedule.integration,
-                    schedule.trigger.cron,
-                    schedule.trigger.timezone,
-                    schedule
-                        .next_occurrence
-                        .as_ref()
-                        .map(|value| value.scheduled_at_ms.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                );
-            }
-            println!(
-                "Node {} is {:?}; scheduler {:?} ({}/{} active)",
-                registration.alias,
-                node.health,
-                node.scheduler.state,
-                node.scheduler.active_executions,
-                node.scheduler.max_concurrent
-            );
-            Ok(())
-        }
-        ScheduleCommands::Create(arguments) => {
-            let workspace = remote_workspace_from_projection(
-                client,
-                &node,
-                arguments
-                    .workspace
-                    .as_deref()
-                    .expect("create workspace was resolved"),
-            )?;
-            let name = cli_name(arguments.name, "schedule")?;
-            let resolved = client.route_node_host_service(
-                &node.node_id,
-                protocol::HostServiceOperation::ResolveDirectory {
-                    path: arguments.cwd,
-                },
-            )?;
-            let protocol::HostServiceResult::Directory { path: cwd } = resolved else {
-                return Err("remote Node returned an unexpected directory response".into());
-            };
-            let prompt = schedule_prompt(arguments.prompt, arguments.prompt_file.as_deref())?;
-            let cron = schedule_cron(
-                arguments.cron.as_deref(),
-                arguments.every.as_deref(),
-                arguments.daily.as_deref(),
-                arguments.weekdays.as_deref(),
-                arguments.weekly.as_deref(),
-            )?;
-            let timezone = arguments
-                .timezone
-                .as_deref()
-                .map(boomux::scheduling::canonicalize_timezone)
-                .transpose()?
-                .map_or_else(boomux::scheduling::resolve_system_timezone, Ok)?;
-            let integration = schedule_integration(&arguments.integration)?;
-            let session = if let Some(session_id) = arguments.continue_session.as_deref() {
-                let result = client.route_node_host_service(
-                    &node.node_id,
-                    protocol::HostServiceOperation::InspectAgentSession {
-                        session_id: session_id.to_owned(),
-                    },
-                )?;
-                let protocol::HostServiceResult::AgentSession { session } = result else {
-                    return Err("remote Node returned an unexpected Agent Session response".into());
-                };
-                if session.summary.workspace_id != workspace.id
-                    || session.summary.integration != integration.key
-                {
-                    return Err(cli_output::failure(
-                        "invalid_argument",
-                        "continued session must belong to the selected owner Workspace and integration",
-                    ));
-                }
-                let external_session_id = session.summary.external_session_id.ok_or_else(|| {
-                    cli_output::failure(
-                        "invalid_argument",
-                        "continued projected session has no canonical external session ID",
-                    )
-                })?;
-                boomux::scheduling::validate_external_session_id(&external_session_id)?;
-                AgentScheduleSession::Continue {
-                    external_session_id,
-                }
-            } else {
-                AgentScheduleSession::Fresh
-            };
-            let spec = AgentScheduleSpec {
-                name,
-                cwd,
-                integration: integration.key.into(),
-                prompt,
-                session,
-                trigger: AgentScheduleTrigger { cron, timezone },
-                state: if arguments.enabled {
-                    AgentScheduleState::Enabled
-                } else {
-                    AgentScheduleState::Paused
-                },
-                overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            };
-            let schedule = match client.route_node_operation(
-                &node.node_id,
-                protocol::RoutedOperation::CreateAgentSchedule {
-                    workspace_id: workspace.id.clone(),
-                    spec,
-                },
-            )? {
-                protocol::RoutedOperationResult::AgentSchedule { schedule } => schedule,
-                _ => return Err("remote Node returned an unexpected create response".into()),
-            };
-            if json {
-                return print_json(
-                    CommandKey::ScheduleCreate,
-                    serde_json::json!({
-                        "node_id": registration.node_id,
-                        "schedule": cli_output::schedule(&schedule, Some(&workspace.name)),
-                    }),
-                );
-            }
-            println!(
-                "Created {} schedule {} ({}) on Node {}",
-                cli_output::schedule_state(schedule.state),
-                schedule.name,
-                schedule.id,
-                registration.alias
-            );
-            Ok(())
-        }
-        ScheduleCommands::Inspect {
-            target, workspace, ..
-        } => {
-            let inspection =
-                remote_schedule_inspection(client, &node, &target, workspace.as_deref())?;
-            if json {
-                return print_json(
-                    CommandKey::ScheduleInspect,
-                    serde_json::json!({
-                        "node_id": registration.node_id,
-                        "schedule": cli_output::schedule_inspection(
-                            &inspection.schedule,
-                            None,
-                            &inspection.prompt,
-                        ),
-                    }),
-                );
-            }
-            println!("Node: {}", registration.alias);
-            print_schedule_inspection(&inspection.schedule, None, &inspection.prompt);
-            Ok(())
-        }
-        ScheduleCommands::Pause {
-            ref target,
-            ref workspace,
-            ..
-        }
-        | ScheduleCommands::Resume {
-            ref target,
-            ref workspace,
-            ..
-        }
-        | ScheduleCommands::Remove {
-            ref target,
-            ref workspace,
-            ..
-        }
-        | ScheduleCommands::Run {
-            ref target,
-            ref workspace,
-            ..
-        } => {
-            let inspection =
-                remote_schedule_inspection(client, &node, target, workspace.as_deref())?;
-            let (key, operation) = match command {
-                ScheduleCommands::Pause { .. } => (
-                    CommandKey::SchedulePause,
-                    protocol::RoutedOperation::PauseAgentSchedule {
-                        schedule_id: inspection.schedule.id.clone(),
-                        expected_revision: inspection.schedule.revision,
-                    },
-                ),
-                ScheduleCommands::Resume { .. } => (
-                    CommandKey::ScheduleResume,
-                    protocol::RoutedOperation::ResumeAgentSchedule {
-                        schedule_id: inspection.schedule.id.clone(),
-                        expected_revision: inspection.schedule.revision,
-                    },
-                ),
-                ScheduleCommands::Remove { .. } => (
-                    CommandKey::ScheduleRemove,
-                    protocol::RoutedOperation::RemoveAgentSchedule {
-                        schedule_id: inspection.schedule.id.clone(),
-                        expected_revision: inspection.schedule.revision,
-                    },
-                ),
-                ScheduleCommands::Run {
-                    idempotency_key, ..
-                } => (
-                    CommandKey::ScheduleRun,
-                    protocol::RoutedOperation::RunAgentSchedule {
-                        schedule_id: inspection.schedule.id.clone(),
-                        dispatch_key: idempotency_key.unwrap_or_else(Uuid::new_v4).to_string(),
-                    },
-                ),
-                _ => unreachable!(),
-            };
-            let result = client.route_node_operation(&node.node_id, operation)?;
-            match result {
-                protocol::RoutedOperationResult::AgentSchedule { schedule } => {
-                    print_schedule_mutation(key, &schedule, None, json)
-                }
-                protocol::RoutedOperationResult::ScheduledExecution { execution, .. } => {
-                    if json {
-                        print_json(
-                            key,
-                            serde_json::json!({
-                                "node_id": registration.node_id,
-                                "execution": cli_output::execution(&execution),
-                            }),
-                        )
-                    } else {
-                        print_execution(key, &execution, false)
-                    }
-                }
-                protocol::RoutedOperationResult::Ok if key == CommandKey::ScheduleRemove => {
-                    if json {
-                        print_json(
-                            key,
-                            serde_json::json!({
-                                "node_id": registration.node_id,
-                                "removed": true,
-                                "schedule": cli_output::schedule(&inspection.schedule, None),
-                            }),
-                        )
-                    } else {
-                        println!(
-                            "Removed schedule {} on Node {}",
-                            inspection.schedule.name, registration.alias
-                        );
-                        Ok(())
-                    }
-                }
-                _ => Err("remote Node returned an unexpected Schedule response".into()),
-            }
-        }
-    }
-}
-
-fn execution_command(
-    command: ExecutionCommands,
-    json: bool,
-    terminal: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    let client = client::connect_or_start()?;
-    if let Some(node) = command.node().map(str::to_owned) {
-        return remote_execution_command(&client, command, &node, json, terminal);
-    }
-    let feature = protocol::ProtocolFeature::ScheduledExecutions;
-    if !feature.is_supported_by(client.protocol_version()?) {
-        return Err(cli_output::failure(
-            "unsupported_version",
-            format!(
-                "scheduled execution inspection requires daemon protocol {}",
-                feature.minimum_version()
-            ),
-        ));
-    }
-    match command {
-        ExecutionCommands::List {
-            workspace,
-            schedule,
-            limit,
-            ..
-        } => {
-            let snapshot = client.snapshot()?;
-            let schedule_workspace = match schedule.as_deref() {
-                Some(target)
-                    if workspace.is_none() && find_schedule(&snapshot, target).is_none() =>
-                {
-                    local_workspace_argument(&client, None)?
-                }
-                _ => None,
-            };
-            let workspace = workspace
-                .as_deref()
-                .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
-                .transpose()?;
-            let schedule_id = schedule
-                .as_deref()
-                .map(|target| {
-                    resolve_cli_schedule(
-                        &snapshot,
-                        target,
-                        workspace
-                            .map(|workspace| workspace.id.as_str())
-                            .or(schedule_workspace.as_deref()),
-                    )
-                    .map(|schedule| schedule.id.clone())
-                })
-                .transpose()?;
-            let page = client.scheduled_execution_page(
-                workspace.map(|workspace| workspace.id.clone()),
-                schedule_id,
-                limit,
-            )?;
-            if json {
-                let executions = page
-                    .executions
-                    .iter()
-                    .map(cli_output::execution)
-                    .collect::<Vec<_>>();
-                return print_json(
-                    CommandKey::ExecutionList,
-                    serde_json::json!({
-                        "executions": executions,
-                        "limit": page.limit,
-                        "truncated": page.truncated,
-                        "schedule_limit": page.schedule_limit,
-                        "schedules_truncated": page.schedules_truncated,
-                        "schedules": page.schedules.iter().map(|projection| serde_json::json!({
-                            "schedule_id": projection.schedule_id,
-                            "next_occurrence": projection.next_occurrence,
-                        })).collect::<Vec<_>>(),
-                    }),
-                );
-            }
-            println!(
-                "STATE\tREASON/OUTCOME\tEXECUTION ID\tSCHEDULE ID\tREQUESTED\tAGENT ID\tSHELL/RUN"
-            );
-            for execution in page.executions {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}/{}",
-                    execution_state(&execution),
-                    execution_result_label(&execution),
-                    execution.id,
-                    execution.schedule_id,
-                    execution.requested_at_ms,
-                    execution.agent_id.as_deref().unwrap_or("-"),
-                    execution.shell_id.as_deref().unwrap_or("-"),
-                    execution.run_id.as_deref().unwrap_or("-"),
-                );
-                if let Some(action) = execution_action(&execution) {
-                    println!("ACTION {}\t{}", execution.id, action);
-                }
-            }
-            if page.truncated {
-                println!(
-                    "Showing newest {} executions; increase --limit to see more retained history.",
-                    page.limit
-                );
-            }
-            if page.schedules_truncated {
-                println!(
-                    "Showing {} schedule projections; narrow by workspace or schedule for the remainder.",
-                    page.schedule_limit
-                );
-            }
-            for projection in page.schedules {
-                println!(
-                    "Next occurrence for schedule {}: {}",
-                    projection.schedule_id,
-                    projection
-                        .next_occurrence
-                        .map(|occurrence| occurrence.scheduled_at_ms.to_string())
-                        .unwrap_or_else(
-                            || "none (paused or scheduler projection unavailable)".into()
-                        )
-                );
-            }
-            Ok(())
-        }
-        ExecutionCommands::Inspect { execution_id, .. } => {
-            let inspection = client.inspect_scheduled_execution(execution_id)?;
-            if json {
-                return print_json(
-                    CommandKey::ExecutionInspect,
-                    serde_json::json!({
-                        "execution": cli_output::execution(&inspection.execution),
-                        "next_occurrence": inspection.next_occurrence,
-                    }),
-                );
-            }
-            print_execution(CommandKey::ExecutionInspect, &inspection.execution, false)?;
-            println!(
-                "Next occurrence: {}",
-                inspection
-                    .next_occurrence
-                    .map(|occurrence| occurrence.scheduled_at_ms.to_string())
-                    .unwrap_or_else(|| "none (paused or scheduler projection unavailable)".into())
-            );
-            Ok(())
-        }
-        ExecutionCommands::Wait {
-            execution_id,
-            after_revision,
-            wait_ms,
-            ..
-        } => {
-            let waited = client.wait_scheduled_execution(execution_id, after_revision, wait_ms)?;
-            if json {
-                return print_json(
-                    CommandKey::ExecutionWait,
-                    serde_json::json!({
-                        "changed": waited.changed,
-                        "execution": cli_output::execution(&waited.execution),
-                    }),
-                );
-            }
-            println!("Changed: {}", waited.changed);
-            print_execution(CommandKey::ExecutionWait, &waited.execution, false)
-        }
-        ExecutionCommands::Open { execution_id, .. } => {
-            let opened = open_scheduled_execution(&client, &execution_id, terminal)?;
-            if json {
-                return print_json(
-                    CommandKey::ExecutionOpen,
-                    serde_json::json!({
-                        "execution": cli_output::execution(&opened.execution),
-                        "target": opened.target,
-                    }),
-                );
-            }
-            println!("{}", opened.message);
-            Ok(())
-        }
-        ExecutionCommands::Cancel { execution_id, .. } => {
-            let execution = client.cancel_scheduled_execution(execution_id)?;
-            print_execution(CommandKey::ExecutionCancel, &execution, json)
-        }
-    }
-}
-
-fn remote_execution_command(
-    client: &client::Client,
-    command: ExecutionCommands,
-    selector: &str,
-    json: bool,
-    terminal: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    let feature = protocol::ProtocolFeature::RemoteSchedules;
-    if !client.supports(feature)? {
-        return Err(cli_output::failure(
-            "unsupported_version",
-            format!(
-                "remote Scheduled Execution management requires local daemon protocol {}",
-                feature.minimum_version()
-            ),
-        ));
-    }
-    let (registration, node) = remote_node_projection(client, selector)?;
-    match command {
-        ExecutionCommands::List {
-            workspace,
-            schedule,
-            limit,
-            ..
-        } => {
-            let workspace = workspace
-                .as_deref()
-                .map(|target| remote_workspace_from_projection(client, &node, target))
-                .transpose()?;
-            let schedule_id = schedule
-                .as_deref()
-                .map(|target| {
-                    remote_schedule_inspection(
-                        client,
-                        &node,
-                        target,
-                        workspace.as_ref().map(|workspace| workspace.id.as_str()),
-                    )
-                    .map(|inspection| inspection.schedule.id)
-                })
-                .transpose()?;
-            let result = client.route_node_operation(
-                &node.node_id,
-                protocol::RoutedOperation::ListScheduledExecutions {
-                    workspace_id: workspace.map(|workspace| workspace.id),
-                    schedule_id,
-                    limit,
-                },
-            )?;
-            let protocol::RoutedOperationResult::ScheduledExecutions {
-                executions,
-                limit,
-                truncated,
-                schedules,
-                schedule_limit,
-                schedules_truncated,
-            } = result
-            else {
-                return Err("remote Node returned an unexpected execution list response".into());
-            };
-            if json {
-                return print_json(
-                    CommandKey::ExecutionList,
-                    serde_json::json!({
-                        "node_id": registration.node_id,
-                        "executions": executions.iter().map(cli_output::execution).collect::<Vec<_>>(),
-                        "limit": limit,
-                        "truncated": truncated,
-                        "schedule_limit": schedule_limit,
-                        "schedules_truncated": schedules_truncated,
-                        "schedules": schedules,
-                    }),
-                );
-            }
-            println!(
-                "NODE\tSTATE\tREASON/OUTCOME\tEXECUTION ID\tSCHEDULE ID\tREQUESTED\tAGENT ID\tSHELL/RUN"
-            );
-            for execution in executions {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}/{}",
-                    registration.alias,
-                    execution_state(&execution),
-                    execution_result_label(&execution),
-                    execution.id,
-                    execution.schedule_id,
-                    execution.requested_at_ms,
-                    execution.agent_id.as_deref().unwrap_or("-"),
-                    execution.shell_id.as_deref().unwrap_or("-"),
-                    execution.run_id.as_deref().unwrap_or("-"),
-                );
-            }
-            Ok(())
-        }
-        ExecutionCommands::Inspect { execution_id, .. } => {
-            let execution = routed_remote_execution(client, &node.node_id, &execution_id)?;
-            if json {
-                return print_json(
-                    CommandKey::ExecutionInspect,
-                    serde_json::json!({
-                        "node_id": registration.node_id,
-                        "execution": cli_output::execution(&execution),
-                    }),
-                );
-            }
-            println!("Node: {}", registration.alias);
-            print_execution(CommandKey::ExecutionInspect, &execution, false)
-        }
-        ExecutionCommands::Wait {
-            execution_id,
-            after_revision,
-            wait_ms,
-            ..
-        } => {
-            let result = client.route_node_operation(
-                &node.node_id,
-                protocol::RoutedOperation::WaitScheduledExecution {
-                    execution_id,
-                    after_revision,
-                    wait_ms,
-                },
-            )?;
-            let protocol::RoutedOperationResult::ScheduledExecutionWait { execution, changed } =
-                result
-            else {
-                return Err("remote Node returned an unexpected execution wait response".into());
-            };
-            if json {
-                return print_json(
-                    CommandKey::ExecutionWait,
-                    serde_json::json!({
-                        "node_id": registration.node_id,
-                        "changed": changed,
-                        "execution": cli_output::execution(&execution),
-                    }),
-                );
-            }
-            println!("Node: {}", registration.alias);
-            println!("Changed: {changed}");
-            print_execution(CommandKey::ExecutionWait, &execution, false)
-        }
-        ExecutionCommands::Cancel { execution_id, .. } => {
-            let execution = routed_remote_execution(client, &node.node_id, &execution_id)?;
-            let result = client.route_node_operation(
-                &node.node_id,
-                protocol::RoutedOperation::CancelScheduledExecution {
-                    execution_id,
-                    expected_revision: execution.revision,
-                },
-            )?;
-            let protocol::RoutedOperationResult::ScheduledExecution { execution, .. } = result
-            else {
-                return Err("remote Node returned an unexpected cancellation response".into());
-            };
-            if json {
-                return print_json(
-                    CommandKey::ExecutionCancel,
-                    serde_json::json!({
-                        "node_id": registration.node_id,
-                        "execution": cli_output::execution(&execution),
-                    }),
-                );
-            }
-            println!("Node: {}", registration.alias);
-            print_execution(CommandKey::ExecutionCancel, &execution, false)
-        }
-        ExecutionCommands::Open { execution_id, .. } => {
-            let opened = open_remote_scheduled_execution(
-                client,
-                &protocol::QualifiedIdentity::new(&node.node_id, execution_id),
-                terminal,
-            )?;
-            if json {
-                return print_json(
-                    CommandKey::ExecutionOpen,
-                    serde_json::json!({
-                        "node_id": registration.node_id,
-                        "execution": cli_output::execution(&opened.execution),
-                        "target": opened.target,
-                    }),
-                );
-            }
-            println!("{}", opened.message);
-            Ok(())
-        }
-    }
-}
-
-fn routed_remote_execution(
-    client: &client::Client,
-    node_id: &str,
-    execution_id: &str,
-) -> Result<ScheduledExecutionSnapshot, Box<dyn Error>> {
-    match client.route_node_operation(
-        node_id,
-        protocol::RoutedOperation::GetScheduledExecution {
-            execution_id: execution_id.to_owned(),
-        },
-    )? {
-        protocol::RoutedOperationResult::ScheduledExecution { execution, .. } => Ok(execution),
-        _ => Err("remote Node returned an unexpected execution response".into()),
-    }
-}
-
-fn print_execution(
-    command: CommandKey,
-    execution: &ScheduledExecutionSnapshot,
-    json: bool,
-) -> Result<(), Box<dyn Error>> {
-    if json {
-        return print_json(
-            command,
-            serde_json::json!({ "execution": cli_output::execution(execution) }),
-        );
-    }
-    println!("Execution {}", execution.id);
-    println!("State: {}", execution_state(execution));
-    println!("Revision: {}", execution.revision);
-    println!("Schedule: {}", execution.schedule_id);
-    println!("Dispatch key: {}", execution.dispatch_key);
-    println!("Result: {}", execution_result_label(execution));
-    if let Some(action) = execution_action(execution) {
-        println!("Action: {action}");
-    }
-    println!("Requested at ms: {}", execution.requested_at_ms);
-    if let Some(started_at_ms) = execution.started_at_ms {
-        println!("Started at ms: {started_at_ms}");
-    }
-    if let Some(ended_at_ms) = execution.ended_at_ms {
-        println!("Ended at ms: {ended_at_ms}");
-    }
-    if let Some(shell_id) = &execution.shell_id {
-        println!("Shell: {shell_id}");
-    }
-    if let Some(run_id) = &execution.run_id {
-        println!("Run: {run_id}");
-    }
-    if let Some(agent_id) = &execution.agent_id {
-        println!("Agent: {agent_id} (inspect with `boomux agent inspect {agent_id}`)");
-    }
-    if execution.state == protocol::ScheduledExecutionState::Active {
-        println!("No automatic timeout; cancel explicitly if this work is blocked or hung.");
-    }
-    Ok(())
-}
-
-fn execution_result_label(execution: &ScheduledExecutionSnapshot) -> String {
-    if let Some(reason) = execution.reason {
-        return format!("reason:{}", cli_output::execution_reason(reason));
-    }
-    match execution.outcome {
-        Some(ScheduledExecutionOutcome::ExitCode { code }) => format!("exit_code:{code}"),
-        Some(ScheduledExecutionOutcome::Signal { signal }) => format!("signal:{signal}"),
-        None => "-".into(),
-    }
-}
-
-fn execution_action(execution: &ScheduledExecutionSnapshot) -> Option<String> {
-    use protocol::ScheduledExecutionReason::*;
-    let action = match execution.reason? {
-        Overlap => format!(
-            "inspect active work with `boomux execution list --schedule {}` and cancel the exact execution if authorized",
-            execution.schedule_id
-        ),
-        ActiveSession => "inspect `boomux attention list` and the linked Agent/session before retrying with `boomux schedule run`".into(),
-        WorkspaceCapacity | GlobalCapacity => "run `boomux execution list` to find active work; cancel only an exact authorized execution before retrying".into(),
-        Missed => "timed work is not caught up; check `boomux daemon status` and use `boomux schedule run` only for an authorized manual replacement".into(),
-        PausedRace => "inspect the schedule and run `boomux schedule resume <schedule> --workspace <workspace>` if future timed work is authorized".into(),
-        InvalidTarget => format!(
-            "run `boomux integration status {}` and `boomux doctor`, then restart the daemon after fixing the target",
-            execution.integration
-        ),
-        RunnerStartFailed | HostSpawnFailed => "run `boomux doctor` and `boomux daemon status`; fix daemon startup environment or integration setup, then `boomux daemon restart`".into(),
-        ColdDaemonRecovery => "the prior process cannot be resumed automatically; inspect this execution and `boomux daemon status` before an authorized `boomux schedule run`".into(),
-        RunnerExitedWithoutReport => "inspect the retained shell/run and `boomux doctor` before retrying manually".into(),
-        CancelledByUser => "no retry is automatic; use `boomux schedule run` only if a new execution is authorized".into(),
-        DaemonShutdown => "restart the daemon and use `boomux schedule run` only if a replacement execution is authorized".into(),
-    };
-    Some(action)
-}
-
-fn execution_state(execution: &ScheduledExecutionSnapshot) -> &'static str {
-    use protocol::ScheduledExecutionState::*;
-    match execution.state {
-        Skipped => "skipped",
-        Claimed => "claimed",
-        Starting => "starting",
-        Active => "active",
-        DispatchFailed => "dispatch_failed",
-        Exited => "exited",
-        Cancelled => "cancelled",
-        Interrupted => "interrupted",
-    }
-}
-
-fn scheduled_runner(schedule_id: &str) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
-    let shell_id = env::var("BOOMUX_SHELL_ID")
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "BOOMUX_SHELL_ID is required"))?;
-    let run_id = env::var("BOOMUX_RUN_ID")
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "BOOMUX_RUN_ID is required"))?;
-    let runner_token = env::var("BOOMUX_SCHEDULE_RUNNER_TOKEN").map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "BOOMUX_SCHEDULE_RUNNER_TOKEN is required",
-        )
-    })?;
-    let claim = retry_runner_request(|client| {
-        client.resolve_scheduled_execution_claim(schedule_id, &shell_id, &run_id, &runner_token)
-    })?;
-    let integration = boomux::integrations::by_key(&claim.execution.integration)
-        .ok_or_else(|| io::Error::other("scheduled integration dispatch is unavailable"))?;
-    let descriptor = integration
-        .schedule_dispatch
-        .ok_or_else(|| io::Error::other("scheduled integration dispatch is unavailable"))?;
-    let dispatch = descriptor
-        .command(&claim.execution.session, &claim.prompt)
-        .ok_or_else(|| io::Error::other("scheduled integration mode is unavailable"))?;
-    let mut command = if integration.run_scoped_launcher.is_some() {
-        Command::new(env::current_exe()?)
-    } else {
-        Command::new(&dispatch.argv[0])
-    };
-    sanitize_inherited_opencode_shim(&mut command);
-    if let Some(launcher) = integration.run_scoped_launcher {
-        command.args(match launcher {
-            boomux::integrations::RunScopedLauncher::Codex => ["codex", "launch", "--"],
-            boomux::integrations::RunScopedLauncher::Kiro => ["kiro", "launch", "--"],
-        });
-    }
-    command
-        .args(&dispatch.argv[1..])
-        .current_dir(&claim.execution.cwd)
-        .env_remove("BOOMUX_SCHEDULE_RUNNER_TOKEN")
-        .stdin(if dispatch.stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::inherit()
-        })
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = retry_runner_request(|client| {
-                client.report_scheduled_runner(
-                    &claim.execution.id,
-                    &shell_id,
-                    &run_id,
-                    &runner_token,
-                    ScheduledRunnerResult::SpawnFailed,
-                )
-            });
-            return Err(io::Error::new(
-                error.kind(),
-                format!("could not start scheduled host: {error}"),
-            )
-            .into());
-        }
-    };
-    if let Some(bytes) = dispatch.stdin {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("scheduled host stdin is unavailable"))?;
-        if let Err(error) = std::io::Write::write_all(&mut stdin, &bytes) {
-            drop(stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = retry_runner_request(|client| {
-                client.report_scheduled_runner(
-                    &claim.execution.id,
-                    &shell_id,
-                    &run_id,
-                    &runner_token,
-                    ScheduledRunnerResult::SpawnFailed,
-                )
-            });
-            return Err(io::Error::new(
-                error.kind(),
-                format!("could not write scheduled host prompt: {error}"),
-            )
-            .into());
-        }
-        drop(stdin);
-    }
-    if let Err(error) = retry_runner_request(|client| {
-        client.report_scheduled_runner(
-            &claim.execution.id,
-            &shell_id,
-            &run_id,
-            &runner_token,
-            ScheduledRunnerResult::Active,
-        )
-    }) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    let status = child.wait()?;
-    let (exit, outcome) = if let Some(code) = status.code() {
-        (
-            process_adapter::ProcessExit::Code(code),
-            ScheduledExecutionOutcome::ExitCode { code },
-        )
-    } else {
-        let signal = status.signal().unwrap_or(0);
-        (
-            process_adapter::ProcessExit::Signal(signal),
-            ScheduledExecutionOutcome::Signal { signal },
-        )
-    };
-    retry_runner_request(|client| {
-        client.report_scheduled_runner(
-            &claim.execution.id,
-            &shell_id,
-            &run_id,
-            &runner_token,
-            ScheduledRunnerResult::Exited {
-                outcome: outcome.clone(),
-            },
-        )
-    })?;
-    Ok(exit)
-}
-
 fn retry_runner_request<T>(
     mut request: impl FnMut(&client::Client) -> client::Result<T>,
 ) -> Result<T, Box<dyn Error>> {
@@ -10757,510 +8336,6 @@ fn retry_runner_request<T>(
         }
         thread::sleep(Duration::from_millis(25));
     }
-}
-
-fn validate_schedule_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
-    let feature = protocol::ProtocolFeature::AgentSchedules;
-    feature
-        .is_supported_by(negotiated)
-        .then_some(())
-        .ok_or_else(|| {
-            cli_output::failure(
-                "unsupported_version",
-                format!(
-                    "Agent schedule management requires daemon protocol {}; negotiated {negotiated}",
-                    feature.minimum_version()
-                ),
-            )
-        })
-}
-
-fn create_coordinated_schedule(
-    client: &client::Client,
-    arguments: ScheduleCreateArgs,
-    selection: CoordinatedOwnerSelection,
-    json: bool,
-) -> Result<(), Box<dyn Error>> {
-    let name = cli_name(arguments.name, "schedule")?;
-    let cwd = resolve_owner_directory(client, &selection.node, arguments.cwd)?;
-    let prompt = schedule_prompt(arguments.prompt, arguments.prompt_file.as_deref())?;
-    let cron = schedule_cron(
-        arguments.cron.as_deref(),
-        arguments.every.as_deref(),
-        arguments.daily.as_deref(),
-        arguments.weekdays.as_deref(),
-        arguments.weekly.as_deref(),
-    )?;
-    let timezone = arguments
-        .timezone
-        .as_deref()
-        .map(boomux::scheduling::canonicalize_timezone)
-        .transpose()?
-        .map_or_else(boomux::scheduling::resolve_system_timezone, Ok)?;
-    let integration = schedule_integration(&arguments.integration)?;
-    let session = if let Some(session_id) = arguments.continue_session.as_deref() {
-        if selection.workspace.placements.iter().all(|placement| {
-            placement.node_id != selection.node.node_id
-                || placement.workspace_id != selection.owner_workspace_id
-        }) {
-            return Err(cli_output::failure(
-                "invalid_argument",
-                "a continuation Schedule requires an existing placement on the selected Node",
-            ));
-        }
-        let external_session_id = if selection.node.local {
-            let owner = client.get_workspace(&selection.owner_workspace_id)?;
-            let catalog = discover_host_catalog(std::slice::from_ref(&owner));
-            let sessions = session_projection::project_workspaces_with_catalog(
-                std::slice::from_ref(&owner),
-                Some(&catalog),
-            );
-            let session =
-                session_projection::resolve_exact(&sessions, session_id).map_err(|_| {
-                    cli_output::failure(
-                        "not_found",
-                        format!("projected session not found on selected Node: {session_id}"),
-                    )
-                })?;
-            if session.integration != integration.key {
-                return Err(cli_output::failure(
-                    "invalid_argument",
-                    "continued session integration does not match --integration",
-                ));
-            }
-            session.external_session_id.clone().ok_or_else(|| {
-                cli_output::failure(
-                    "invalid_argument",
-                    "continued projected session has no canonical external session ID",
-                )
-            })?
-        } else {
-            let result = client.route_node_host_service(
-                &selection.node.node_id,
-                protocol::HostServiceOperation::InspectAgentSession {
-                    session_id: session_id.to_owned(),
-                },
-            )?;
-            let protocol::HostServiceResult::AgentSession { session } = result else {
-                return Err("owner Node returned an unexpected Agent Session response".into());
-            };
-            if session.summary.workspace_id != selection.owner_workspace_id
-                || session.summary.integration != integration.key
-            {
-                return Err(cli_output::failure(
-                    "invalid_argument",
-                    "continued session must belong to the selected placement and integration",
-                ));
-            }
-            session.summary.external_session_id.ok_or_else(|| {
-                cli_output::failure(
-                    "invalid_argument",
-                    "continued projected session has no canonical external session ID",
-                )
-            })?
-        };
-        boomux::scheduling::validate_external_session_id(&external_session_id)?;
-        if !integration
-            .schedule_dispatch
-            .is_some_and(|dispatch| dispatch.continuation.is_some())
-        {
-            return Err(cli_output::failure(
-                "unsupported_integration",
-                "integration does not support continuation schedule dispatch",
-            ));
-        }
-        AgentScheduleSession::Continue {
-            external_session_id,
-        }
-    } else {
-        if !integration
-            .schedule_dispatch
-            .is_some_and(|dispatch| dispatch.fresh.is_some())
-        {
-            return Err(cli_output::failure(
-                "unsupported_integration",
-                "integration does not support fresh schedule dispatch",
-            ));
-        }
-        AgentScheduleSession::Fresh
-    };
-    let spec = AgentScheduleSpec {
-        name,
-        cwd: cwd.clone(),
-        integration: integration.key.to_owned(),
-        prompt,
-        session,
-        trigger: AgentScheduleTrigger { cron, timezone },
-        state: if arguments.enabled {
-            AgentScheduleState::Enabled
-        } else {
-            AgentScheduleState::Paused
-        },
-        overlap_policy: AgentScheduleOverlapPolicy::Skip,
-    };
-    let owner_default_cwd = selection.default_cwd.clone().or(Some(cwd));
-    let (_, schedule) = client.create_global_workspace_agent_schedule(
-        Uuid::new_v4().to_string(),
-        &selection.workspace.id,
-        selection.workspace.revision,
-        &selection.node.node_id,
-        selection.owner_workspace_id,
-        owner_default_cwd,
-        Uuid::new_v4().to_string(),
-        spec,
-    )?;
-    if json {
-        return print_json(
-            CommandKey::ScheduleCreate,
-            serde_json::json!({
-                "node_id": selection.node.node_id,
-                "workspace_id": selection.workspace.id,
-                "schedule": cli_output::schedule(&schedule, Some(&selection.workspace.name)),
-            }),
-        );
-    }
-    println!(
-        "Created {} schedule {} ({}) in {} on Node {}",
-        cli_output::schedule_state(schedule.state),
-        sanitize_table_cell(&schedule.name),
-        sanitize_table_cell(&schedule.id),
-        selection.workspace.name,
-        selection.node.alias,
-    );
-    Ok(())
-}
-
-fn create_schedule(
-    client: &client::Client,
-    arguments: ScheduleCreateArgs,
-    json: bool,
-) -> Result<(), Box<dyn Error>> {
-    let snapshot = client.snapshot()?;
-    let workspace = resolve_workspace_target(
-        &snapshot.workspaces,
-        arguments
-            .workspace
-            .as_deref()
-            .expect("create workspace was resolved"),
-    )?;
-    let name = cli_name(arguments.name, "schedule")?;
-    let cwd = resolve_directory(&arguments.cwd).map_err(|error| {
-        cli_output::failure(
-            "invalid_argument",
-            format!("schedule working directory is invalid: {error}"),
-        )
-    })?;
-    let prompt = schedule_prompt(arguments.prompt, arguments.prompt_file.as_deref())?;
-    let cron = schedule_cron(
-        arguments.cron.as_deref(),
-        arguments.every.as_deref(),
-        arguments.daily.as_deref(),
-        arguments.weekdays.as_deref(),
-        arguments.weekly.as_deref(),
-    )?;
-    let timezone = arguments
-        .timezone
-        .as_deref()
-        .map(boomux::scheduling::canonicalize_timezone)
-        .transpose()?
-        .map_or_else(boomux::scheduling::resolve_system_timezone, Ok)?;
-    let integration = schedule_integration(&arguments.integration)?;
-    let session = if let Some(session_id) = arguments.continue_session.as_deref() {
-        let catalog = discover_host_catalog(std::slice::from_ref(workspace));
-        let sessions = session_projection::project_workspaces_with_catalog(
-            std::slice::from_ref(workspace),
-            Some(&catalog),
-        );
-        let session = session_projection::resolve_exact(&sessions, session_id).map_err(
-            |error| match error {
-                session_projection::ResolveError::NotFound => cli_output::failure(
-                    "not_found",
-                    format!(
-                        "projected session not found in workspace {}: {session_id}",
-                        workspace.name
-                    ),
-                ),
-                session_projection::ResolveError::DuplicateId => cli_output::failure(
-                    "internal",
-                    format!("duplicate projected session ID: {session_id}"),
-                ),
-            },
-        )?;
-        if session.integration != integration.key {
-            return Err(cli_output::failure(
-                "invalid_argument",
-                "continued session integration does not match --integration",
-            ));
-        }
-        let external_session_id = session.external_session_id.as_deref().ok_or_else(|| {
-            cli_output::failure(
-                "invalid_argument",
-                "continued projected session has no canonical external session ID",
-            )
-        })?;
-        boomux::scheduling::validate_external_session_id(external_session_id)?;
-        if !integration
-            .schedule_dispatch
-            .is_some_and(|dispatch| dispatch.continuation.is_some())
-        {
-            return Err(cli_output::failure(
-                "unsupported_integration",
-                "integration does not support continuation schedule dispatch",
-            ));
-        }
-        AgentScheduleSession::Continue {
-            external_session_id: external_session_id.to_owned(),
-        }
-    } else {
-        if !integration
-            .schedule_dispatch
-            .is_some_and(|dispatch| dispatch.fresh.is_some())
-        {
-            return Err(cli_output::failure(
-                "unsupported_integration",
-                "integration does not support fresh schedule dispatch",
-            ));
-        }
-        AgentScheduleSession::Fresh
-    };
-    let spec = AgentScheduleSpec {
-        name,
-        cwd,
-        integration: integration.key.to_owned(),
-        prompt,
-        session,
-        trigger: AgentScheduleTrigger { cron, timezone },
-        state: if arguments.enabled {
-            AgentScheduleState::Enabled
-        } else {
-            AgentScheduleState::Paused
-        },
-        overlap_policy: AgentScheduleOverlapPolicy::Skip,
-    };
-    let schedule = client.create_agent_schedule(&workspace.id, spec)?;
-    if json {
-        return print_json(
-            CommandKey::ScheduleCreate,
-            serde_json::json!({
-                "schedule": cli_output::schedule(&schedule, Some(&workspace.name)),
-            }),
-        );
-    }
-    println!(
-        "Created {} schedule {} ({})",
-        cli_output::schedule_state(schedule.state),
-        sanitize_table_cell(&schedule.name),
-        sanitize_table_cell(&schedule.id)
-    );
-    if schedule.state == AgentScheduleState::Enabled {
-        println!("Timed dispatch is not available yet; use schedule run for explicit run-now work");
-    }
-    Ok(())
-}
-
-fn schedule_prompt(inline: Option<String>, file: Option<&Path>) -> Result<String, Box<dyn Error>> {
-    let prompt = match (inline, file) {
-        (Some(prompt), None) => prompt,
-        (None, Some(path)) => {
-            let metadata = fs::symlink_metadata(path).map_err(|error| {
-                io::Error::new(error.kind(), format!("cannot inspect prompt file: {error}"))
-            })?;
-            if !metadata.file_type().is_file() {
-                return Err(cli_output::failure(
-                    "invalid_argument",
-                    "prompt file must be a regular file and not a symlink",
-                ));
-            }
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-                .map_err(|_| {
-                    cli_output::failure(
-                        "invalid_argument",
-                        "prompt file changed or could not be opened safely",
-                    )
-                })?;
-            if !file.metadata()?.file_type().is_file() {
-                return Err(cli_output::failure(
-                    "invalid_argument",
-                    "prompt file changed before it could be read safely",
-                ));
-            }
-            let mut bytes = Vec::new();
-            file.by_ref()
-                .take((boomux::scheduling::MAX_PROMPT_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() > boomux::scheduling::MAX_PROMPT_BYTES {
-                return Err(cli_output::failure(
-                    "invalid_argument",
-                    format!(
-                        "prompt must be at most {} bytes",
-                        boomux::scheduling::MAX_PROMPT_BYTES
-                    ),
-                ));
-            }
-            String::from_utf8(bytes).map_err(|_| {
-                cli_output::failure("invalid_argument", "prompt file must contain valid UTF-8")
-            })?
-        }
-        _ => {
-            return Err(cli_output::failure(
-                "invalid_argument",
-                "exactly one prompt source is required",
-            ));
-        }
-    };
-    boomux::scheduling::validate_prompt(&prompt)?;
-    Ok(prompt)
-}
-
-fn schedule_cron(
-    cron: Option<&str>,
-    every: Option<&str>,
-    daily: Option<&str>,
-    weekdays: Option<&str>,
-    weekly: Option<&str>,
-) -> Result<String, Box<dyn Error>> {
-    let expression = if let Some(cron) = cron {
-        boomux::scheduling::canonicalize_cron(cron)?
-    } else if let Some(every) = every {
-        let (amount, unit) = every.split_at(every.len().saturating_sub(1));
-        let amount = amount
-            .parse::<u8>()
-            .map_err(|_| cli_output::failure("invalid_argument", "--every must use Nm or Nh"))?;
-        match unit {
-            "m" => boomux::scheduling::every_minutes_cron(amount)?,
-            "h" => boomux::scheduling::every_hours_cron(amount)?,
-            _ => {
-                return Err(cli_output::failure(
-                    "invalid_argument",
-                    "--every must use Nm or Nh",
-                ));
-            }
-        }
-    } else if let Some(time) = daily {
-        let (hour, minute) = schedule_time(time)?;
-        boomux::scheduling::daily_cron(hour, minute)?
-    } else if let Some(time) = weekdays {
-        let (hour, minute) = schedule_time(time)?;
-        boomux::scheduling::weekdays_cron(hour, minute)?
-    } else if let Some(value) = weekly {
-        let (day, time) = value.split_once('@').ok_or_else(|| {
-            cli_output::failure("invalid_argument", "--weekly must use DAY@HH:MM")
-        })?;
-        let (hour, minute) = schedule_time(time)?;
-        boomux::scheduling::weekly_cron(day, hour, minute)?
-    } else {
-        return Err(cli_output::failure(
-            "invalid_argument",
-            "exactly one trigger source is required",
-        ));
-    };
-    Ok(expression)
-}
-
-fn schedule_time(value: &str) -> Result<(u8, u8), Box<dyn Error>> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 5
-        || bytes[2] != b':'
-        || !bytes[..2].iter().chain(&bytes[3..]).all(u8::is_ascii_digit)
-    {
-        return Err(cli_output::failure(
-            "invalid_argument",
-            "schedule time must use HH:MM",
-        ));
-    }
-    Ok((value[..2].parse()?, value[3..].parse()?))
-}
-
-fn schedule_integration(
-    key: &str,
-) -> Result<&'static boomux::integrations::IntegrationDescriptor, Box<dyn Error>> {
-    boomux::scheduling::validate_integration_key(key)?;
-    boomux::integrations::by_key(key)
-        .filter(|integration| integration.schedule_dispatch.is_some())
-        .ok_or_else(|| {
-            cli_output::failure(
-                "unsupported_integration",
-                "integration does not support schedule dispatch",
-            )
-        })
-}
-
-fn print_schedule_mutation(
-    command: CommandKey,
-    schedule: &AgentScheduleSnapshot,
-    workspace_name: Option<&str>,
-    json: bool,
-) -> Result<(), Box<dyn Error>> {
-    if json {
-        print_json(
-            command,
-            serde_json::json!({
-                "schedule": cli_output::schedule(schedule, workspace_name),
-            }),
-        )?;
-    }
-    Ok(())
-}
-
-fn print_schedule_inspection(
-    schedule: &AgentScheduleSnapshot,
-    workspace_name: Option<&str>,
-    prompt: &str,
-) {
-    println!("ID\t{}", sanitize_table_cell(&schedule.id));
-    println!("NAME\t{}", sanitize_table_cell(&schedule.name));
-    println!(
-        "WORKSPACE\t{}",
-        sanitize_table_cell(workspace_name.unwrap_or("-"))
-    );
-    println!("STATE\t{}", cli_output::schedule_state(schedule.state));
-    println!(
-        "CWD\t{}",
-        sanitize_table_cell(&schedule.cwd.display().to_string())
-    );
-    println!(
-        "INTEGRATION\t{}",
-        sanitize_table_cell(&schedule.integration)
-    );
-    println!(
-        "SESSION\t{}",
-        sanitize_table_cell(&schedule_session_label(&schedule.session))
-    );
-    println!("CRON\t{}", sanitize_table_cell(&schedule.trigger.cron));
-    println!(
-        "TIMEZONE\t{}",
-        sanitize_table_cell(&schedule.trigger.timezone)
-    );
-    println!("OVERLAP POLICY\tskip");
-    println!("REVISION\t{}", schedule.revision);
-    println!("PROMPT REVISION\t{}", schedule.prompt_revision);
-    println!("TRIGGER REVISION\t{}", schedule.trigger_revision);
-    println!(
-        "NEXT OCCURRENCE MS\t{}",
-        schedule
-            .next_occurrence
-            .as_ref()
-            .map(|occurrence| occurrence.scheduled_at_ms.to_string())
-            .as_deref()
-            .unwrap_or("-")
-    );
-    println!("CREATED AT MS\t{}", schedule.created_at_ms);
-    println!("UPDATED AT MS\t{}", schedule.updated_at_ms);
-    println!(
-        "EVALUATION FRONTIER MS\t{}",
-        schedule.evaluation_frontier_ms
-    );
-    println!(
-        "EXECUTION SHELL ID\t{}",
-        sanitize_table_cell(schedule.execution_shell_id.as_deref().unwrap_or("-"))
-    );
-    println!(
-        "PROMPT (PRIVATE; ESCAPED FOR TERMINAL SAFETY)\n{}",
-        escape_terminal_text(prompt)
-    );
 }
 
 fn escape_terminal_text(value: &str) -> String {
@@ -11281,58 +8356,6 @@ fn is_bidi_control(character: char) -> bool {
         character,
         '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
     )
-}
-
-fn schedule_session_label(session: &AgentScheduleSession) -> String {
-    match session {
-        AgentScheduleSession::Fresh => "fresh".into(),
-        AgentScheduleSession::Continue {
-            external_session_id,
-        } => format!("continue:{external_session_id}"),
-    }
-}
-
-fn resolve_cli_schedule<'a>(
-    snapshot: &'a Snapshot,
-    target: &str,
-    workspace: Option<&str>,
-) -> Result<&'a AgentScheduleSnapshot, Box<dyn Error>> {
-    if let Some(schedule) = find_schedule(snapshot, target) {
-        return Ok(schedule);
-    }
-    let workspace = resolve_context_workspace(snapshot, workspace)?;
-    workspace
-        .schedules
-        .iter()
-        .find(|schedule| schedule.name == target)
-        .ok_or_else(|| {
-            cli_output::failure(
-                "not_found",
-                format!(
-                    "schedule {target:?} was not found in workspace {}",
-                    workspace.name
-                ),
-            )
-        })
-}
-
-fn find_schedule<'a>(snapshot: &'a Snapshot, id: &str) -> Option<&'a AgentScheduleSnapshot> {
-    snapshot
-        .workspaces
-        .iter()
-        .flat_map(|workspace| &workspace.schedules)
-        .find(|schedule| schedule.id == id)
-}
-
-fn schedule_workspace_name<'a>(
-    snapshot: &'a Snapshot,
-    schedule: &AgentScheduleSnapshot,
-) -> Option<&'a str> {
-    snapshot
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.id == schedule.workspace_id)
-        .map(|workspace| workspace.name.as_str())
 }
 
 fn validate_attention_protocol(negotiated: u32) -> Result<(), Box<dyn Error>> {
@@ -12296,15 +9319,6 @@ fn open_dashboard_shell(
     terminal: Option<&str>,
 ) -> Result<String, Box<dyn Error>> {
     let shell = client.get_shell(shell_id)?;
-    if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
-        && shell.status != ShellStatus::Running
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "schedule-owned shell is attachable only while its execution is active",
-        )
-        .into());
-    }
     let workspace = client.get_workspace(&shell.workspace_id)?;
     let title = format!("{} - {}", workspace.name, shell.name);
     let placement = if hyprland_special_workspaces_enabled()? {
@@ -12347,15 +9361,6 @@ fn open_dashboard_remote_shell(
 ) -> Result<String, Box<dyn Error>> {
     let registration = client.node_registration(&identity.node_id)?;
     let shell = routed_dashboard_shell(client, identity, "").map_err(io::Error::other)?;
-    if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
-        && shell.status != ShellStatus::Running
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "schedule-owned shell is attachable only while its execution is active",
-        )
-        .into());
-    }
     let workspace = match client.route_node_operation(
         &identity.node_id,
         protocol::RoutedOperation::GetWorkspace {
@@ -12479,11 +9484,7 @@ fn attempt_open_workspace(
             }
         }
     }
-    for shell in workspace
-        .shells
-        .iter()
-        .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
-    {
+    for shell in &workspace.shells {
         let opened = if let Some((global_workspace_id, node_id)) = desktop_placement {
             terminal::open_placed(
                 terminal,
@@ -12517,11 +9518,7 @@ fn attempt_open_workspace(
 }
 
 fn workspace_user_shell_count(workspace: &WorkspaceSnapshot) -> usize {
-    workspace
-        .shells
-        .iter()
-        .filter(|shell| matches!(shell.owner, protocol::ShellOwner::User))
-        .count()
+    workspace.shells.len()
 }
 
 fn invoke_workspace_launcher(
@@ -12618,15 +9615,6 @@ fn open_shell(
         let registration = client.node_registration(selector)?;
         let identity = protocol::QualifiedIdentity::new(&registration.node_id, shell_id);
         let shell = routed_dashboard_shell(&client, &identity, "").map_err(io::Error::other)?;
-        if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
-            && shell.status != ShellStatus::Running
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "schedule-owned shell is attachable only while its execution is active",
-            )
-            .into());
-        }
         let workspace = match client.route_node_operation(
             &registration.node_id,
             protocol::RoutedOperation::GetWorkspace {
@@ -12667,15 +9655,6 @@ fn open_shell(
         };
     }
     let shell = client.get_shell(shell_id)?;
-    if matches!(shell.owner, protocol::ShellOwner::Schedule { .. })
-        && shell.status != ShellStatus::Running
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "schedule-owned shell is attachable only while its execution is active",
-        )
-        .into());
-    }
     let title = title.map(str::to_owned).unwrap_or_else(|| {
         client
             .get_workspace(&shell.workspace_id)
@@ -13284,39 +10263,6 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     eprintln!("    {warning}");
                 }
             }
-            match daemon_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.scheduler.as_ref())
-            {
-                Some(scheduler)
-                    if scheduler.state == protocol::SchedulerState::Active
-                        && scheduler.max_concurrent
-                            == config.notifications.max_scheduled_execution_concurrency =>
-                {
-                    println!(
-                        "ok  scheduler: active, max_concurrent={} (sampled at daemon start)",
-                        scheduler.max_concurrent
-                    );
-                }
-                Some(scheduler) if scheduler.state == protocol::SchedulerState::Offline => {
-                    healthy = false;
-                    eprintln!("err scheduler: offline; timed schedules are not being evaluated");
-                }
-                Some(scheduler) => {
-                    healthy = false;
-                    eprintln!(
-                        "err scheduler: daemon uses max_concurrent={}, config resolves {}; restart daemon after changes",
-                        scheduler.max_concurrent,
-                        config.notifications.max_scheduled_execution_concurrency
-                    );
-                }
-                None => {
-                    healthy = false;
-                    eprintln!(
-                        "err scheduler: offline or unavailable; timed schedules require the Boomux daemon and user session"
-                    );
-                }
-            }
             let terminal = terminal_override.or(config.terminal.as_deref());
             match terminal::selected(terminal) {
                 Ok(selected) => println!("ok  terminal: {selected}"),
@@ -13527,7 +10473,7 @@ fn plausible_desktop_bus() -> bool {
 mod tests {
     use super::*;
     use crate::integration_management::{opencode_config_root, pi_config_root};
-    use std::os::unix::net::UnixListener;
+    use std::io::Read;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -13543,7 +10489,6 @@ mod tests {
 
     fn shell(id: &str, workspace_id: &str, name: &str) -> ShellSnapshot {
         ShellSnapshot {
-            owner: boomux::protocol::ShellOwner::User,
             id: id.into(),
             revision: 1,
             workspace_id: workspace_id.into(),
@@ -13574,7 +10519,6 @@ mod tests {
             shells,
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
         }
     }
 
@@ -13799,11 +10743,6 @@ mod tests {
             observed_capabilities: vec!["global_workspaces".into()],
             workspace_owner_eligible: eligible,
             workspace_owner_unavailable_reason: (!eligible).then(|| "unavailable".into()),
-            scheduler: protocol::SchedulerHealth {
-                state: protocol::SchedulerState::Active,
-                active_executions: 0,
-                max_concurrent: 4,
-            },
             local_snapshot: None,
             remote_projection: None,
         }
@@ -13934,85 +10873,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_schedule_item_owner_is_rewritten_before_action_qualification() {
-        let snapshot = workspace(
-            "owner-local",
-            "local",
-            vec![shell("shell-local", "owner-local", "placeholder")],
-        );
-        let mut cache = git::Cache::default();
-        let mut views = dashboard_projection::project(&[snapshot], &mut cache);
-        views[0].items[0] = tui::WorkspaceItemView::Schedule(tui::ScheduleItemView {
-            id: "schedule-local".into(),
-            name: "schedule".into(),
-            integration: "opencode".into(),
-            state: tui::ScheduleDisplayState::Paused,
-            friendly_trigger: "daily".into(),
-        });
-        let mut local = views[0].node.clone();
-        local.id = Uuid::from_u128(88).to_string();
-        assign_local_workspace_node(&mut views, &local);
-        let owner = &views[0].item_owners[0];
-        let action_id = protocol::QualifiedIdentity::new(&owner.node.id, "schedule-local");
-        assert_eq!(action_id.node_id, local.id);
-        assert_eq!(action_id.inner_id, "schedule-local");
-    }
-
-    fn schedule(id: &str, workspace_id: &str, name: &str) -> AgentScheduleSnapshot {
-        AgentScheduleSnapshot {
-            id: id.into(),
-            workspace_id: workspace_id.into(),
-            name: name.into(),
-            cwd: PathBuf::from("/tmp/project"),
-            integration: "opencode".into(),
-            session: AgentScheduleSession::Fresh,
-            trigger: AgentScheduleTrigger {
-                cron: "0 9 * * 1-5".into(),
-                timezone: "UTC".into(),
-            },
-            state: AgentScheduleState::Paused,
-            overlap_policy: AgentScheduleOverlapPolicy::Skip,
-            revision: 1,
-            prompt_revision: 1,
-            trigger_revision: 1,
-            created_at_ms: 10,
-            updated_at_ms: 10,
-            evaluation_frontier_ms: 10,
-            execution_shell_id: None,
-            next_occurrence: None,
-        }
-    }
-
-    fn scheduled_execution(id: &str, schedule_id: &str) -> ScheduledExecutionSnapshot {
-        ScheduledExecutionSnapshot {
-            id: id.into(),
-            workspace_id: "w1".into(),
-            schedule_id: schedule_id.into(),
-            revision: 1,
-            state: protocol::ScheduledExecutionState::Active,
-            dispatch_kind: protocol::ScheduledExecutionDispatchKind::Manual,
-            dispatch_key: Uuid::new_v4().to_string(),
-            schedule_revision: 1,
-            prompt_revision: 1,
-            trigger_revision: 1,
-            requested_at_ms: 20,
-            scheduled_at_ms: None,
-            coalesced_through_ms: None,
-            started_at_ms: Some(21),
-            ended_at_ms: None,
-            cwd: "/tmp/project".into(),
-            integration: "opencode".into(),
-            session: AgentScheduleSession::Fresh,
-            reason: None,
-            outcome: None,
-            shell_id: Some("schedule-shell".into()),
-            run_id: Some("schedule-run".into()),
-            agent_id: None,
-            external_session_id: None,
-        }
-    }
-
     fn agent(id: &str, workspace_id: &str, shell_id: &str) -> AgentInstanceSnapshot {
         AgentInstanceSnapshot {
             id: id.into(),
@@ -14046,476 +10906,6 @@ mod tests {
             cwd: PathBuf::from("/tmp/project"),
             command: vec!["zeditor".into(), ".".into()],
         }
-    }
-
-    #[test]
-    fn dashboard_refresh_uses_one_snapshot_request() {
-        let directory =
-            env::temp_dir().join(format!("boomux-dashboard-refresh-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        let socket = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let initial = Snapshot {
-            workspaces: vec![workspace(
-                "w1",
-                "before",
-                vec![shell("s1", "w1", "one"), shell("s2", "w1", "two")],
-            )],
-            focused_terminal: None,
-            scheduler: None,
-        };
-        let event_refreshed = Snapshot {
-            workspaces: vec![workspace(
-                "w1",
-                "after-event",
-                vec![shell("s1", "w1", "one"), shell("s2", "w1", "two")],
-            )],
-            focused_terminal: None,
-            scheduler: None,
-        };
-        let fallback_refreshed = Snapshot {
-            workspaces: vec![workspace(
-                "w1",
-                "after-fallback",
-                vec![shell("s1", "w1", "one"), shell("s2", "w1", "two")],
-            )],
-            focused_terminal: None,
-            scheduler: None,
-        };
-        let server = thread::spawn({
-            let initial = initial.clone();
-            let event_refreshed = event_refreshed.clone();
-            let fallback_refreshed = fallback_refreshed.clone();
-            move || {
-                for expected in [
-                    "ping",
-                    "baseline",
-                    "protocol_ping",
-                    "bounded_support_ping",
-                    "execution_seed",
-                    "changed_poll",
-                    "event_snapshot",
-                    "newer_poll",
-                    "newer_snapshot",
-                    "duplicate_poll",
-                    "duplicate_snapshot",
-                    "removed_poll",
-                    "removed_snapshot",
-                    "idle_poll",
-                    "fallback_snapshot",
-                ] {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    let request: protocol::Envelope<protocol::Request> =
-                        protocol::read_message(&mut stream).unwrap();
-                    let response = match (expected, request.message) {
-                        ("ping", protocol::Request::Ping) => protocol::Response::Pong,
-                        ("protocol_ping", protocol::Request::Ping)
-                        | ("bounded_support_ping", protocol::Request::Ping) => {
-                            protocol::Response::Pong
-                        }
-                        (
-                            "baseline",
-                            protocol::Request::Events {
-                                after: None,
-                                wait_ms: 0,
-                                ..
-                            },
-                        ) => protocol::Response::Events {
-                            stream_id: "stream-1".into(),
-                            cursor: EventCursor {
-                                stream_id: "stream-1".into(),
-                                event_id: 0,
-                            },
-                            snapshot: Some(initial.clone()),
-                            events: Vec::new(),
-                        },
-                        (
-                            "execution_seed",
-                            protocol::Request::ListScheduledExecutions {
-                                workspace_id: None,
-                                schedule_id: None,
-                                limit: Some(DASHBOARD_EXECUTION_CACHE_LIMIT),
-                            },
-                        ) => {
-                            let mut execution =
-                                scheduled_execution("execution-event", "schedule-1");
-                            execution.revision = 3;
-                            protocol::Response::ScheduledExecutions {
-                                executions: vec![execution],
-                                limit: DASHBOARD_EXECUTION_CACHE_LIMIT,
-                                truncated: false,
-                                schedules: Vec::new(),
-                                schedule_limit:
-                                    protocol::MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS,
-                                schedules_truncated: false,
-                            }
-                        }
-                        (
-                            "changed_poll",
-                            protocol::Request::Events {
-                                after: Some(_),
-                                wait_ms: 0,
-                                ..
-                            },
-                        ) => protocol::Response::Events {
-                            stream_id: "stream-1".into(),
-                            cursor: EventCursor {
-                                stream_id: "stream-1".into(),
-                                event_id: 1,
-                            },
-                            snapshot: None,
-                            events: vec![protocol::DaemonEvent {
-                                id: 1,
-                                at_ms: 1,
-                                kind: protocol::DaemonEventKind::ScheduledExecutionChanged {
-                                    workspace_id: "w1".into(),
-                                    execution: {
-                                        let mut execution =
-                                            scheduled_execution("execution-event", "schedule-1");
-                                        execution.revision = 2;
-                                        execution
-                                    },
-                                },
-                            }],
-                        },
-                        ("event_snapshot", protocol::Request::Snapshot) => {
-                            protocol::Response::Snapshot {
-                                snapshot: event_refreshed.clone(),
-                            }
-                        }
-                        (
-                            "newer_poll",
-                            protocol::Request::Events {
-                                after: Some(_),
-                                wait_ms: 0,
-                                ..
-                            },
-                        ) => protocol::Response::Events {
-                            stream_id: "stream-1".into(),
-                            cursor: EventCursor {
-                                stream_id: "stream-1".into(),
-                                event_id: 2,
-                            },
-                            snapshot: None,
-                            events: vec![protocol::DaemonEvent {
-                                id: 2,
-                                at_ms: 2,
-                                kind: protocol::DaemonEventKind::ScheduledExecutionChanged {
-                                    workspace_id: "w1".into(),
-                                    execution: {
-                                        let mut execution =
-                                            scheduled_execution("execution-event", "schedule-1");
-                                        execution.revision = 4;
-                                        execution.state =
-                                            protocol::ScheduledExecutionState::Starting;
-                                        execution
-                                    },
-                                },
-                            }],
-                        },
-                        ("newer_snapshot", protocol::Request::Snapshot) => {
-                            protocol::Response::Snapshot {
-                                snapshot: event_refreshed.clone(),
-                            }
-                        }
-                        (
-                            "duplicate_poll",
-                            protocol::Request::Events {
-                                after: Some(_),
-                                wait_ms: 0,
-                                ..
-                            },
-                        ) => protocol::Response::Events {
-                            stream_id: "stream-1".into(),
-                            cursor: EventCursor {
-                                stream_id: "stream-1".into(),
-                                event_id: 3,
-                            },
-                            snapshot: None,
-                            events: vec![protocol::DaemonEvent {
-                                id: 3,
-                                at_ms: 3,
-                                kind: protocol::DaemonEventKind::ScheduledExecutionChanged {
-                                    workspace_id: "w1".into(),
-                                    execution: {
-                                        let mut execution =
-                                            scheduled_execution("execution-event", "schedule-1");
-                                        execution.revision = 4;
-                                        execution.state =
-                                            protocol::ScheduledExecutionState::Cancelled;
-                                        execution.reason = Some(
-                                            protocol::ScheduledExecutionReason::CancelledByUser,
-                                        );
-                                        execution.ended_at_ms = Some(3);
-                                        execution
-                                    },
-                                },
-                            }],
-                        },
-                        ("duplicate_snapshot", protocol::Request::Snapshot) => {
-                            protocol::Response::Snapshot {
-                                snapshot: event_refreshed.clone(),
-                            }
-                        }
-                        (
-                            "removed_poll",
-                            protocol::Request::Events {
-                                after: Some(_),
-                                wait_ms: 0,
-                                ..
-                            },
-                        ) => protocol::Response::Events {
-                            stream_id: "stream-1".into(),
-                            cursor: EventCursor {
-                                stream_id: "stream-1".into(),
-                                event_id: 4,
-                            },
-                            snapshot: None,
-                            events: vec![protocol::DaemonEvent {
-                                id: 4,
-                                at_ms: 4,
-                                kind: protocol::DaemonEventKind::AgentScheduleRemoved {
-                                    workspace_id: "w1".into(),
-                                    schedule_id: "schedule-1".into(),
-                                },
-                            }],
-                        },
-                        ("removed_snapshot", protocol::Request::Snapshot) => {
-                            protocol::Response::Snapshot {
-                                snapshot: event_refreshed.clone(),
-                            }
-                        }
-                        (
-                            "idle_poll",
-                            protocol::Request::Events {
-                                after: Some(_),
-                                wait_ms: 0,
-                                ..
-                            },
-                        ) => protocol::Response::Events {
-                            stream_id: "stream-1".into(),
-                            cursor: EventCursor {
-                                stream_id: "stream-1".into(),
-                                event_id: 1,
-                            },
-                            snapshot: None,
-                            events: Vec::new(),
-                        },
-                        ("fallback_snapshot", protocol::Request::Snapshot) => {
-                            protocol::Response::Snapshot {
-                                snapshot: fallback_refreshed.clone(),
-                            }
-                        }
-                        (_, request) => panic!("unexpected {expected} request: {request:?}"),
-                    };
-                    protocol::write_message(
-                        &mut stream,
-                        &protocol::Envelope::with_version(request.version, response),
-                    )
-                    .unwrap();
-                }
-            }
-        });
-        let client = client::Client::from_socket_path(socket);
-        let mut refresh = DashboardRefresh::baseline(&client).unwrap();
-
-        let (snapshot, stream_changed) = refresh.check(&client).unwrap().unwrap();
-        assert_eq!(snapshot, event_refreshed);
-        assert!(!stream_changed);
-        assert_eq!(refresh.executions().len(), 1);
-        assert_eq!(refresh.executions()[0].id, "execution-event");
-        assert_eq!(refresh.executions()[0].revision, 3);
-        assert_eq!(
-            refresh.executions()[0].state,
-            protocol::ScheduledExecutionState::Active
-        );
-
-        refresh.check(&client).unwrap().unwrap();
-        assert_eq!(refresh.executions()[0].revision, 4);
-        assert_eq!(
-            refresh.executions()[0].state,
-            protocol::ScheduledExecutionState::Starting
-        );
-
-        refresh.check(&client).unwrap().unwrap();
-        assert_eq!(refresh.executions()[0].revision, 4);
-        assert_eq!(
-            refresh.executions()[0].state,
-            protocol::ScheduledExecutionState::Starting
-        );
-
-        refresh.check(&client).unwrap().unwrap();
-        assert!(refresh.executions().is_empty());
-
-        refresh.last_snapshot_at = Instant::now() - DASHBOARD_FALLBACK_REFRESH_INTERVAL;
-        let (snapshot, stream_changed) = refresh.check(&client).unwrap().unwrap();
-
-        assert_eq!(snapshot, fallback_refreshed);
-        assert!(!stream_changed);
-        server.join().unwrap();
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn dashboard_protocol_23_and_24_do_not_request_unbounded_execution_history() {
-        for version in [23, 24] {
-            let directory = env::temp_dir().join(format!(
-                "boomux-dashboard-old-protocol-{version}-{}",
-                Uuid::new_v4()
-            ));
-            fs::create_dir_all(&directory).unwrap();
-            let socket = directory.join("daemon.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
-            let snapshot = Snapshot {
-                workspaces: Vec::new(),
-                focused_terminal: None,
-                scheduler: None,
-            };
-            let server = thread::spawn(move || {
-                for phase in 0..2 {
-                    for requested_version in (version..=protocol::PROTOCOL_VERSION).rev() {
-                        let (mut stream, _) = listener.accept().unwrap();
-                        let request: protocol::Envelope<protocol::Request> =
-                            protocol::read_message(&mut stream).unwrap();
-                        assert_eq!(request.version, requested_version);
-                        assert!(matches!(request.message, protocol::Request::Ping));
-                        protocol::write_message(
-                            &mut stream,
-                            &protocol::Envelope::with_version(version, protocol::Response::Pong),
-                        )
-                        .unwrap();
-                    }
-                    if phase != 0 {
-                        continue;
-                    }
-                    let (mut stream, _) = listener.accept().unwrap();
-                    let request: protocol::Envelope<protocol::Request> =
-                        protocol::read_message(&mut stream).unwrap();
-                    assert!(matches!(
-                        request.message,
-                        protocol::Request::Events {
-                            after: None,
-                            wait_ms: 0,
-                            ..
-                        }
-                    ));
-                    protocol::write_message(
-                        &mut stream,
-                        &protocol::Envelope::with_version(
-                            version,
-                            protocol::Response::Events {
-                                stream_id: format!("stream-{version}"),
-                                cursor: EventCursor {
-                                    stream_id: format!("stream-{version}"),
-                                    event_id: 0,
-                                },
-                                snapshot: Some(snapshot.clone()),
-                                events: Vec::new(),
-                            },
-                        ),
-                    )
-                    .unwrap();
-                }
-            });
-            let client = client::Client::from_socket_path(socket);
-            let refresh = DashboardRefresh::baseline(&client).unwrap();
-            assert_eq!(refresh.negotiated_protocol, version);
-            assert!(refresh.executions().is_empty());
-            server.join().unwrap();
-            fs::remove_dir_all(directory).unwrap();
-        }
-    }
-
-    #[test]
-    fn failed_execution_reseed_preserves_cache_and_retries_on_next_check() {
-        let directory = env::temp_dir().join(format!("boomux-dashboard-reseed-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        let socket = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let snapshot = Snapshot {
-            workspaces: Vec::new(),
-            focused_terminal: None,
-            scheduler: None,
-        };
-        let server = thread::spawn(move || {
-            for expected in [
-                "feature_ping",
-                "baseline",
-                "protocol_ping",
-                "seed_support",
-                "seed",
-                "failed_support",
-                "failed_seed",
-                "retry_support",
-                "retry_seed",
-            ] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request: protocol::Envelope<protocol::Request> =
-                    protocol::read_message(&mut stream).unwrap();
-                if expected == "failed_seed" {
-                    assert!(matches!(
-                        request.message,
-                        protocol::Request::ListScheduledExecutions { .. }
-                    ));
-                    drop(stream);
-                    continue;
-                }
-                let response = match (expected, request.message) {
-                    (
-                        "feature_ping" | "protocol_ping" | "seed_support" | "failed_support"
-                        | "retry_support",
-                        protocol::Request::Ping,
-                    ) => protocol::Response::Pong,
-                    (
-                        "baseline",
-                        protocol::Request::Events {
-                            after: None,
-                            wait_ms: 0,
-                            ..
-                        },
-                    ) => protocol::Response::Events {
-                        stream_id: "stream-reseed".into(),
-                        cursor: EventCursor {
-                            stream_id: "stream-reseed".into(),
-                            event_id: 0,
-                        },
-                        snapshot: Some(snapshot.clone()),
-                        events: Vec::new(),
-                    },
-                    ("seed" | "retry_seed", protocol::Request::ListScheduledExecutions { .. }) => {
-                        let mut execution = scheduled_execution("execution-1", "schedule-1");
-                        execution.revision = if expected == "seed" { 4 } else { 5 };
-                        protocol::Response::ScheduledExecutions {
-                            executions: vec![execution],
-                            limit: DASHBOARD_EXECUTION_CACHE_LIMIT,
-                            truncated: false,
-                            schedules: Vec::new(),
-                            schedule_limit: protocol::MAX_SCHEDULED_EXECUTION_SCHEDULE_PROJECTIONS,
-                            schedules_truncated: false,
-                        }
-                    }
-                    (_, request) => panic!("unexpected reseed request: {request:?}"),
-                };
-                protocol::write_message(
-                    &mut stream,
-                    &protocol::Envelope::with_version(request.version, response),
-                )
-                .unwrap();
-            }
-        });
-        let client = client::Client::from_socket_path(socket);
-        let mut refresh = DashboardRefresh::baseline(&client).unwrap();
-        assert_eq!(refresh.executions()[0].revision, 4);
-        refresh.needs_reseed = true;
-
-        assert!(refresh.check(&client).is_err());
-        assert!(refresh.needs_reseed);
-        assert_eq!(refresh.executions()[0].revision, 4);
-        assert!(refresh.check(&client).unwrap().is_some());
-        assert!(!refresh.needs_reseed);
-        assert_eq!(refresh.executions()[0].revision, 5);
-        server.join().unwrap();
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -16032,7 +12422,6 @@ mod tests {
         let value = json_snapshot(Snapshot {
             workspaces: vec![project],
             focused_terminal: None,
-            scheduler: None,
         })
         .unwrap();
 
@@ -16050,7 +12439,6 @@ mod tests {
         let snapshot = Snapshot {
             workspaces: vec![workspace("w2", "w1", vec![]), project],
             focused_terminal: None,
-            scheduler: None,
         };
 
         assert_eq!(
@@ -16141,7 +12529,6 @@ mod tests {
                 workspace("w2", "two", vec![shell("s2", "w2", "tests")]),
             ],
             focused_terminal: None,
-            scheduler: None,
         };
         assert_eq!(
             resolve_shell_target(&snapshot, None, "s2").unwrap().id,
@@ -16253,11 +12640,6 @@ mod tests {
                 observed_capabilities: Vec::new(),
                 workspace_owner_eligible: true,
                 workspace_owner_unavailable_reason: None,
-                scheduler: protocol::SchedulerHealth {
-                    state: protocol::SchedulerState::Active,
-                    max_concurrent: 4,
-                    active_executions: 0,
-                },
             },
             id: "w1".into(),
             name: "project".into(),
@@ -16770,118 +13152,11 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_run_now_backend_generates_a_fresh_dispatch_key() {
-        let directory = env::temp_dir().join(format!("boomux-dashboard-run-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        let socket = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = thread::spawn(move || {
-            let mut keys = Vec::new();
-            for index in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request: protocol::Envelope<protocol::Request> =
-                    protocol::read_message(&mut stream).unwrap();
-                let protocol::Request::RunAgentSchedule {
-                    schedule_id,
-                    dispatch_key,
-                } = request.message
-                else {
-                    panic!("expected run schedule request");
-                };
-                assert_eq!(schedule_id, "schedule-1");
-                Uuid::parse_str(&dispatch_key).unwrap();
-                keys.push(dispatch_key.clone());
-                let mut execution =
-                    scheduled_execution(&format!("execution-{index}"), "schedule-1");
-                execution.dispatch_key = dispatch_key;
-                protocol::write_message(
-                    &mut stream,
-                    &protocol::Envelope::with_version(
-                        request.version,
-                        protocol::Response::ScheduledExecution {
-                            execution,
-                            next_occurrence: None,
-                        },
-                    ),
-                )
-                .unwrap();
-            }
-            keys
-        });
-        let client = client::Client::from_socket_path(socket);
-
-        assert!(
-            run_dashboard_schedule(&client, "schedule-1")
-                .unwrap()
-                .contains("execution-0")
-        );
-        assert!(
-            run_dashboard_schedule(&client, "schedule-1")
-                .unwrap()
-                .contains("execution-1")
-        );
-        let keys = server.join().unwrap();
-        assert_ne!(keys[0], keys[1]);
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn dashboard_cancel_backend_revalidates_exact_execution_state() {
-        let directory = env::temp_dir().join(format!("boomux-dashboard-cancel-{}", Uuid::new_v4()));
-        fs::create_dir_all(&directory).unwrap();
-        let socket = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request: protocol::Envelope<protocol::Request> =
-                protocol::read_message(&mut stream).unwrap();
-            assert!(matches!(
-                request.message,
-                protocol::Request::GetScheduledExecution { ref execution_id }
-                    if execution_id == "execution-1"
-            ));
-            let mut execution = scheduled_execution("execution-1", "schedule-1");
-            execution.state = protocol::ScheduledExecutionState::Exited;
-            execution.ended_at_ms = Some(22);
-            execution.outcome = Some(ScheduledExecutionOutcome::ExitCode { code: 0 });
-            protocol::write_message(
-                &mut stream,
-                &protocol::Envelope::with_version(
-                    request.version,
-                    protocol::Response::ScheduledExecution {
-                        execution,
-                        next_occurrence: None,
-                    },
-                ),
-            )
-            .unwrap();
-        });
-        let client = client::Client::from_socket_path(socket);
-
-        let error = cancel_dashboard_execution(&client, "execution-1").unwrap_err();
-        assert!(error.contains("no longer active"));
-        server.join().unwrap();
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn restoring_empty_workspace_returns_actionable_error() {
         let error =
             open_workspace(&workspace("w1", "empty", Vec::new()), None, None, true).unwrap_err();
 
         assert!(error.to_string().contains("workspace empty has no shells"));
-    }
-
-    #[test]
-    fn workspace_restore_excludes_schedule_owned_shells_from_openability_and_counts() {
-        let mut scheduled = shell("schedule-shell", "w1", "scheduled");
-        scheduled.owner = protocol::ShellOwner::Schedule {
-            schedule_id: "schedule-1".into(),
-        };
-        let workspace = workspace("w1", "scheduled-only", vec![scheduled]);
-        assert_eq!(workspace_user_shell_count(&workspace), 0);
-        let error = open_workspace(&workspace, None, None, true).unwrap_err();
-        assert!(error.to_string().contains("has no shells or launchers"));
     }
 
     #[test]
@@ -16917,72 +13192,6 @@ mod tests {
             dashboard_session_resume_plan(&session)
                 .unwrap_err()
                 .contains("already active")
-        );
-    }
-
-    #[test]
-    fn exact_execution_open_rejects_a_reused_schedule_shell_run() {
-        let mut execution = scheduled_execution("execution-1", "schedule-1");
-        execution.shell_id = Some("schedule-shell".into());
-        execution.run_id = Some("execution-run".into());
-        let mut shell = shell("schedule-shell", "w1", "scheduled");
-        shell.owner = protocol::ShellOwner::Schedule {
-            schedule_id: "schedule-1".into(),
-        };
-        shell.run.as_mut().unwrap().id = "execution-run".into();
-        assert!(
-            validate_dashboard_execution_open(
-                &execution,
-                &shell,
-                "schedule-shell",
-                "execution-run"
-            )
-            .is_ok()
-        );
-
-        shell.run.as_mut().unwrap().id = "later-run".into();
-        let error = validate_dashboard_execution_open(
-            &execution,
-            &shell,
-            "schedule-shell",
-            "execution-run",
-        )
-        .unwrap_err();
-        assert!(error.contains("different run"));
-    }
-
-    #[test]
-    fn execution_open_target_uses_exact_run_or_linked_agent_identity() {
-        let mut execution = scheduled_execution("execution-1", "schedule-1");
-        execution.shell_id = Some("schedule-shell".into());
-        execution.run_id = Some("schedule-run".into());
-        assert!(matches!(
-            scheduled_execution_open_target(&execution),
-            Ok(ScheduledExecutionOpenTarget::Run {
-                shell_id: "schedule-shell",
-                run_id: "schedule-run"
-            })
-        ));
-
-        execution.run_id = None;
-        assert_eq!(
-            scheduled_execution_open_target(&execution).unwrap_err().0,
-            "busy"
-        );
-
-        execution.state = protocol::ScheduledExecutionState::Exited;
-        execution.agent_id = Some("agent-1".into());
-        assert!(matches!(
-            scheduled_execution_open_target(&execution),
-            Ok(ScheduledExecutionOpenTarget::Session {
-                agent_id: "agent-1"
-            })
-        ));
-
-        execution.agent_id = None;
-        assert_eq!(
-            scheduled_execution_open_target(&execution).unwrap_err().0,
-            "not_found"
         );
     }
 
@@ -17407,7 +13616,6 @@ mod tests {
                 workspace("w1", "Alpha", vec![shell("s1", "w1", "frontend")]),
             ],
             focused_terminal: None,
-            scheduler: None,
         };
         let targets = vec![
             integration_management::VerificationTarget {
@@ -17596,194 +13804,6 @@ mod tests {
     }
 
     #[test]
-    fn schedule_parser_enforces_sources_and_descriptors() {
-        let valid = [
-            "boomux",
-            "schedule",
-            "create",
-            "review",
-            "--workspace",
-            "project",
-            "--cwd",
-            "/tmp",
-            "--integration",
-            "opencode",
-            "--prompt",
-            "review exactly\n",
-            "--weekdays",
-            "09:30",
-            "--continue",
-            "projected-session",
-            "--enabled",
-            "--json",
-        ];
-        let cli = Cli::try_parse_from(valid).unwrap();
-        assert_eq!(cli.command_descriptor().key, "schedule.create");
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Schedule {
-                command: ScheduleCommands::Create(arguments)
-            }) if arguments.prompt.as_deref() == Some("review exactly\n")
-                && arguments.continue_session.as_deref() == Some("projected-session")
-                && arguments.enabled
-        ));
-
-        for arguments in [
-            vec!["boomux", "schedule", "list", "--json"],
-            vec!["boomux", "schedule", "inspect", "id", "--json"],
-            vec!["boomux", "schedule", "pause", "id", "--json"],
-            vec!["boomux", "schedule", "resume", "id", "--json"],
-            vec!["boomux", "schedule", "remove", "id", "--json"],
-            vec!["boomux", "execution", "open", "execution-id", "--json"],
-        ] {
-            assert_eq!(
-                Cli::try_parse_from(arguments)
-                    .unwrap()
-                    .command_descriptor()
-                    .output,
-                OutputMode::Json
-            );
-        }
-
-        let required = [
-            "boomux",
-            "schedule",
-            "create",
-            "review",
-            "--workspace",
-            "project",
-            "--cwd",
-            "/tmp",
-            "--integration",
-            "opencode",
-        ];
-        assert!(Cli::try_parse_from(required.into_iter().chain(["--daily", "09:00"])).is_err());
-        assert!(
-            Cli::try_parse_from(required.into_iter().chain([
-                "--prompt",
-                "one",
-                "--prompt-file",
-                "/tmp/prompt",
-                "--daily",
-                "09:00",
-            ]))
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from(required.into_iter().chain([
-                "--prompt",
-                "one",
-                "--daily",
-                "09:00",
-                "--cron",
-                "0 9 * * *",
-            ]))
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from(required.into_iter().chain([
-                "--prompt",
-                "one",
-                "--daily",
-                "09:00",
-                "--fresh",
-                "--continue",
-                "session",
-            ]))
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from(required.into_iter().chain([
-                "--prompt",
-                "one",
-                "--daily",
-                "09:00",
-                "--paused",
-                "--enabled",
-            ]))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn schedule_helpers_preserve_prompt_files_and_resolve_targets_safely() {
-        use std::os::unix::fs::symlink;
-        use std::os::unix::net::UnixListener;
-
-        assert!(validate_schedule_protocol(21).is_err());
-        assert!(validate_schedule_protocol(22).is_ok());
-        assert_eq!(
-            schedule_cron(None, Some("15m"), None, None, None).unwrap(),
-            "*/15 * * * *"
-        );
-        assert_eq!(
-            schedule_cron(None, None, None, Some("17:30"), None).unwrap(),
-            "30 17 * * 1-5"
-        );
-        assert_eq!(
-            schedule_cron(None, None, None, None, Some("mon@08:00")).unwrap(),
-            "0 8 * * 1"
-        );
-        assert!(schedule_cron(None, None, Some("9:00"), None, None).is_err());
-
-        let directory = test_skill_home("schedule-prompt");
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("prompt.txt");
-        fs::write(&path, b"private instructions\n").unwrap();
-        assert_eq!(
-            schedule_prompt(None, Some(&path)).unwrap(),
-            "private instructions\n"
-        );
-        assert!(schedule_prompt(None, Some(&directory)).is_err());
-        let link = directory.join("prompt-link");
-        symlink(&path, &link).unwrap();
-        let error = schedule_prompt(None, Some(&link)).unwrap_err();
-        assert_eq!(
-            cli_output::classify_for_test("schedule.create", error.as_ref()),
-            "invalid_argument"
-        );
-        let socket = directory.join("prompt.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
-        let error = schedule_prompt(None, Some(&socket)).unwrap_err();
-        assert_eq!(
-            cli_output::classify_for_test("schedule.create", error.as_ref()),
-            "invalid_argument"
-        );
-        assert_eq!(
-            escape_terminal_text("line one\nsecret\u{1b}]52;c;payload\u{7}"),
-            "line one\\nsecret\\u{1b}]52;c;payload\\u{7}"
-        );
-        fs::write(&path, vec![b'x'; boomux::scheduling::MAX_PROMPT_BYTES + 1]).unwrap();
-        let error = schedule_prompt(None, Some(&path)).unwrap_err().to_string();
-        assert!(!error.contains(&"x".repeat(100)));
-        fs::remove_dir_all(directory).unwrap();
-
-        let mut first = workspace("w1", "first", Vec::new());
-        first.schedules.push(schedule("schedule-1", "w1", "review"));
-        let mut second = workspace("w2", "second", Vec::new());
-        second
-            .schedules
-            .push(schedule("schedule-2", "w2", "review"));
-        let snapshot = Snapshot {
-            workspaces: vec![first, second],
-            focused_terminal: None,
-            scheduler: None,
-        };
-        assert_eq!(
-            resolve_cli_schedule(&snapshot, "schedule-2", None)
-                .unwrap()
-                .workspace_id,
-            "w2"
-        );
-        assert_eq!(
-            resolve_cli_schedule(&snapshot, "review", Some("first"))
-                .unwrap()
-                .id,
-            "schedule-1"
-        );
-    }
-
-    #[test]
     fn capabilities_advertise_phase_two_agent_integration_surface() {
         let json_commands = json_commands().collect::<Vec<_>>();
         assert!(json_commands.contains(&"shell.suggest-name"));
@@ -17806,16 +13826,6 @@ mod tests {
             "integration.install",
             "integration.uninstall",
             "integration.verify",
-        ] {
-            assert!(json_commands.contains(&command));
-        }
-        for command in [
-            "schedule.create",
-            "schedule.list",
-            "schedule.inspect",
-            "schedule.pause",
-            "schedule.resume",
-            "schedule.remove",
         ] {
             assert!(json_commands.contains(&command));
         }
@@ -17870,7 +13880,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 46);
+        assert_eq!(protocol::PROTOCOL_VERSION, 47);
     }
 
     #[test]
@@ -17955,18 +13965,6 @@ mod tests {
                 "integration.verify",
                 "session.list",
                 "session.inspect",
-                "schedule.create",
-                "schedule.list",
-                "schedule.inspect",
-                "schedule.pause",
-                "schedule.resume",
-                "schedule.remove",
-                "schedule.run",
-                "execution.list",
-                "execution.inspect",
-                "execution.wait",
-                "execution.open",
-                "execution.cancel",
                 "daemon.status",
             ]
         );
@@ -18175,18 +14173,6 @@ mod tests {
             "boomux session list",
             "boomux session inspect",
             "boomux session resume",
-            "boomux schedule create",
-            "boomux schedule list",
-            "boomux schedule inspect",
-            "boomux schedule pause",
-            "boomux schedule resume",
-            "boomux schedule remove",
-            "boomux schedule run",
-            "boomux execution list",
-            "boomux execution inspect",
-            "boomux execution wait",
-            "boomux execution open",
-            "boomux execution cancel",
             "boomux integration list",
             "boomux integration status",
             "boomux integration install",

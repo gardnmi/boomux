@@ -26,21 +26,9 @@ Protocol 21 adds a targeted focused-terminal read for clients that use events as
 registry invalidation while refreshing ephemeral focus independently. Running
 shell reads refresh foreground-process hints from a daemon-side one-second cache
 shared by concurrent clients.
-Protocol 22 adds durable Agent Schedule management. Workspace snapshots include
-ordered, prompt-free schedule summaries, while exact schedule inspection is the
-only management response that discloses the current prompt.
-Protocol 23 adds durable manual Scheduled Executions and schedule-owned shells.
-Protocol 24 adds daemon-native timed decisions, skipped policy outcomes,
-deterministic next occurrences, and scheduler health.
-Protocol 25 adds positive durable execution revisions, bounded execution-list
-metadata, and exact revision-aware execution waits.
-Protocol 26 adds exact-run attachment, and protocol 27 adds optimistic paused
-schedule-definition updates with prompt-free update events.
+Protocol 26 adds exact-run attachment.
 Protocol 32 adds owner-side reduced Node projection cuts and the local
 `node_projection_changed` cache invalidation event.
-Protocol 37 adds remote Schedule management and execution observation without a
-new event kind: owner events remain owner-local and the presenting Node receives
-only its existing projection invalidation.
 Protocol 39 adds live Node-qualified focused-terminal presentation to the
 combined Node snapshot and the prompt-free
 `focused_terminal_presentation_changed` invalidation event. The event wakes
@@ -54,23 +42,16 @@ copies owner events into the presenting Node's domain journal.
 Protocol 43 likewise adds no event kind or baseline field. Claude Remote Control
 bindings are ephemeral local handoff presentation state, not durable Agent state
 or reduced Node projection data.
+Protocol 47 removes Agent Schedules and Scheduled Executions. Current snapshots
+and event streams contain no schedule definitions, execution records, scheduler
+health, or schedule events. Historical schedule request and event shapes are not
+part of the protocol-47 wire contract.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
 unchanged on timeout, rejects future revisions, and wakes with
 `daemon_stopping` during replacement. Callers reconnect and repeat with the same
 revision; no waiter state is persisted.
-
-`boomux execution wait <id> --after-revision <revision>` has the same
-newer/timeout/future-revision and reconnect rules. Unlike terminal Agent `done`,
-an equal terminal execution revision continues waiting because a lifecycle
-integration may still link the canonical Agent for that exact ShellRun. The wait
-uses the event condition variable as a wakeup signal and does not consume the
-global cursor. It reads only the execution map installed at the persisted event
-publication frontier. Persistence in flight, pending durable storage, and
-lifecycle reservations do not extend `wait_ms`: timeout returns `changed: false`
-with the last committed exact snapshot, including when the mutable record has an
-unpublished revision or has been provisionally pruned.
 
 ## Cursors
 
@@ -107,8 +88,8 @@ Local clients can therefore continue using one local cursor that orders local
 observations without reinterpreting a remote mutation as local authority.
 
 Remote cursor expiry reseeds only the affected Node. A disconnect marks its
-cached projection stale and publishes no Agent completion, execution outcome,
-attention acknowledgment, Schedule decision, or replacement dispatch. Recovered
+cached projection stale and publishes no Agent completion, attention
+acknowledgment, or replacement dispatch. Recovered
 baselines update presentation but emit neither historical notifications nor a
 reconnect digest because the expired stream cannot prove which transitions were
 unseen. Older clients remain local-only and do not receive federation
@@ -132,9 +113,6 @@ The event vocabulary is:
 - `run_started`, `output_changed`, `run_exited`
 - `agent_registered`, `agent_state_changed`, `agent_completed`,
   `agent_attention_acknowledged`
-- `agent_schedule_created`, `agent_schedule_updated`, `agent_schedule_paused`,
-  `agent_schedule_resumed`, `agent_schedule_removed`
-- `scheduled_execution_created`, `scheduled_execution_changed`
 - `node_projection_changed`
 - `focused_terminal_presentation_changed`
 - `handoff_completed`
@@ -166,88 +144,22 @@ resulting Agent snapshot after the item is removed. The acknowledgment is
 conditional on its raising observation revision, persists before publication,
 and does not increment the lifecycle observation revision.
 
-Schedule create, update, pause, resume, and remove events never contain prompt
-content. Create, changed update, and changed pause/resume operations publish the
-complete prompt-free schedule summary after persistence. Exact update no-ops and
-idempotent pause/resume emit no event and do not advance the schedule revision.
-Removing a schedule emits only its workspace and schedule identities.
-
-`scheduled_execution_created` publishes every persisted manual or timed claim or
-skip decision.
-`scheduled_execution_changed` publishes later prompt-free shell/run binding,
-active, dispatch-failed, exited, cancelled, interrupted, and Agent-link changes.
-Both carry the complete public execution snapshot and its positive durable
-revision and never carry the retained
-prompt or daemon startup environment. Process outcomes do not imply Agent
-lifecycle observations.
-
-An exact runner ShellRun exit reconciles a still-starting or active execution in
-the same persisted event batch. A staged host outcome produces `exited`, a staged
-host-spawn failure produces `dispatch_failed`, and an EOF without either produces
-`interrupted`. `run_exited` precedes the terminal
-`scheduled_execution_changed`. The staged host outcome remains authoritative.
-
-Closing a workspace removes all of its schedules and stored prompts as part of
-the workspace transaction. The stream publishes the existing single
-`workspace_closed` event; it does not publish one `agent_schedule_removed` event
-per owned schedule.
-
 Protocol-8 and older event clients do not receive protocol-9 agent snapshots or
 agent events. Filtering does not rewrite the journal: their returned cursor
 still advances across filtered agent events, preserving the stream's total
 publication order. Agent get, register, and report requests require protocol 9;
 ensure requires protocol 10.
 
-Protocol-21 and older clients receive workspace snapshots without schedules and
-do not receive schedule events. The returned cursor still advances across those
-filtered events, preserving the stream's total publication order. Schedule
-management requests require protocol 22.
-
-Protocol-26 and older clients do not receive `agent_schedule_updated`, but their
-cursor advances across it. Schedule update requests require protocol 27.
-
-Protocol-22 and older clients do not receive scheduled-execution events, but
-their cursor advances across them. Execution dispatch, list, exact inspect, and
-cancel requests require protocol 23. Protocol-22 snapshots also omit
-schedule-owned shells and execution-shell links rather than presenting those
-shells as user-owned. Historical schedule-shell ownership used for this filtering
-is retained exactly while the bounded event journal still contains a generic
-event for that shell; it cannot be evicted independently of that event.
-
-Protocol-23 clients retain manual non-skipped execution records but omit timed
-and skipped records and their events. Snapshot scheduler health and schedule
-next-occurrence fields are also omitted. Filtering never rewinds the event
-cursor, so an old client can reconnect across hidden scheduler activity without
-replaying or stalling the stream.
-
-Protocol-24 and older clients ignore the additive execution revision and bounded
-list metadata. Their existing record/event filtering remains unchanged. In all
-versions the returned cursor advances across hidden execution events.
-
 Protocol-31 and older clients do not receive `node_projection_changed`; their
 cursor still advances across the invalidation. A projection cut resumes only
 when every remote event through its captured cursor fits within 256 records;
 otherwise it returns a fresh reduced baseline and no transition history.
-
-Manual final eligibility, claim creation, shell/run binding, and runner spawn are
-serialized against Agent activity mutations. A protocol-23 client therefore
-cannot observe a manual `claimed` creation whose only terminal transition is a
-protocol-24-only policy skip. If Agent activity wins first, the execution is
-created directly as skipped and its event is hidden consistently while the
-protocol-23 cursor still advances.
 
 Event IDs provide one total publication order. The daemon transition coordinator
 couples durable lifecycle mutation, persistence, and event publication. Events
 are published only after their corresponding state is persisted. If persistence
 fails, the event batch remains pending; background recovery publishes queued
 batches in transition order and exactly once.
-Execution notifications are derived at that actual publication boundary, so a
-dispatch failure whose first persistence attempt fails is notified once after a
-later pending flush, never before durable commit. Qualification compares each
-published execution event with the prior committed snapshot, so revisions that
-retain a qualifying terminal state and reason, including late Agent linkage, do
-not notify again.
-
 Lifecycle event reservations have distinct abort and persistence-transfer exits.
 An abort releases and publishes queued runtime events immediately when no durable
 batch or persistence operation still blocks publication. A successful lifecycle

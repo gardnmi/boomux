@@ -12,17 +12,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::protocol::{
-    AgentAttentionSnapshot, AgentObservationSnapshot, AgentScheduleOverlapPolicy,
-    AgentScheduleSession, AgentScheduleState, AgentScheduleTrigger, ScheduledExecutionDispatchKind,
-    ScheduledExecutionOutcome, ScheduledExecutionReason, ScheduledExecutionState, ShellOwner,
-    ShellRunExitReason, TerminalProfile,
+    AgentAttentionSnapshot, AgentObservationSnapshot, ShellRunExitReason, TerminalProfile,
 };
 
-const STATE_VERSION: u32 = 13;
-const VERSION_TWELVE_STATE_VERSION: u32 = 12;
-const VERSION_ELEVEN_STATE_VERSION: u32 = 11;
-const VERSION_TEN_STATE_VERSION: u32 = 10;
-const VERSION_NINE_STATE_VERSION: u32 = 9;
+const STATE_VERSION: u32 = 14;
 const VERSION_EIGHT_STATE_VERSION: u32 = 8;
 const VERSION_SEVEN_STATE_VERSION: u32 = 7;
 const PREVIOUS_STATE_VERSION: u32 = 6;
@@ -32,7 +25,6 @@ const VERSION_THREE_STATE_VERSION: u32 = 3;
 const VERSION_TWO_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
-const DISPATCH_KEY_FILTER_BYTES: usize = 2048;
 
 const fn initial_revision() -> u64 {
     1
@@ -65,97 +57,6 @@ pub(crate) struct PersistedWorkspace {
     pub(crate) shells: Vec<PersistedShell>,
     pub(crate) launchers: Vec<PersistedWorkspaceLauncher>,
     pub(crate) agents: Vec<PersistedAgentInstance>,
-    pub(crate) schedules: Vec<PersistedAgentSchedule>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PersistedAgentSchedule {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) cwd: PathBuf,
-    pub(crate) integration: String,
-    pub(crate) prompt: String,
-    pub(crate) session: AgentScheduleSession,
-    pub(crate) trigger: AgentScheduleTrigger,
-    pub(crate) state: AgentScheduleState,
-    pub(crate) overlap_policy: AgentScheduleOverlapPolicy,
-    pub(crate) revision: u64,
-    pub(crate) prompt_revision: u64,
-    pub(crate) trigger_revision: u64,
-    pub(crate) created_at_ms: u64,
-    pub(crate) updated_at_ms: u64,
-    pub(crate) evaluation_frontier_ms: u64,
-    pub(crate) evaluation_frontier_trigger_revision: u64,
-    pub(crate) execution_shell_id: Option<String>,
-    pub(crate) dispatch_key_filter: Vec<u8>,
-    pub(crate) executions: Vec<PersistedScheduledExecution>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PersistedScheduledExecution {
-    pub(crate) id: String,
-    pub(crate) revision: u64,
-    pub(crate) state: ScheduledExecutionState,
-    pub(crate) dispatch_kind: ScheduledExecutionDispatchKind,
-    pub(crate) dispatch_key: String,
-    pub(crate) schedule_revision: u64,
-    pub(crate) prompt_revision: u64,
-    pub(crate) trigger_revision: u64,
-    pub(crate) requested_at_ms: u64,
-    pub(crate) scheduled_at_ms: Option<u64>,
-    pub(crate) coalesced_through_ms: Option<u64>,
-    pub(crate) started_at_ms: Option<u64>,
-    pub(crate) ended_at_ms: Option<u64>,
-    pub(crate) cwd: PathBuf,
-    pub(crate) integration: String,
-    pub(crate) session: AgentScheduleSession,
-    pub(crate) prompt: String,
-    pub(crate) runner_token: String,
-    pub(crate) reason: Option<ScheduledExecutionReason>,
-    pub(crate) outcome: Option<ScheduledExecutionOutcome>,
-    pub(crate) shell_id: Option<String>,
-    pub(crate) run_id: Option<String>,
-    pub(crate) agent_id: Option<String>,
-    pub(crate) external_session_id: Option<String>,
-}
-
-impl std::fmt::Debug for PersistedScheduledExecution {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PersistedScheduledExecution")
-            .field("id", &self.id)
-            .field("state", &self.state)
-            .field("dispatch_key", &self.dispatch_key)
-            .field("prompt", &"<redacted>")
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for PersistedAgentSchedule {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PersistedAgentSchedule")
-            .field("id", &self.id)
-            .field("name", &self.name)
-            .field("cwd", &self.cwd)
-            .field("integration", &self.integration)
-            .field("prompt", &"<redacted>")
-            .field("session", &self.session)
-            .field("trigger", &self.trigger)
-            .field("state", &self.state)
-            .field("overlap_policy", &self.overlap_policy)
-            .field("revision", &self.revision)
-            .field("prompt_revision", &self.prompt_revision)
-            .field("trigger_revision", &self.trigger_revision)
-            .field("created_at_ms", &self.created_at_ms)
-            .field("updated_at_ms", &self.updated_at_ms)
-            .field("evaluation_frontier_ms", &self.evaluation_frontier_ms)
-            .field("execution_shell_id", &self.execution_shell_id)
-            .field("executions", &self.executions)
-            .finish()
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -194,7 +95,6 @@ pub(crate) struct PersistedShell {
     pub(crate) name: String,
     pub(crate) cwd: PathBuf,
     pub(crate) command: Vec<String>,
-    pub(crate) owner: ShellOwner,
     pub(crate) last_run: Option<PersistedShellRun>,
 }
 
@@ -206,56 +106,6 @@ struct PreOwnershipPersistedShell {
     cwd: PathBuf,
     command: Vec<String>,
     last_run: Option<PersistedShellRun>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VersionNinePersistedState {
-    version: u32,
-    workspaces: Vec<VersionNinePersistedWorkspace>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VersionNinePersistedWorkspace {
-    id: String,
-    name: String,
-    default_cwd: Option<PathBuf>,
-    shells: Vec<VersionNinePersistedShell>,
-    launchers: Vec<PersistedWorkspaceLauncher>,
-    agents: Vec<PersistedAgentInstance>,
-    schedules: Vec<VersionNinePersistedAgentSchedule>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VersionNinePersistedShell {
-    id: String,
-    name: String,
-    cwd: PathBuf,
-    command: Vec<String>,
-    last_run: Option<PersistedShellRun>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VersionNinePersistedAgentSchedule {
-    id: String,
-    name: String,
-    cwd: PathBuf,
-    integration: String,
-    prompt: String,
-    session: AgentScheduleSession,
-    trigger: AgentScheduleTrigger,
-    state: AgentScheduleState,
-    overlap_policy: AgentScheduleOverlapPolicy,
-    revision: u64,
-    prompt_revision: u64,
-    trigger_revision: u64,
-    created_at_ms: u64,
-    updated_at_ms: u64,
-    evaluation_frontier_ms: u64,
-    execution_shell_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,17 +448,6 @@ impl StateStore {
         })?;
         let (state, migrated) = match version.version {
             STATE_VERSION => (parse_current_state(&bytes, &self.path)?, false),
-            VERSION_TWELVE_STATE_VERSION => {
-                (migrate_version_twelve_state(&bytes, &self.path)?, true)
-            }
-            VERSION_ELEVEN_STATE_VERSION => {
-                (migrate_version_eleven_state(&bytes, &self.path)?, true)
-            }
-            VERSION_TEN_STATE_VERSION => (migrate_version_ten_state(&bytes, &self.path)?, true),
-            VERSION_NINE_STATE_VERSION => {
-                let previous: VersionNinePersistedState = parse_state(&bytes, &self.path)?;
-                (migrate_version_nine_state(previous), true)
-            }
             VERSION_EIGHT_STATE_VERSION => {
                 let previous: VersionEightPersistedState = parse_state(&bytes, &self.path)?;
                 (migrate_version_eight_state(previous), true)
@@ -687,85 +526,6 @@ impl StateStore {
         }
         result
     }
-}
-
-fn migrate_version_twelve_state(bytes: &[u8], path: &Path) -> io::Result<PersistedState> {
-    let mut previous: serde_json::Value = parse_state(bytes, path)?;
-    previous["version"] = serde_json::Value::from(STATE_VERSION);
-    if let Some(workspaces) = previous["workspaces"].as_array_mut() {
-        for workspace in workspaces {
-            workspace["revision"] = serde_json::Value::from(1);
-            if let Some(shells) = workspace["shells"].as_array_mut() {
-                for shell in shells {
-                    shell["revision"] = serde_json::Value::from(1);
-                }
-            }
-            if let Some(launchers) = workspace["launchers"].as_array_mut() {
-                for launcher in launchers {
-                    launcher["revision"] = serde_json::Value::from(1);
-                }
-            }
-        }
-    }
-    serde_json::from_value(previous).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("could not migrate {}: {error}", path.display()),
-        )
-    })
-}
-
-fn migrate_version_eleven_state(bytes: &[u8], path: &Path) -> io::Result<PersistedState> {
-    let mut previous: serde_json::Value = parse_state(bytes, path)?;
-    previous["version"] = serde_json::Value::from(STATE_VERSION);
-    if let Some(workspaces) = previous["workspaces"].as_array_mut() {
-        for workspace in workspaces {
-            if let Some(schedules) = workspace["schedules"].as_array_mut() {
-                for schedule in schedules {
-                    if let Some(executions) = schedule["executions"].as_array_mut() {
-                        for execution in executions {
-                            execution["revision"] = serde_json::Value::from(1);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    serde_json::from_value(previous).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("could not migrate {}: {error}", path.display()),
-        )
-    })
-}
-
-fn migrate_version_ten_state(bytes: &[u8], path: &Path) -> io::Result<PersistedState> {
-    let mut previous: serde_json::Value = parse_state(bytes, path)?;
-    previous["version"] = serde_json::Value::from(VERSION_ELEVEN_STATE_VERSION);
-    if let Some(workspaces) = previous["workspaces"].as_array_mut() {
-        for workspace in workspaces {
-            if let Some(schedules) = workspace["schedules"].as_array_mut() {
-                for schedule in schedules {
-                    schedule["evaluation_frontier_trigger_revision"] =
-                        schedule["trigger_revision"].clone();
-                    if let Some(executions) = schedule["executions"].as_array_mut() {
-                        for execution in executions {
-                            execution["scheduled_at_ms"] = serde_json::Value::Null;
-                            execution["coalesced_through_ms"] = serde_json::Value::Null;
-                            execution["revision"] = serde_json::Value::from(1);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    previous["version"] = serde_json::Value::from(STATE_VERSION);
-    serde_json::from_value(previous).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("could not migrate {}: {error}", path.display()),
-        )
-    })
 }
 
 fn parse_state<T: for<'de> Deserialize<'de>>(bytes: &[u8], path: &Path) -> io::Result<T> {
@@ -852,7 +612,6 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
                         name: shell.name,
                         cwd: shell.cwd,
                         command: shell.command,
-                        owner: ShellOwner::User,
                         last_run: shell.last_profile.map(|profile| PersistedShellRun {
                             id: Uuid::new_v4().to_string(),
                             generation: 1,
@@ -868,64 +627,6 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
                     .collect(),
                 launchers: Vec::new(),
                 agents: Vec::new(),
-                schedules: Vec::new(),
-            })
-            .collect(),
-    }
-}
-
-fn migrate_version_nine_state(previous: VersionNinePersistedState) -> PersistedState {
-    debug_assert_eq!(previous.version, VERSION_NINE_STATE_VERSION);
-    PersistedState {
-        version: STATE_VERSION,
-        workspaces: previous
-            .workspaces
-            .into_iter()
-            .map(|workspace| PersistedWorkspace {
-                id: workspace.id,
-                revision: 1,
-                name: workspace.name,
-                default_cwd: workspace.default_cwd,
-                shells: workspace
-                    .shells
-                    .into_iter()
-                    .map(|shell| PersistedShell {
-                        id: shell.id,
-                        revision: 1,
-                        name: shell.name,
-                        cwd: shell.cwd,
-                        command: shell.command,
-                        owner: ShellOwner::User,
-                        last_run: shell.last_run,
-                    })
-                    .collect(),
-                launchers: workspace.launchers,
-                agents: workspace.agents,
-                schedules: workspace
-                    .schedules
-                    .into_iter()
-                    .map(|schedule| PersistedAgentSchedule {
-                        id: schedule.id,
-                        name: schedule.name,
-                        cwd: schedule.cwd,
-                        integration: schedule.integration,
-                        prompt: schedule.prompt,
-                        session: schedule.session,
-                        trigger: schedule.trigger,
-                        state: schedule.state,
-                        overlap_policy: schedule.overlap_policy,
-                        revision: schedule.revision,
-                        prompt_revision: schedule.prompt_revision,
-                        trigger_revision: schedule.trigger_revision,
-                        created_at_ms: schedule.created_at_ms,
-                        updated_at_ms: schedule.updated_at_ms,
-                        evaluation_frontier_ms: schedule.evaluation_frontier_ms,
-                        evaluation_frontier_trigger_revision: schedule.trigger_revision,
-                        execution_shell_id: schedule.execution_shell_id,
-                        dispatch_key_filter: vec![0; DISPATCH_KEY_FILTER_BYTES],
-                        executions: Vec::new(),
-                    })
-                    .collect(),
             })
             .collect(),
     }
@@ -938,7 +639,6 @@ fn migrate_pre_ownership_shell(shell: PreOwnershipPersistedShell) -> PersistedSh
         name: shell.name,
         cwd: shell.cwd,
         command: shell.command,
-        owner: ShellOwner::User,
         last_run: shell.last_run,
     }
 }
@@ -962,7 +662,6 @@ fn migrate_version_eight_state(previous: VersionEightPersistedState) -> Persiste
                     .collect(),
                 launchers: workspace.launchers,
                 agents: workspace.agents,
-                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -989,7 +688,6 @@ fn migrate_version_seven_state(previous: VersionSevenPersistedState) -> Persiste
                         name: shell.name,
                         cwd: shell.cwd,
                         command: shell.command,
-                        owner: ShellOwner::User,
                         last_run: shell.last_run.map(|run| PersistedShellRun {
                             id: run.id,
                             generation: run.generation,
@@ -1005,7 +703,6 @@ fn migrate_version_seven_state(previous: VersionSevenPersistedState) -> Persiste
                     .collect(),
                 launchers: workspace.launchers,
                 agents: workspace.agents,
-                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -1030,7 +727,6 @@ fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
                     .collect(),
                 launchers: workspace.launchers,
                 agents: workspace.agents,
-                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -1071,7 +767,6 @@ fn migrate_version_five_state(previous: VersionFivePersistedState) -> PersistedS
                         attention: None,
                     })
                     .collect(),
-                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -1118,7 +813,6 @@ fn migrate_version_four_state(previous: VersionFourPersistedState) -> PersistedS
                             attention: None,
                         })
                         .collect(),
-                    schedules: Vec::new(),
                 }
             })
             .collect(),
@@ -1144,7 +838,6 @@ fn migrate_version_three_state(previous: VersionThreePersistedState) -> Persiste
                     .collect(),
                 launchers: workspace.launchers,
                 agents: Vec::new(),
-                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -1169,7 +862,6 @@ fn migrate_version_two_state(previous: VersionTwoPersistedState) -> PersistedSta
                     .collect(),
                 launchers: Vec::new(),
                 agents: Vec::new(),
-                schedules: Vec::new(),
             })
             .collect(),
     }
@@ -1226,228 +918,22 @@ pub(crate) fn effective_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{AgentAuthority, AgentState};
-
-    #[test]
-    fn atomically_round_trips_state() {
-        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
-        let store = StateStore::at(directory.join("boomux/state.json"));
-        let state = PersistedState {
-            version: STATE_VERSION,
-            workspaces: vec![PersistedWorkspace {
-                id: Uuid::new_v4().to_string(),
-                revision: 1,
-                name: "saved".into(),
-                default_cwd: Some("/tmp/project".into()),
-                shells: vec![PersistedShell {
-                    id: "shell-1".into(),
-                    revision: 1,
-                    name: "agent".into(),
-                    cwd: "/tmp/project".into(),
-                    command: vec!["opencode".into()],
-                    owner: ShellOwner::User,
-                    last_run: Some(PersistedShellRun {
-                        id: "run-1".into(),
-                        generation: 1,
-                        started_at_ms: 1,
-                        ended_at_ms: Some(2),
-                        exit_reason: Some(ShellRunExitReason::Interrupted),
-                        output_revision: 3,
-                        environment_has_run_id: true,
-                        profile: TerminalProfile {
-                            term: Some("xterm-256color".into()),
-                            colorterm: None,
-                            term_program: None,
-                            term_program_version: None,
-                            rows: 24,
-                            cols: 80,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        },
-                        terminal_history: Some("bounded output".into()),
-                    }),
-                }],
-                launchers: vec![
-                    PersistedWorkspaceLauncher {
-                        id: "launcher-1".into(),
-                        revision: 1,
-                        name: "editor".into(),
-                        cwd: "/tmp/project".into(),
-                        command: vec!["editor".into(), "".into(), "two words".into()],
-                    },
-                    PersistedWorkspaceLauncher {
-                        id: "launcher-2".into(),
-                        revision: 1,
-                        name: "server".into(),
-                        cwd: "/tmp/project/server".into(),
-                        command: vec!["server".into()],
-                    },
-                ],
-                agents: vec![
-                    PersistedAgentInstance {
-                        id: "agent-1".into(),
-                        shell_id: "shell-1".into(),
-                        run_id: "run-1".into(),
-                        name: "first".into(),
-                        integration: "test".into(),
-                        external_session_id: Some("external-1".into()),
-                        cwd: Some("/tmp/project".into()),
-                        started_at_ms: 10,
-                        ended_at_ms: None,
-                        observation: AgentObservationSnapshot {
-                            revision: 2,
-                            state: AgentState::Working,
-                            authority: AgentAuthority::LifecycleIntegration,
-                            evidence: "active".into(),
-                            confidence: 90,
-                            observed_at_ms: 11,
-                        },
-                        attention: None,
-                    },
-                    PersistedAgentInstance {
-                        id: "agent-2".into(),
-                        shell_id: "shell-2".into(),
-                        run_id: "run-2".into(),
-                        name: "second".into(),
-                        integration: "adapter".into(),
-                        external_session_id: None,
-                        cwd: None,
-                        started_at_ms: 20,
-                        ended_at_ms: Some(30),
-                        observation: AgentObservationSnapshot {
-                            revision: 3,
-                            state: AgentState::Done,
-                            authority: AgentAuthority::DaemonLifecycle,
-                            evidence: "run exited".into(),
-                            confidence: 100,
-                            observed_at_ms: 30,
-                        },
-                        attention: Some(AgentAttentionSnapshot {
-                            reason: crate::protocol::AgentAttentionReason::Completed,
-                            observation: AgentObservationSnapshot {
-                                revision: 3,
-                                state: AgentState::Done,
-                                authority: AgentAuthority::DaemonLifecycle,
-                                evidence: "run exited".into(),
-                                confidence: 100,
-                                observed_at_ms: 30,
-                            },
-                        }),
-                    },
-                ],
-                schedules: vec![PersistedAgentSchedule {
-                    id: "schedule-1".into(),
-                    name: "daily review".into(),
-                    cwd: "/tmp/project".into(),
-                    integration: "opencode".into(),
-                    prompt: "Review the current changes".into(),
-                    session: AgentScheduleSession::Continue {
-                        external_session_id: "external-1".into(),
-                    },
-                    trigger: AgentScheduleTrigger {
-                        cron: "0 9 * * 1-5".into(),
-                        timezone: "America/New_York".into(),
-                    },
-                    state: AgentScheduleState::Enabled,
-                    overlap_policy: AgentScheduleOverlapPolicy::Skip,
-                    revision: 4,
-                    prompt_revision: 2,
-                    trigger_revision: 3,
-                    created_at_ms: 40,
-                    updated_at_ms: 50,
-                    evaluation_frontier_ms: 60,
-                    evaluation_frontier_trigger_revision: 1,
-                    execution_shell_id: Some("shell-1".into()),
-                    dispatch_key_filter: vec![0; DISPATCH_KEY_FILTER_BYTES],
-                    executions: Vec::new(),
-                }],
-            }],
-        };
-        let debug = format!("{state:?}");
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("Review the current changes"));
-
-        store.save(&state).unwrap();
-        let restored = store.load().unwrap().unwrap();
-
-        assert_eq!(restored.workspaces[0].name, "saved");
-        assert_eq!(
-            restored.workspaces[0].shells[0]
-                .last_run
-                .as_ref()
-                .and_then(|run| run.terminal_history.as_deref()),
-            Some("bounded output")
-        );
-        assert_eq!(
-            restored.workspaces[0].default_cwd.as_deref(),
-            Some(Path::new("/tmp/project"))
-        );
-        assert_eq!(restored.workspaces[0].launchers[0].id, "launcher-1");
-        assert_eq!(restored.workspaces[0].launchers[0].name, "editor");
-        assert_eq!(
-            restored.workspaces[0].launchers[0].cwd,
-            Path::new("/tmp/project")
-        );
-        assert_eq!(
-            restored.workspaces[0].launchers[0].command,
-            vec![
-                String::from("editor"),
-                String::new(),
-                String::from("two words")
-            ]
-        );
-        assert_eq!(restored.workspaces[0].launchers[1].id, "launcher-2");
-        assert_eq!(restored.workspaces[0].agents[0].id, "agent-1");
-        assert_eq!(restored.workspaces[0].agents[1].id, "agent-2");
-        assert_eq!(
-            restored.workspaces[0].agents[1].observation.state,
-            AgentState::Done
-        );
-        assert_eq!(
-            restored.workspaces[0].agents[1]
-                .attention
-                .as_ref()
-                .map(|attention| attention.reason),
-            Some(crate::protocol::AgentAttentionReason::Completed)
-        );
-        let schedule = &restored.workspaces[0].schedules[0];
-        assert_eq!(schedule.id, "schedule-1");
-        assert_eq!(schedule.prompt, "Review the current changes");
-        assert_eq!(
-            schedule.session,
-            AgentScheduleSession::Continue {
-                external_session_id: "external-1".into()
-            }
-        );
-        assert_eq!(schedule.trigger.cron, "0 9 * * 1-5");
-        assert_eq!(schedule.execution_shell_id.as_deref(), Some("shell-1"));
-        assert_eq!(
-            fs::metadata(directory.join("boomux/state.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
 
     #[test]
     fn rejects_unsupported_state_versions() {
         let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
         let path = directory.join("boomux/state.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, br#"{"version":99,"workspaces":[]}"#).unwrap();
-        let store = StateStore::at(path);
-
-        let error = store.load().unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        for version in [9, 10, 11, 12, 13, 99] {
+            fs::write(&path, format!(r#"{{"version":{version},"workspaces":[]}}"#)).unwrap();
+            let error = StateStore::at(path.clone()).load().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn migrates_version_eight_workspaces_without_schedules() {
+    fn migrates_version_eight_workspaces() {
         let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
         let path = directory.join("boomux/state.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1516,266 +1002,12 @@ mod tests {
             Some("external-1")
         );
         assert!(workspace.agents[0].attention.is_some());
-        assert!(workspace.schedules.is_empty());
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 13")
+                .contains("\"version\": 14")
         );
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn migrates_version_nine_shell_ownership_and_empty_execution_history() {
-        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
-        let path = directory.join("boomux/state.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(
-            &path,
-            r#"{
-              "version": 9,
-              "workspaces": [{
-                "id": "workspace-1", "name": "saved", "default_cwd": null,
-                "shells": [{"id":"shell-1","name":"shell","cwd":"/tmp","command":[],"last_run":null}],
-                "launchers": [], "agents": [],
-                "schedules": [{
-                  "id":"schedule-1","name":"review","cwd":"/tmp","integration":"opencode",
-                  "prompt":"private prompt","session":"fresh",
-                  "trigger":{"cron":"0 9 * * *","timezone":"UTC"},"state":"paused",
-                  "overlap_policy":"skip","revision":1,"prompt_revision":1,"trigger_revision":1,
-                  "created_at_ms":1,"updated_at_ms":1,"evaluation_frontier_ms":1,
-                  "execution_shell_id":null
-                }]
-              }]
-            }"#,
-        )
-        .unwrap();
-
-        let migrated = StateStore::at(path.clone()).load().unwrap().unwrap();
-        assert_eq!(migrated.workspaces[0].shells[0].owner, ShellOwner::User);
-        assert!(migrated.workspaces[0].schedules[0].executions.is_empty());
-        assert!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .contains("\"version\": 13")
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn migrates_version_ten_frontier_revision_and_manual_occurrence_fields() {
-        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
-        let path = directory.join("boomux/state.json");
-        let dispatch_key = Uuid::new_v4().to_string();
-        let mut state = PersistedState::default();
-        state.workspaces.push(PersistedWorkspace {
-            id: Uuid::new_v4().to_string(),
-            revision: 1,
-            name: "saved".into(),
-            default_cwd: None,
-            shells: Vec::new(),
-            launchers: Vec::new(),
-            agents: Vec::new(),
-            schedules: vec![PersistedAgentSchedule {
-                id: Uuid::new_v4().to_string(),
-                name: "review".into(),
-                cwd: "/tmp".into(),
-                integration: "opencode".into(),
-                prompt: "private".into(),
-                session: AgentScheduleSession::Fresh,
-                trigger: AgentScheduleTrigger {
-                    cron: "0 9 * * *".into(),
-                    timezone: "UTC".into(),
-                },
-                state: AgentScheduleState::Paused,
-                overlap_policy: AgentScheduleOverlapPolicy::Skip,
-                revision: 3,
-                prompt_revision: 2,
-                trigger_revision: 3,
-                created_at_ms: 1,
-                updated_at_ms: 2,
-                evaluation_frontier_ms: 4,
-                evaluation_frontier_trigger_revision: 3,
-                execution_shell_id: None,
-                dispatch_key_filter: vec![0; DISPATCH_KEY_FILTER_BYTES],
-                executions: vec![PersistedScheduledExecution {
-                    id: Uuid::new_v4().to_string(),
-                    revision: 1,
-                    state: ScheduledExecutionState::DispatchFailed,
-                    dispatch_kind: ScheduledExecutionDispatchKind::Manual,
-                    dispatch_key,
-                    schedule_revision: 3,
-                    prompt_revision: 2,
-                    trigger_revision: 3,
-                    requested_at_ms: 3,
-                    scheduled_at_ms: None,
-                    coalesced_through_ms: None,
-                    started_at_ms: None,
-                    ended_at_ms: Some(3),
-                    cwd: "/tmp".into(),
-                    integration: "opencode".into(),
-                    session: AgentScheduleSession::Fresh,
-                    prompt: "private".into(),
-                    runner_token: Uuid::new_v4().to_string(),
-                    reason: Some(ScheduledExecutionReason::RunnerStartFailed),
-                    outcome: None,
-                    shell_id: None,
-                    run_id: None,
-                    agent_id: None,
-                    external_session_id: None,
-                }],
-            }],
-        });
-        let mut value = serde_json::to_value(&state).unwrap();
-        value["version"] = serde_json::Value::from(10);
-        let schedule = &mut value["workspaces"][0]["schedules"][0];
-        schedule
-            .as_object_mut()
-            .unwrap()
-            .remove("evaluation_frontier_trigger_revision");
-        let execution = &mut schedule["executions"][0];
-        execution.as_object_mut().unwrap().remove("scheduled_at_ms");
-        execution
-            .as_object_mut()
-            .unwrap()
-            .remove("coalesced_through_ms");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-
-        let migrated = StateStore::at(path.clone()).load().unwrap().unwrap();
-        let schedule = &migrated.workspaces[0].schedules[0];
-        assert_eq!(schedule.evaluation_frontier_trigger_revision, 3);
-        assert_eq!(schedule.executions[0].scheduled_at_ms, None);
-        assert_eq!(schedule.executions[0].coalesced_through_ms, None);
-        assert_eq!(schedule.executions[0].revision, 1);
-        assert!(
-            fs::read_to_string(&path)
-                .unwrap()
-                .contains("\"version\": 13")
-        );
-
-        let mut version_eleven = serde_json::to_value(&migrated).unwrap();
-        version_eleven["version"] = serde_json::Value::from(11);
-        version_eleven["workspaces"][0]["schedules"][0]["executions"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("revision");
-        fs::write(&path, serde_json::to_vec(&version_eleven).unwrap()).unwrap();
-        let migrated_eleven = StateStore::at(path.clone()).load().unwrap().unwrap();
-        assert_eq!(
-            migrated_eleven.workspaces[0].schedules[0].executions[0].revision,
-            1
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn migrates_version_twelve_resource_revisions() {
-        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
-        let path = directory.join("boomux/state.json");
-        let state = PersistedState {
-            version: STATE_VERSION,
-            workspaces: vec![PersistedWorkspace {
-                id: "workspace".into(),
-                revision: 9,
-                name: "saved".into(),
-                default_cwd: None,
-                shells: vec![PersistedShell {
-                    id: "shell".into(),
-                    revision: 8,
-                    name: "main".into(),
-                    cwd: "/tmp".into(),
-                    command: Vec::new(),
-                    owner: ShellOwner::User,
-                    last_run: None,
-                }],
-                launchers: vec![PersistedWorkspaceLauncher {
-                    id: "launcher".into(),
-                    revision: 7,
-                    name: "build".into(),
-                    cwd: "/tmp".into(),
-                    command: vec!["true".into()],
-                }],
-                agents: Vec::new(),
-                schedules: Vec::new(),
-            }],
-        };
-        let mut value = serde_json::to_value(state).unwrap();
-        value["version"] = serde_json::Value::from(12);
-        value["workspaces"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("revision");
-        value["workspaces"][0]["shells"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("revision");
-        value["workspaces"][0]["launchers"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("revision");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-
-        let migrated = StateStore::at(path.clone()).load().unwrap().unwrap();
-        assert_eq!(migrated.workspaces[0].revision, 1);
-        assert_eq!(migrated.workspaces[0].shells[0].revision, 1);
-        assert_eq!(migrated.workspaces[0].launchers[0].revision, 1);
-        assert!(
-            fs::read_to_string(path)
-                .unwrap()
-                .contains("\"version\": 13")
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn rejects_malformed_current_schedule_schema() {
-        let schedule_missing_frontier = r#"{
-          "id":"schedule-1","name":"review","cwd":"/tmp/project",
-          "integration":"opencode","prompt":"Review changes","session":"fresh",
-          "trigger":{"cron":"0 9 * * 1-5","timezone":"UTC"},"state":"paused",
-          "overlap_policy":"skip","revision":1,"prompt_revision":1,
-          "trigger_revision":1,"created_at_ms":1,"updated_at_ms":1,
-          "execution_shell_id":null
-        }"#;
-        let schedule_with_unknown_field = r#"{
-          "id":"schedule-1","name":"review","cwd":"/tmp/project",
-          "integration":"opencode","prompt":"Review changes","session":"fresh",
-          "trigger":{"cron":"0 9 * * 1-5","timezone":"UTC"},"state":"paused",
-          "overlap_policy":"skip","revision":1,"prompt_revision":1,
-          "trigger_revision":1,"created_at_ms":1,"updated_at_ms":1,
-          "evaluation_frontier_ms":1,"execution_shell_id":null,"workspace_id":"w1"
-        }"#;
-        let schedule_with_unknown_trigger_field = r#"{
-          "id":"schedule-1","name":"review","cwd":"/tmp/project",
-          "integration":"opencode","prompt":"Review changes","session":"fresh",
-          "trigger":{"cron":"0 9 * * 1-5","timezone":"UTC","private":"ignored"},
-          "state":"paused","overlap_policy":"skip","revision":1,"prompt_revision":1,
-          "trigger_revision":1,"created_at_ms":1,"updated_at_ms":1,
-          "evaluation_frontier_ms":1,"execution_shell_id":null
-        }"#;
-
-        for schedule in [
-            schedule_missing_frontier,
-            schedule_with_unknown_field,
-            schedule_with_unknown_trigger_field,
-        ] {
-            let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
-            let path = directory.join("boomux/state.json");
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(
-                &path,
-                format!(
-                    r#"{{"version":10,"workspaces":[{{"id":"w1","name":"saved","default_cwd":null,"shells":[],"launchers":[],"agents":[],"schedules":[{schedule}]}}]}}"#
-                ),
-            )
-            .unwrap();
-
-            let error = StateStore::at(path).load().unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            fs::remove_dir_all(directory).unwrap();
-        }
     }
 
     #[test]
@@ -1819,11 +1051,10 @@ mod tests {
                 .terminal_history
                 .is_none()
         );
-        assert!(migrated.workspaces[0].schedules.is_empty());
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 13")
+                .contains("\"version\": 14")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1879,11 +1110,10 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 13")
+                .contains("\"version\": 14")
         );
         assert!(migrated.workspaces[0].launchers.is_empty());
         assert!(migrated.workspaces[0].agents.is_empty());
-        assert!(migrated.workspaces[0].schedules.is_empty());
 
         let reloaded = store.load().unwrap().unwrap();
         assert_eq!(
@@ -1930,10 +1160,9 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 13")
+                .contains("\"version\": 14")
         );
         assert!(migrated.workspaces[0].agents.is_empty());
-        assert!(migrated.workspaces[0].schedules.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1966,11 +1195,10 @@ mod tests {
 
         assert_eq!(migrated.workspaces[0].launchers[0].id, "l1");
         assert!(migrated.workspaces[0].agents.is_empty());
-        assert!(migrated.workspaces[0].schedules.is_empty());
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 13")
+                .contains("\"version\": 14")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2043,11 +1271,10 @@ mod tests {
             Some(Path::new("/tmp/project"))
         );
         assert!(migrated.workspaces[0].agents[1].cwd.is_none());
-        assert!(migrated.workspaces[0].schedules.is_empty());
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 13")
+                .contains("\"version\": 14")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2081,9 +1308,8 @@ mod tests {
         let migrated = store.load().unwrap().unwrap();
 
         assert!(migrated.workspaces[0].agents[0].attention.is_none());
-        assert!(migrated.workspaces[0].schedules.is_empty());
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 13"));
+        assert!(saved.contains("\"version\": 14"));
         assert!(saved.contains("\"attention\": null"));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2110,13 +1336,12 @@ mod tests {
 
         assert!(deferred);
         assert!(migrated.workspaces[0].default_cwd.is_none());
-        assert!(migrated.workspaces[0].schedules.is_empty());
         let original = fs::read_to_string(&path).unwrap();
         assert!(original.contains("\"version\": 6"));
         assert!(!original.contains("default_cwd"));
         store.save(&migrated).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 13"));
+        assert!(saved.contains("\"version\": 14"));
         assert!(saved.contains("\"default_cwd\": null"));
         fs::remove_dir_all(directory).unwrap();
     }

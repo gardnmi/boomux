@@ -336,7 +336,6 @@ mod tests {
                 name: "shell".into(),
                 cwd: "/tmp".into(),
                 command: Vec::new(),
-                owner: crate::protocol::ShellOwner::User,
                 status: crate::protocol::ShellStatus::Pending,
                 run: None,
                 recovered_agent_id: None,

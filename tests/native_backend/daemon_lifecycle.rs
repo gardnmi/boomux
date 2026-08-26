@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -12,26 +12,6 @@ use crate::support::{
     TestDaemon, acknowledge_reconnect, assert_generated_name, assert_remote_code, contains,
     parse_pid, process_exists, profile, read_until, wait_for_attach_with_profile, wait_until,
 };
-
-fn assert_unsafe_native_clock_rejected(runtime_dir: &std::path::Path, clock: &std::path::Path) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_boomux"))
-        .args(["daemon", "run"])
-        .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env("XDG_STATE_HOME", runtime_dir.join("state"))
-        .env("SHELL", "/bin/sh")
-        .env("BOOMUX_NATIVE_TEST_HOOKS", "1")
-        .env("BOOMUX_NATIVE_TEST_CLOCK", clock)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    wait_until(
-        || child.try_wait().unwrap().is_some(),
-        "daemon accepted an unsafe native clock path",
-    );
-    assert!(!child.wait().unwrap().success());
-}
 
 #[test]
 fn native_daemon_lifecycle() {
@@ -102,12 +82,6 @@ fn native_daemon_lifecycle() {
         "integration.status",
         "integration.install",
         "integration.verify",
-        "schedule.create",
-        "schedule.list",
-        "schedule.inspect",
-        "schedule.pause",
-        "schedule.resume",
-        "schedule.remove",
     ] {
         assert!(json_commands.iter().any(|current| current == command));
     }
@@ -118,11 +92,6 @@ fn native_daemon_lifecycle() {
     ] {
         assert!(!json_commands.iter().any(|current| current == command));
     }
-    assert!(
-        capabilities["data"]["integration_hosts"]["opencode"]
-            .get("schedule_dispatch")
-            .is_none()
-    );
     let features = capabilities["data"]["features"].as_array().unwrap();
     for feature in [
         "revision_aware_reads",
@@ -137,12 +106,7 @@ fn native_daemon_lifecycle() {
         "protocol_19",
         "protocol_20",
         "protocol_21",
-        "protocol_22",
-        "protocol_23",
-        "protocol_24",
-        "protocol_25",
         "protocol_26",
-        "protocol_27",
         "protocol_28",
         "protocol_29",
         "protocol_30",
@@ -152,11 +116,11 @@ fn native_daemon_lifecycle() {
         "protocol_34",
         "protocol_35",
         "protocol_36",
-        "protocol_37",
         "protocol_38",
         "protocol_39",
         "protocol_40",
         "protocol_42",
+        "protocol_47",
         "opencode_shared_runtime_claims",
         "node_registration_management",
         "node_projection_sync",
@@ -173,8 +137,6 @@ fn native_daemon_lifecycle() {
         "remote_integration_management",
         "remote_agent_session_catalog",
         "remote_exact_session_resume",
-        "remote_agent_schedule_management",
-        "remote_scheduled_execution_observation",
         "global_workspaces",
         "multi_node_workspace_placements",
         "guarded_workspace_adoption",
@@ -184,14 +146,6 @@ fn native_daemon_lifecycle() {
         "cached_projection_dismissal",
         "exact_run_attachment",
         "stable_node_identity",
-        "revision_aware_scheduled_execution_wait",
-        "bounded_scheduled_execution_history",
-        "scheduled_execution_notifications",
-        "agent_schedule_management",
-        "durable_agent_schedules",
-        "timed_schedule_dispatch",
-        "scheduler_health",
-        "bounded_scheduled_execution_concurrency",
         "workspace_default_cwd",
         "structured_terminal_previews",
         "focused_terminal_read",
@@ -217,7 +171,6 @@ fn native_daemon_lifecycle() {
     assert!(status.status.success());
     let status_text = String::from_utf8_lossy(&status.stdout);
     assert!(status_text.contains(&format!("running (protocol {}", protocol::PROTOCOL_VERSION)));
-    assert!(status_text.contains("scheduler active (0/4 active executions)"));
     let status = daemon
         .command()
         .args(["daemon", "status", "--json"])
@@ -231,53 +184,22 @@ fn native_daemon_lifecycle() {
         status["data"]["executable"],
         daemon.executable.display().to_string()
     );
-    assert_eq!(status["data"]["scheduler"]["state"], "active");
-    assert_eq!(status["data"]["scheduler"]["active_executions"], 0);
-    assert_eq!(status["data"]["scheduler"]["max_concurrent"], 4);
-    for max_concurrent in [0, 65, u16::MAX] {
-        let mut stream = UnixStream::connect(daemon.client.socket_path()).unwrap();
-        protocol::write_message(
-            &mut stream,
-            &protocol::Envelope::with_version(
-                24,
-                protocol::Request::RestartWithNotificationConfig {
-                    notifications: protocol::NotificationDeliveryConfig {
-                        desktop_enabled: false,
-                        sound_enabled: false,
-                        blocked: true,
-                        completed: true,
-                        blocked_sound: "blocked".into(),
-                        completed_sound: "completed".into(),
-                        resume_agents: true,
-                        persist_terminal_history: false,
-                        max_scheduled_execution_concurrency: max_concurrent,
-                        ..Default::default()
-                    },
-                    environment: None,
-                },
-            ),
-        )
-        .unwrap();
-        let response: protocol::Envelope<protocol::Response> =
-            protocol::read_message(&mut stream).unwrap();
-        assert!(matches!(
-            response.message,
-            protocol::Response::Error {
-                code: Some(ErrorCode::InvalidArgument),
-                ..
-            }
-        ));
-    }
-    let mut protocol_six = UnixStream::connect(daemon.client.socket_path()).unwrap();
+    let mut protocol_forty_six = UnixStream::connect(daemon.client.socket_path()).unwrap();
     protocol::write_message(
-        &mut protocol_six,
-        &protocol::Envelope::with_version(6, protocol::Request::Ping),
+        &mut protocol_forty_six,
+        &protocol::Envelope::with_version(46, protocol::Request::Ping),
     )
     .unwrap();
     let response: protocol::Envelope<protocol::Response> =
-        protocol::read_message(&mut protocol_six).unwrap();
-    assert_eq!(response.version, 6);
-    assert_eq!(response.message, protocol::Response::Pong);
+        protocol::read_message(&mut protocol_forty_six).unwrap();
+    assert_eq!(response.version, 47);
+    assert!(matches!(
+        response.message,
+        protocol::Response::Error {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }
+    ));
 
     let missing_id = Uuid::new_v4().to_string();
     let error = daemon.client.get_shell(&missing_id).unwrap_err();
@@ -454,35 +376,6 @@ fn native_daemon_lifecycle() {
         .unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("selected-launcher"));
-    let output = daemon
-        .command()
-        .env_remove("BOOMUX_WORKSPACE_ID")
-        .env_remove("BOOMUX_SHELL_ID")
-        .args(["schedule", "create", "selected-schedule", "--cwd"])
-        .arg(std::env::temp_dir())
-        .args([
-            "--integration",
-            "opencode",
-            "--prompt",
-            "selected context",
-            "--daily",
-            "09:00",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "schedule create failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let output = daemon
-        .command()
-        .env_remove("BOOMUX_WORKSPACE_ID")
-        .env_remove("BOOMUX_SHELL_ID")
-        .args(["schedule", "remove", "selected-schedule"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
     let output = daemon
         .command()
         .env_remove("BOOMUX_WORKSPACE_ID")
@@ -1066,7 +959,10 @@ fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
     let mut stream = UnixStream::connect(daemon.client.socket_path()).unwrap();
     protocol::write_message(
         &mut stream,
-        &protocol::Envelope::with_version(29, protocol::Request::OpenFederationChannel),
+        &protocol::Envelope::with_version(
+            protocol::PROTOCOL_VERSION,
+            protocol::Request::OpenFederationChannel,
+        ),
     )
     .unwrap();
     let response: protocol::Envelope<protocol::Response> =
@@ -1074,7 +970,7 @@ fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
     assert_eq!(
         response,
         protocol::Envelope::with_version(
-            29,
+            protocol::PROTOCOL_VERSION,
             protocol::Response::FederationChannel {
                 node_id: node_id.clone(),
             },
@@ -1082,14 +978,14 @@ fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
     );
     protocol::write_message(
         &mut stream,
-        &protocol::Envelope::with_version(29, protocol::Request::Ping),
+        &protocol::Envelope::with_version(protocol::PROTOCOL_VERSION, protocol::Request::Ping),
     )
     .unwrap();
     let response: protocol::Envelope<protocol::Response> =
         protocol::read_message(&mut stream).unwrap();
     assert_eq!(
         response,
-        protocol::Envelope::with_version(29, protocol::Response::Pong)
+        protocol::Envelope::with_version(protocol::PROTOCOL_VERSION, protocol::Response::Pong)
     );
 
     let mut child = daemon
@@ -1113,7 +1009,7 @@ fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
 
     protocol::write_message(
         &mut stdin,
-        &protocol::Envelope::with_version(30, protocol::Request::Ping),
+        &protocol::Envelope::with_version(protocol::PROTOCOL_VERSION, protocol::Request::Ping),
     )
     .unwrap();
     drop(stdin);
@@ -1121,7 +1017,7 @@ fn federation_helper_binds_handshake_and_inner_request_to_one_daemon_socket() {
         protocol::read_message(&mut stdout).unwrap();
     assert_eq!(
         response,
-        protocol::Envelope::with_version(30, protocol::Response::Pong)
+        protocol::Envelope::with_version(protocol::PROTOCOL_VERSION, protocol::Response::Pong)
     );
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -1191,115 +1087,4 @@ fn node_rekey_is_expected_identity_conditional_and_drains_federation_channels() 
     )
     .unwrap();
     assert_eq!(identity["node_id"], replacement);
-}
-
-#[test]
-fn scheduling_config_is_sampled_and_applied_by_graceful_restart() {
-    let config = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let config_for_daemon = std::sync::Arc::clone(&config);
-    let daemon = TestDaemon::start_with(move |command, runtime_dir| {
-        let path = runtime_dir.join("config.toml");
-        fs::write(&path, "[scheduling]\nmax_concurrent = 2\n").unwrap();
-        *config_for_daemon.lock().unwrap() = Some(path.clone());
-        command.env("BOOMUX_CONFIG", path);
-    });
-    let config = config.lock().unwrap().clone().unwrap();
-
-    assert_eq!(
-        daemon
-            .client
-            .snapshot()
-            .unwrap()
-            .scheduler
-            .unwrap()
-            .max_concurrent,
-        2
-    );
-    fs::write(&config, "[scheduling]\nmax_concurrent = 3\n").unwrap();
-    assert_eq!(
-        daemon
-            .client
-            .snapshot()
-            .unwrap()
-            .scheduler
-            .unwrap()
-            .max_concurrent,
-        2
-    );
-
-    let doctor = daemon
-        .command()
-        .env("BOOMUX_CONFIG", &config)
-        .arg("doctor")
-        .output()
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&doctor.stderr).contains(
-            "daemon uses max_concurrent=2, config resolves 3; restart daemon after changes"
-        )
-    );
-
-    let restart = daemon
-        .command()
-        .env("BOOMUX_CONFIG", &config)
-        .args(["daemon", "restart"])
-        .output()
-        .unwrap();
-    assert!(
-        restart.status.success(),
-        "daemon restart failed: {}",
-        String::from_utf8_lossy(&restart.stderr)
-    );
-    assert_eq!(
-        daemon
-            .client
-            .snapshot()
-            .unwrap()
-            .scheduler
-            .unwrap()
-            .max_concurrent,
-        3
-    );
-}
-
-#[test]
-fn native_clock_hook_rejects_outside_symlinked_and_unsafe_paths() {
-    for case in ["outside", "symlink", "marker-symlink", "unsafe-marker"] {
-        let runtime_dir =
-            std::env::temp_dir().join(format!("boomux-unsafe-clock-{}-{}", case, Uuid::new_v4()));
-        let private_runtime = runtime_dir.join("boomux");
-        fs::create_dir_all(&private_runtime).unwrap();
-        fs::set_permissions(&private_runtime, fs::Permissions::from_mode(0o700)).unwrap();
-        let outside = runtime_dir.join("outside-clock");
-        fs::create_dir(&outside).unwrap();
-        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(outside.join("tick"), "1 1767225600000").unwrap();
-        fs::set_permissions(outside.join("tick"), fs::Permissions::from_mode(0o600)).unwrap();
-        let clock = match case {
-            "outside" => outside.clone(),
-            "symlink" => {
-                let path = private_runtime.join("clock-link");
-                symlink(&outside, &path).unwrap();
-                path
-            }
-            "marker-symlink" => {
-                let path = private_runtime.join("clock-marker-link");
-                fs::create_dir(&path).unwrap();
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-                symlink(outside.join("tick"), path.join("tick")).unwrap();
-                path
-            }
-            "unsafe-marker" => {
-                let path = private_runtime.join("clock");
-                fs::create_dir(&path).unwrap();
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-                fs::write(path.join("tick"), "1 1767225600000").unwrap();
-                fs::set_permissions(path.join("tick"), fs::Permissions::from_mode(0o644)).unwrap();
-                path
-            }
-            _ => unreachable!(),
-        };
-        assert_unsafe_native_clock_rejected(&runtime_dir, &clock);
-        fs::remove_dir_all(runtime_dir).unwrap();
-    }
 }

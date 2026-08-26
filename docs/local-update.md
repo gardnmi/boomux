@@ -58,6 +58,35 @@ independent signing authority.
 
 ## Activation And Recovery
 
+### Protocol-47 Alpha Break
+
+v0.32/state schema 13 cannot use guided self-update or graceful daemon handoff
+into the schedule-free protocol-47 release. Handoff H8 deliberately rejects the
+v0.32 H7 manifest, and protocol-47 clients, daemons, and Nodes do not negotiate
+protocol 46. This is an explicit alpha-breaking cold upgrade, not a migration.
+
+Before replacing a v0.32 installation:
+
+1. Run `boomux daemon stop` with the v0.32 binary. This terminates every managed
+   process and PTY.
+2. Back up, then remove `state.json`, `global_workspaces.json`,
+   `local_shell_transactions.log`, `node-cache.json`, and
+   `selected-workspace.json` from `$XDG_STATE_HOME/boomux`, or
+   `~/.local/state/boomux` when `XDG_STATE_HOME` is unset. The independent
+   `node.json` identity and `node_registrations.json` routes may remain.
+3. Remove the complete `[scheduling]` table from every active configuration
+   layer. Also remove `scheduled_dispatch_failed` and `scheduled_interrupted`
+   from `[notifications]` and remove the same two keys from
+   `[notifications.sound]`. Apply this to the global
+   `$XDG_CONFIG_HOME/boomux/config.toml` (default
+   `~/.config/boomux/config.toml`) and any file selected by `BOOMUX_CONFIG`.
+4. Install the protocol-47 binary and start Boomux with an ordinary command such
+   as `boomux`.
+
+There is no schedule migration, legacy schedule field, or graceful rollback
+across this boundary. A retained schema-13 store or removed configuration key is
+rejected rather than silently reinterpreted.
+
 The candidate is written with `create_new` in the install directory, synchronized,
 and required to report the exact expected `boomux VERSION`. Immediately before
 activation, the installed baseline and candidate fingerprints are revalidated.

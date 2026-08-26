@@ -358,7 +358,6 @@ mod tests {
 
     fn workspace(id: &str, agent_ids: &[&str]) -> WorkspaceSnapshot {
         let shell = boomux::protocol::ShellSnapshot {
-            owner: boomux::protocol::ShellOwner::User,
             id: "shell".into(),
             revision: 1,
             workspace_id: id.into(),
@@ -385,7 +384,6 @@ mod tests {
             default_cwd: None,
             shells: vec![shell],
             launchers: Vec::new(),
-            schedules: Vec::new(),
             agents: agent_ids
                 .iter()
                 .enumerate()

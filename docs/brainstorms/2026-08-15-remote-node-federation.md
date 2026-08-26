@@ -10,7 +10,7 @@ status: accepted-plan
 
 Make Agents running on SSH machines feel native on the local host. The local
 Boomux TUI and Omarchy plugin must present local and remote Workspaces, Agents,
-Schedules, attention, and execution state together. Remote terminals must open
+and attention together. Remote terminals must open
 in local native terminal windows, while remote work remains alive when the
 local host sleeps, restarts, or loses its SSH connection.
 
@@ -19,8 +19,8 @@ local host sleeps, restarts, or loses its SSH connection.
 A Boomux Node is a durable authority represented by successive daemon
 incarnations and the runtime resources it authoritatively owns.
 Each Workspace belongs to exactly one Node. Shells, ShellRuns, Agent Instances,
-projected Agent Sessions, Agent Schedules, and Scheduled Executions retain their
-existing meanings and scopes under the owning Node.
+and projected Agent Sessions retain their existing meanings and scopes under the
+owning Node.
 
 An SSH target is a route to a Node, not its identity. Every Node has a stable
 random ID. Federated resource identity is the structured pair of Node ID and
@@ -28,8 +28,8 @@ the resource's unchanged Node-local resource ID. The Node is an outer scope:
 Workspace names are Node-local, while other resources preserve their existing
 Workspace or exact-identity scopes.
 
-The remote daemon owns remote processes, PTYs, lifecycle state, schedules, and
-durable attention. The local daemon owns local resources plus a separate,
+The remote daemon owns remote processes, PTYs, lifecycle state, and durable
+attention. The local daemon owns local resources plus a separate,
 read-only projection and routing subsystem for registered remote Nodes. Remote
 projections never enter the authoritative local registry.
 
@@ -150,9 +150,9 @@ The cache retains only the reduced persisted field allowlist defined by
 synchronization time, and local notification deduplication state. It does not
 serialize existing public summary objects wholesale.
 
-The cache must never retain Schedule prompts, terminal output, attachment
-environments, runner capabilities, SSH credentials, host session files, restart
-environments, or private transport frames.
+The cache must never retain terminal output, attachment environments, SSH
+credentials, host session files, restart environments, or private transport
+frames.
 
 ## Background Synchronization
 
@@ -162,16 +162,16 @@ backoff and jitter, stops aggressive retries after authentication or identity
 failure, and reports actionable Node health.
 
 Remote event cursors remain internal per Node. One owner-side synchronization
-operation captures the reduced projection, bounded executions, cursor, and
-resumable transition records at one event cut. A complete cache replacement is
+operation captures the reduced projection, cursor, and resumable transition
+records at one event cut. A complete cache replacement is
 persisted before the local daemon publishes a `NodeProjectionChanged`
 invalidation through its existing local event stream. The public local cursor
 therefore remains scalar and orders local observations without claiming a
 cross-machine causal order.
 
 On remote cursor expiry or cold restart, only that Node is reseeded from a new
-prompt-free baseline. Other Nodes remain usable. Disconnect never marks an
-Agent done, interrupts a Scheduled Execution, or starts replacement work.
+prompt-free baseline. Other Nodes remain usable. Disconnect never marks an Agent
+done or starts replacement work.
 
 Cached resources remain visible as stale after local restart. All actions are
 disabled until the owning Node reconnects and verifies its identity.
@@ -180,8 +180,8 @@ disabled until the owning Node reconnects and verifies its identity.
 
 The local gateway never executes a mutation from cached state and never queues
 offline mutations. It verifies the pinned Node before forwarding any inner
-request bytes, negotiates the remote core protocol, and preserves exact IDs,
-run IDs, revisions, dispatch keys, and typed errors.
+request bytes, negotiates the remote core protocol, and preserves exact IDs, run
+IDs, revisions, and typed errors.
 
 Ambiguous writes are not retried after transport loss unless the request carries
 an explicit wire idempotency key, in which case only that exact key can be
@@ -189,9 +189,9 @@ reused. A conditional revision alone is not an automatic retry key. The client
 reports an unknown outcome and requires an authoritative refresh when no durable
 postcondition proves the exact intent committed.
 
-Full management parity includes Workspaces, Shells, Agents, launchers,
-attention, Schedules, Scheduled Executions, project discovery, integration
-management, and exact Agent Session resume. Filesystem validation, host
+Full management parity includes Workspaces, Shells, Agents, launchers, attention,
+project discovery, integration management, and exact Agent Session resume.
+Filesystem validation, host
 catalogs, executable discovery, launchers, and Agent commands execute on the
 owning remote Node, never on the local machine.
 
@@ -215,20 +215,6 @@ and exact-run attachment remain authoritative on the remote daemon.
 Remote daemon handoff relays its normal reconnect behavior. Local daemon
 handoff asks local clients to reconnect and creates fresh SSH bridges; no remote
 PTY descriptor crosses machines.
-
-## Schedules
-
-Agent Schedules belong to and are evaluated by one Node. A remote Schedule
-continues while the local host is offline. If the owning remote machine or
-daemon is offline, its existing missed-occurrence policy applies.
-
-There is no automatic failover in the initial implementation. Another Node
-never substitutes its filesystem, environment, credentials, integration, or
-Agent Session. Future failover may be introduced only as an explicit placement
-policy with its own portability and authority contract.
-
-Scheduler health and concurrency are displayed per Node. Concurrency is not a
-federated global lease.
 
 ## Attention And Notifications
 
@@ -278,8 +264,8 @@ Node-scoped target, and unknown mutation outcome.
 
 No SSH or network wait may occur while core mutation, persistence, event,
 runtime, or federation registry locks are held. Local daemon stop, restart, or
-Node removal never terminates remote work. Remote projections never trigger the
-local scheduler or enter the authoritative local registry.
+Node removal never terminates remote work. Remote projections never enter the
+authoritative local registry.
 
 ## Delivery Order
 
@@ -293,9 +279,8 @@ local scheduler or enter the authoritative local registry.
 7. Attach remote PTYs through local native terminals.
 8. Route remote host services, project discovery, integration operations, and
    exact Agent Session resume.
-9. Project and manage remote Schedules without automatic failover.
-10. Deliver remote Agent attention through the local notification subscriber.
-11. Add federated Node management to the Omarchy plugin.
+9. Deliver remote Agent attention through the local notification subscriber.
+10. Add federated Node management to the Omarchy plugin.
 
 ## GitHub Delivery
 
@@ -308,7 +293,6 @@ local scheduler or enter the authoritative local registry.
 - [#179](https://github.com/gardnmi/boomux/issues/179) routes safe remote management operations.
 - [#180](https://github.com/gardnmi/boomux/issues/180) attaches remote PTYs in local native terminals.
 - [#181](https://github.com/gardnmi/boomux/issues/181) routes remote host services and exact session resume.
-- [#182](https://github.com/gardnmi/boomux/issues/182) manages remote Schedules and executions.
 - [#183](https://github.com/gardnmi/boomux/issues/183) presents remote Agent attention locally.
 - [#184](https://github.com/gardnmi/boomux/issues/184) tracks the Omarchy plugin implementation from the Boomux repository.
 
@@ -320,6 +304,6 @@ atomic installation, stable identity and mismatch, duplicate names and inner
 IDs, online/stale/offline/reconnect transitions, cache bounds and privacy,
 cursor expiry, exact mutation routing, ambiguous writes, PTY input/resize/
 takeover/reconnect, local and remote graceful handoff, local-stop preservation
-of remote PIDs, remote Schedule continuity, absence of failover, notification
+of remote PIDs, absence of failover, notification
 deduplication and digest behavior, mixed protocol versions, and Omarchy routing
 and stale-state safeguards.

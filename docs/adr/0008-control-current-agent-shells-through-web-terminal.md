@@ -38,7 +38,7 @@ This is remote shell access, not a transcript projection. Terminal bytes are not
 persisted by the gateway, copied into Agent or Node projections, cached by the
 service worker, logged, or interpreted as lifecycle evidence. The gateway stays
 on loopback; Tailscale or another private access layer owns TLS, identity, and
-access policy. Remote projected Nodes and schedule-owned Agents are excluded.
+access policy. Remote projected Nodes are excluded.
 
 Rejected alternatives were:
 

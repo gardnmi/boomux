@@ -20,14 +20,13 @@ pub(crate) struct NodeProjectionView {
 }
 use crate::state_store::{effective_uid, secure_state_dir, state_directory_from_environment};
 
-const NODE_CACHE_VERSION: u32 = 4;
+const NODE_CACHE_VERSION: u32 = 5;
 const MAX_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_NODES: usize = 128;
 const MAX_WORKSPACES_PER_NODE: usize = 1_024;
 const MAX_SHELLS_PER_NODE: usize = 4_096;
 const MAX_LAUNCHERS_PER_NODE: usize = 4_096;
 const MAX_AGENTS_PER_NODE: usize = 4_096;
-const MAX_SCHEDULES_PER_NODE: usize = 1_024;
 const MAX_CAPABILITIES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;
 const MAX_HELPER_VERSION_BYTES: usize = 128;
@@ -62,8 +61,6 @@ pub(crate) struct ProjectionObservation {
 pub(crate) enum RemoteNotificationCategory {
     AgentBlocked,
     AgentCompleted,
-    ScheduledDispatchFailed,
-    ScheduledInterrupted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -604,11 +601,6 @@ impl CachedNode {
                     .launchers
                     .iter()
                     .filter(|launcher| launcher.workspace_id == workspace.id)
-                    .count()
-                + projection
-                    .schedules
-                    .iter()
-                    .filter(|schedule| schedule.workspace_id == workspace.id)
                     .count();
             let attention_count = projection
                 .agents
@@ -650,9 +642,6 @@ fn validate_projection(projection: &NodeProjectionSnapshot) -> io::Result<()> {
         || projection.shells.len() > MAX_SHELLS_PER_NODE
         || projection.launchers.len() > MAX_LAUNCHERS_PER_NODE
         || projection.agents.len() > MAX_AGENTS_PER_NODE
-        || projection.schedules.len() > MAX_SCHEDULES_PER_NODE
-        || projection.executions.len()
-            > usize::from(crate::protocol::MAX_NODE_PROJECTION_EXECUTIONS)
     {
         return Err(invalid("Node projection exceeds its structural bounds"));
     }
@@ -670,7 +659,6 @@ fn validate_projection(projection: &NodeProjectionSnapshot) -> io::Result<()> {
         .map(|item| item.name.as_str())
         .chain(projection.launchers.iter().map(|item| item.name.as_str()))
         .chain(projection.agents.iter().map(|item| item.name.as_str()))
-        .chain(projection.schedules.iter().map(|item| item.name.as_str()))
     {
         validate_name(name)?;
     }
@@ -803,16 +791,8 @@ fn load(path: &Path) -> io::Result<(CacheState, bool)> {
                 true,
             )
         }
-        3 => {
-            let mut old: CacheState =
-                serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
-            if old.version != 3 {
-                return Err(invalid("invalid Node cache version"));
-            }
-            old.version = NODE_CACHE_VERSION;
-            (old, true)
-        }
-        4 => (
+        3 | 4 => return Err(invalid("unsupported disposable Node cache version")),
+        5 => (
             serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?,
             false,
         ),
@@ -938,8 +918,7 @@ mod tests {
     use super::*;
     use crate::protocol::{
         AgentAttentionReason, AgentState, NodeProjectionAgent, NodeProjectionAttention,
-        NodeProjectionShell, NodeProjectionWorkspace, SchedulerHealth, SchedulerState, ShellOwner,
-        ShellStatus,
+        NodeProjectionShell, NodeProjectionWorkspace, ShellStatus,
     };
 
     fn projection(node_id: String) -> NodeProjectionSnapshot {
@@ -949,14 +928,6 @@ mod tests {
             shells: Vec::new(),
             launchers: Vec::new(),
             agents: Vec::new(),
-            schedules: Vec::new(),
-            executions: Vec::new(),
-            executions_truncated: false,
-            scheduler: SchedulerHealth {
-                state: SchedulerState::Active,
-                max_concurrent: 4,
-                active_executions: 0,
-            },
         }
     }
 
@@ -972,7 +943,6 @@ mod tests {
             id: "shell-1".into(),
             workspace_id: "workspace-1".into(),
             name: "agent".into(),
-            owner: ShellOwner::User,
             status: ShellStatus::Running,
             run_id: Some("run-1".into()),
             generation: Some(1),
@@ -1313,7 +1283,7 @@ mod tests {
         drop(NodeProjectionCache::load_at(path.clone()));
         let migrated: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(migrated["version"], 4);
+        assert_eq!(migrated["version"], 5);
         assert_eq!(
             migrated["nodes"][0]["dismissed_shell_ids"],
             serde_json::json!([])
@@ -1385,7 +1355,7 @@ mod tests {
         let cache = NodeProjectionCache::load_at(path.clone());
         let migrated: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(migrated["version"], 4);
+        assert_eq!(migrated["version"], 5);
         assert_eq!(
             migrated["nodes"][0]["notification_claims"],
             serde_json::json!([])
@@ -1438,7 +1408,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_three_migrates_helper_version_as_unobserved_and_validates_bounds() {
+    fn schema_three_is_discarded_and_helper_version_bounds_are_validated() {
         let root = std::env::temp_dir().join(format!("boomux-node-v3-{}", Uuid::new_v4()));
         let path = root.join("boomux/node-cache.json");
         let node_id = Uuid::from_u128(2).to_string();
@@ -1485,12 +1455,7 @@ mod tests {
                 .observed_helper_version,
             None
         );
-        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(stored["version"], 4);
-        assert_eq!(
-            stored["nodes"][0]["observed_helper_version"],
-            serde_json::Value::Null
-        );
+        assert!(!path.exists());
 
         let generation = migrated.cursor_and_generation(&registration).unwrap().1;
         let error = migrated
@@ -1510,6 +1475,37 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_four_is_discarded() {
+        let root = std::env::temp_dir().join(format!("boomux-node-v4-{}", Uuid::new_v4()));
+        let path = root.join("boomux/node-cache.json");
+        let registration = NodeRegistrationSnapshot {
+            alias: "work".into(),
+            target: "work.example".into(),
+            node_id: Uuid::from_u128(2).to_string(),
+            revision: 1,
+            tombstone_epoch: 0,
+        };
+        let cache = NodeProjectionCache::load_at(path.clone());
+        cache
+            .mark_health(&registration, 0, NodeProjectionHealthCode::Stale, 1, None)
+            .unwrap();
+        drop(cache);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy["version"] = 4.into();
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let discarded = NodeProjectionCache::load_at(path.clone());
+        assert_eq!(
+            discarded.health(&registration).unwrap().code,
+            NodeProjectionHealthCode::Unobserved
+        );
+        assert!(!path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

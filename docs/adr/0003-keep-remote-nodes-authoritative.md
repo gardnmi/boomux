@@ -2,9 +2,9 @@
 
 Status: Accepted for runtime resources; Workspace ownership superseded by ADR 0004
 
-Remote Workspaces and their Shells, ShellRuns, Agent Instances, Schedules,
-Scheduled Executions, PTYs, and processes remain authoritative on one remote
-Boomux Node. Agent Sessions remain projections whose host lookup and underlying
+Remote Workspaces and their Shells, ShellRuns, Agent Instances, PTYs, and
+processes remain authoritative on one remote Boomux Node. Agent Sessions remain
+projections whose host lookup and underlying
 Agent occurrences are Node-local. A local Node may reach remote authority through
 an SSH stdio bridge and retain a bounded prompt-free projection for native local
 presentation, but it does not import remote resources into its durable registry
