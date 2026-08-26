@@ -2280,6 +2280,20 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listener_holder_identity_requires_exactly_one_process() {
+        assert_eq!(unique_listener_holder(vec![42]).unwrap(), 42);
+        assert_eq!(
+            unique_listener_holder(Vec::new()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            unique_listener_holder(vec![42, 43]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
     #[test]
     fn optional_runtime_accepts_legacy_typed_absence_without_changing_required_callers() {
         let directory = env::temp_dir().join(format!("boomux-client-runtime-{}", Uuid::new_v4()));
