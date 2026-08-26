@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/gardnmi/boomux/compare/v1.0.1...v1.0.2) (2026-08-26)
+
+
+### Bug Fixes
+
+* **node:** unblock upgrade maintenance during projection reads ([#282](https://github.com/gardnmi/boomux/issues/282)) ([032a80b](https://github.com/gardnmi/boomux/commit/032a80b4074e2626d70b570282f4d677c6bcf54d))
+
 ## [1.0.1](https://github.com/gardnmi/boomux/compare/v1.0.0...v1.0.1) (2026-08-26)
 
 
