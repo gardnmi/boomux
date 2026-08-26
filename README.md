@@ -39,12 +39,17 @@ The release recipe below requires GitHub CLI (`gh`), `sha256sum`, `tar`, and
 ### Latest Release
 
 ```console
+case "$(uname -m)" in
+  x86_64) target=x86_64-unknown-linux-gnu ;;
+  aarch64) target=aarch64-unknown-linux-gnu ;;
+  *) printf 'unsupported architecture\n' >&2; exit 1 ;;
+esac
 version=$(gh release view --repo gardnmi/boomux --json tagName --jq .tagName)
 gh release download "$version" --repo gardnmi/boomux \
-  --pattern "boomux-$version-x86_64-unknown-linux-gnu.tar.gz*"
-sha256sum --check "boomux-$version-x86_64-unknown-linux-gnu.tar.gz.sha256"
-tar -xzf "boomux-$version-x86_64-unknown-linux-gnu.tar.gz"
-install -Dm755 "boomux-$version-x86_64-unknown-linux-gnu/boomux" ~/.local/bin/boomux
+  --pattern "boomux-$version-$target.tar.gz*"
+sha256sum --check "boomux-$version-$target.tar.gz.sha256"
+tar -xzf "boomux-$version-$target.tar.gz"
+install -Dm755 "boomux-$version-$target/boomux" ~/.local/bin/boomux
 boomux doctor
 ```
 
@@ -59,13 +64,21 @@ Source installations may include unreleased changes. Run `boomux --version` and
 
 ### Update
 
-Replace the binary using the release steps above, then activate it without
-terminating managed processes:
+Official release binaries installed at `~/.local/bin/boomux` have an explicit
+guided updater:
 
 ```console
-boomux daemon restart
+boomux update status
+boomux update
 boomux doctor
 ```
+
+The updater verifies the fixed GitHub release, exact architecture asset, and
+SHA-256 checksum before replacing the executable. If the daemon is running, it
+uses graceful handoff so managed processes and PTYs survive. Package-manager,
+source, development, root-owned, custom-path, and unsafe installations are never
+self-replaced, and Boomux never silently downgrades. Automatic updates are not
+enabled.
 
 Prefer `daemon restart` over `daemon stop`: stopping the daemon terminates every
 managed process. Upgrade registered remote Nodes separately with

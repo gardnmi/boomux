@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: 2026 Mike Gardner
+# SPDX-License-Identifier: 0BSD
+# Maintainer: Mike Gardner (gardnmi) <https://github.com/gardnmi>
+pkgname=boomux-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Terminal session manager (prebuilt binary)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/gardnmi/boomux'
+license=('MIT')
+depends=('curl' 'gcc-libs' 'git' 'glibc' 'xdg-terminal-exec')
+optdepends=(
+  'openssh: remote Node connections'
+  'tar: remote helper installation from official release archives'
+)
+provides=("boomux=${pkgver}")
+conflicts=('boomux')
+options=('!strip')
+source_x86_64=("boomux-${pkgver}-x86_64.tar.gz::${url}/releases/download/v${pkgver}/boomux-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("boomux-${pkgver}-aarch64.tar.gz::${url}/releases/download/v${pkgver}/boomux-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('@X86_64_SHA256@')
+sha256sums_aarch64=('@AARCH64_SHA256@')
+
+package() {
+  local target
+  case "$CARCH" in
+    x86_64) target=x86_64-unknown-linux-gnu ;;
+    aarch64) target=aarch64-unknown-linux-gnu ;;
+    *) error "unsupported architecture: $CARCH"; return 1 ;;
+  esac
+
+  local root="${srcdir}/boomux-v${pkgver}-${target}"
+  install -Dm755 "${root}/boomux" "${pkgdir}/usr/bin/boomux"
+  install -Dm644 "${root}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${root}/README.md" "${pkgdir}/usr/share/doc/boomux/README.md"
+  install -Dm644 "${root}/THIRD_PARTY_NOTICES.md" \
+    "${pkgdir}/usr/share/doc/boomux/THIRD_PARTY_NOTICES.md"
+}

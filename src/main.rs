@@ -54,6 +54,7 @@ mod session_projection;
 mod tailscale_serve;
 mod terminal;
 mod tui;
+mod update;
 mod web_terminal;
 mod workspace_selection;
 
@@ -299,6 +300,8 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "coordinated_shell_desktop_placement",
     "desktop_workspace_show",
     "node_reauthentication",
+    "local_update_status",
+    "guided_local_update",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -449,6 +452,11 @@ enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
+    },
+    /// Check for or install an official local Boomux release
+    Update {
+        #[command(subcommand)]
+        command: Option<UpdateCommands>,
     },
     /// Discover configured projects
     Project {
@@ -669,6 +677,12 @@ enum ConfigCommands {
     Validate,
     /// Edit and transactionally replace the active writable layer
     Edit,
+}
+
+#[derive(Subcommand)]
+enum UpdateCommands {
+    /// Report local installation and latest release status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1530,6 +1544,8 @@ command_keys! {
     ConfigPath => ("config.path", HumanOnly),
     ConfigValidate => ("config.validate", HumanOnly),
     ConfigEdit => ("config.edit", HumanOnly),
+    UpdateStatus => ("update.status", Json),
+    Update => ("update", HumanOnly),
     ProjectList => ("project.list", Json),
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
@@ -1635,6 +1651,10 @@ impl Cli {
             Some(Commands::Config {
                 command: ConfigCommands::Edit,
             }) => CommandKey::ConfigEdit,
+            Some(Commands::Update {
+                command: Some(UpdateCommands::Status),
+            }) => CommandKey::UpdateStatus,
+            Some(Commands::Update { command: None }) => CommandKey::Update,
             Some(Commands::Project {
                 command: ProjectCommands::List { .. },
             }) => CommandKey::ProjectList,
@@ -2185,6 +2205,35 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             }
         }
         Some(Commands::Config { command }) => config_command(command),
+        Some(Commands::Update {
+            command: Some(UpdateCommands::Status),
+        }) => {
+            let status = update::status();
+            if cli.json {
+                print_json(CommandKey::UpdateStatus, serde_json::to_value(status)?)
+            } else {
+                let value = serde_json::to_value(status)?;
+                println!(
+                    "current: {}",
+                    value["current"].as_str().unwrap_or("unknown")
+                );
+                println!(
+                    "latest: {}",
+                    value["latest"].as_str().unwrap_or("unavailable")
+                );
+                println!(
+                    "state: {}",
+                    value["state"].as_str().unwrap_or("check_failed")
+                );
+                println!(
+                    "install: {}",
+                    value["install_kind"].as_str().unwrap_or("unknown")
+                );
+                println!("path: {}", value["path"].as_str().unwrap_or("unknown"));
+                Ok(())
+            }
+        }
+        Some(Commands::Update { command: None }) => update::guided_update(),
         Some(Commands::Project {
             command: ProjectCommands::List { node },
         }) => list_projects(cli.json, node.as_deref()),
@@ -17876,6 +17925,7 @@ mod tests {
                 "shells",
                 "read",
                 "events",
+                "update.status",
                 "project.list",
                 "workspace.list",
                 "workspace.inspect",

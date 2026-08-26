@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -2274,6 +2275,43 @@ fn classify_wire_error(error: io::Error) -> ClientError {
     }
 }
 
+#[derive(Debug)]
+pub struct DaemonLockReservation {
+    _lock: std::fs::File,
+}
+
+pub fn reserve_daemon_lock(socket_path: &Path) -> io::Result<Option<DaemonLockReservation>> {
+    let lock_path = socket_path
+        .parent()
+        .ok_or_else(|| io::Error::other("daemon socket has no parent"))?
+        .join("daemon.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(lock_path)?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon lock is not an owner-controlled regular file",
+        ));
+    }
+    // The descriptor remains live for both flock operations.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(DaemonLockReservation { _lock: lock }));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
 fn daemon_lock_available(socket_path: &Path) -> io::Result<bool> {
     let lock_path = socket_path
         .parent()
@@ -2284,11 +2322,10 @@ fn daemon_lock_available(socket_path: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error),
     };
-    // The descriptor remains live for both flock operations.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
         return Ok(true);
-    }
+    };
     let error = io::Error::last_os_error();
     if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
         Ok(false)

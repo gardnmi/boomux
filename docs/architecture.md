@@ -35,6 +35,7 @@
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
+| `src/update.rs` | Local release discovery, installation classification, interactive self-update authorization, atomic executable replacement, and daemon handoff verification |
 | `src/claude_hooks.rs`, `src/codex_hooks.rs`, `src/kiro_hooks.rs` | Bounded Claude Code, Codex, and Kiro hook decoding and lifecycle reduction |
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/scheduling.rs` | Bounded canonical cron parsing and occurrence evaluation, IANA timezone and DST policy, prompt bounds, and schedule identity validation |
@@ -61,6 +62,9 @@
 - **Exact argument vectors:** workspace launchers, process adapters, terminal
   launch, integration management, and configuration editor launch execute argv
   directly without shell interpretation.
+- **Local update ownership:** [`local-update.md`](local-update.md) defines the
+  official-release eligibility, package-manager refusal, no-downgrade rule,
+  atomic replacement, and graceful daemon handoff boundary.
 - **Scheduled Agent authority:** [`scheduled-agent-work.md`](scheduled-agent-work.md)
   defines the boundary between manual and timed dispatch, concurrency policy,
   process outcome, and authoritative Agent lifecycle.
@@ -1881,6 +1885,32 @@ The same graceful boundary transfers the Shared Harness Runtime's strict process
 identity and generation but no Agent Session Claims. Surviving TUI holders
 reacquire claims after reconnect. Cold startup adopts a runtime only when all
 identity checks match; otherwise it starts a new generation when next needed.
+
+## Local Release Updates
+
+`boomux update status` is a local CLI read that discovers the latest stable
+release without starting or contacting the daemon. `boomux update` is a
+human-only guided mutation. It supports only an official `github-release` build
+running from the current user's canonical `~/.local/bin/boomux`; package-managed,
+source, development, root-owned, custom-path, unsafe, and unknown installations
+are reported but never replaced. The complete contract is
+[`local-update.md`](local-update.md).
+
+The updater downloads only the exact GNU/Linux release asset for the current
+`x86_64` or `aarch64` architecture through fixed HTTPS endpoints. Existing
+bounded release download and checksum validation from `src/ssh_bootstrap.rs` is
+shared with remote helper installation. A strict stable semantic-version
+comparison prevents downgrade, including when the installed build is newer than
+the latest published release.
+
+After explicit confirmation, the updater pins the installed executable and
+candidate bytes, smoke-tests the candidate, retains a same-directory hard-link
+rollback inode, and atomically renames the candidate over the path. If the daemon
+was absent it remains absent. If it was running from that exact path, the updater
+uses the existing graceful restart and verifies the replacement process argv,
+path, inode, and digest against the pinned candidate. Failed activation restores
+the old pathname and coordinates a reverse graceful restart. No updater state is
+added to durable daemon state, and no protocol or persistence version changes.
 
 ## Next Technical Steps
 

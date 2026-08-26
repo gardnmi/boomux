@@ -25,9 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release-created: ${{ steps.release.outputs.release_created }}
-      tag-name: ${{ steps.release.outputs.tag_name || inputs.tag }}
+      tag-name: ${{ inputs.tag || steps.release.outputs.tag_name }}
     steps:
       - name: Run Release Please
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
@@ -36,13 +37,24 @@ jobs:
           manifest-file: .release-please-manifest.json
 
   build-release:
-    name: Build Linux x86_64 release
+    name: Build Linux ${{ matrix.arch }} release
     needs: release-please
     if: ${{ needs.release-please.outputs.release-created == 'true' || inputs.tag != '' }}
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
     env:
+      BOOMUX_DISTRIBUTION: github-release
       RUSTUP_TOOLCHAIN: stable
-      TARGET: x86_64-unknown-linux-gnu
+      TARGET: ${{ matrix.target }}
       TAG: ${{ needs.release-please.outputs.tag-name }}
     steps:
       - name: Check out release tag
@@ -77,11 +89,17 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.release-please.outputs.tag-name }}
     steps:
+      - name: Check out release tag
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.TAG }}
+
       - name: Download release artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
-          name: boomux-${{ env.TAG }}-x86_64-unknown-linux-gnu
+          pattern: boomux-${{ env.TAG }}-*
           path: dist
+          merge-multiple: true
 
       - name: Upload assets to GitHub Release
-        run: gh release upload "$TAG" dist/* --clobber
+        run: bash .github/scripts/upload-release-assets.sh "$TAG" dist/*

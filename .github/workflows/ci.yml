@@ -58,3 +58,72 @@ jobs:
 
       - name: Run integration tests
         run: bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
+
+  release-packaging:
+    name: Release packaging (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      BOOMUX_DISTRIBUTION: github-release
+      RUSTUP_TOOLCHAIN: stable
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Read package version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "boomux") | .version')
+          printf 'TAG=v%s\n' "$version" >> "$GITHUB_ENV"
+
+      - name: Build native release binary
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package and smoke test native release
+        run: bash .github/scripts/package-release.sh "$TAG" "$TARGET"
+
+      - name: Validate release scripts
+        if: ${{ matrix.arch == 'x86_64' }}
+        run: bash -n .github/scripts/package-release.sh .github/scripts/upload-release-assets.sh
+
+  aur-package:
+    name: AUR package metadata
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel@sha256:68bfc3b0d277b08a99101dc9b94aaa03e5ae70cf1b4fb965c03b2b87b915760d
+    steps:
+      - name: Prepare Arch build user
+        run: useradd --create-home builder
+
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Render and validate AUR metadata as an unprivileged user
+        run: |
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- bash -c '
+            set -euo pipefail
+            cd "$1"
+            bash -n packaging/aur/render-pkgbuild.sh packaging/aur/validate-pkgbuild.sh
+            tmp=$(mktemp -d)
+            printf x86_64 > "$tmp/boomux-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+            printf aarch64 > "$tmp/boomux-v1.2.3-aarch64-unknown-linux-gnu.tar.gz"
+            mkdir "$tmp/first" "$tmp/second"
+            packaging/aur/render-pkgbuild.sh 1.2.3 "$tmp/boomux-v1.2.3-x86_64-unknown-linux-gnu.tar.gz" "$tmp/boomux-v1.2.3-aarch64-unknown-linux-gnu.tar.gz" "$tmp/first"
+            packaging/aur/render-pkgbuild.sh 1.2.3 "$tmp/boomux-v1.2.3-x86_64-unknown-linux-gnu.tar.gz" "$tmp/boomux-v1.2.3-aarch64-unknown-linux-gnu.tar.gz" "$tmp/second"
+            cmp "$tmp/first/PKGBUILD" "$tmp/second/PKGBUILD"
+            cmp "$tmp/first/.SRCINFO" "$tmp/second/.SRCINFO"
+            packaging/aur/validate-pkgbuild.sh "$tmp/first"
+            rm -rf "$tmp"
+          ' _ "$GITHUB_WORKSPACE"

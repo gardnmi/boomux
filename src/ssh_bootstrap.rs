@@ -13,6 +13,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use semver::Version;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -38,6 +39,10 @@ const RUNTIME_STAGE_PREFIX: &str = "boomux-runtime-v1";
 const DAEMON_STATUS_PREFIX: &[u8] = b"boomux-daemon-status-v1";
 const DAEMON_PRESENCE_PREFIX: &[u8] = b"boomux-daemon-presence-v1";
 const MAX_RELEASE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_RELEASE_METADATA_BYTES: u64 = 64 * 1024;
+const RELEASE_DOWNLOAD_TIMEOUT_SECONDS: &str = "120";
+const RELEASE_CONNECT_TIMEOUT_SECONDS: &str = "10";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/gardnmi/boomux/releases/latest";
 
 macro_rules! remote_runtime_prefix {
     () => {
@@ -2850,10 +2855,56 @@ fn download_release_binary(target: &str, tag: &str) -> io::Result<Vec<u8>> {
         .parent()
         .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?;
     secure_runtime_directory(parent)?;
-    let directory = parent.join(format!("release-{}", Uuid::new_v4()));
+    download_release_binary_in(parent, target, tag)
+}
+
+pub fn download_latest_release_metadata(parent: &Path) -> io::Result<Vec<u8>> {
+    let directory = create_release_directory(parent)?;
+    let destination = directory.join("latest.json");
+    let result = (|| {
+        download_release_url(LATEST_RELEASE_URL, &destination, MAX_RELEASE_METADATA_BYTES)?;
+        read_bounded_file_limit(&destination, MAX_RELEASE_METADATA_BYTES)
+    })();
+    let _ = fs::remove_dir_all(&directory);
+    result
+}
+
+pub fn download_release_binary_in(parent: &Path, target: &str, tag: &str) -> io::Result<Vec<u8>> {
+    if !matches!(
+        target,
+        "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+    ) || !is_release_tag(tag)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Boomux release target or tag",
+        ));
+    }
+    let directory = create_release_directory(parent)?;
+    let result = download_release_binary_from_directory(&directory, target, tag);
+    let _ = fs::remove_dir_all(&directory);
+    result
+}
+
+fn create_release_directory(parent: &Path) -> io::Result<PathBuf> {
+    let directory = parent.join(format!(".boomux-release-{}", Uuid::new_v4()));
     fs::create_dir(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    let result = (|| {
+    Ok(directory)
+}
+
+fn is_release_tag(tag: &str) -> bool {
+    tag.strip_prefix('v')
+        .and_then(|version| Version::parse(version).ok())
+        .is_some_and(|version| version.pre.is_empty() && version.build.is_empty())
+}
+
+fn download_release_binary_from_directory(
+    directory: &Path,
+    target: &str,
+    tag: &str,
+) -> io::Result<Vec<u8>> {
+    (|| {
         let archive_name = format!("boomux-{tag}-{target}.tar.gz");
         let archive = directory.join(&archive_name);
         let checksum = directory.join(format!("{archive_name}.sha256"));
@@ -2866,22 +2917,7 @@ fn download_release_binary(target: &str, tag: &str) -> io::Result<Vec<u8>> {
             ),
             (format!("{base}/{archive_name}.sha256"), &checksum, 1024),
         ] {
-            let status = Command::new("curl")
-                .args([
-                    "--fail",
-                    "--location",
-                    "--silent",
-                    "--show-error",
-                    "--output",
-                ])
-                .arg(destination)
-                .arg("--max-filesize")
-                .arg(maximum_size.to_string())
-                .arg(url)
-                .status()?;
-            if !status.success() {
-                return Err(io::Error::other("could not download Boomux release asset"));
-            }
+            download_release_url(&url, destination, maximum_size)?;
         }
         if fs::metadata(&archive)?.len() > MAX_RELEASE_BYTES {
             return Err(invalid_probe(
@@ -2894,16 +2930,80 @@ fn download_release_binary(target: &str, tag: &str) -> io::Result<Vec<u8>> {
             .args(["-xzf"])
             .arg(&archive)
             .args(["-C"])
-            .arg(&directory)
+            .arg(directory)
             .arg(&member)
+            .env_remove("TAR_OPTIONS")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()?;
         if !status.success() {
             return Err(io::Error::other("could not extract Boomux release asset"));
         }
         read_bounded_file(&directory.join(member))
-    })();
-    let _ = fs::remove_dir_all(&directory);
-    result
+    })()
+}
+
+fn download_release_url(url: &str, destination: &Path, maximum_size: u64) -> io::Result<()> {
+    let status = Command::new("curl")
+        .args([
+            "--disable",
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
+            "--connect-timeout",
+            RELEASE_CONNECT_TIMEOUT_SECONDS,
+            "--max-time",
+            RELEASE_DOWNLOAD_TIMEOUT_SECONDS,
+            "--output",
+        ])
+        .arg(destination)
+        .arg("--max-filesize")
+        .arg(maximum_size.to_string())
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other("could not download Boomux release asset"));
+    }
+    let metadata = fs::symlink_metadata(destination)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > maximum_size {
+        return Err(invalid_probe(
+            "Boomux release download is not a bounded regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_file_limit(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
+        return Err(invalid_probe(
+            "Boomux release metadata exceeds its size limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > limit {
+        return Err(invalid_probe(
+            "Boomux release metadata changed while reading",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn verify_release_checksum(archive: &Path, checksum: &Path, archive_name: &str) -> io::Result<()> {
@@ -3316,7 +3416,7 @@ impl Drop for SshInvocation {
     }
 }
 
-fn secure_runtime_directory(path: &Path) -> io::Result<()> {
+pub fn secure_runtime_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || metadata.uid() != effective_uid() {
@@ -7995,5 +8095,16 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn release_download_accepts_only_stable_strict_semver_tags() {
+        assert!(is_release_tag("v1.2.3"));
+        assert!(!is_release_tag("1.2.3"));
+        assert!(!is_release_tag("v1.2"));
+        assert!(!is_release_tag("v1.02.3"));
+        assert!(!is_release_tag("v1.2.3-rc.1"));
+        assert!(!is_release_tag("v1.2.3+build"));
+        assert!(!is_release_tag("v../../asset"));
     }
 }

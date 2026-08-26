@@ -197,6 +197,7 @@ dependencies = [
  "nix",
  "portable-pty",
  "ratatui",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
