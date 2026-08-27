@@ -19,7 +19,8 @@
       "release-type": "rust",
       "package-name": "boomux",
       "include-component-in-tag": false,
-      "draft": true
+      "draft": true,
+      "force-tag-creation": true
     }
   }
 }
