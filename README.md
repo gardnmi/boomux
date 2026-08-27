@@ -30,10 +30,11 @@ After [installing Boomux](#install-and-update), run the guided setup:
 boomux setup
 ```
 
-On Omarchy, confirm the prompts to install and enable the
-[Boomux plugin](https://github.com/gardnmi/omarchy-boomux) and, if wanted, its
-managed keybindings. Setup restarts Omarchy Shell after plugin changes. The
-plugin adds a Boomux icon to the bar and opens a persistent side pane for
+On Omarchy, the recommended core experience installs and enables the
+[Boomux plugin](https://github.com/gardnmi/omarchy-boomux), enables coordinated
+Workspace presentation in Hyprland, and optionally installs managed keybindings.
+Setup asks before each change and restarts Omarchy Shell after plugin changes.
+The plugin adds a Boomux icon to the bar and opens a persistent side pane for
 Workspaces, Shells, Agents, and Nodes.
 
 - Click the bar icon to open or close the pane.
@@ -183,20 +184,6 @@ launchers or adapters.
 | Crash or reboot | Managed Shell runs and PTYs are lost. Durable definitions and run history remain; recovered Shells are pending until reopened. Eligible Agent recovery may use the integration's native resume command. |
 
 ## Hyprland Workspace Layer
-
-In an active Hyprland session, Boomux presents terminal-bearing coordinated
-Workspaces on demand as named special Workspaces. Empty and launcher-only
-Workspaces have no terminal layer to show.
-
-The adapter defaults on. To opt out while using Hyprland:
-
-```toml
-[desktop]
-workspace_layer = "disabled"
-```
-
-This setting is read by local CLI presentation paths and does not require a
-daemon restart.
 
 ### Desktop Commands
 
@@ -391,16 +378,17 @@ max_depth = 3
 follow_focused_terminal = true
 
 [desktop]
-# Default: "hyprland-special"
-# workspace_layer = "disabled"
+# Default: "disabled"
+# workspace_layer = "hyprland-special"
 
 [recovery]
 resume_agents = true
 persist_terminal_history = false
 ```
 
-Desktop and sound notifications are disabled by default. Terminal history
-persistence is also disabled because output can contain secrets. Daemon-owned
+The Hyprland Workspace layer, desktop and sound notifications, and terminal
+history persistence are disabled by default. `boomux setup` offers to enable the
+Workspace layer as part of its recommended Omarchy experience. Daemon-owned
 settings require `boomux daemon restart`; local desktop presentation settings do
 not.
 

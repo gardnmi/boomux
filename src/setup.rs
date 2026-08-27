@@ -416,49 +416,67 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
     );
 
     let plugins = omarchy_plugins(&omarchy)?;
-    let (plugin_enabled, plugin_changed) =
-        match plugins.iter().find(|plugin| plugin.id == OMARCHY_PLUGIN_ID) {
-            Some(plugin) if plugin.enabled => {
+    let (plugin_enabled, plugin_changed) = match plugins
+        .iter()
+        .find(|plugin| plugin.id == OMARCHY_PLUGIN_ID)
+    {
+        Some(plugin) if plugin.enabled => {
+            status(
+                "ok",
+                "32",
+                "omarchy-boomux",
+                "recommended core experience installed and enabled",
+            );
+            detail("Reload the shell if the plugin was installed after Omarchy Shell started.");
+            (
+                true,
+                confirm("Restart Omarchy Shell and reload omarchy-boomux?")?,
+            )
+        }
+        Some(_) => {
+            status(
+                "!!",
+                "33",
+                "omarchy-boomux",
+                "recommended core experience is disabled",
+            );
+            detail("Enabling the plugin also restarts Omarchy Shell so it is loaded.");
+            if confirm("Enable and load the recommended omarchy-boomux plugin?")? {
+                run_command(
+                    &omarchy,
+                    &["plugin", "enable", OMARCHY_PLUGIN_ID],
+                    COMMAND_TIMEOUT,
+                )?;
+                status("ok", "32", "omarchy-boomux", "enabled");
+                (true, true)
+            } else {
+                (false, false)
+            }
+        }
+        None => {
+            status(
+                "->",
+                "36",
+                "omarchy-boomux",
+                "recommended core Omarchy experience",
+            );
+            detail("Keep Workspaces, Shells, Agents, and Nodes available in a persistent pane.");
+            detail("Plugins run as unsandboxed code inside the Omarchy shell.");
+            detail(format!("Source: {OMARCHY_PLUGIN_URL}"));
+            detail("Installation also restarts Omarchy Shell so the plugin is loaded.");
+            if confirm("Install, enable, and load the recommended omarchy-boomux plugin?")? {
+                run_command(
+                    &omarchy,
+                    &["plugin", "add", OMARCHY_PLUGIN_URL, "--enable", "--yes"],
+                    PLUGIN_INSTALL_TIMEOUT,
+                )?;
                 status("ok", "32", "omarchy-boomux", "installed and enabled");
-                detail("Reload the shell if the plugin was installed after Omarchy Shell started.");
-                (
-                    true,
-                    confirm("Restart Omarchy Shell and reload omarchy-boomux?")?,
-                )
+                (true, true)
+            } else {
+                (false, false)
             }
-            Some(_) => {
-                status("!!", "33", "omarchy-boomux", "installed but disabled");
-                detail("Enabling the plugin also restarts Omarchy Shell so it is loaded.");
-                if confirm("Enable and load omarchy-boomux?")? {
-                    run_command(
-                        &omarchy,
-                        &["plugin", "enable", OMARCHY_PLUGIN_ID],
-                        COMMAND_TIMEOUT,
-                    )?;
-                    status("ok", "32", "omarchy-boomux", "enabled");
-                    (true, true)
-                } else {
-                    (false, false)
-                }
-            }
-            None => {
-                status("->", "36", "omarchy-boomux", "not installed");
-                detail("Plugins run as unsandboxed code inside the Omarchy shell.");
-                detail(format!("Source: {OMARCHY_PLUGIN_URL}"));
-                detail("Installation also restarts Omarchy Shell so the plugin is loaded.");
-                if confirm("Install, enable, and load omarchy-boomux?")? {
-                    run_command(
-                        &omarchy,
-                        &["plugin", "add", OMARCHY_PLUGIN_URL, "--enable", "--yes"],
-                        PLUGIN_INSTALL_TIMEOUT,
-                    )?;
-                    status("ok", "32", "omarchy-boomux", "installed and enabled");
-                    (true, true)
-                } else {
-                    (false, false)
-                }
-            }
-        };
+        }
+    };
     if plugin_changed {
         run_command(&omarchy, &["restart", "shell"], PLUGIN_INSTALL_TIMEOUT)?;
         status("ok", "32", "Omarchy Shell", "restarted with plugin loaded");
@@ -467,6 +485,8 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
         status("--", "2", "Keybindings", "skipped; plugin is not enabled");
         return Ok(());
     }
+
+    setup_hyprland_workspace_layer()?;
 
     let plan = bindings_plan()?;
     if !plan.changed {
@@ -567,6 +587,32 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
     if hyprland_active {
         status("ok", "32", "Hyprland config", "reloaded without errors");
     }
+    Ok(())
+}
+
+fn setup_hyprland_workspace_layer() -> Result<(), Box<dyn Error>> {
+    if crate::config::load()?.desktop.workspace_layer
+        == crate::config::DesktopWorkspaceLayer::HyprlandSpecial
+    {
+        status("ok", "32", "Workspace layer", "enabled");
+        return Ok(());
+    }
+
+    status(
+        "->",
+        "36",
+        "Workspace layer",
+        "recommended for the core Omarchy experience",
+    );
+    detail("Present coordinated Boomux Workspaces as named Hyprland special Workspaces.");
+    if !confirm("Enable the recommended Hyprland Workspace layer?")? {
+        status("--", "2", "Workspace layer", "kept disabled");
+        return Ok(());
+    }
+
+    let path = crate::config::enable_hyprland_workspace_layer()?;
+    status("ok", "32", "Workspace layer", "enabled");
+    detail(format!("config: {}", path.display()));
     Ok(())
 }
 

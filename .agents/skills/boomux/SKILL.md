@@ -432,8 +432,10 @@ are not retained.
 
 ## Create And Enter Workspaces
 
-The local Hyprland special-Workspace layer defaults on. These human-only
-commands are suitable for desktop keybindings:
+The local Hyprland special-Workspace layer defaults off. `boomux setup` offers
+to enable it as part of the recommended Omarchy plugin experience; otherwise set
+`desktop.workspace_layer = "hyprland-special"` explicitly. These human-only
+commands are suitable for desktop keybindings when the layer is enabled:
 
 ```console
 boomux desktop toggle
