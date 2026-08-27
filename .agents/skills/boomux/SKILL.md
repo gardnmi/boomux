@@ -505,7 +505,7 @@ boomux doctor
 `BOOMUX_SHELL_ID` is set. Bare `boomux` prints command help. `boomux doctor` can
 run in either context.
 
-`boomux web` serves an experimental read-only Agent PWA on
+`boomux web` serves an installable Agent dashboard on
 `127.0.0.1:3737`. Use `--port` to change the loopback port. `--tailscale` is an
 explicit mutation that publishes the dashboard and enabled OpenCode runtime
 through a connected PATH-resolved Tailscale CLI. It reuses compatible routes,
@@ -527,7 +527,9 @@ Conflicts and failures from an installed runtime remain fatal.
 an unrelated server. `--no-opencode-web` disables web-triggered runtime startup
 and native links. Boomux does not proxy or authenticate that full-control
 service. The private access layer owns TLS, authentication, and ACLs. Remote
-Agents remain unlinked.
+Agents remain unlinked. Current local Agent cards can authorize short-lived
+collaborative access to their exact active terminal; this is writable shell
+access, while the native terminal remains resize authority.
 Stop only the default gateway with `boomux web stop`, or an alternate gateway
 with `boomux web stop --port PORT`. This leaves the daemon, managed processes,
 and Shared Harness Runtime running. The command is safe when no matching gateway

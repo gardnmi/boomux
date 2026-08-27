@@ -61,8 +61,11 @@ controls and safety behavior. For CLI-only creation, continue to
 
 ### Requirements
 
-- A Unix-like system with an absolute `XDG_RUNTIME_DIR`. Official binaries are
-  available only for x86_64 and aarch64 GNU/Linux.
+- Current Omarchy is the supported desktop environment. Official x86_64 release
+  binaries are compatibility-tested on a pinned Arch Linux baseline selected for
+  Omarchy. Official binaries are also built for aarch64 GNU/Linux; other Linux
+  desktop environments are best-effort when the requirements below are present.
+- An absolute `XDG_RUNTIME_DIR`.
 - `xdg-terminal-exec` and an available terminal desktop entry.
 
 Git is optional for core session persistence; without it, repository metadata is
@@ -435,12 +438,13 @@ versions, downgrade behavior, and protocol history.
 - Boomux does not preserve a terminal emulator's tabs, panes, or window layout.
 - Shells are not containers; they retain the privileges of their owner account.
 - Browser terminal control is limited to exact current local Agent runs.
-- Official releases currently target x86_64 and aarch64 GNU/Linux desktop
-  sessions.
+- Current Omarchy is the supported desktop environment. Other GNU/Linux desktop
+  environments are best-effort; official binaries target x86_64 and aarch64.
 
 ## Further Documentation
 
 - [Architecture](docs/architecture.md)
+- [Security Policy](SECURITY.md)
 - [CLI JSON contract](docs/cli-json.md)
 - [Local Update](docs/local-update.md)
 - [Uninstall](docs/uninstall.md)
@@ -458,10 +462,14 @@ Run the core repository checks:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --lib --bins --locked -- --test-threads=1
+cargo test --test config_cli --locked -- --test-threads=1
 cargo test --test native_backend --locked -- --test-threads=1
+cargo deny check
 bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
 ```
 
 ## License
 
-Boomux is licensed under the [MIT License](LICENSE).
+Boomux is licensed under the [MIT License](LICENSE). Resolved Rust dependencies
+are checked against the repository's [license and advisory policy](deny.toml);
+notices for embedded web assets are in [Third-Party Notices](THIRD_PARTY_NOTICES.md).

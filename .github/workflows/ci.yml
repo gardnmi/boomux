@@ -35,8 +35,21 @@ jobs:
       - name: Run Rust unit tests
         run: cargo test --lib --bins --locked -- --test-threads=1
 
+      - name: Run configuration CLI tests
+        run: cargo test --test config_cli --locked -- --test-threads=1
+
       - name: Run native backend tests
         run: cargo test --test native_backend --locked -- --test-threads=1
+
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Audit advisories, licenses, and dependency sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   integrations:
     name: Integrations
@@ -94,6 +107,14 @@ jobs:
       - name: Package and smoke test native release
         run: bash .github/scripts/package-release.sh "$TAG" "$TARGET"
 
+      - name: Retain package for compatibility testing
+        if: ${{ matrix.arch == 'x86_64' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compatibility-${{ matrix.target }}
+          path: dist/boomux-${{ env.TAG }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
       - name: Validate release scripts
         if: ${{ matrix.arch == 'x86_64' }}
         run: |
@@ -132,3 +153,24 @@ jobs:
             packaging/aur/validate-pkgbuild.sh "$tmp/first"
             rm -rf "$tmp"
           ' _ "$GITHUB_WORKSPACE"
+
+  arch-compatibility:
+    name: Pinned Arch compatibility
+    needs: release-packaging
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel@sha256:68bfc3b0d277b08a99101dc9b94aaa03e5ae70cf1b4fb965c03b2b87b915760d
+    steps:
+      - name: Download x86_64 release package
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: compatibility-x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Smoke test Ubuntu-built binary on pinned Arch
+        run: |
+          archive=$(printf '%s\n' dist/boomux-v*-x86_64-unknown-linux-gnu.tar.gz)
+          package=${archive%.tar.gz}
+          package=${package#dist/}
+          tar -C dist -xzf "$archive"
+          dist/"$package"/boomux --version
+          dist/"$package"/boomux capabilities --json >/dev/null

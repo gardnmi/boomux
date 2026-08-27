@@ -75,10 +75,11 @@ feature from the daemon.
 
 ### Accepted Remote Node Compatibility
 
-Remote Node federation is an incremental extension tracked by #173. Protocol 31
-advertises registration management explicitly; clients must not infer support
-from a CLI or daemon version string. Registration commands manage local routes
-only and do not imply projected reads or routed resource mutation.
+Remote Node federation was delivered incrementally under #173. Protocol 31
+advertises registration management explicitly; clients must not infer individual
+capabilities from a CLI or daemon version string. Registration commands manage
+local routes only; later protocol capabilities separately advertise projected
+reads and routed resource mutation.
 
 Protocol 33 advertises the separately named `node.snapshot` combined read. It
 contacts only the local daemon and returns qualified local plus bounded cached

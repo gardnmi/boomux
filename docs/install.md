@@ -26,6 +26,11 @@ current-user-owned directories that are not group/world-writable; missing local
 directories are created owner-only. The sole destination is
 `~/.local/bin/boomux`.
 
+Platform acceptance is separate from desktop support. Current Omarchy is the
+supported desktop environment, and the official x86_64 binary is smoke-tested
+on the repository's pinned Arch Linux compatibility baseline. Other Linux
+desktop environments and the aarch64 binary are best-effort.
+
 An existing file or symbolic link at that destination is never replaced, even
 if it appears while the installer is running. The operator must use `boomux
 update`, the owning package manager, or the workflow that owns a source or
