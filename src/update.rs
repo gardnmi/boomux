@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 use boomux::{client, ssh_bootstrap};
 
+use crate::setup;
+
 const DISTRIBUTION: Option<&str> = option_env!("BOOMUX_DISTRIBUTION");
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SMOKE_OUTPUT_BYTES: usize = 4096;
@@ -142,7 +144,21 @@ pub(crate) fn guided_update() -> Result<(), Box<dyn std::error::Error>> {
             io::Error::new(io::ErrorKind::PermissionDenied, refusal_message(status)).into(),
         );
     }
-    print!("Download, verify, and install this release? [y/N] ");
+    let omarchy_plugin = match setup::installed_omarchy_plugin() {
+        Ok(plugin) => plugin,
+        Err(error) => {
+            eprintln!(
+                "Warning: omarchy-boomux could not be inspected and will not be updated: {error}"
+            );
+            None
+        }
+    };
+    let prompt = if omarchy_plugin.is_some() {
+        "Download, verify, and install this release, then update the installed omarchy-boomux plugin? [y/N] "
+    } else {
+        "Download, verify, and install this release? [y/N] "
+    };
+    print!("{prompt}");
     io::stdout().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -188,6 +204,43 @@ pub(crate) fn guided_update() -> Result<(), Box<dyn std::error::Error>> {
             || recover_daemon_after_rollback(&daemon),
         )?;
         println!("Updated Boomux to {latest}");
+        if let Some(omarchy) = omarchy_plugin.as_deref() {
+            match setup::update_omarchy_plugin(omarchy) {
+                Ok(setup::OmarchyPluginUpdateOutcome::NotInstalled) => {
+                    println!(
+                        "Skipped omarchy-boomux plugin update because it is no longer installed"
+                    )
+                }
+                Ok(setup::OmarchyPluginUpdateOutcome::Updated) => {
+                    println!("Updated omarchy-boomux plugin")
+                }
+                Ok(setup::OmarchyPluginUpdateOutcome::UpdatedAndReloaded) => {
+                    println!("Updated omarchy-boomux plugin and restarted Omarchy Shell")
+                }
+                Ok(setup::OmarchyPluginUpdateOutcome::UpdateOutcomeUnknown(error)) => {
+                    return Err(io::Error::other(format!(
+                        "Boomux was updated to {latest}, but the omarchy-boomux update outcome is unknown and Omarchy Shell was not restarted: {error}"
+                    )));
+                }
+                Ok(setup::OmarchyPluginUpdateOutcome::UpdatedButReloadStateUnknown(error)) => {
+                    println!("Updated omarchy-boomux plugin");
+                    return Err(io::Error::other(format!(
+                        "Boomux and omarchy-boomux were updated, but the plugin's enabled state could not be rechecked and Omarchy Shell was not restarted: {error}"
+                    )));
+                }
+                Ok(setup::OmarchyPluginUpdateOutcome::UpdatedButReloadFailed(error)) => {
+                    println!("Updated omarchy-boomux plugin");
+                    return Err(io::Error::other(format!(
+                        "Boomux and omarchy-boomux were updated, but Omarchy Shell could not be restarted: {error}"
+                    )));
+                }
+                Err(error) => {
+                    return Err(io::Error::other(format!(
+                        "Boomux was updated to {latest}, but omarchy-boomux could not be inspected before its update: {error}"
+                    )));
+                }
+            }
+        }
         Ok(())
     })();
     if result.is_err() {

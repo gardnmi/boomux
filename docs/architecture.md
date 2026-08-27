@@ -35,7 +35,7 @@
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
-| `src/setup.rs` | Interactive local setup orchestration, Omarchy plugin discovery, and ownership-bounded Hyprland binding installation |
+| `src/setup.rs` | Interactive local setup orchestration, Omarchy plugin discovery and lifecycle operations, and ownership-bounded Hyprland binding installation |
 | `src/update.rs` | Local release discovery, installation classification, interactive self-update authorization, atomic executable replacement, and daemon handoff verification |
 | `src/uninstall.rs` | Interactive release uninstall orchestration, owned-asset cleanup, bounded purge validation, and process shutdown ordering |
 | `src/claude_hooks.rs`, `src/codex_hooks.rs`, `src/kiro_hooks.rs` | Bounded Claude Code, Codex, and Kiro hook decoding and lifecycle reduction |
@@ -956,6 +956,10 @@ plugin lifecycle ownership. A Cargo-private executable without a corresponding
 absent from the graphical session's `PATH`. After installing or enabling the
 plugin, setup runs bounded `omarchy restart shell` so the running shell loads it.
 Reruns offer the same reload for an already-enabled but potentially stale plugin.
+After a guided local Boomux update commits, the updater revalidates an installed
+companion plugin, delegates its update to the fixed exact-argument Omarchy CLI,
+and restarts Omarchy Shell when the plugin is enabled. Omarchy remains the plugin
+lifecycle owner, and plugin failure cannot roll back the committed executable.
 Boomux never edits `/usr/share/omarchy`. The full
 desktop binding profile is one marked block in the current user's
 `~/.config/hypr/bindings.lua`. Setup reports conflicts before consent, preserves

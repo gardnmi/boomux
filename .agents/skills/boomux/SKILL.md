@@ -787,12 +787,15 @@ versions, target, release URL, and recommended action. It is passive but perform
 a bounded network request to the fixed Boomux GitHub release endpoint.
 
 Use `boomux update` only after the user explicitly authorizes local executable
-replacement and graceful daemon restart. It is interactive and human-only. It
-can replace only an official release binary at `~/.local/bin/boomux`; AUR/pacman,
-source, development, root-owned, custom, and unknown installations must be
-updated through their owning installation method. It never downgrades, never
-updates remote Nodes, and leaves a stopped daemon stopped. Remote helpers remain
-under `boomux node upgrade`.
+replacement, graceful daemon restart, and the named companion-plugin update when
+the Omarchy plugin is installed. It is interactive and human-only. It can replace
+only an official release binary at `~/.local/bin/boomux`; AUR/pacman, source,
+development, root-owned, custom, and unknown installations must be updated
+through their owning installation method. After the executable update commits,
+it delegates an installed `io.github.gardnmi.boomux` update to Omarchy and reloads
+the shell when that plugin is enabled. It never downgrades, never updates remote
+Nodes, and leaves a stopped daemon stopped. Remote helpers remain under
+`boomux node upgrade`.
 
 Remove an official canonical local release installation with:
 
