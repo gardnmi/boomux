@@ -123,11 +123,6 @@ and reloading it when enabled. Other installation types must be updated through
 their original installer. Boomux never silently downgrades or enables automatic
 updates.
 
-> [!CAUTION]
-> Upgrading from v0.32 to v1.x crosses an incompatible protocol and state
-> boundary. It requires a cold upgrade that terminates managed processes. Follow
-> the exact [local update procedure](docs/local-update.md#protocol-47-alpha-break).
-
 Prefer `daemon restart` over `daemon stop`: stopping the daemon terminates every
 managed process. Upgrade registered remote Nodes separately with
 `boomux node upgrade NODE`.
