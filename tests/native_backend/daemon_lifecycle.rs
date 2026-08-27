@@ -71,6 +71,7 @@ fn native_daemon_lifecycle() {
     for command in [
         "events",
         "project.list",
+        "workspace.create",
         "node.snapshot",
         "agent.register",
         "agent.ensure",
@@ -147,6 +148,7 @@ fn native_daemon_lifecycle() {
         "exact_run_attachment",
         "stable_node_identity",
         "workspace_default_cwd",
+        "atomic_workspace_shell_creation",
         "structured_terminal_previews",
         "focused_terminal_read",
         "focused_terminal_following",
@@ -192,7 +194,7 @@ fn native_daemon_lifecycle() {
     .unwrap();
     let response: protocol::Envelope<protocol::Response> =
         protocol::read_message(&mut protocol_forty_six).unwrap();
-    assert_eq!(response.version, 48);
+    assert_eq!(response.version, protocol::PROTOCOL_VERSION);
     assert!(matches!(
         response.message,
         protocol::Response::Error {

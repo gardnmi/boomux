@@ -32,8 +32,8 @@ use crate::desktop_notifications::{
 };
 use crate::fd_transfer::send_descriptor;
 use crate::global_workspace_store::{
-    GlobalWorkspaceStore, PendingResourceKind, PendingWorkspaceResource, PreparedWorkspaceResource,
-    PreparedWorkspaceShell,
+    GlobalWorkspaceStore, PendingResourceKind, PendingWorkspaceResource,
+    PreparedDefaultCwdOperation, PreparedWorkspaceResource, PreparedWorkspaceShell,
 };
 use crate::handoff;
 use crate::host_services::{self, PreparedIntegrationMutation};
@@ -2302,6 +2302,16 @@ fn response_for_version(response: Response, version: u32) -> Response {
             _ => {}
         }
     }
+    if !protocol::ProtocolFeature::WorkspacePlacementDefaultCwd.is_supported_by(version)
+        && let Response::Events { events, .. } = &mut response
+    {
+        events.retain(|event| {
+            !matches!(
+                event.kind,
+                DaemonEventKind::WorkspaceDefaultCwdChanged { .. }
+            )
+        });
+    }
     if !protocol::ProtocolFeature::NodeProjectionSync.is_supported_by(version)
         && let Response::Events { events, .. } = &mut response
     {
@@ -2603,6 +2613,17 @@ fn routed_result(response: Response) -> Result<RoutedOperationResult, Box<Respon
 fn routed_postcondition(operation: &RoutedOperation, response: &Response) -> bool {
     match (operation, response) {
         (
+            RoutedOperation::SetWorkspaceDefaultCwd {
+                default_cwd,
+                expected_revision,
+                ..
+            },
+            Response::Workspace { workspace },
+        ) => {
+            workspace.default_cwd.as_ref() == Some(default_cwd)
+                && workspace.revision >= *expected_revision
+        }
+        (
             RoutedOperation::RenameWorkspace {
                 name,
                 expected_revision,
@@ -2685,6 +2706,22 @@ fn send_registered_node_request_with_timeout(
     response_timeout: Duration,
     route_feature: Option<protocol::ProtocolFeature>,
 ) -> io::Result<Response> {
+    send_registered_node_request_with_timeout_after_handshake(
+        registration,
+        request,
+        response_timeout,
+        route_feature,
+        &mut || Ok(()),
+    )
+}
+
+fn send_registered_node_request_with_timeout_after_handshake(
+    registration: &crate::protocol::NodeRegistrationSnapshot,
+    request: Request,
+    response_timeout: Duration,
+    route_feature: Option<protocol::ProtocolFeature>,
+    before_request: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<Response> {
     let target = SshTarget::parse(registration.target.clone())?;
     let mut bootstrap = ssh_bootstrap::BootstrapSession::open(
         target,
@@ -2706,16 +2743,29 @@ fn send_registered_node_request_with_timeout(
             "remote Node identity changed",
         ));
     }
-    if let Some(feature) = route_feature.or_else(|| request.required_feature())
-        && !feature.is_supported_by(helper.handshake.core_protocol_version)
+    prepare_supported_owner_request(
+        helper.handshake.core_protocol_version,
+        route_feature.or_else(|| request.required_feature()),
+        before_request,
+    )?;
+    let mut remote = bootstrap.connect(helper, Duration::from_secs(2))?;
+    remote.request(request, response_timeout)
+}
+
+fn prepare_supported_owner_request(
+    protocol_version: u32,
+    feature: Option<protocol::ProtocolFeature>,
+    before_request: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    if let Some(feature) = feature
+        && !feature.is_supported_by(protocol_version)
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("remote Node does not support {}", feature.requirement()),
         ));
     }
-    let mut remote = bootstrap.connect(helper, Duration::from_secs(2))?;
-    remote.request(request, response_timeout)
+    before_request()
 }
 
 fn routed_response_timeout(operation: &RoutedOperation) -> Duration {
@@ -2724,6 +2774,9 @@ fn routed_response_timeout(operation: &RoutedOperation) -> Duration {
 }
 
 fn routed_owner_feature(operation: &RoutedOperation) -> Option<protocol::ProtocolFeature> {
+    if matches!(operation, RoutedOperation::SetWorkspaceDefaultCwd { .. }) {
+        return Some(protocol::ProtocolFeature::WorkspacePlacementDefaultCwd);
+    }
     if matches!(
         operation,
         RoutedOperation::CreateWorkspaceShell { .. }
@@ -2743,6 +2796,13 @@ fn require_guard(actual: u64, expected: u64, resource: &str) -> DaemonResult<()>
             format!("{resource} revision is {actual}; guarded operation supplied {expected}"),
         ))
     }
+}
+
+fn default_cwd_owner_error_is_ambiguous(code: Option<ErrorCode>) -> bool {
+    matches!(
+        code,
+        Some(ErrorCode::OutcomeUnknown | ErrorCode::PersistenceFailed | ErrorCode::Timeout)
+    )
 }
 
 fn request_fingerprint(value: &impl Serialize) -> DaemonResult<String> {
@@ -3494,6 +3554,11 @@ enum DurableUndo {
         previous: String,
         previous_revision: u64,
     },
+    SetWorkspaceDefaultCwd {
+        workspace: Arc<Workspace>,
+        previous: Option<PathBuf>,
+        previous_revision: u64,
+    },
     RenamedShell {
         shell: Arc<Shell>,
         previous: String,
@@ -4074,6 +4139,7 @@ fn reduce_projection_transition(event: &DaemonEvent) -> Option<NodeProjectionTra
     let kind = match &event.kind {
         DaemonEventKind::WorkspaceCreated { workspace_id, .. }
         | DaemonEventKind::WorkspaceRenamed { workspace_id, .. }
+        | DaemonEventKind::WorkspaceDefaultCwdChanged { workspace_id, .. }
         | DaemonEventKind::WorkspaceClosed { workspace_id } => {
             NodeProjectionTransitionKind::Workspace {
                 workspace_id: workspace_id.clone(),
@@ -4314,7 +4380,7 @@ impl DurableRegistry {
             id: workspace_id.clone(),
             revision: Mutex::new(1),
             name: Mutex::new(name.clone()),
-            default_cwd,
+            default_cwd: Mutex::new(default_cwd),
             shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
             launcher_ids: Mutex::new(Vec::new()),
             agent_ids: Mutex::new(Vec::new()),
@@ -4323,7 +4389,7 @@ impl DurableRegistry {
             id: workspace_id.clone(),
             revision: 1,
             name: name.clone(),
-            default_cwd: workspace.default_cwd.clone(),
+            default_cwd: lock(&workspace.default_cwd)?.clone(),
             shells: shells
                 .iter()
                 .map(|shell| shell.snapshot())
@@ -4379,7 +4445,7 @@ impl DurableRegistry {
             id: workspace_id.to_owned(),
             revision: Mutex::new(1),
             name: Mutex::new(name.clone()),
-            default_cwd: default_cwd.clone(),
+            default_cwd: Mutex::new(default_cwd.clone()),
             shell_ids: Mutex::new(Vec::new()),
             launcher_ids: Mutex::new(Vec::new()),
             agent_ids: Mutex::new(Vec::new()),
@@ -4839,6 +4905,32 @@ impl DurableRegistry {
         }))
     }
 
+    fn set_workspace_default_cwd(
+        &self,
+        workspace_id: &str,
+        default_cwd: PathBuf,
+    ) -> io::Result<Option<DurableUndo>> {
+        validate_cwd(&default_cwd)?;
+        let workspace = self.workspace(workspace_id)?;
+        let mut revision = lock(&workspace.revision)?;
+        let mut current = lock(&workspace.default_cwd)?;
+        if current.as_ref() == Some(&default_cwd) {
+            return Ok(None);
+        }
+        let previous_revision = *revision;
+        *revision = revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("workspace revision exhausted"))?;
+        let previous = current.replace(default_cwd);
+        drop(current);
+        drop(revision);
+        Ok(Some(DurableUndo::SetWorkspaceDefaultCwd {
+            workspace,
+            previous,
+            previous_revision,
+        }))
+    }
+
     fn register_agent(
         &self,
         shell_id: &str,
@@ -5152,6 +5244,14 @@ impl DurableRegistry {
                 *lock(&workspace.name)? = previous;
                 *lock(&workspace.revision)? = previous_revision;
             }
+            DurableUndo::SetWorkspaceDefaultCwd {
+                workspace,
+                previous,
+                previous_revision,
+            } => {
+                *lock(&workspace.default_cwd)? = previous;
+                *lock(&workspace.revision)? = previous_revision;
+            }
             DurableUndo::RenamedShell {
                 shell,
                 previous,
@@ -5309,6 +5409,8 @@ impl DurableRegistry {
         workspaces.sort_by(|left, right| left.id.cmp(&right.id));
         let mut saved = PersistedState::default();
         for workspace in workspaces {
+            let (workspace_revision, workspace_default_cwd) =
+                workspace.revision_and_default_cwd()?;
             let ids = lock(&workspace.shell_ids)?.clone();
             let mut shells = Vec::with_capacity(ids.len());
             for id in ids {
@@ -5348,9 +5450,9 @@ impl DurableRegistry {
             }
             saved.workspaces.push(PersistedWorkspace {
                 id: workspace.id.clone(),
-                revision: *lock(&workspace.revision)?,
+                revision: workspace_revision,
                 name: lock(&workspace.name)?.clone(),
-                default_cwd: workspace.default_cwd.clone(),
+                default_cwd: workspace_default_cwd,
                 shells,
                 launchers,
                 agents,
@@ -6227,7 +6329,7 @@ struct Workspace {
     id: String,
     revision: Mutex<u64>,
     name: Mutex<String>,
-    default_cwd: Option<PathBuf>,
+    default_cwd: Mutex<Option<PathBuf>>,
     shell_ids: Mutex<Vec<String>>,
     launcher_ids: Mutex<Vec<String>>,
     agent_ids: Mutex<Vec<String>>,
@@ -8076,6 +8178,15 @@ impl DaemonService {
     }
 
     fn route_node_operation(&self, node_id: &str, operation: RoutedOperation) -> Response {
+        self.route_node_operation_after_handshake(node_id, operation, &mut || Ok(()))
+    }
+
+    fn route_node_operation_after_handshake(
+        &self,
+        node_id: &str,
+        operation: RoutedOperation,
+        before_request: &mut dyn FnMut() -> io::Result<()>,
+    ) -> Response {
         let registrations = match self.node_registrations() {
             Ok(registrations) => registrations,
             Err(error) => return error.into_response(),
@@ -8099,18 +8210,20 @@ impl DaemonService {
         }
         let response_timeout = routed_response_timeout(&operation);
         let owner_feature = routed_owner_feature(&operation);
-        let mut result = send_registered_node_request_with_timeout(
+        let mut result = send_registered_node_request_with_timeout_after_handshake(
             &registration,
             operation.owner_request(),
             response_timeout,
             owner_feature,
+            before_request,
         );
         if result.is_err() && operation.is_retryable() {
-            result = send_registered_node_request_with_timeout(
+            result = send_registered_node_request_with_timeout_after_handshake(
                 &registration,
                 operation.owner_request(),
                 response_timeout,
                 owner_feature,
+                before_request,
             );
         }
         let proven = if result.is_err() && !operation.is_retryable() {
@@ -8537,6 +8650,20 @@ impl DaemonService {
     fn preflight_workspace_owner(&self, node_id: &str) -> DaemonResult<()> {
         self.require_cached_workspace_owner_eligible(node_id)?;
         self.with_live_workspace_node(node_id, |_| Ok(()))
+    }
+
+    fn preflight_remote_workspace_feature(
+        &self,
+        node_id: &str,
+        feature: protocol::ProtocolFeature,
+    ) -> DaemonResult<()> {
+        let local_node_id = self.node_identity()?.id()?;
+        if node_id == local_node_id {
+            return Ok(());
+        }
+        self.with_live_workspace_node(node_id, |node| {
+            require_capabilities_support_feature(&node.observed_capabilities, feature)
+        })
     }
 
     fn require_cached_workspace_owner_eligible(&self, node_id: &str) -> DaemonResult<()> {
@@ -9127,6 +9254,202 @@ impl DaemonService {
                 eprintln!(
                     "boomux: prepared Workspace resource {} remains unresolved: {error}",
                     pending.operation_id
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_global_workspace_default_cwd(
+        &self,
+        operation_id: &str,
+        global_workspace_id: &str,
+        expected_global_revision: u64,
+        node_id: &str,
+        owner_workspace_id: &str,
+        expected_owner_revision: u64,
+        default_cwd: PathBuf,
+    ) -> DaemonResult<protocol::WorkspaceDefaultCwdResult> {
+        self.with_workspace_operation_lock(operation_id, || {
+            let requested_default_cwd = default_cwd.clone();
+            if let Some(result) = self
+                .global_workspaces()?
+                .completed_default_cwd(
+                    operation_id,
+                    global_workspace_id,
+                    expected_global_revision,
+                    node_id,
+                    owner_workspace_id,
+                    expected_owner_revision,
+                    &requested_default_cwd,
+                )
+                .map_err(global_workspace_error)?
+            {
+                return Ok(result);
+            }
+            let local_node_id = self.node_identity()?.id()?;
+            self.preflight_remote_workspace_feature(
+                node_id,
+                protocol::ProtocolFeature::WorkspacePlacementDefaultCwd,
+            )?;
+            let default_cwd = if node_id == local_node_id {
+                host_services::resolve_directory(&default_cwd).map_err(DaemonError::from)?
+            } else {
+                match self.route_node_host_service(
+                    node_id,
+                    HostServiceOperation::ResolveDirectory { path: default_cwd },
+                ) {
+                    Response::HostService {
+                        result: HostServiceResult::Directory { path },
+                    } => path,
+                    Response::Error { message, code } => {
+                        return Err(DaemonError::lifecycle(
+                            code.unwrap_or(ErrorCode::Internal),
+                            message,
+                        ));
+                    }
+                    _ => {
+                        return Err(DaemonError::lifecycle(
+                            ErrorCode::Internal,
+                            "owner returned an unexpected directory response",
+                        ));
+                    }
+                }
+            };
+            let prepared = self
+                .global_workspaces()?
+                .prepare_default_cwd(
+                    operation_id,
+                    global_workspace_id,
+                    expected_global_revision,
+                    node_id,
+                    owner_workspace_id,
+                    expected_owner_revision,
+                    requested_default_cwd,
+                    default_cwd.clone(),
+                )
+                .map_err(global_workspace_error)?;
+            let mut pending = match prepared {
+                PreparedDefaultCwdOperation::Completed(result) => return Ok(result),
+                PreparedDefaultCwdOperation::Pending(pending) => pending,
+            };
+            let owner_identity = protocol::QualifiedIdentity::new(node_id, owner_workspace_id);
+            let owner = self.owner_workspace(&owner_identity)?;
+            if pending.owner_attempted
+                && owner.default_cwd.as_ref() == Some(&pending.default_cwd)
+                && matches!(
+                    owner.revision.checked_sub(pending.expected_owner_revision),
+                    Some(0 | 1)
+                )
+            {
+                return self
+                    .global_workspaces()?
+                    .complete_default_cwd(&pending, &owner)
+                    .map_err(global_workspace_error);
+            }
+            if owner.revision != expected_owner_revision {
+                self.global_workspaces()?
+                    .cancel_default_cwd(&pending)
+                    .map_err(global_workspace_error)?;
+                require_guard(owner.revision, expected_owner_revision, "owner Workspace")?;
+            }
+            let operation = RoutedOperation::SetWorkspaceDefaultCwd {
+                workspace_id: pending.owner_workspace_id.clone(),
+                expected_revision: pending.expected_owner_revision,
+                default_cwd: pending.default_cwd.clone(),
+            };
+            let response = if pending.node_id == local_node_id {
+                pending = self
+                    .global_workspaces()?
+                    .mark_default_cwd_owner_attempted(&pending)
+                    .map_err(global_workspace_error)?;
+                self.dispatch(operation.owner_request())
+                    .unwrap_or_else(DaemonError::into_response)
+            } else {
+                let store = self.global_workspaces()?;
+                let pending_node_id = pending.node_id.clone();
+                let mut mark_attempted = || {
+                    pending = store.mark_default_cwd_owner_attempted(&pending)?;
+                    Ok(())
+                };
+                self.route_node_operation_after_handshake(
+                    &pending_node_id,
+                    operation,
+                    &mut mark_attempted,
+                )
+            };
+            let owner = match response {
+                Response::Workspace { workspace } => workspace,
+                Response::RoutedNodeOperation {
+                    result: RoutedOperationResult::Workspace { workspace },
+                } => workspace,
+                Response::Error { message, code } => {
+                    if !default_cwd_owner_error_is_ambiguous(code) {
+                        self.global_workspaces()?
+                            .cancel_default_cwd(&pending)
+                            .map_err(global_workspace_error)?;
+                    } else if !pending.owner_attempted {
+                        self.global_workspaces()?
+                            .cancel_default_cwd_if_never_attempted(&pending)
+                            .map_err(global_workspace_error)?;
+                    }
+                    return Err(DaemonError::lifecycle(
+                        code.unwrap_or(ErrorCode::Internal),
+                        message,
+                    ));
+                }
+                _ => {
+                    return Err(DaemonError::lifecycle(
+                        ErrorCode::Internal,
+                        "owner returned an unexpected Workspace response",
+                    ));
+                }
+            };
+            self.global_workspaces()?
+                .complete_default_cwd(&pending, &owner)
+                .map_err(global_workspace_error)
+        })
+    }
+
+    fn reconcile_pending_default_cwds(&self) {
+        let pending = match self.global_workspaces().and_then(|store| {
+            store
+                .pending_default_cwd_operations()
+                .map_err(global_workspace_error)
+        }) {
+            Ok(pending) => pending,
+            Err(_) => return,
+        };
+        for operation in pending {
+            let recovered = self.with_workspace_operation_lock(&operation.operation_id, || {
+                if !operation.owner_attempted {
+                    self.global_workspaces()?
+                        .cancel_default_cwd_if_never_attempted(&operation)
+                        .map_err(global_workspace_error)?;
+                    return Ok(());
+                }
+                let owner = self.owner_workspace(&protocol::QualifiedIdentity::new(
+                    &operation.node_id,
+                    &operation.owner_workspace_id,
+                ))?;
+                if owner.default_cwd.as_ref() == Some(&operation.default_cwd)
+                    && matches!(
+                        owner
+                            .revision
+                            .checked_sub(operation.expected_owner_revision),
+                        Some(0 | 1)
+                    )
+                {
+                    self.global_workspaces()?
+                        .complete_default_cwd(&operation, &owner)
+                        .map_err(global_workspace_error)?;
+                }
+                Ok::<(), DaemonError>(())
+            });
+            if let Err(error) = recovered {
+                eprintln!(
+                    "boomux: prepared Workspace default cwd operation {} remains unresolved: {error}",
+                    operation.operation_id
                 );
             }
         }
@@ -10432,7 +10755,12 @@ impl DaemonService {
             if matches!(&request, Request::GetCombinedNodeSnapshot { .. }) {
                 self.global_workspaces
                     .as_ref()
-                    .map(|store| store.pending_resources().map(|pending| !pending.is_empty()))
+                    .map(|store| {
+                        Ok::<_, io::Error>(
+                            !store.pending_resources()?.is_empty()
+                                || !store.pending_default_cwd_operations()?.is_empty(),
+                        )
+                    })
                     .transpose()
                     .map_err(global_workspace_error)?
                     .unwrap_or(false)
@@ -10608,6 +10936,7 @@ impl DaemonService {
             Request::GetCombinedNodeSnapshot { selector } => {
                 if reconcile_combined_snapshot {
                     self.reconcile_pending_workspace_resources();
+                    self.reconcile_pending_default_cwds();
                 }
                 Ok(Response::CombinedNodeSnapshot {
                     snapshot: self.combined_node_snapshot(selector.as_deref())?,
@@ -10901,6 +11230,25 @@ impl DaemonService {
                     resource,
                 })
             }
+            Request::SetGlobalWorkspaceDefaultCwd {
+                operation_id,
+                global_workspace_id,
+                expected_global_revision,
+                node_id,
+                owner_workspace_id,
+                expected_owner_revision,
+                default_cwd,
+            } => Ok(Response::WorkspaceDefaultCwd {
+                result: self.set_global_workspace_default_cwd(
+                    &operation_id,
+                    &global_workspace_id,
+                    expected_global_revision,
+                    &node_id,
+                    &owner_workspace_id,
+                    expected_owner_revision,
+                    default_cwd,
+                )?,
+            }),
             Request::RouteNodeOperation { node_id, operation } => {
                 Ok(self.route_node_operation(&node_id, operation))
             }
@@ -11292,6 +11640,40 @@ impl DaemonService {
                 let workspace = self.workspace(&workspace_id)?.snapshot(&self.durable)?;
                 Ok(mutation.map(|()| Response::Workspace { workspace }))
             }),
+            Request::GuardedSetWorkspaceDefaultCwd {
+                workspace_id,
+                expected_revision,
+                default_cwd,
+            } => {
+                let default_cwd =
+                    host_services::resolve_directory(&default_cwd).map_err(DaemonError::from)?;
+                self.durable_mutation_outcome(|undo| {
+                    let workspace = self.workspace(&workspace_id)?;
+                    require_guard(*lock(&workspace.revision)?, expected_revision, "workspace")?;
+                    let Some(record) = self
+                        .durable
+                        .set_workspace_default_cwd(&workspace_id, default_cwd.clone())?
+                    else {
+                        return Ok(DurableMutation::Unchanged(Response::Workspace {
+                            workspace: workspace.snapshot(&self.durable)?,
+                        }));
+                    };
+                    undo.record(record);
+                    let workspace = workspace.snapshot(&self.durable)?;
+                    Ok(DurableMutation::Changed(
+                        Response::Workspace {
+                            workspace: workspace.clone(),
+                        },
+                        vec![DaemonEventKind::WorkspaceDefaultCwdChanged {
+                            workspace_id,
+                            default_cwd: workspace
+                                .default_cwd
+                                .clone()
+                                .expect("updated Workspace has a default cwd"),
+                        }],
+                    ))
+                })
+            }
             Request::RenameShell { shell_id, name } => self.durable_mutation_outcome(|undo| {
                 Ok(self
                     .rename_shell_mutation(undo, &shell_id, name)?
@@ -11563,7 +11945,7 @@ impl DaemonService {
                 id: saved_workspace.id.clone(),
                 revision: Mutex::new(saved_workspace.revision),
                 name: Mutex::new(saved_workspace.name),
-                default_cwd: saved_workspace.default_cwd,
+                default_cwd: Mutex::new(saved_workspace.default_cwd),
                 shell_ids: Mutex::new(shell_ids),
                 launcher_ids: Mutex::new(launcher_ids),
                 agent_ids: Mutex::new(workspace_agent_ids),
@@ -11609,6 +11991,30 @@ impl DaemonService {
             registry.persist()?;
         }
         Ok(registry)
+    }
+}
+
+fn capabilities_support_feature(
+    capabilities: &[String],
+    feature: protocol::ProtocolFeature,
+) -> bool {
+    feature
+        .capability_names()
+        .iter()
+        .all(|required| capabilities.iter().any(|capability| capability == required))
+}
+
+fn require_capabilities_support_feature(
+    capabilities: &[String],
+    feature: protocol::ProtocolFeature,
+) -> DaemonResult<()> {
+    if capabilities_support_feature(capabilities, feature) {
+        Ok(())
+    } else {
+        Err(DaemonError::lifecycle(
+            ErrorCode::UnsupportedVersion,
+            format!("owner Node does not support {}", feature.requirement()),
+        ))
     }
 }
 
@@ -12354,8 +12760,11 @@ impl DaemonService {
             .iter()
             .copied()
             .filter(|feature| {
-                *feature != protocol::ProtocolFeature::GlobalWorkspaces
-                    || self.global_workspaces.is_some()
+                !matches!(
+                    feature,
+                    protocol::ProtocolFeature::GlobalWorkspaces
+                        | protocol::ProtocolFeature::WorkspacePlacementDefaultCwd
+                ) || self.global_workspaces.is_some()
             })
             .flat_map(protocol::ProtocolFeature::capability_names)
             .copied()
@@ -13209,7 +13618,14 @@ impl DaemonService {
 }
 
 impl Workspace {
+    fn revision_and_default_cwd(&self) -> io::Result<(u64, Option<PathBuf>)> {
+        let revision = lock(&self.revision)?;
+        let default_cwd = lock(&self.default_cwd)?;
+        Ok((*revision, default_cwd.clone()))
+    }
+
     fn snapshot(&self, registry: &DurableRegistry) -> io::Result<WorkspaceSnapshot> {
+        let (revision, default_cwd) = self.revision_and_default_cwd()?;
         let (shells, launchers, agents) = {
             let state = lock(&registry.state)?;
             let shell_ids = lock(&self.shell_ids)?;
@@ -13243,9 +13659,9 @@ impl Workspace {
             .collect::<io::Result<_>>()?;
         Ok(WorkspaceSnapshot {
             id: self.id.clone(),
-            revision: *lock(&self.revision)?,
+            revision,
             name: lock(&self.name)?.clone(),
-            default_cwd: self.default_cwd.clone(),
+            default_cwd,
             shells,
             launchers,
             agents,
@@ -20472,6 +20888,245 @@ mod tests {
     }
 
     #[test]
+    fn protocol_forty_eight_filters_default_cwd_events_but_advances_cursor() {
+        let cursor = EventCursor {
+            stream_id: "stream".into(),
+            event_id: 4,
+        };
+        let response = Response::Events {
+            stream_id: "stream".into(),
+            cursor: cursor.clone(),
+            snapshot: None,
+            events: vec![DaemonEvent {
+                id: 4,
+                at_ms: 1,
+                kind: DaemonEventKind::WorkspaceDefaultCwdChanged {
+                    workspace_id: "workspace".into(),
+                    default_cwd: "/work".into(),
+                },
+            }],
+        };
+        let Response::Events {
+            cursor: filtered_cursor,
+            events,
+            ..
+        } = response_for_version(response, 48)
+        else {
+            panic!("expected events response");
+        };
+        assert_eq!(filtered_cursor, cursor);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn protocol_forty_eight_owner_fails_default_cwd_feature_preflight() {
+        let protocol_forty_eight = protocol::ProtocolFeature::ALL
+            .iter()
+            .copied()
+            .filter(|feature| feature.minimum_version() <= 48)
+            .flat_map(protocol::ProtocolFeature::capability_names)
+            .map(|capability| (*capability).to_owned())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            require_capabilities_support_feature(
+                &protocol_forty_eight,
+                protocol::ProtocolFeature::WorkspacePlacementDefaultCwd,
+            ),
+            Err(DaemonError::Lifecycle {
+                code: ErrorCode::UnsupportedVersion,
+                ..
+            })
+        ));
+        let mut protocol_forty_nine = protocol_forty_eight;
+        protocol_forty_nine.extend(
+            protocol::ProtocolFeature::WorkspacePlacementDefaultCwd
+                .capability_names()
+                .iter()
+                .map(|capability| (*capability).to_owned()),
+        );
+        assert!(capabilities_support_feature(
+            &protocol_forty_nine,
+            protocol::ProtocolFeature::WorkspacePlacementDefaultCwd,
+        ));
+    }
+
+    #[test]
+    fn remote_default_cwd_attempt_is_marked_only_after_supported_handshake() {
+        let mut attempted = false;
+        let unsupported = prepare_supported_owner_request(
+            48,
+            Some(protocol::ProtocolFeature::WorkspacePlacementDefaultCwd),
+            &mut || {
+                attempted = true;
+                Ok(())
+            },
+        );
+        assert_eq!(unsupported.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert!(!attempted);
+
+        prepare_supported_owner_request(
+            49,
+            Some(protocol::ProtocolFeature::WorkspacePlacementDefaultCwd),
+            &mut || {
+                attempted = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(attempted);
+    }
+
+    #[test]
+    fn default_cwd_retains_only_ambiguous_owner_errors() {
+        for code in [
+            ErrorCode::OutcomeUnknown,
+            ErrorCode::PersistenceFailed,
+            ErrorCode::Timeout,
+        ] {
+            assert!(default_cwd_owner_error_is_ambiguous(Some(code)));
+        }
+        for code in [
+            ErrorCode::RevisionAhead,
+            ErrorCode::UnsupportedVersion,
+            ErrorCode::NotFound,
+            ErrorCode::Internal,
+        ] {
+            assert!(!default_cwd_owner_error_is_ambiguous(Some(code)));
+        }
+        assert!(!default_cwd_owner_error_is_ambiguous(None));
+    }
+
+    #[test]
+    fn guarded_workspace_default_cwd_changes_only_future_defaults() {
+        let root = env::temp_dir().join(format!("boomux-default-cwd-{}", Uuid::new_v4()));
+        let old = root.join("old");
+        let new = root.join("new");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        let registry = DaemonService::default();
+        let workspace = registry
+            .create_workspace_with_default_cwd(
+                "work".into(),
+                Some(old.clone()),
+                vec![ShellSpec::login("existing", old.clone())],
+            )
+            .unwrap();
+        let response = registry
+            .dispatch(Request::GuardedSetWorkspaceDefaultCwd {
+                workspace_id: workspace.id.clone(),
+                expected_revision: workspace.revision,
+                default_cwd: new.clone(),
+            })
+            .unwrap();
+        let Response::Workspace { workspace: updated } = response else {
+            panic!("expected Workspace response");
+        };
+        assert_eq!(updated.revision, workspace.revision + 1);
+        assert_eq!(updated.default_cwd.as_deref(), Some(new.as_path()));
+        assert_eq!(updated.shells[0].cwd, old);
+
+        let Response::Events { cursor, .. } = registry
+            .dispatch(Request::Events {
+                after: None,
+                limit: 256,
+                wait_ms: 0,
+            })
+            .unwrap()
+        else {
+            panic!("expected event baseline");
+        };
+        let unchanged = registry
+            .dispatch(Request::GuardedSetWorkspaceDefaultCwd {
+                workspace_id: workspace.id.clone(),
+                expected_revision: updated.revision,
+                default_cwd: new,
+            })
+            .unwrap();
+        let Response::Workspace {
+            workspace: unchanged,
+        } = unchanged
+        else {
+            panic!("expected unchanged Workspace response");
+        };
+        assert_eq!(unchanged.revision, updated.revision);
+        let Response::Events { events, .. } = registry
+            .dispatch(Request::Events {
+                after: Some(cursor),
+                limit: 256,
+                wait_ms: 0,
+            })
+            .unwrap()
+        else {
+            panic!("expected event page");
+        };
+        assert!(events.is_empty());
+        let stale = registry.dispatch(Request::GuardedSetWorkspaceDefaultCwd {
+            workspace_id: workspace.id,
+            expected_revision: workspace.revision,
+            default_cwd: root.clone(),
+        });
+        assert!(matches!(
+            stale,
+            Err(DaemonError::Lifecycle {
+                code: ErrorCode::RevisionAhead,
+                ..
+            })
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_snapshot_never_tears_revision_from_default_cwd() {
+        let root = env::temp_dir().join(format!("boomux-cwd-snapshot-{}", Uuid::new_v4()));
+        let old = root.join("old");
+        let new = root.join("new");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        let registry = Arc::new(DaemonService::default());
+        let workspace = registry
+            .create_workspace_with_default_cwd("work".into(), Some(old.clone()), Vec::new())
+            .unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let writer_registry = Arc::clone(&registry);
+        let writer_finished = Arc::clone(&finished);
+        let workspace_id = workspace.id.clone();
+        let writer_old = old.clone();
+        let writer_new = new.clone();
+        let writer = thread::spawn(move || {
+            for index in 0..2_000 {
+                let cwd = if index % 2 == 0 {
+                    writer_new.clone()
+                } else {
+                    writer_old.clone()
+                };
+                assert!(
+                    writer_registry
+                        .durable
+                        .set_workspace_default_cwd(&workspace_id, cwd)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            writer_finished.store(true, Ordering::Release);
+        });
+        while !finished.load(Ordering::Acquire) {
+            let snapshot = registry
+                .workspace(&workspace.id)
+                .unwrap()
+                .snapshot(&registry.durable)
+                .unwrap();
+            let expected = if snapshot.revision % 2 == 0 {
+                new.as_path()
+            } else {
+                old.as_path()
+            };
+            assert_eq!(snapshot.default_cwd.as_deref(), Some(expected));
+        }
+        writer.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn protocol_seven_event_pages_hide_launcher_events() {
         let cursor = EventCursor {
             stream_id: "stream".into(),
@@ -20896,7 +21551,7 @@ mod tests {
 
         assert_eq!(&*lock(&workspace.name).unwrap(), "workspace-2");
         assert_eq!(
-            workspace.default_cwd.as_deref(),
+            lock(&workspace.default_cwd).unwrap().as_deref(),
             Some(env::temp_dir().as_path())
         );
         registry.shutdown().unwrap();

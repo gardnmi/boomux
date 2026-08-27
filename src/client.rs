@@ -939,6 +939,31 @@ impl Client {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_global_workspace_default_cwd(
+        &self,
+        operation_id: impl Into<String>,
+        global_workspace_id: impl Into<String>,
+        expected_global_revision: u64,
+        node_id: impl Into<String>,
+        owner_workspace_id: impl Into<String>,
+        expected_owner_revision: u64,
+        default_cwd: PathBuf,
+    ) -> Result<crate::protocol::WorkspaceDefaultCwdResult> {
+        match self.workspace_resource_request(Request::SetGlobalWorkspaceDefaultCwd {
+            operation_id: operation_id.into(),
+            global_workspace_id: global_workspace_id.into(),
+            expected_global_revision,
+            node_id: node_id.into(),
+            owner_workspace_id: owner_workspace_id.into(),
+            expected_owner_revision,
+            default_cwd,
+        })? {
+            Response::WorkspaceDefaultCwd { result } => Ok(result),
+            response => unexpected(response),
+        }
+    }
+
     pub fn route_node_operation(
         &self,
         node_id: impl Into<String>,
@@ -2370,7 +2395,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            for expected in [48, 47] {
+            for expected in [49, 48, 47] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
                 assert_eq!(request.version, expected);

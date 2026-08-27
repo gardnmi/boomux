@@ -14,7 +14,7 @@
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
-| `src/global_workspace_store.rs` | Independently versioned coordinator Workspace metadata, placement membership, initialization and schema migration, prepared resource recovery, and resumable close progress |
+| `src/global_workspace_store.rs` | Independently versioned coordinator Workspace metadata, placement membership, initialization and schema migration, prepared resource and placement-default recovery, and resumable close progress |
 | `src/local_shell_journal.rs` | Checksummed owner-only commit journal for local coordinated Shell creation and initial run start across owner and coordinator checkpoints |
 | `src/node_identity.rs` | Stable Node identity persistence, federation admission leases, and bounded rekey drain |
 | `src/node_registration.rs` | Independently versioned remote Node registrations, identity pinning, admission drain, validation, and atomic storage |
@@ -221,6 +221,22 @@ now-inaccessible disposable projection. The remote mutation remains a fixed SSH
 bootstrap operation rather than an arbitrary routed daemon request. Protocol-47
 peers retain every prior Node operation but cannot use this atomic completion
 primitive.
+Protocol 49 adds `workspace_placement_default_cwd`. One exact coordinated
+Workspace placement can change its owner-resolved default cwd under the current
+global Workspace and owner Workspace revisions. The coordinator persists a
+recoverable operation before owner mutation, proves ambiguous completion by an
+exact owner Workspace read, then publishes the updated placement mirror. The
+coordinator live-verifies protocol-49 owner support before preparing a remote
+operation and again on the dispatch helper handshake before durably marking the
+owner attempted. Definitive unsupported owners and cold-recovered preparations
+that never crossed that attempted boundary leave no recovery state. The
+coordinator also cancels the exact preparation after a definitive owner
+rejection while retaining transport-ambiguous outcomes for readback recovery.
+The owner persists before emitting `workspace_default_cwd_changed`; protocol-48
+event readers filter that event while retaining cursor progress. Coordinator
+Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
+default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
+unchanged because owner Workspaces already persist `default_cwd`.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -237,8 +253,10 @@ name resolution, and dashboard backend orchestration. `src/dashboard_projection.
 converts daemon snapshots and projected sessions into typed TUI view models.
 `src/session_projection.rs` is the shared binary projection used by the CLI and
 dashboard to combine one daemon snapshot with bounded host session catalogs.
-Omitted Shell and Agent Instance names are resolved here to random lowercase
-`adjective-noun` values before requests are sent. Generated shell names are
+Omitted Workspace names in atomic create, and omitted Shell and Agent Instance
+names, are resolved here to random lowercase `adjective-noun` values before
+requests are sent. Generated names are collision-excluded from the relevant
+snapshot. Generated shell names in existing Workspaces are
 checked against the workspace snapshot and retried on a typed daemon collision;
 the resulting concrete names use the ordinary protocol and durable state fields.
 
@@ -385,6 +403,7 @@ The daemon supports:
 
 - Empty or explicitly populated workspace creation with an optional shell cwd
   default
+- Guarded owner-resolved placement default-cwd changes for future Shell creation
 - Atomic shell creation with an implicit `workspace-N` container when no
   workspace is selected
 - Additional shell creation
@@ -499,8 +518,9 @@ satisfied, so retained history does not extend PTY-writer lock hold time.
 boomux __attach <shell-id> --takeover --restart-exited
 ```
 
-`shell create --open` prepares and spawns the terminal before the coordinated
-creation request so window presentation overlaps durable coordinator work. The
+`shell create --open` and atomic `workspace create --node NODE --cwd DIRECTORY
+--open` prepare and spawn the exact terminal before the coordinated creation
+request so window presentation overlaps durable coordinator work. The
 hidden attachment waits on an owner-only runtime socket and receives success
 only after the parent has received the completed creation response. Creation
 failure closes the gate without attaching, so a ShellRun cannot start before

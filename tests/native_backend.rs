@@ -30,3 +30,5 @@ mod shell_lifecycle;
 mod shell_name_suggestion;
 #[path = "native_backend/update.rs"]
 mod update;
+#[path = "native_backend/workspace_creation.rs"]
+mod workspace_creation;

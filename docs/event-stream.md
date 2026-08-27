@@ -46,6 +46,9 @@ Protocol 47 removes Agent Schedules and Scheduled Executions. Current snapshots
 and event streams contain no schedule definitions, execution records, scheduler
 health, or schedule events. Historical schedule request and event shapes are not
 part of the protocol-47 wire contract.
+Protocol 49 adds `workspace_default_cwd_changed` after the owner Workspace and
+its revision are durably persisted. Protocol-48 clients do not receive the new
+event, but their returned cursor still advances across it.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
@@ -107,7 +110,8 @@ The resulting local `node_projection_changed` remains the only journal event.
 
 The event vocabulary is:
 
-- `workspace_created`, `workspace_renamed`, `workspace_closed`
+- `workspace_created`, `workspace_renamed`, `workspace_default_cwd_changed`,
+  `workspace_closed`
 - `shell_created`, `shell_renamed`, `shell_closed`
 - `launcher_created`, `launcher_renamed`, `launcher_removed`
 - `run_started`, `output_changed`, `run_exited`
@@ -137,6 +141,9 @@ successful no-ops with no event. Equal-authority reports with changed content
 are updates and emit the normal state-change or completion event. Retrying the
 exact accepted `done` report is idempotent and emits no second completion event;
 other reports against a completed instance are rejected.
+
+`workspace_default_cwd_changed` carries the owner Workspace ID and resolved
+absolute default cwd. It does not rewrite existing Shell or launcher cwd values.
 
 Accepted blocked and completed observations also carry an outstanding attention
 item in their Agent snapshot. `agent_attention_acknowledged` contains the full

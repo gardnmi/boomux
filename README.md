@@ -118,14 +118,17 @@ To remove an official release installation, use `boomux uninstall`. Add
 Create a coordinated Workspace and its first Shell from a project directory:
 
 ```console
-boomux workspace create my-project
-boomux shell create my-project --cwd . --open
+boomux workspace create my-project --node LOCAL_NODE_ID --cwd . --open
 ```
 
-With only the local Node eligible, the Shell establishes its placement and opens
-in a native terminal. If multiple Nodes are eligible, add `--node NODE`. In
-Hyprland, the default desktop adapter places the terminal in the Workspace's
-named Boomux special Workspace.
+This atomically creates the coordinated Workspace, its exact local placement,
+and its first Shell before opening the native terminal. Obtain the stable local
+Node ID from `boomux node snapshot --json`. Omit `my-project` to let Boomux
+generate both Workspace and Shell names. In Hyprland, the default desktop
+adapter places the terminal in the Workspace's named Boomux special Workspace.
+
+`boomux workspace create my-project` remains the empty-Workspace form. Add its
+first Shell later with `boomux shell create my-project --cwd . --open`.
 
 For a simpler current-terminal workflow:
 

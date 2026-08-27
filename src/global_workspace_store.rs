@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::protocol::{
-    GlobalWorkspaceSnapshot, RoutedOperationResult, Snapshot, WorkspacePlacementSnapshot,
-    WorkspacePlacementState, WorkspaceSnapshot,
+    GlobalWorkspaceSnapshot, RoutedOperationResult, Snapshot, WorkspaceDefaultCwdResult,
+    WorkspacePlacementSnapshot, WorkspacePlacementState, WorkspaceSnapshot,
 };
 use crate::state_store::{effective_uid, secure_state_dir, state_directory_from_environment};
 
-const COORDINATOR_WORKSPACE_VERSION: u32 = 7;
+const COORDINATOR_WORKSPACE_VERSION: u32 = 8;
 const MAX_STORE_BYTES: u64 = 1024 * 1024;
 const MAX_WORKSPACES: usize = 1_024;
 const MAX_PLACEMENTS: usize = 128;
@@ -44,6 +44,38 @@ struct PersistedGlobalWorkspaces {
     pending_resources: Vec<PendingWorkspaceResource>,
     #[serde(default)]
     completed_operations: Vec<CompletedWorkspaceOperation>,
+    #[serde(default)]
+    pending_default_cwd_operations: Vec<PendingDefaultCwdOperation>,
+    #[serde(default)]
+    completed_default_cwd_operations: Vec<CompletedDefaultCwdOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingDefaultCwdOperation {
+    pub(crate) operation_id: String,
+    pub(crate) global_workspace_id: String,
+    pub(crate) expected_global_revision: u64,
+    pub(crate) node_id: String,
+    pub(crate) owner_workspace_id: String,
+    pub(crate) expected_owner_revision: u64,
+    pub(crate) requested_default_cwd: PathBuf,
+    pub(crate) default_cwd: PathBuf,
+    pub(crate) owner_attempted: bool,
+    completion_reservation: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedDefaultCwdOperation {
+    request: PendingDefaultCwdOperation,
+    result: WorkspaceDefaultCwdResult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedDefaultCwdOperation {
+    Pending(PendingDefaultCwdOperation),
+    Completed(WorkspaceDefaultCwdResult),
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +168,10 @@ impl GlobalWorkspaceStore {
                 state.version = COORDINATOR_WORKSPACE_VERSION;
                 (state, true)
             }
+            Ok(mut state) if state.version == 7 => {
+                state.version = COORDINATOR_WORKSPACE_VERSION;
+                (state, true)
+            }
             Ok(state) => (state, false),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (
                 PersistedGlobalWorkspaces {
@@ -144,6 +180,8 @@ impl GlobalWorkspaceStore {
                     workspaces: Vec::new(),
                     pending_resources: Vec::new(),
                     completed_operations: Vec::new(),
+                    pending_default_cwd_operations: Vec::new(),
+                    completed_default_cwd_operations: Vec::new(),
                 },
                 false,
             ),
@@ -223,6 +261,295 @@ impl GlobalWorkspaceStore {
 
     pub(crate) fn pending_resources(&self) -> io::Result<Vec<PendingWorkspaceResource>> {
         Ok(self.lock()?.pending_resources.clone())
+    }
+
+    pub(crate) fn pending_default_cwd_operations(
+        &self,
+    ) -> io::Result<Vec<PendingDefaultCwdOperation>> {
+        Ok(self.lock()?.pending_default_cwd_operations.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn completed_default_cwd(
+        &self,
+        operation_id: &str,
+        global_workspace_id: &str,
+        expected_global_revision: u64,
+        node_id: &str,
+        owner_workspace_id: &str,
+        expected_owner_revision: u64,
+        requested_default_cwd: &Path,
+    ) -> io::Result<Option<WorkspaceDefaultCwdResult>> {
+        let state = self.lock()?;
+        let Some(completed) = state
+            .completed_default_cwd_operations
+            .iter()
+            .find(|completed| completed.request.operation_id == operation_id)
+        else {
+            return Ok(None);
+        };
+        let request = &completed.request;
+        if request.global_workspace_id != global_workspace_id
+            || request.expected_global_revision != expected_global_revision
+            || request.node_id != node_id
+            || request.owner_workspace_id != owner_workspace_id
+            || request.expected_owner_revision != expected_owner_revision
+            || request.requested_default_cwd != requested_default_cwd
+        {
+            return Err(operation_conflict());
+        }
+        Ok(Some(completed.result.clone()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_default_cwd(
+        &self,
+        operation_id: &str,
+        global_workspace_id: &str,
+        expected_global_revision: u64,
+        node_id: &str,
+        owner_workspace_id: &str,
+        expected_owner_revision: u64,
+        requested_default_cwd: PathBuf,
+        default_cwd: PathBuf,
+    ) -> io::Result<PreparedDefaultCwdOperation> {
+        let request = PendingDefaultCwdOperation {
+            operation_id: operation_id.to_owned(),
+            global_workspace_id: global_workspace_id.to_owned(),
+            expected_global_revision,
+            node_id: node_id.to_owned(),
+            owner_workspace_id: owner_workspace_id.to_owned(),
+            expected_owner_revision,
+            requested_default_cwd,
+            default_cwd,
+            owner_attempted: false,
+            completion_reservation: " ".repeat(8 * 1024),
+        };
+        self.mutate(|state| {
+            if state
+                .pending_resources
+                .iter()
+                .any(|pending| pending.operation_id == operation_id)
+                || state
+                    .completed_operations
+                    .iter()
+                    .any(|completed| completed.operation_id == operation_id)
+            {
+                return Err(operation_conflict());
+            }
+            if let Some(completed) = state
+                .completed_default_cwd_operations
+                .iter()
+                .find(|completed| completed.request.operation_id == operation_id)
+            {
+                if !same_default_cwd_request(&completed.request, &request) {
+                    return Err(operation_conflict());
+                }
+                return Ok(PreparedDefaultCwdOperation::Completed(
+                    completed.result.clone(),
+                ));
+            }
+            if let Some(pending) = state
+                .pending_default_cwd_operations
+                .iter()
+                .find(|pending| pending.operation_id == operation_id)
+            {
+                if !same_default_cwd_request(pending, &request) {
+                    return Err(operation_conflict());
+                }
+                return Ok(PreparedDefaultCwdOperation::Pending(pending.clone()));
+            }
+            ensure_no_pending_resource(state, global_workspace_id)?;
+            let workspace = state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == global_workspace_id)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "global Workspace not found")
+                })?;
+            require_revision(
+                workspace.revision,
+                expected_global_revision,
+                "global Workspace",
+            )?;
+            if workspace.closing {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "global Workspace close is in progress",
+                ));
+            }
+            let placement = workspace
+                .placements
+                .iter()
+                .find(|placement| placement.node_id == node_id)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "Workspace placement not found")
+                })?;
+            if placement.workspace_id != owner_workspace_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "exact owner Workspace placement not found",
+                ));
+            }
+            require_revision(
+                placement.owner_revision,
+                expected_owner_revision,
+                "owner Workspace",
+            )?;
+            state.pending_default_cwd_operations.push(request.clone());
+            compact_prepared_state(state)?;
+            Ok(PreparedDefaultCwdOperation::Pending(request))
+        })
+    }
+
+    pub(crate) fn mark_default_cwd_owner_attempted(
+        &self,
+        operation: &PendingDefaultCwdOperation,
+    ) -> io::Result<PendingDefaultCwdOperation> {
+        self.mutate(|state| {
+            let pending = state
+                .pending_default_cwd_operations
+                .iter_mut()
+                .find(|pending| pending.operation_id == operation.operation_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "prepared default cwd operation not found",
+                    )
+                })?;
+            if !same_default_cwd_request(pending, operation) {
+                return Err(operation_conflict());
+            }
+            pending.owner_attempted = true;
+            Ok(pending.clone())
+        })
+    }
+
+    pub(crate) fn cancel_default_cwd_if_never_attempted(
+        &self,
+        operation: &PendingDefaultCwdOperation,
+    ) -> io::Result<bool> {
+        self.mutate(|state| {
+            let Some(index) = state
+                .pending_default_cwd_operations
+                .iter()
+                .position(|pending| pending.operation_id == operation.operation_id)
+            else {
+                return Ok(false);
+            };
+            if !same_default_cwd_request(&state.pending_default_cwd_operations[index], operation) {
+                return Err(operation_conflict());
+            }
+            if state.pending_default_cwd_operations[index].owner_attempted {
+                return Ok(false);
+            }
+            state.pending_default_cwd_operations.remove(index);
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn cancel_default_cwd(
+        &self,
+        operation: &PendingDefaultCwdOperation,
+    ) -> io::Result<bool> {
+        self.mutate(|state| {
+            let Some(index) = state
+                .pending_default_cwd_operations
+                .iter()
+                .position(|pending| pending.operation_id == operation.operation_id)
+            else {
+                return Ok(false);
+            };
+            if !same_default_cwd_request(&state.pending_default_cwd_operations[index], operation) {
+                return Err(operation_conflict());
+            }
+            state.pending_default_cwd_operations.remove(index);
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn complete_default_cwd(
+        &self,
+        operation: &PendingDefaultCwdOperation,
+        owner: &WorkspaceSnapshot,
+    ) -> io::Result<WorkspaceDefaultCwdResult> {
+        self.mutate(|state| {
+            if let Some(completed) = state
+                .completed_default_cwd_operations
+                .iter()
+                .find(|completed| completed.request.operation_id == operation.operation_id)
+            {
+                if !same_default_cwd_request(&completed.request, operation) {
+                    return Err(operation_conflict());
+                }
+                return Ok(completed.result.clone());
+            }
+            let index = state
+                .pending_default_cwd_operations
+                .iter()
+                .position(|pending| pending.operation_id == operation.operation_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "prepared default cwd operation not found",
+                    )
+                })?;
+            let mut pending = state.pending_default_cwd_operations[index].clone();
+            if !same_default_cwd_request(&pending, operation)
+                || owner.id != pending.owner_workspace_id
+                || owner.default_cwd.as_ref() != Some(&pending.default_cwd)
+            {
+                return Err(operation_conflict());
+            }
+            let changed = match owner.revision.checked_sub(pending.expected_owner_revision) {
+                Some(0) => false,
+                Some(1) => true,
+                _ => return Err(operation_conflict()),
+            };
+            let workspace = state
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == pending.global_workspace_id)
+                .ok_or_else(|| invalid("prepared global Workspace is missing"))?;
+            let placement = workspace
+                .placements
+                .iter_mut()
+                .find(|placement| {
+                    placement.node_id == pending.node_id
+                        && placement.workspace_id == pending.owner_workspace_id
+                })
+                .ok_or_else(|| invalid("prepared Workspace placement is missing"))?;
+            if placement.owner_revision != pending.expected_owner_revision {
+                return Err(operation_conflict());
+            }
+            placement.owner_revision = owner.revision;
+            placement.default_cwd = Some(pending.default_cwd.clone());
+            if changed {
+                workspace.revision = next(workspace.revision)?;
+            }
+            let result = WorkspaceDefaultCwdResult {
+                workspace_id: workspace.id.clone(),
+                node_id: pending.node_id.clone(),
+                owner_workspace_id: pending.owner_workspace_id.clone(),
+                default_cwd: pending.default_cwd.clone(),
+                global_revision: workspace.revision,
+                owner_revision: owner.revision,
+                result: if changed { "updated" } else { "unchanged" }.into(),
+            };
+            state.pending_default_cwd_operations.remove(index);
+            pending.completion_reservation.clear();
+            state
+                .completed_default_cwd_operations
+                .push(CompletedDefaultCwdOperation {
+                    request: pending,
+                    result: result.clone(),
+                });
+            if state.completed_default_cwd_operations.len() > MAX_COMPLETED_OPERATIONS {
+                state.completed_default_cwd_operations.remove(0);
+            }
+            compact_prepared_state(state)?;
+            Ok(result)
+        })
     }
 
     pub(crate) fn completed_operation(
@@ -1255,6 +1582,10 @@ fn ensure_no_pending_resource(
         .pending_resources
         .iter()
         .any(|pending| pending.global_workspace_id == global_id)
+        || state
+            .pending_default_cwd_operations
+            .iter()
+            .any(|pending| pending.global_workspace_id == global_id)
     {
         Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -1428,12 +1759,15 @@ fn compact_prepared_state(state: &mut PersistedGlobalWorkspaces) -> io::Result<(
         .len() as u64
         > MAX_STORE_BYTES
     {
-        if state.completed_operations.is_empty() {
+        if !state.completed_operations.is_empty() {
+            state.completed_operations.remove(0);
+        } else if !state.completed_default_cwd_operations.is_empty() {
+            state.completed_default_cwd_operations.remove(0);
+        } else {
             return Err(invalid(
                 "coordinator store has insufficient capacity to reserve the completed Workspace operation",
             ));
         }
-        state.completed_operations.remove(0);
     }
     Ok(())
 }
@@ -1443,6 +1777,20 @@ fn operation_conflict() -> io::Error {
         io::ErrorKind::AlreadyExists,
         "prepared operation identity exists with a different request fingerprint",
     )
+}
+
+fn same_default_cwd_request(
+    left: &PendingDefaultCwdOperation,
+    right: &PendingDefaultCwdOperation,
+) -> bool {
+    left.operation_id == right.operation_id
+        && left.global_workspace_id == right.global_workspace_id
+        && left.expected_global_revision == right.expected_global_revision
+        && left.node_id == right.node_id
+        && left.owner_workspace_id == right.owner_workspace_id
+        && left.expected_owner_revision == right.expected_owner_revision
+        && left.requested_default_cwd == right.requested_default_cwd
+        && left.default_cwd == right.default_cwd
 }
 
 fn require_revision(actual: u64, expected: u64, label: &str) -> io::Result<()> {
@@ -1475,6 +1823,8 @@ fn validate(state: &PersistedGlobalWorkspaces) -> io::Result<()> {
         || state.workspaces.len() > MAX_WORKSPACES
         || state.pending_resources.len() > MAX_PENDING_RESOURCES
         || state.completed_operations.len() > MAX_COMPLETED_OPERATIONS
+        || state.pending_default_cwd_operations.len() > MAX_PENDING_RESOURCES
+        || state.completed_default_cwd_operations.len() > MAX_COMPLETED_OPERATIONS
     {
         return Err(invalid("unsupported or oversized global Workspace store"));
     }
@@ -1569,7 +1919,70 @@ fn validate(state: &PersistedGlobalWorkspaces) -> io::Result<()> {
             return Err(invalid("completed Workspace operation is invalid"));
         }
     }
+    let mut default_cwd_operations = HashSet::new();
+    for operation in &state.pending_default_cwd_operations {
+        if Uuid::parse_str(&operation.operation_id).is_err()
+            || Uuid::parse_str(&operation.global_workspace_id).is_err()
+            || Uuid::parse_str(&operation.node_id).is_err()
+            || Uuid::parse_str(&operation.owner_workspace_id).is_err()
+            || operation.expected_global_revision == 0
+            || operation.expected_owner_revision == 0
+            || !operation.default_cwd.is_absolute()
+            || operation.completion_reservation.len() != 8 * 1024
+            || operation
+                .completion_reservation
+                .bytes()
+                .any(|byte| byte != b' ')
+            || !ids.contains(&operation.global_workspace_id)
+            || pending.contains(&operation.operation_id)
+            || completed.contains(&operation.operation_id)
+            || !default_cwd_operations.insert(&operation.operation_id)
+        {
+            return Err(invalid("prepared default cwd operation is invalid"));
+        }
+    }
+    for operation in &state.completed_default_cwd_operations {
+        let request = &operation.request;
+        let result = &operation.result;
+        if Uuid::parse_str(&request.operation_id).is_err()
+            || Uuid::parse_str(&request.global_workspace_id).is_err()
+            || Uuid::parse_str(&request.node_id).is_err()
+            || Uuid::parse_str(&request.owner_workspace_id).is_err()
+            || request.expected_global_revision == 0
+            || request.expected_owner_revision == 0
+            || !request.default_cwd.is_absolute()
+            || !request.completion_reservation.is_empty()
+            || !matches!(result.result.as_str(), "updated" | "unchanged")
+            || result.workspace_id != request.global_workspace_id
+            || result.node_id != request.node_id
+            || result.owner_workspace_id != request.owner_workspace_id
+            || result.default_cwd != request.default_cwd
+            || !completed_default_cwd_revisions_are_valid(request, result)
+            || pending.contains(&request.operation_id)
+            || completed.contains(&request.operation_id)
+            || !default_cwd_operations.insert(&request.operation_id)
+        {
+            return Err(invalid("completed default cwd operation is invalid"));
+        }
+    }
     Ok(())
+}
+
+fn completed_default_cwd_revisions_are_valid(
+    request: &PendingDefaultCwdOperation,
+    result: &WorkspaceDefaultCwdResult,
+) -> bool {
+    match result.result.as_str() {
+        "unchanged" => {
+            result.global_revision == request.expected_global_revision
+                && result.owner_revision == request.expected_owner_revision
+        }
+        "updated" => {
+            request.expected_global_revision.checked_add(1) == Some(result.global_revision)
+                && request.expected_owner_revision.checked_add(1) == Some(result.owner_revision)
+        }
+        _ => false,
+    }
 }
 
 fn valid_fingerprint(fingerprint: &str) -> bool {
@@ -1733,6 +2146,328 @@ mod tests {
     }
 
     #[test]
+    fn schema_seven_migrates_with_empty_default_cwd_operation_ledgers() {
+        let root = std::env::temp_dir().join(format!("boomux-global-v7-{}", Uuid::new_v4()));
+        let path = root.join("boomux/global_workspaces.json");
+        let store = GlobalWorkspaceStore::load_at(path.clone()).unwrap();
+        store.checkpoint().unwrap();
+        drop(store);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy["version"] = 7.into();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("pending_default_cwd_operations");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("completed_default_cwd_operations");
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let migrated = GlobalWorkspaceStore::load_at(path.clone()).unwrap();
+        assert!(
+            migrated
+                .pending_default_cwd_operations()
+                .unwrap()
+                .is_empty()
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["version"], 8);
+        assert_eq!(
+            persisted["pending_default_cwd_operations"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            persisted["completed_default_cwd_operations"],
+            serde_json::json!([])
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_cwd_prepare_complete_replays_exactly_and_guards_revisions() {
+        let root = std::env::temp_dir().join(format!("boomux-global-cwd-{}", Uuid::new_v4()));
+        let path = root.join("boomux/global_workspaces.json");
+        let store = GlobalWorkspaceStore::load_at(path.clone()).unwrap();
+        let node_id = Uuid::from_u128(1).to_string();
+        let owner_id = Uuid::from_u128(2).to_string();
+        let owner = snapshot(&owner_id, "work", 7);
+        store
+            .initialize_local_once(&node_id, &daemon_snapshot(vec![owner.clone()]))
+            .unwrap();
+        let global = store.list().unwrap().remove(0);
+        let operation_id = Uuid::from_u128(3).to_string();
+        let prepared = store
+            .prepare_default_cwd(
+                &operation_id,
+                &global.id,
+                global.revision,
+                &node_id,
+                &owner_id,
+                owner.revision,
+                "/owner/next".into(),
+                "/owner/next".into(),
+            )
+            .unwrap();
+        let PreparedDefaultCwdOperation::Pending(prepared) = prepared else {
+            panic!("expected prepared default cwd operation");
+        };
+        let attempted = store.mark_default_cwd_owner_attempted(&prepared).unwrap();
+        drop(store);
+
+        let restored = GlobalWorkspaceStore::load_at(path.clone()).unwrap();
+        assert_eq!(
+            restored.pending_default_cwd_operations().unwrap(),
+            vec![attempted.clone()]
+        );
+        let mut updated_owner = owner.clone();
+        updated_owner.revision += 1;
+        updated_owner.default_cwd = Some("/owner/next".into());
+        let completed = restored
+            .complete_default_cwd(&attempted, &updated_owner)
+            .unwrap();
+        assert_eq!(completed.result, "updated");
+        assert_eq!(completed.global_revision, global.revision + 1);
+        assert_eq!(completed.owner_revision, owner.revision + 1);
+        assert_eq!(
+            restored
+                .prepare_default_cwd(
+                    &operation_id,
+                    &global.id,
+                    global.revision,
+                    &node_id,
+                    &owner_id,
+                    owner.revision,
+                    "/owner/next".into(),
+                    "/owner/next".into(),
+                )
+                .unwrap(),
+            PreparedDefaultCwdOperation::Completed(completed)
+        );
+        assert_eq!(
+            restored
+                .prepare_default_cwd(
+                    &operation_id,
+                    &global.id,
+                    global.revision,
+                    &node_id,
+                    &owner_id,
+                    owner.revision,
+                    "/owner/conflict".into(),
+                    "/owner/conflict".into(),
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(
+            restored
+                .prepare_default_cwd(
+                    &Uuid::from_u128(4).to_string(),
+                    &global.id,
+                    global.revision,
+                    &node_id,
+                    &owner_id,
+                    updated_owner.revision,
+                    "/owner/other".into(),
+                    "/owner/other".into(),
+                )
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn never_attempted_default_cwd_can_be_cancelled_after_reload() {
+        let root = std::env::temp_dir().join(format!("boomux-global-cwd-{}", Uuid::new_v4()));
+        let path = root.join("boomux/global_workspaces.json");
+        let store = GlobalWorkspaceStore::load_at(path.clone()).unwrap();
+        let node_id = Uuid::from_u128(1).to_string();
+        let owner_id = Uuid::from_u128(2).to_string();
+        let owner = snapshot(&owner_id, "work", 7);
+        store
+            .initialize_local_once(&node_id, &daemon_snapshot(vec![owner.clone()]))
+            .unwrap();
+        let global = store.list().unwrap().remove(0);
+        let prepared = store
+            .prepare_default_cwd(
+                &Uuid::from_u128(3).to_string(),
+                &global.id,
+                global.revision,
+                &node_id,
+                &owner_id,
+                owner.revision,
+                "/owner/next".into(),
+                "/owner/next".into(),
+            )
+            .unwrap();
+        let PreparedDefaultCwdOperation::Pending(prepared) = prepared else {
+            panic!("expected prepared default cwd operation");
+        };
+        drop(store);
+
+        let restored = GlobalWorkspaceStore::load_at(path).unwrap();
+        assert!(
+            restored
+                .cancel_default_cwd_if_never_attempted(&prepared)
+                .unwrap()
+        );
+        assert!(
+            restored
+                .pending_default_cwd_operations()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !restored
+                .cancel_default_cwd_if_never_attempted(&prepared)
+                .unwrap()
+        );
+        assert!(
+            restored
+                .rename(&global.id, global.revision, "available".into())
+                .is_ok()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attempted_default_cwd_can_be_cancelled_after_definitive_owner_rejection() {
+        let root = std::env::temp_dir().join(format!("boomux-global-cwd-{}", Uuid::new_v4()));
+        let path = root.join("boomux/global_workspaces.json");
+        let store = GlobalWorkspaceStore::load_at(path).unwrap();
+        let node_id = Uuid::from_u128(1).to_string();
+        let owner_id = Uuid::from_u128(2).to_string();
+        let owner = snapshot(&owner_id, "work", 7);
+        store
+            .initialize_local_once(&node_id, &daemon_snapshot(vec![owner.clone()]))
+            .unwrap();
+        let global = store.list().unwrap().remove(0);
+        let prepared = store
+            .prepare_default_cwd(
+                &Uuid::from_u128(3).to_string(),
+                &global.id,
+                global.revision,
+                &node_id,
+                &owner_id,
+                owner.revision,
+                "/owner/next".into(),
+                "/owner/next".into(),
+            )
+            .unwrap();
+        let PreparedDefaultCwdOperation::Pending(prepared) = prepared else {
+            panic!("expected prepared default cwd operation");
+        };
+        let attempted = store.mark_default_cwd_owner_attempted(&prepared).unwrap();
+
+        assert!(store.cancel_default_cwd(&attempted).unwrap());
+        assert!(store.pending_default_cwd_operations().unwrap().is_empty());
+        assert!(
+            store
+                .rename(&global.id, global.revision, "available".into())
+                .is_ok()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_default_cwd_keeps_both_revisions() {
+        let root = std::env::temp_dir().join(format!("boomux-global-cwd-noop-{}", Uuid::new_v4()));
+        let store =
+            GlobalWorkspaceStore::load_at(root.join("boomux/global_workspaces.json")).unwrap();
+        let node_id = Uuid::from_u128(1).to_string();
+        let owner = snapshot(&Uuid::from_u128(2).to_string(), "work", 7);
+        store
+            .initialize_local_once(&node_id, &daemon_snapshot(vec![owner.clone()]))
+            .unwrap();
+        let global = store.list().unwrap().remove(0);
+        let prepared = store
+            .prepare_default_cwd(
+                &Uuid::from_u128(3).to_string(),
+                &global.id,
+                global.revision,
+                &node_id,
+                &owner.id,
+                owner.revision,
+                owner.default_cwd.clone().unwrap(),
+                owner.default_cwd.clone().unwrap(),
+            )
+            .unwrap();
+        let PreparedDefaultCwdOperation::Pending(prepared) = prepared else {
+            panic!("expected pending operation");
+        };
+        let result = store.complete_default_cwd(&prepared, &owner).unwrap();
+        assert_eq!(result.result, "unchanged");
+        assert_eq!(result.global_revision, global.revision);
+        assert_eq!(result.owner_revision, owner.revision);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_eight_rejects_completed_default_cwd_revision_mismatches() {
+        let root =
+            std::env::temp_dir().join(format!("boomux-global-cwd-invalid-{}", Uuid::new_v4()));
+        let path = root.join("boomux/global_workspaces.json");
+        let store = GlobalWorkspaceStore::load_at(path.clone()).unwrap();
+        let node_id = Uuid::from_u128(1).to_string();
+        let owner = snapshot(&Uuid::from_u128(2).to_string(), "work", 7);
+        store
+            .initialize_local_once(&node_id, &daemon_snapshot(vec![owner.clone()]))
+            .unwrap();
+        let global = store.list().unwrap().remove(0);
+        let prepared = store
+            .prepare_default_cwd(
+                &Uuid::from_u128(3).to_string(),
+                &global.id,
+                global.revision,
+                &node_id,
+                &owner.id,
+                owner.revision,
+                "/owner/next".into(),
+                "/owner/next".into(),
+            )
+            .unwrap();
+        let PreparedDefaultCwdOperation::Pending(prepared) = prepared else {
+            panic!("expected pending operation");
+        };
+        let mut updated_owner = owner;
+        updated_owner.revision += 1;
+        updated_owner.default_cwd = Some("/owner/next".into());
+        store
+            .complete_default_cwd(&prepared, &updated_owner)
+            .unwrap();
+        drop(store);
+        let valid = fs::read(&path).unwrap();
+
+        for (field, value) in [
+            ("result", serde_json::json!("unchanged")),
+            ("global_revision", serde_json::json!(global.revision)),
+            ("owner_revision", serde_json::json!(7)),
+        ] {
+            let mut invalid_state: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+            invalid_state["completed_default_cwd_operations"][0]["result"][field] = value;
+            fs::write(&path, serde_json::to_vec_pretty(&invalid_state).unwrap()).unwrap();
+            let error = match GlobalWorkspaceStore::load_at(path.clone()) {
+                Ok(_) => panic!("schema 8 accepted invalid completed {field}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+
+        let mut overflow: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+        overflow["completed_default_cwd_operations"][0]["request"]["expected_global_revision"] =
+            u64::MAX.into();
+        overflow["completed_default_cwd_operations"][0]["result"]["global_revision"] =
+            u64::MAX.into();
+        fs::write(&path, serde_json::to_vec_pretty(&overflow).unwrap()).unwrap();
+        assert!(GlobalWorkspaceStore::load_at(path.clone()).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn equal_names_never_merge_and_link_guards_both_authorities() {
         let root = std::env::temp_dir().join(format!("boomux-global-link-{}", Uuid::new_v4()));
         let store =
@@ -1852,7 +2587,7 @@ mod tests {
         assert_eq!(workspace.placements[0].owner_workspace_name, None);
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 7);
+        assert_eq!(persisted["version"], 8);
         assert_eq!(persisted["pending_resources"], serde_json::json!([]));
         assert_eq!(persisted["completed_operations"], serde_json::json!([]));
         fs::remove_dir_all(root).unwrap();
@@ -1901,7 +2636,7 @@ mod tests {
         assert!(!pending[0].creates_workspace);
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 7);
+        assert_eq!(persisted["version"], 8);
         assert_eq!(
             persisted["pending_resources"][0]["operation_id"],
             resource_id
@@ -1957,7 +2692,7 @@ mod tests {
         assert!(pending.owner_attempted);
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 7);
+        assert_eq!(persisted["version"], 8);
         assert_eq!(persisted["completed_operations"], serde_json::json!([]));
         fs::remove_dir_all(root).unwrap();
     }
@@ -2903,7 +3638,7 @@ mod tests {
             .unwrap();
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 7);
+        assert_eq!(persisted["version"], 8);
         assert!(
             persisted["pending_resources"][0]["completion_reservation"]
                 .as_str()
@@ -2953,7 +3688,7 @@ mod tests {
         assert!(migrated.pending_resources().unwrap()[0].owner_attempted);
         let persisted: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted["version"], 7);
+        assert_eq!(persisted["version"], 8);
         assert_eq!(persisted["pending_resources"][0]["owner_attempted"], true);
         fs::remove_dir_all(root).unwrap();
     }
@@ -3183,6 +3918,8 @@ mod tests {
             workspaces: vec![workspace.clone()],
             pending_resources: Vec::new(),
             completed_operations: Vec::new(),
+            pending_default_cwd_operations: Vec::new(),
+            completed_default_cwd_operations: Vec::new(),
         };
         for offset in 0..=MAX_COMPLETED_OPERATIONS {
             push_completed(

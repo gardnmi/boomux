@@ -35,6 +35,9 @@
 > the helper over one authenticated SSH endpoint. Confirmed remote removal
 > atomically consumes local maintenance into registration deletion; uncertain
 > outcomes retain the route.
+> Protocol 49 adds exact routed Workspace placement default-cwd mutation with
+> coordinator prepare/attempt/complete recovery. Coordinator Workspace schema 8
+> explicitly migrates schema 7 with empty default-cwd operation ledgers.
 
 ## Purpose
 
@@ -72,6 +75,22 @@ bound of the completed response, evicting oldest outcomes if necessary. A reques
 that cannot reserve within 1 MiB fails before any owner mutation. Concurrent
 distinct placements atomically enlarge all related pending reservations for the
 additional future placement before either new owner dispatch proceeds.
+Changing a placement default cwd uses the same authority boundary but a distinct
+prepared operation. The request fixes the global Workspace ID and revision,
+Node ID, owner Workspace ID and fresh revision, and owner-resolved directory.
+Before preparing anything, the coordinator live-verifies that a remote owner
+advertises protocol 49 and `workspace_placement_default_cwd`. The dispatch
+helper repeats that check on the connection used for mutation before durably
+marking the owner attempted. Definitive protocol-48 rejection and cold recovery
+of a preparation that never crossed that attempted boundary remove the pending
+record.
+The owner persists first. Coordinator completion accepts only the unchanged
+guarded owner revision or its single updated successor with the exact cwd, then
+updates the placement mirror and, for an update, the global revision. Exact
+replay returns the bounded durable result; a conflicting operation UUID fails.
+Definitive owner rejection cancels the exact preparation; timeout, persistence,
+and outcome-unknown responses retain it for exact owner readback.
+Existing resources are unchanged, and no offline write is queued.
 
 The dashboard has a dedicated Nodes tab rather than a Node filter. Inspection is
 read-only; `R` opens interactive reauthentication for a selected
@@ -859,19 +878,22 @@ new event kind; protocol-31 filtering of `node_projection_changed` remains the
 event compatibility boundary. Protocol 39 adds the local-only
 `focused_terminal_presentation_changed` invalidation; older clients do not
 receive it, but their cursors advance across the filtered event.
+Protocol 49 adds owner-routed default-cwd mutation and the owner-local
+`workspace_default_cwd_changed` event. Protocol-48 event readers filter it while
+advancing their cursor. A protocol-48 owner cannot receive the guarded request.
 
 Federation has three independent compatibility boundaries:
 
-- The local CLI and local daemon negotiate the ordinary core protocol. Clients
-  and daemons must both use protocol 47; protocol 46 is rejected.
+- The local CLI and local daemon negotiate the ordinary core protocol. The
+  supported range is protocol 47 through 49; protocol 46 is rejected.
 - The local coordinator and remote helper negotiate the federation handshake
   before an inner request. An absent helper triggers explicit bootstrap; an
   unsupported handshake fails with a typed pre-protocol error and sends no inner
   bytes. Unknown additive handshake fields are ignored only within a negotiated
   compatible federation version.
 - The helper and remote daemon negotiate the ordinary core protocol for every
-  channel. Protocol 47 is the current floor, so a protocol-46 helper or daemon is
-  never admitted as a Node.
+  channel. Protocol 47 is the floor and protocol 49 is current, so a protocol-46
+  helper or daemon is never admitted as a Node.
 
 A compatible running remote daemon is not restarted solely because release
 versions differ. Automatic and ad hoc bootstrap reject an all-incompatible
@@ -900,6 +922,10 @@ require no state or Node-cache schema change. If a
 later implementation places any Node field in that durable representation, it
 must bump `STATE_VERSION` and provide the ordinary explicit migration and cold
 recovery evidence.
+Coordinator Workspace schema 8 adds bounded pending and completed placement
+default-cwd operation ledgers. Schema 7 migrates explicitly with both ledgers
+empty. Owner `STATE_VERSION` and handoff remain unchanged because `default_cwd`
+already belongs to the persisted Workspace shape.
 
 Registration schema 1 is stored in owner-only `node_registrations.json` beside,
 but independently from, `state.json` and `node.json`. It stores only alias,
