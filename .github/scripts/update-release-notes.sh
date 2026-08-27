@@ -14,10 +14,12 @@ fi
 
 marker='<!-- boomux-install-handoff -->'
 end_marker='<!-- /boomux-install-handoff -->'
-release_id=$(gh api "repos/${repo}/releases/tags/${tag}" --jq .id 2>/dev/null || true)
-if [[ -z "$release_id" ]]; then
+release_id=$(gh api "repos/${repo}/releases/tags/${tag}" --jq .id 2>/dev/null \
+  | sed -n '/^[0-9][0-9]*$/p' || true)
+if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
   release_id=$(gh api --paginate "repos/${repo}/releases?per_page=100" \
-    --jq ".[] | select(.tag_name == \"$tag\") | .id")
+    --jq ".[] | select(.tag_name == \"$tag\") | .id" \
+    | sed -n '/^[0-9][0-9]*$/p')
 fi
 if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
   printf 'could not resolve one release for %s\n' "$tag" >&2
@@ -62,12 +64,6 @@ for attempt in 1 2 3; do
     exit 0
   fi
 
-  response=$(gh api --include "$endpoint")
-  etag=$(printf '%s\n' "$response" | sed -n 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//p' | tr -d '\r' | sed -n '1p')
-  if [[ -z "$etag" ]]; then
-    printf 'release response did not include an ETag\n' >&2
-    exit 1
-  fi
   if [[ $(gh api "$endpoint" --jq '.body // ""') != "$body" ]]; then
     continue
   fi
@@ -77,7 +73,7 @@ for attempt in 1 2 3; do
     updated+=$'\n\n'
   fi
   updated+=$handoff
-  if gh api --method PATCH "$endpoint" -H "If-Match: $etag" -f body="$updated" >/dev/null; then
+  if gh api --method PATCH "$endpoint" -f body="$updated" >/dev/null; then
     verified=$(gh api "$endpoint" --jq '.body // ""')
     marker_count=$(count_occurrences "$verified" "$marker")
     end_marker_count=$(count_occurrences "$verified" "$end_marker")
@@ -87,5 +83,5 @@ for attempt in 1 2 3; do
   fi
 done
 
-printf 'release notes changed concurrently; handoff was not applied\n' >&2
+printf 'release notes changed concurrently or update verification failed; handoff was not applied\n' >&2
 exit 1
