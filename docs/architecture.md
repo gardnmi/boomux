@@ -922,10 +922,11 @@ reporting, and `integration uninstall` safely removes one or all managed assets.
 
 The human-only top-level `boomux setup` command composes these existing local
 primitives without adding protocol or durable setup state. It requires terminal
-input and output, probes every bundled harness, and offers installation only for
-harness executables found on the current `PATH`. Each harness mutation has a
-separate default-no prompt; modified assets are identified and require explicit
-replacement consent. The optional Agent Skill remains a separate owned asset.
+input and output, connects to or starts the local daemon during its system check,
+probes every bundled harness, and offers installation only for harness executables
+found on the current `PATH`. Each harness mutation has a separate default-no
+prompt; modified assets are identified and require explicit replacement consent.
+The optional Agent Skill remains a separate owned asset.
 
 On an Omarchy installation, setup executes only bounded exact-argument `omarchy`
 commands. Plugin inventory comes from `omarchy plugin list --json`; installation

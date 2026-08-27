@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use boomux::client;
+
 use crate::integration_management::{self, AssetState, HostState, InstallAction, IntegrationId};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -169,7 +171,13 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
             "Discover harnesses, lifecycle integrations, and desktop support."
         )
     );
-    println!("{}", paint("2", "Every change requires confirmation."));
+    println!(
+        "{}",
+        paint(
+            "2",
+            "Daemon readiness is automatic; configuration changes require confirmation."
+        )
+    );
 
     section("System Check");
     if let Some(terminal_resolver) = executable_on_path("xdg-terminal-exec") {
@@ -182,6 +190,18 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
     } else {
         status("!!", "33", "Terminal resolver", "not found on PATH");
     }
+    let daemon_was_running = client::connect().is_ok();
+    client::connect_or_start()?;
+    status(
+        "ok",
+        "32",
+        "Daemon",
+        if daemon_was_running {
+            "already running"
+        } else {
+            "started"
+        },
+    );
 
     let environment = integration_management::Environment::from_process();
     let statuses = IntegrationId::all()

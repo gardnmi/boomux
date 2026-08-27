@@ -32,16 +32,17 @@ boomux setup
 
 This is the recommended way to configure Boomux. The wizard discovers supported
 Agent harnesses on `PATH`, offers each missing or modified lifecycle integration
-separately, and can install the Boomux Agent Skill when it finds a harness. On
-Omarchy it can install, enable, and load `omarchy-boomux`, analyze existing
-keybindings, warn which bindings would be overridden, and install the full
-desktop profile. Desktop setup requires `boomux` to be available to Omarchy's
-graphical environment; the official release installation uses `~/.local/bin`.
+separately, starts the local Boomux daemon when needed, and can install the
+Boomux Agent Skill when it finds a harness. On Omarchy it can install, enable,
+and load `omarchy-boomux`, analyze existing keybindings, warn which bindings
+would be overridden, and install the full desktop profile. Desktop setup requires
+`boomux` to be available to Omarchy's graphical environment; the official release
+installation uses `~/.local/bin`.
 
-Every prompt defaults to no and modified assets require explicit replacement.
-Rerunning setup is safe: compatible user-managed bindings are recognized, their
-reinstall impact is shown, and they remain unchanged unless you confirm the
-managed profile installation.
+Every configuration prompt defaults to no and modified assets require explicit
+replacement. Daemon startup is automatic. Rerunning setup is safe: compatible
+user-managed bindings are recognized, their reinstall impact is shown, and they
+remain unchanged unless you confirm the managed profile installation.
 
 For automation, use the individual `integration status`, `integration install`,
 and `skill install` commands instead. `boomux setup` intentionally requires an

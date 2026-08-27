@@ -4,6 +4,42 @@ use std::process::Command;
 use uuid::Uuid;
 
 #[test]
+fn workspace_create_starts_the_daemon_when_absent() {
+    let root = std::env::temp_dir().join(format!(
+        "bmux-create-start-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let runtime = root.join("runtime");
+    fs::create_dir_all(&runtime).unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_boomux"));
+        command
+            .env("HOME", &root)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("state"));
+        command
+    };
+
+    let created = command()
+        .args(["workspace", "create", "cold-start"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "workspace create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(String::from_utf8_lossy(&created.stdout).contains("Created workspace cold-start"));
+    assert!(runtime.join("boomux/daemon.sock").exists());
+
+    let stopped = command().args(["daemon", "stop"]).output().unwrap();
+    assert!(stopped.status.success());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn bare_cli_prints_command_help_without_starting_the_daemon() {
     let root = std::env::temp_dir().join(format!(
         "boomux-bare-help-{}-{}",

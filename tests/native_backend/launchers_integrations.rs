@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use boomux::protocol::{self, WorkspaceLauncherSpec};
@@ -8,6 +9,28 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
 
 use crate::support::{TestDaemon, wait_until};
+
+fn setup_runtime(root: &Path) -> PathBuf {
+    let runtime = root.join("runtime");
+    fs::create_dir_all(&runtime).unwrap();
+    runtime
+}
+
+fn stop_setup_daemon(executable: &Path, root: &Path, runtime: &Path) {
+    let output = Command::new(executable)
+        .args(["daemon", "stop"])
+        .env("HOME", root)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "daemon stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 #[test]
 fn guided_setup_requires_an_interactive_terminal() {
@@ -32,6 +55,7 @@ fn guided_setup_discovers_and_installs_one_selected_harness() {
     ));
     let bin = root.join("bin");
     let config = root.join("config");
+    let runtime = setup_runtime(&root);
     fs::create_dir_all(&bin).unwrap();
     for (name, content) in [
         ("opencode", "#!/bin/sh\nprintf '1.18.18\\n'\n"),
@@ -54,6 +78,8 @@ fn guided_setup_discovers_and_installs_one_selected_harness() {
     command.arg("setup");
     command.env("HOME", &root);
     command.env("XDG_CONFIG_HOME", &config);
+    command.env("XDG_RUNTIME_DIR", &runtime);
+    command.env("XDG_STATE_HOME", root.join("state"));
     command.env("PATH", &bin);
     let mut child = pty.slave.spawn_command(command).unwrap();
     drop(pty.slave);
@@ -65,6 +91,8 @@ fn guided_setup_discovers_and_installs_one_selected_harness() {
     let mut output = String::new();
     std::io::Read::read_to_string(reader.as_mut(), &mut output).unwrap();
     assert!(output.contains("OpenCode"));
+    assert!(output.contains("Daemon"));
+    assert!(output.contains("started"));
     assert!(output.contains("host available | integration missing"));
     assert!(output.contains("integration installed"));
     assert!(output.contains("Omarchy"));
@@ -74,19 +102,22 @@ fn guided_setup_discovers_and_installs_one_selected_harness() {
         "{output}"
     );
     assert!(!root.join(".agents/skills/boomux/SKILL.md").exists());
+    assert!(runtime.join("boomux/daemon.sock").exists());
+    stop_setup_daemon(Path::new(env!("CARGO_BIN_EXE_boomux")), &root, &runtime);
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn guided_setup_rejects_cargo_private_boomux_before_desktop_mutation() {
     let root = std::env::temp_dir().join(format!(
-        "boomux-guided-desktop-cargo-path-{}-{}",
+        "bmux-setup-cargo-{}-{}",
         std::process::id(),
         Uuid::new_v4()
     ));
     let cargo_bin = root.join(".cargo/bin");
     let bin = root.join("bin");
     let log = root.join("commands.log");
+    let runtime = setup_runtime(&root);
     fs::create_dir_all(&cargo_bin).unwrap();
     fs::create_dir_all(&bin).unwrap();
     let installed = cargo_bin.join("boomux");
@@ -115,6 +146,8 @@ fn guided_setup_rejects_cargo_private_boomux_before_desktop_mutation() {
     command.arg("setup");
     command.env("HOME", &root);
     command.env("CARGO_HOME", root.join(".cargo"));
+    command.env("XDG_RUNTIME_DIR", &runtime);
+    command.env("XDG_STATE_HOME", root.join("state"));
     command.env("PATH", &bin);
     command.env("LOG", &log);
     let mut child = pty.slave.spawn_command(command).unwrap();
@@ -127,6 +160,7 @@ fn guided_setup_rejects_cargo_private_boomux_before_desktop_mutation() {
     assert!(output.contains(".local/bin/boomux"), "{output}");
     assert_eq!(fs::read_to_string(&log).unwrap(), "version\n");
 
+    stop_setup_daemon(&installed, &root, &runtime);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -139,6 +173,7 @@ fn guided_setup_installs_omarchy_plugin_and_managed_bindings() {
     ));
     let bin = root.join("bin");
     let log = root.join("commands.log");
+    let runtime = setup_runtime(&root);
     fs::create_dir_all(&bin).unwrap();
     let omarchy = bin.join("omarchy");
     fs::write(
@@ -175,6 +210,8 @@ fn guided_setup_installs_omarchy_plugin_and_managed_bindings() {
     command.arg("setup");
     command.env("HOME", &root);
     command.env("PATH", &bin);
+    command.env("XDG_RUNTIME_DIR", &runtime);
+    command.env("XDG_STATE_HOME", root.join("state"));
     command.env("LOG", &log);
     command.env("HYPRLAND_INSTANCE_SIGNATURE", "test-instance");
     let mut child = pty.slave.spawn_command(command).unwrap();
@@ -198,6 +235,7 @@ fn guided_setup_installs_omarchy_plugin_and_managed_bindings() {
     let bindings = fs::read_to_string(root.join(".config/hypr/bindings.lua")).unwrap();
     assert!(bindings.contains("BEGIN BOOMUX MANAGED KEYBINDINGS"));
     assert!(bindings.contains("boomux desktop gather"));
+    stop_setup_daemon(Path::new(env!("CARGO_BIN_EXE_boomux")), &root, &runtime);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -209,6 +247,7 @@ fn guided_setup_declined_bindings_do_not_create_hyprland_config() {
         Uuid::new_v4()
     ));
     let bin = root.join("bin");
+    let runtime = setup_runtime(&root);
     fs::create_dir_all(&bin).unwrap();
     let omarchy = bin.join("omarchy");
     fs::write(
@@ -233,6 +272,8 @@ fn guided_setup_declined_bindings_do_not_create_hyprland_config() {
     command.arg("setup");
     command.env("HOME", &root);
     command.env("PATH", &bin);
+    command.env("XDG_RUNTIME_DIR", &runtime);
+    command.env("XDG_STATE_HOME", root.join("state"));
     let mut child = pty.slave.spawn_command(command).unwrap();
     drop(pty.slave);
     let mut writer = pty.master.take_writer().unwrap();
@@ -240,6 +281,7 @@ fn guided_setup_declined_bindings_do_not_create_hyprland_config() {
     drop(writer);
     assert!(child.wait().unwrap().success());
     assert!(!root.join(".config/hypr").exists());
+    stop_setup_daemon(Path::new(env!("CARGO_BIN_EXE_boomux")), &root, &runtime);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -252,6 +294,7 @@ fn guided_setup_recognizes_compatible_user_managed_bindings() {
     ));
     let bin = root.join("bin");
     let hypr = root.join(".config/hypr");
+    let runtime = setup_runtime(&root);
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&hypr).unwrap();
     let bindings = b"o.bind(\"SUPER + B\", \"Toggle Boomux panel\", \"omarchy-shell io.github.gardnmi.boomux toggle\")\n\
@@ -293,6 +336,8 @@ o.bind(\"SUPER + CTRL + W\", \"Close Shell\", \"boomux close --focused\")\n";
     command.arg("setup");
     command.env("HOME", &root);
     command.env("PATH", &bin);
+    command.env("XDG_RUNTIME_DIR", &runtime);
+    command.env("XDG_STATE_HOME", root.join("state"));
     command.env("NO_COLOR", "1");
     let mut child = pty.slave.spawn_command(command).unwrap();
     drop(pty.slave);
@@ -313,6 +358,7 @@ o.bind(\"SUPER + CTRL + W\", \"Close Shell\", \"boomux close --focused\")\n";
         "{output}"
     );
     assert_eq!(fs::read(hypr.join("bindings.lua")).unwrap(), bindings);
+    stop_setup_daemon(Path::new(env!("CARGO_BIN_EXE_boomux")), &root, &runtime);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -326,6 +372,7 @@ fn guided_setup_restores_bindings_after_hyprland_validation_failure() {
     let bin = root.join("bin");
     let hypr = root.join(".config/hypr");
     let validation_count = root.join("validation-count");
+    let runtime = setup_runtime(&root);
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&hypr).unwrap();
     let baseline = b"-- exact user bindings\n\xff\n";
@@ -361,6 +408,8 @@ fn guided_setup_restores_bindings_after_hyprland_validation_failure() {
     command.env("HOME", &root);
     command.env("PATH", &bin);
     command.env("VALIDATION_COUNT", &validation_count);
+    command.env("XDG_RUNTIME_DIR", &runtime);
+    command.env("XDG_STATE_HOME", root.join("state"));
     command.env("HYPRLAND_INSTANCE_SIGNATURE", "test-instance");
     let mut child = pty.slave.spawn_command(command).unwrap();
     drop(pty.slave);
@@ -369,6 +418,7 @@ fn guided_setup_restores_bindings_after_hyprland_validation_failure() {
     drop(writer);
     assert!(!child.wait().unwrap().success());
     assert_eq!(fs::read(hypr.join("bindings.lua")).unwrap(), baseline);
+    stop_setup_daemon(Path::new(env!("CARGO_BIN_EXE_boomux")), &root, &runtime);
     fs::remove_dir_all(root).unwrap();
 }
 
