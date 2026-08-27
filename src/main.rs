@@ -50,6 +50,7 @@ mod mobile_web;
 mod process_adapter;
 mod projects;
 mod session_projection;
+mod setup;
 mod tailscale_serve;
 mod terminal;
 mod tui;
@@ -154,6 +155,7 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "local_update_status",
     "guided_local_update",
     "guided_local_uninstall",
+    "guided_setup",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -265,6 +267,8 @@ enum Commands {
     },
     /// Check that Boomux's dependencies and daemon are available
     Doctor,
+    /// Discover and configure local Agent harnesses and desktop integration
+    Setup,
     /// Report stable integration capabilities without starting the daemon
     Capabilities,
     /// List all managed shells
@@ -1178,6 +1182,7 @@ command_keys! {
     WebStatus => ("web.status", Json),
     WebStop => ("web.stop", Json),
     Doctor => ("doctor", HumanOnly),
+    Setup => ("setup", HumanOnly),
     Capabilities => ("capabilities", Json),
     List => ("list", Json),
     Shells => ("shells", Json),
@@ -1441,6 +1446,7 @@ impl Cli {
             }) => CommandKey::Daemon,
             Some(Commands::Ui) | None => CommandKey::Ui,
             Some(Commands::Doctor) => CommandKey::Doctor,
+            Some(Commands::Setup) => CommandKey::Setup,
             Some(Commands::Close { .. }) => CommandKey::Close,
             Some(Commands::Skill {
                 command: SkillCommands::Install { .. },
@@ -1776,6 +1782,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
         Some(Commands::Web { .. }) => unreachable!(),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
+        Some(Commands::Setup) => setup::guided_setup(),
         Some(Commands::Capabilities) => capabilities(cli.json),
         Some(Commands::List) => list_shells(cli.json),
         Some(Commands::Shells) => list_workspace_shells(cli.json),
@@ -11292,6 +11299,14 @@ mod tests {
             cli.command.as_ref(),
             Some(Commands::UninstallFingerprint)
         ));
+    }
+
+    #[test]
+    fn guided_setup_is_human_only() {
+        let cli = Cli::try_parse_from(["boomux", "setup"]).unwrap();
+        assert!(matches!(cli.command.as_ref(), Some(Commands::Setup)));
+        assert_eq!(cli.command_descriptor().key, "setup");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
     }
 
     #[test]

@@ -47,6 +47,13 @@ not appear in `json_commands`, and do not provide remote configuration mutation.
 `config validate` covers the complete global plus optional `BOOMUX_CONFIG`
 layered result without starting the daemon.
 
+`boomux setup` is a human-only local discovery and mutation workflow. It requires
+an interactive terminal, does not support `--json`, and is absent from
+`json_commands`. Automation must compose the advertised integration status,
+install, and uninstall commands instead. The static `guided_setup` feature means
+the binary contains this workflow; it does not claim that a supported harness,
+Omarchy, Hyprland, `hyprctl`, or the companion plugin is currently available.
+
 `boomux desktop toggle`, `desktop show TARGET`, `desktop next`, `desktop previous`, `desktop terminal`,
 `desktop close`, `desktop pop`, `desktop return`, and `desktop gather` are also
 human-only. They orchestrate the default local Hyprland

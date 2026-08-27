@@ -4,9 +4,314 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
 use boomux::protocol::{self, WorkspaceLauncherSpec};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use uuid::Uuid;
 
 use crate::support::{TestDaemon, wait_until};
+
+#[test]
+fn guided_setup_requires_an_interactive_terminal() {
+    let output = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .arg("setup")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Boomux setup requires an interactive terminal")
+    );
+}
+
+#[test]
+fn guided_setup_discovers_and_installs_one_selected_harness() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-guided-setup-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bin = root.join("bin");
+    let config = root.join("config");
+    fs::create_dir_all(&bin).unwrap();
+    for (name, content) in [
+        ("opencode", "#!/bin/sh\nprintf '1.18.18\\n'\n"),
+        ("xdg-terminal-exec", "#!/bin/sh\nexit 0\n"),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, content).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 800,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_boomux"));
+    command.arg("setup");
+    command.env("HOME", &root);
+    command.env("XDG_CONFIG_HOME", &config);
+    command.env("PATH", &bin);
+    let mut child = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let mut writer = pty.master.take_writer().unwrap();
+    writer.write_all(b"yes\nno\n").unwrap();
+    drop(writer);
+    assert!(child.wait().unwrap().success());
+    let mut output = String::new();
+    std::io::Read::read_to_string(reader.as_mut(), &mut output).unwrap();
+    assert!(output.contains("OpenCode"));
+    assert!(output.contains("host available | integration missing"));
+    assert!(output.contains("integration installed"));
+    assert!(output.contains("Omarchy"));
+    assert!(output.contains("not detected"));
+    assert!(
+        config.join("opencode/plugins/boomux.js").is_file(),
+        "{output}"
+    );
+    assert!(!root.join(".agents/skills/boomux/SKILL.md").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn guided_setup_installs_omarchy_plugin_and_managed_bindings() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-guided-desktop-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bin = root.join("bin");
+    let log = root.join("commands.log");
+    fs::create_dir_all(&bin).unwrap();
+    let omarchy = bin.join("omarchy");
+    fs::write(
+        &omarchy,
+        "#!/bin/sh\nprintf 'omarchy %s\\n' \"$*\" >> \"$LOG\"\ncase \"$*\" in\n  version) printf 'Omarchy 4.0\\n' ;;\n  'plugin list --json') printf '[]\\n' ;;\n  'plugin add https://github.com/gardnmi/omarchy-boomux.git --enable --yes') ;;\n  'menu keybindings --print') printf 'SUPER + B  → Browser\\nSUPER CTRL + W  → Close\\n' ;;\n  *) exit 97 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&omarchy, fs::Permissions::from_mode(0o755)).unwrap();
+    let hyprctl = bin.join("hyprctl");
+    fs::write(
+        &hyprctl,
+        "#!/bin/sh\nprintf 'hyprctl %s\\n' \"$*\" >> \"$LOG\"\ncase \"$1\" in reload|configerrors) ;; *) exit 98 ;; esac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hyprctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let terminal = bin.join("xdg-terminal-exec");
+    fs::write(&terminal, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&terminal, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 800,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_boomux"));
+    command.arg("setup");
+    command.env("HOME", &root);
+    command.env("PATH", &bin);
+    command.env("LOG", &log);
+    command.env("HYPRLAND_INSTANCE_SIGNATURE", "test-instance");
+    let mut child = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let mut writer = pty.master.take_writer().unwrap();
+    writer.write_all(b"yes\nyes\n").unwrap();
+    drop(writer);
+    assert!(child.wait().unwrap().success());
+    let mut output = String::new();
+    std::io::Read::read_to_string(reader.as_mut(), &mut output).unwrap();
+    assert!(output.contains("conflicts require replacement"));
+    assert!(output.contains("reloaded without errors"));
+    let commands = fs::read_to_string(&log).unwrap();
+    assert!(commands.contains(
+        "omarchy plugin add https://github.com/gardnmi/omarchy-boomux.git --enable --yes\n"
+    ));
+    assert!(commands.contains("hyprctl reload\n"));
+    assert!(commands.contains("hyprctl configerrors\n"));
+    let bindings = fs::read_to_string(root.join(".config/hypr/bindings.lua")).unwrap();
+    assert!(bindings.contains("BEGIN BOOMUX MANAGED KEYBINDINGS"));
+    assert!(bindings.contains("boomux desktop gather"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn guided_setup_declined_bindings_do_not_create_hyprland_config() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-guided-desktop-decline-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let omarchy = bin.join("omarchy");
+    fs::write(
+        &omarchy,
+        "#!/bin/sh\ncase \"$*\" in\n  version) printf 'Omarchy 4.0\\n' ;;\n  'plugin list --json') printf '[{\"id\":\"io.github.gardnmi.boomux\",\"enabled\":true}]\\n' ;;\n  'menu keybindings --print') printf '' ;;\n  *) exit 97 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&omarchy, fs::Permissions::from_mode(0o755)).unwrap();
+    let terminal = bin.join("xdg-terminal-exec");
+    fs::write(&terminal, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&terminal, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 800,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_boomux"));
+    command.arg("setup");
+    command.env("HOME", &root);
+    command.env("PATH", &bin);
+    let mut child = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let mut writer = pty.master.take_writer().unwrap();
+    writer.write_all(b"no\n").unwrap();
+    drop(writer);
+    assert!(child.wait().unwrap().success());
+    assert!(!root.join(".config/hypr").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn guided_setup_recognizes_compatible_user_managed_bindings() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-guided-desktop-existing-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bin = root.join("bin");
+    let hypr = root.join(".config/hypr");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&hypr).unwrap();
+    let bindings = b"o.bind(\"SUPER + B\", \"Toggle Boomux panel\", \"omarchy-shell io.github.gardnmi.boomux toggle\")\n\
+o.bind(\"SUPER + A\", \"Focus Boomux panel\", \"omarchy-shell io.github.gardnmi.boomux focus\")\n\
+hl.exec_cmd(\"omarchy-shell io.github.gardnmi.boomux releaseFocus\")\n\
+o.bind(\"SUPER + LEFT\", \"Focus on left window\", focus(\"l\"))\n\
+o.bind(\"SUPER + RIGHT\", \"Focus on right window\", focus(\"r\"))\n\
+o.bind(\"SUPER + UP\", \"Focus on above window\", focus(\"u\"))\n\
+o.bind(\"SUPER + DOWN\", \"Focus on below window\", focus(\"d\"))\n\
+o.bind(\"SUPER + TAB\", \"Next workspace\", \"boomux desktop next\")\n\
+o.bind(\"SUPER + SHIFT + TAB\", \"Previous workspace\", \"boomux desktop previous\")\n\
+o.bind(\"SUPER + RETURN\", \"Contextual terminal\", \"boomux desktop terminal\")\n\
+o.bind(\"SUPER + O\", \"Pop window contextually\", \"boomux desktop pop\")\n\
+o.bind(\"SUPER + ALT + B\", \"Return terminal\", \"boomux desktop return\")\n\
+o.bind(\"SUPER + ALT + R\", \"Gather terminals\", \"boomux desktop gather\")\n\
+o.bind(\"SUPER + CTRL + RETURN\", \"New Shell\", \"boomux shell create --open\")\n\
+o.bind(\"SUPER + CTRL + W\", \"Close Shell\", \"boomux close --focused\")\n";
+    fs::write(hypr.join("bindings.lua"), bindings).unwrap();
+    let omarchy = bin.join("omarchy");
+    fs::write(
+        &omarchy,
+        "#!/bin/sh\ncase \"$*\" in\n  version) printf 'Omarchy 4.0\\n' ;;\n  'plugin list --json') printf '[{\"id\":\"io.github.gardnmi.boomux\",\"enabled\":true}]\\n' ;;\n  'menu keybindings --print') printf 'SUPER + B  → Toggle Boomux panel\\nSUPER + RETURN  → Contextual terminal\\n' ;;\n  *) exit 97 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&omarchy, fs::Permissions::from_mode(0o755)).unwrap();
+    let terminal = bin.join("xdg-terminal-exec");
+    fs::write(&terminal, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&terminal, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 800,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_boomux"));
+    command.arg("setup");
+    command.env("HOME", &root);
+    command.env("PATH", &bin);
+    command.env("NO_COLOR", "1");
+    let mut child = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let mut writer = pty.master.take_writer().unwrap();
+    writer.write_all(b"no\n").unwrap();
+    drop(writer);
+    assert!(child.wait().unwrap().success());
+    let mut output = String::new();
+    std::io::Read::read_to_string(reader.as_mut(), &mut output).unwrap();
+    assert!(
+        output.contains("compatible user-managed profile"),
+        "{output}"
+    );
+    assert!(output.contains("Reinstall impact"), "{output}");
+    assert!(
+        output.contains("Reinstall the standard Boomux keybinding profile?"),
+        "{output}"
+    );
+    assert_eq!(fs::read(hypr.join("bindings.lua")).unwrap(), bindings);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn guided_setup_restores_bindings_after_hyprland_validation_failure() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-guided-desktop-rollback-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let bin = root.join("bin");
+    let hypr = root.join(".config/hypr");
+    let validation_count = root.join("validation-count");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&hypr).unwrap();
+    let baseline = b"-- exact user bindings\n\xff\n";
+    fs::write(hypr.join("bindings.lua"), baseline).unwrap();
+    let omarchy = bin.join("omarchy");
+    fs::write(
+        &omarchy,
+        "#!/bin/sh\ncase \"$*\" in\n  version) printf 'Omarchy 4.0\\n' ;;\n  'plugin list --json') printf '[{\"id\":\"io.github.gardnmi.boomux\",\"enabled\":true}]\\n' ;;\n  'menu keybindings --print') printf '' ;;\n  *) exit 97 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&omarchy, fs::Permissions::from_mode(0o755)).unwrap();
+    let hyprctl = bin.join("hyprctl");
+    fs::write(
+        &hyprctl,
+        "#!/bin/sh\ncase \"$1\" in\n  reload) ;;\n  configerrors) if [ ! -e \"$VALIDATION_COUNT\" ]; then : > \"$VALIDATION_COUNT\"; printf 'bad binding\\n'; fi ;;\n  *) exit 98 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hyprctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let terminal = bin.join("xdg-terminal-exec");
+    fs::write(&terminal, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&terminal, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 800,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_boomux"));
+    command.arg("setup");
+    command.env("HOME", &root);
+    command.env("PATH", &bin);
+    command.env("VALIDATION_COUNT", &validation_count);
+    command.env("HYPRLAND_INSTANCE_SIGNATURE", "test-instance");
+    let mut child = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let mut writer = pty.master.take_writer().unwrap();
+    writer.write_all(b"yes\n").unwrap();
+    drop(writer);
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(fs::read(hypr.join("bindings.lua")).unwrap(), baseline);
+    fs::remove_dir_all(root).unwrap();
+}
 
 #[test]
 fn workspace_launchers_persist_emit_events_and_open_without_shells() {

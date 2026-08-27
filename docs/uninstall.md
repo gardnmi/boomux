@@ -43,6 +43,14 @@ never uses integration force-removal implicitly. Host configuration and session
 catalogs owned by OpenCode, Pi, Claude, Codex, or Kiro are not Boomux assets and
 are never removed.
 
+An unchanged keybinding block installed by `boomux setup` is also a Boomux-owned
+asset and is removed while preserving every other byte in
+`~/.config/hypr/bindings.lua`. A modified, malformed, symlinked, special, or
+uninspectable binding target is preserved and reported. The external
+`io.github.gardnmi.boomux` Omarchy plugin remains owned by Omarchy and is not
+removed implicitly; uninstall prints its explicit `omarchy plugin remove`
+command.
+
 ## Process And Data Safety
 
 Before filesystem removal, uninstall discovers and stops bounded Boomux web

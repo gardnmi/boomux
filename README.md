@@ -18,9 +18,32 @@ terminal as ordinary native windows.
 </p>
 
 > [!WARNING]
-> Boomux is pre-1.0. Human-facing commands and presentation may evolve. Durable
-> state uses explicit versioned migrations, and supported automation output uses
-> the stable `boomux.cli/v1` contract.
+> Human-facing commands and presentation may evolve. Supported automation output
+> uses the stable `boomux.cli/v1` contract.
+
+## Get Started
+
+After installing the Boomux binary using one of the methods below, run the
+guided setup:
+
+```console
+boomux setup
+```
+
+This is the recommended way to configure Boomux. The wizard discovers supported
+Agent harnesses on `PATH`, offers each missing or modified lifecycle integration
+separately, and can install the Boomux Agent Skill when it finds a harness. On
+Omarchy it can install and enable `omarchy-boomux`, analyze existing keybindings,
+warn which bindings would be overridden, and install the full desktop profile.
+
+Every prompt defaults to no and modified assets require explicit replacement.
+Rerunning setup is safe: compatible user-managed bindings are recognized, their
+reinstall impact is shown, and they remain unchanged unless you confirm the
+managed profile installation.
+
+For automation, use the individual `integration status`, `integration install`,
+and `skill install` commands instead. `boomux setup` intentionally requires an
+interactive terminal and does not support `--json`.
 
 ## Install And Update
 
@@ -29,12 +52,14 @@ terminal as ordinary native windows.
 - Unix or Linux with an absolute `XDG_RUNTIME_DIR`.
 - `xdg-terminal-exec` and an available terminal desktop entry.
 
-Git is optional; without it, repository metadata is empty. The default desktop
-Workspace layer additionally requires an active Hyprland session and compatible
-`hyprctl`. Outside Hyprland, ordinary Boomux terminal opens remain native windows.
+Git is optional at runtime; without it, repository metadata is empty. The default
+desktop Workspace layer additionally requires an active Hyprland session and
+compatible `hyprctl`. Outside Hyprland, ordinary Boomux terminal opens remain
+native windows.
 
 The release recipe below requires GitHub CLI (`gh`), `sha256sum`, `tar`, and
-`install`. Building from source requires Git and a Rust toolchain.
+`install`. Installing from Git requires Git and a Rust toolchain; compiling an
+existing source tree requires only the Rust toolchain.
 
 ### Latest Release
 
@@ -81,25 +106,20 @@ self-replaced, and Boomux never silently downgrades. Automatic updates are not
 enabled.
 
 > [!CAUTION]
-> v0.32 uses protocol 46, state schema 13, and handoff H7. It cannot gracefully
-> self-update into the schedule-free protocol-47 release. Before installing this
-> release, use the v0.32 binary to run `boomux daemon stop`; this terminates every
-> managed process. Back up and remove
-> `$XDG_STATE_HOME/boomux/state.json`, `global_workspaces.json`,
-> `local_shell_transactions.log`, `node-cache.json`, and
-> `selected-workspace.json` (using `~/.local/state` when `XDG_STATE_HOME` is
-> unset). Remove the `[scheduling]` table and the
-> `scheduled_dispatch_failed` and `scheduled_interrupted` keys from both
-> `[notifications]` and `[notifications.sound]` in every active config layer,
-> including `BOOMUX_CONFIG`. Then install the new binary and start it with an
-> ordinary command such as `boomux`. `node.json` and `node_registrations.json`
-> are not part of this reset.
+> Upgrading from v0.32 to v1.x crosses an incompatible protocol and state
+> boundary. It requires a cold upgrade that terminates managed processes. Follow
+> the exact [local update procedure](docs/local-update.md#protocol-47-alpha-break).
 
 Prefer `daemon restart` over `daemon stop`: stopping the daemon terminates every
 managed process. Upgrade registered remote Nodes separately with
 `boomux node upgrade NODE`.
 
-## Quick Start
+To remove an official release installation, use `boomux uninstall`. Add
+`--purge` only when you also intend to remove user data. Use
+`boomux node uninstall NODE` for an identity-verified remote uninstall. See
+[Uninstall](docs/uninstall.md) for ownership and preservation guarantees.
+
+## Create Your First Workspace
 
 Create a coordinated Workspace and its first Shell from a project directory:
 
@@ -135,13 +155,13 @@ boomux
 
 | Term | Meaning |
 | --- | --- |
-| **Node** | One independently authoritative Boomux daemon and its local resources. |
+| **Node** | A durable host-local authority with stable identity, implemented by a replaceable Boomux daemon. |
 | **Workspace** | A durable task grouping. A coordinated Workspace explicitly links owner-Node placements. |
 | **Desktop Workspace Layer** | Local presentation of a coordinated Workspace as a Hyprland special Workspace derived from its immutable coordinator ID. It owns no durable resources. |
 | **Shell** | A durable Workspace slot with at most one current process run. Each live run owns its PTY; closing its terminal attachment does not close the Shell. |
 | **Command** | A Shell with stored exact arguments instead of an interactive login command. |
 | **Launcher** | A detached exact-argument command invoked by an explicit Workspace open or restore. Desktop navigation alone never invokes it. |
-| **Agent Instance** | Run-scoped lifecycle state reported by an integration; not a permanent process-completion record. |
+| **Agent Instance** | A durable identity for one external Agent session associated with one Shell run; process exit alone never establishes completion. |
 
 Boomux preserves exact argument vectors and does not add shell interpolation to
 launchers or adapters.
@@ -188,37 +208,15 @@ boomux desktop return
 boomux desktop gather
 ```
 
-- `toggle` shows or hides the selected Workspace. If the layer has no terminal
-  windows, Boomux opens or reuses available user-Shell attachments without
-  invoking launchers. It does not fill missing siblings once one window exists.
-- `show` targets one exact coordinated Workspace with the same behavior.
-- `next` and `previous` cycle active, non-closing coordinated Workspaces. Outside
-  a Boomux layer they retain ordinary Hyprland Workspace navigation.
-- `terminal` creates a Shell in the visible layer or opens a normal terminal
-  outside one.
-- `close` permanently closes the focused Boomux Shell inside its layer; outside
-  one it closes the ordinary active window.
-- `pop` floats the active window contextually. `return` moves one exactly
-  identified Boomux terminal back to its owner layer.
-- `gather` returns the target Workspace's existing Shell windows and opens
-  missing user-Shell attachments. It does not invoke launchers.
-
-`desktop show` is navigation, not a full restore. Use the following to reveal a
-layer and perform normal Workspace restore semantics, including launchers and
-all available placements:
+`desktop toggle` and `desktop show` navigate without invoking launchers. Use the
+following to reveal a layer and perform normal Workspace restore semantics:
 
 ```console
 boomux workspace open <workspace-name-or-id> --show
 ```
 
-With the layer enabled, TUI Workspace restore and individual Agent/Shell opens
-use the same presentation. The TUI stays active in its original terminal and
-refreshes when you return.
-
-Boomux correlates adapter-opened windows using exact Node and Shell IDs encoded
-in immutable initial terminal titles. Those IDs are visible to local compositor
-inspection but are not credentials. Hyprland window addresses are ephemeral and
-never persisted or treated as Boomux identity.
+See [Architecture](docs/architecture.md) for exact navigation, placement, and
+restore semantics.
 
 ## Common Workflows
 
@@ -250,8 +248,8 @@ Use `boomux --help` and `boomux <command> --help` for the complete current CLI.
 Run `boomux` in a terminal. The dashboard provides four primary views:
 
 - **Workspaces**: coordinated tasks, placement state, attention, and ownership.
-- **Shells**: durable Shell slots, commands, launchers, and exact run state.
 - **Agents**: current Agent lifecycle and canonical Sessions.
+- **Shells**: durable Shell slots, commands, and exact run state.
 - **Nodes**: registration, route health, compatibility, and upgrade actions.
 
 Core keys:
@@ -292,22 +290,13 @@ boomux web --tailscale
 boomux web start --tailscale
 ```
 
-Boomux reuses compatible Serve routes, rejects conflicts, and removes only routes
-it created. It does not configure Tailscale grants or ACLs.
-
-`boomux web` also attempts to start a shared OpenCode runtime. When active,
-`--tailscale` publishes that separate full-control origin alongside the dashboard.
-Set a nonempty `OPENCODE_SERVER_PASSWORD` before its first start unless tailnet
-policy is intentionally the authentication boundary.
-
-The dashboard can dismiss exact local attention and authorize a short-lived
-**writable** web terminal for an exact current local Agent Shell run. Web-terminal
-control is equivalent to remote shell access. Restrict access to trusted tailnet
-users. OpenCode Web is a separate full-control origin and needs its own access
-boundary. Remote-Node terminal control is not exposed.
+> [!WARNING]
+> Web-terminal access is equivalent to shell access. OpenCode Web is a separate
+> full-control origin. Restrict both to trusted users and configure their access
+> boundaries deliberately.
 
 See [Mobile Web](docs/mobile-web.md) for complete security, lifecycle, and
-experimental HTTP behavior documentation.
+Tailscale behavior.
 
 ## Coding-Agent Integrations
 
@@ -326,7 +315,7 @@ report lifecycle events; they do not infer completion from quiet terminal output
 or parse conversations as transcripts. Modified or ineligible host invocations
 remain untracked rather than receiving fabricated authority.
 
-Install the vendor-neutral Agent skill separately when desired:
+Install the vendor-neutral Agent Skill manually when desired:
 
 ```console
 boomux skill install
@@ -437,6 +426,8 @@ versions, downgrade behavior, and protocol history.
 
 - [Architecture](docs/architecture.md)
 - [CLI JSON contract](docs/cli-json.md)
+- [Local Update](docs/local-update.md)
+- [Uninstall](docs/uninstall.md)
 - [Remote Nodes](docs/remote-nodes.md)
 - [Mobile Web](docs/mobile-web.md)
 - [Event Stream](docs/event-stream.md)

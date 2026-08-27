@@ -132,6 +132,15 @@ boomux integration status opencode --json
 boomux integration status codex --json
 ```
 
+When the user explicitly asks for first-run local configuration, `boomux setup`
+is the interactive end-to-end workflow. It discovers installed harnesses, offers
+their lifecycle assets individually, optionally installs this Agent Skill, and
+can configure the Omarchy companion plugin and Boomux-owned Hyprland bindings.
+It recognizes and preserves a complete compatible user-managed binding profile.
+It requires a terminal and every mutation prompt defaults to no. Do not run it
+for inspection alone or without explicit authorization; use the JSON status and
+dry-run commands below instead.
+
 Mutation commands include:
 
 ```console

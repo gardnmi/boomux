@@ -35,6 +35,7 @@
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
+| `src/setup.rs` | Interactive local setup orchestration, Omarchy plugin discovery, and ownership-bounded Hyprland binding installation |
 | `src/update.rs` | Local release discovery, installation classification, interactive self-update authorization, atomic executable replacement, and daemon handoff verification |
 | `src/uninstall.rs` | Interactive release uninstall orchestration, owned-asset cleanup, bounded purge validation, and process shutdown ordering |
 | `src/claude_hooks.rs`, `src/codex_hooks.rs`, `src/kiro_hooks.rs` | Bounded Claude Code, Codex, and Kiro hook decoding and lifecycle reduction |
@@ -918,6 +919,29 @@ Individual host installers remain equivalent shortcuts over the same registry
 and safe primitives. `integration setup` provides guided consent and reload
 guidance, `integration verify` checks current-run authoritative lifecycle
 reporting, and `integration uninstall` safely removes one or all managed assets.
+
+The human-only top-level `boomux setup` command composes these existing local
+primitives without adding protocol or durable setup state. It requires terminal
+input and output, probes every bundled harness, and offers installation only for
+harness executables found on the current `PATH`. Each harness mutation has a
+separate default-no prompt; modified assets are identified and require explicit
+replacement consent. The optional Agent Skill remains a separate owned asset.
+
+On an Omarchy installation, setup executes only bounded exact-argument `omarchy`
+commands. Plugin inventory comes from `omarchy plugin list --json`; installation
+uses the fixed `gardnmi/omarchy-boomux` HTTPS repository and Omarchy retains
+plugin lifecycle ownership. Boomux never edits `/usr/share/omarchy`. The full
+desktop binding profile is one marked block in the current user's
+`~/.config/hypr/bindings.lua`. Setup reports conflicts before consent, preserves
+all bytes outside that block, rejects symlinked, special, non-owned, oversized,
+or malformed targets, revalidates the inspected baseline, preserves mode, and
+atomically replaces and synchronizes the file. An active Hyprland session is
+reloaded and checked with `hyprctl configerrors`; otherwise the bindings take
+effect at the next session. The complete historical user-managed Boomux profile
+is recognized by its exact panel, focus-release, desktop, Shell-create, and
+focused-close actions and remains user-owned without adding a managed block.
+Local uninstall removes only an unchanged managed binding block and leaves the
+independently managed Omarchy plugin installed.
 
 Observed host compatibility and provider-dependent gaps are recorded in
 [`lifecycle-validation.md`](lifecycle-validation.md). Focused unit fixtures
