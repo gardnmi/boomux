@@ -96,7 +96,11 @@ jobs:
 
       - name: Validate release scripts
         if: ${{ matrix.arch == 'x86_64' }}
-        run: bash -n .github/scripts/package-release.sh .github/scripts/upload-release-assets.sh
+        run: |
+          bash -n .github/scripts/package-release.sh .github/scripts/upload-release-assets.sh .github/scripts/update-release-notes.sh .github/scripts/test-update-release-notes.sh packaging/render-installer.sh packaging/test-installer.sh
+          sh -n packaging/install-release.sh.in
+          bash packaging/test-installer.sh
+          bash .github/scripts/test-update-release-notes.sh
 
   aur-package:
     name: AUR package metadata
@@ -124,6 +128,7 @@ jobs:
             packaging/aur/render-pkgbuild.sh 1.2.3 "$tmp/boomux-v1.2.3-x86_64-unknown-linux-gnu.tar.gz" "$tmp/boomux-v1.2.3-aarch64-unknown-linux-gnu.tar.gz" "$tmp/second"
             cmp "$tmp/first/PKGBUILD" "$tmp/second/PKGBUILD"
             cmp "$tmp/first/.SRCINFO" "$tmp/second/.SRCINFO"
+            cmp "$tmp/first/boomux-bin.install" "$tmp/second/boomux-bin.install"
             packaging/aur/validate-pkgbuild.sh "$tmp/first"
             rm -rf "$tmp"
           ' _ "$GITHUB_WORKSPACE"

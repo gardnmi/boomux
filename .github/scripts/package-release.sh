@@ -49,6 +49,13 @@ for file in LICENSE README.md THIRD_PARTY_NOTICES.md; do
     exit 1
   fi
 done
+packaged_readme="${smoke_dir}/${package}/README.md"
+if ! grep -Fq 'releases/latest/download/boomux-installer.sh' "$packaged_readme" \
+  || ! grep -Fq 'offers to run `boomux setup` immediately' "$packaged_readme" \
+  || ! grep -Fq '~/.local/bin/boomux setup' "$packaged_readme"; then
+  printf 'packaged README is missing the installer or setup handoff\n' >&2
+  exit 1
+fi
 
 smoke_home="${smoke_dir}/home"
 smoke_bin="${smoke_dir}/bin"

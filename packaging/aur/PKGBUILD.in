@@ -16,6 +16,7 @@ optdepends=(
 provides=("boomux=${pkgver}")
 conflicts=('boomux')
 options=('!strip')
+install=boomux-bin.install
 source_x86_64=("boomux-${pkgver}-x86_64.tar.gz::${url}/releases/download/v${pkgver}/boomux-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
 source_aarch64=("boomux-${pkgver}-aarch64.tar.gz::${url}/releases/download/v${pkgver}/boomux-v${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
 sha256sums_x86_64=('@X86_64_SHA256@')
