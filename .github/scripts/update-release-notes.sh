@@ -18,7 +18,7 @@ release_id=$(gh api "repos/${repo}/releases/tags/${tag}" --jq .id 2>/dev/null \
   | sed -n '/^[0-9][0-9]*$/p' || true)
 if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
   release_id=$(gh api --paginate "repos/${repo}/releases?per_page=100" \
-    --jq ".[] | select(.tag_name == \"$tag\") | .id" \
+    --jq ".[] | select((.tag_name == \"$tag\") or (.draft == true and .name == \"$tag\")) | .id" \
     | sed -n '/^[0-9][0-9]*$/p')
 fi
 if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
@@ -73,7 +73,7 @@ for attempt in 1 2 3; do
     updated+=$'\n\n'
   fi
   updated+=$handoff
-  if gh api --method PATCH "$endpoint" -f body="$updated" >/dev/null; then
+  if gh api --method PATCH "$endpoint" -f tag_name="$tag" -f body="$updated" >/dev/null; then
     verified=$(gh api "$endpoint" --jq '.body // ""')
     marker_count=$(count_occurrences "$verified" "$marker")
     end_marker_count=$(count_occurrences "$verified" "$end_marker")

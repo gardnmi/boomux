@@ -14,11 +14,17 @@ cat > "$root/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ " $* " == *' --method PATCH '* ]]; then
+  preserved_tag=false
   for argument in "$@"; do
     case $argument in
       body=*) printf '%s' "${argument#body=}" > "$RELEASE_BODY" ;;
+      tag_name=v1.2.3) preserved_tag=true ;;
     esac
   done
+  if [[ $preserved_tag != true ]]; then
+    printf 'release update did not preserve its tag name\n' >&2
+    exit 1
+  fi
   updates=$(<"$RELEASE_UPDATES")
   printf '%s' "$((updates + 1))" > "$RELEASE_UPDATES"
 elif [[ " $* " == *' --jq .id '* ]]; then

@@ -69,7 +69,7 @@ jobs:
           fi
           release_id=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .id 2>/dev/null | sed -n '/^[0-9][0-9]*$/p' || true)
           if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
-            release_id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | sed -n '/^[0-9][0-9]*$/p')
+            release_id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select((.tag_name == \"$TAG\") or (.draft == true and .name == \"$TAG\")) | .id" | sed -n '/^[0-9][0-9]*$/p')
           fi
           if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
             printf 'could not resolve one release for %s\n' "$TAG" >&2
@@ -163,9 +163,17 @@ jobs:
         run: |
           release_id=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .id 2>/dev/null | sed -n '/^[0-9][0-9]*$/p' || true)
           if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
-            release_id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | sed -n '/^[0-9][0-9]*$/p')
+            release_id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select((.tag_name == \"$TAG\") or (.draft == true and .name == \"$TAG\")) | .id" | sed -n '/^[0-9][0-9]*$/p')
           fi
-          if [[ $(gh api "repos/$GH_REPO/releases/$release_id" --jq .draft) == true ]]; then
-            gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
-              -f tag_name="$TAG" -F draft=false >/dev/null
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            printf 'could not resolve one release for %s\n' "$TAG" >&2
+            exit 1
+          fi
+          gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+            -f tag_name="$TAG" -F draft=false >/dev/null
+          published=$(gh api "repos/$GH_REPO/releases/$release_id" \
+            --jq '[.tag_name, (.draft | tostring)] | join("\t")')
+          if [[ "$published" != "$TAG"$'\tfalse' ]]; then
+            printf 'release publication verification failed for %s\n' "$TAG" >&2
+            exit 1
           fi
