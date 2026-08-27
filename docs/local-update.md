@@ -130,15 +130,19 @@ than blocking the Boomux executable update.
 
 ## Release And Package Channels
 
-Release Please remains the version and tag authority. Its release build matrix
+Release Please remains the version and tag authority. It creates a draft release
+without exposing a tag, then its release build matrix
 produces native `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu` archives, smoke-tests each on a native GitHub-hosted
 runner, and publishes assets idempotently. Existing same-digest assets are left
 unchanged; a same-name digest conflict fails instead of clobbering a release.
+Before atomically publishing the completed draft and tag, the workflow
+idempotently appends the reviewed installer and `boomux setup` handoff to the
+generated GitHub release notes without replacing Release Please's content.
 
 The AUR package is `boomux-bin` because it consumes prebuilt release artifacts.
 Its architecture-specific sources pin both archive checksums. The AUR Git
-repository contains generated `PKGBUILD` and `.SRCINFO`; this source repository
-retains the reviewed template and deterministic renderer. AUR publication is a
-separate maintainer action and never grants the local updater ownership of
-pacman-managed files.
+repository contains generated `PKGBUILD`, `.SRCINFO`, and the post-install setup
+reminder; this source repository retains the reviewed templates and deterministic
+renderer. AUR publication is a separate maintainer action and never grants the
+local updater ownership of pacman-managed files.

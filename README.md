@@ -61,20 +61,33 @@ controls and safety behavior. For CLI-only creation, continue to
 
 ### Requirements
 
-- A Unix-like system with an absolute `XDG_RUNTIME_DIR`. Official v1.2.0 binaries
-  are available only for x86_64 and aarch64 GNU/Linux.
+- A Unix-like system with an absolute `XDG_RUNTIME_DIR`. Official binaries are
+  available only for x86_64 and aarch64 GNU/Linux.
 - `xdg-terminal-exec` and an available terminal desktop entry.
 
 Git is optional for core session persistence; without it, repository metadata is
 empty. `boomux doctor` currently reports missing Git as a failed dependency
-check. The default desktop Workspace layer additionally requires an active
+check. The optional desktop Workspace layer additionally requires an active
 Hyprland session and compatible `hyprctl`. Outside Hyprland, ordinary Boomux
 terminal opens remain native windows.
 
-The release recipe below requires GitHub CLI (`gh`), `sha256sum`, `tar`, and
-`install`.
+The guided installer requires `curl`, `sha256sum`, `tar`, and `install`.
 
 ### Latest Release
+
+```console
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh
+```
+
+The release-pinned installer verifies the published archive checksum, installs
+to `~/.local/bin/boomux`, and offers to run `boomux setup` immediately. It
+refuses to replace an existing installation; use that installation's update
+mechanism instead. Pass `--no-setup` with `sh -s -- --no-setup` when a
+noninteractive installation should print the next command without opening the
+wizard. See the [installation contract](docs/install.md) for exact guarantees.
+
+To inspect and install the release manually, use GitHub CLI (`gh`):
 
 ```console
 case "$(uname -s):$(uname -m)" in
@@ -88,7 +101,7 @@ gh release download "$version" --repo gardnmi/boomux \
 sha256sum --check "boomux-$version-$target.tar.gz.sha256"
 tar -xzf "boomux-$version-$target.tar.gz"
 install -Dm755 "boomux-$version-$target/boomux" ~/.local/bin/boomux
-~/.local/bin/boomux doctor
+~/.local/bin/boomux setup
 ```
 
 ### Update
@@ -109,11 +122,6 @@ plugin is installed, the same confirmation authorizes updating it after Boomux
 and reloading it when enabled. Other installation types must be updated through
 their original installer. Boomux never silently downgrades or enables automatic
 updates.
-
-> [!CAUTION]
-> Upgrading from v0.32 to v1.x crosses an incompatible protocol and state
-> boundary. It requires a cold upgrade that terminates managed processes. Follow
-> the exact [local update procedure](docs/local-update.md#protocol-47-alpha-break).
 
 Prefer `daemon restart` over `daemon stop`: stopping the daemon terminates every
 managed process. Upgrade registered remote Nodes separately with

@@ -1,0 +1,169 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Mike Gardner
+# SPDX-License-Identifier: 0BSD
+set -eu
+
+tag='@TAG@'
+repository='https://github.com/gardnmi/boomux'
+run_setup=true
+
+usage() {
+  printf 'Usage: boomux-installer.sh [--no-setup]\n'
+}
+
+if [ "$#" -gt 1 ]; then
+  usage >&2
+  exit 64
+fi
+case ${1-} in
+  '') ;;
+  --no-setup) run_setup=false ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 64 ;;
+esac
+
+case "$(uname -s):$(uname -m)" in
+  Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
+  Linux:aarch64) target=aarch64-unknown-linux-gnu ;;
+  *)
+    printf 'Boomux has no official release for %s.\n' "$(uname -s):$(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+for command in curl id install ln mkdir mktemp rm sha256sum stat tar uname; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    printf '%s is required to install Boomux.\n' "$command" >&2
+    exit 1
+  fi
+done
+
+case ${HOME-} in
+  /*) ;;
+  *) printf 'HOME must be an absolute path.\n' >&2; exit 1 ;;
+esac
+
+validate_directory() {
+  directory=$1
+  label=$2
+  if [ ! -d "$directory" ] || [ -L "$directory" ]; then
+    printf '%s must be a real directory: %s\n' "$label" "$directory" >&2
+    exit 1
+  fi
+  owner=$(stat -c '%u' -- "$directory")
+  mode=$(stat -c '%a' -- "$directory")
+  if [ "$owner" != "$(id -u)" ] || [ $(((mode / 10) % 10 & 2)) -ne 0 ] \
+    || [ $((mode % 10 & 2)) -ne 0 ]; then
+    printf '%s must be owned by the current user and not group/world-writable: %s\n' \
+      "$label" "$directory" >&2
+    exit 1
+  fi
+}
+
+validate_directory "$HOME" HOME
+local_directory=$HOME/.local
+bin_directory=$local_directory/bin
+if [ ! -e "$local_directory" ] && [ ! -L "$local_directory" ]; then
+  (umask 077 && mkdir "$local_directory")
+fi
+validate_directory "$local_directory" '~/.local'
+if [ ! -e "$bin_directory" ] && [ ! -L "$bin_directory" ]; then
+  (umask 077 && mkdir "$bin_directory")
+fi
+validate_directory "$bin_directory" '~/.local/bin'
+
+destination=$bin_directory/boomux
+if [ -e "$destination" ] || [ -L "$destination" ]; then
+  printf 'Boomux is already installed at %s.\n' "$destination" >&2
+  printf 'Use `boomux update` or the installation method that owns that file.\n' >&2
+  exit 1
+fi
+
+package=boomux-${tag}-${target}
+archive=${package}.tar.gz
+checksum=${archive}.sha256
+base_url=${repository}/releases/download/${tag}
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/boomux-install.XXXXXX")
+staged=
+cleanup() {
+  if [ -n "$staged" ]; then rm -f "$staged"; fi
+  rm -rf "$temporary"
+}
+trap cleanup EXIT HUP INT TERM
+
+printf 'Downloading Boomux %s for %s...\n' "${tag#v}" "$target"
+curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+  --output "$temporary/$archive" "$base_url/$archive"
+curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+  --output "$temporary/$checksum" "$base_url/$checksum"
+(
+  cd "$temporary"
+  {
+    IFS=' ' read -r expected expected_archive trailing \
+      || { printf 'The release checksum is malformed.\n' >&2; exit 1; }
+    if IFS= read -r unexpected; then
+      printf 'The release checksum contains unexpected entries.\n' >&2
+      exit 1
+    fi
+    case $expected in
+      *[!0-9a-f]*) valid=false ;;
+      *) valid=true ;;
+    esac
+    if [ "$valid" != true ] || [ "${#expected}" -ne 64 ] \
+      || [ "$expected_archive" != "$archive" ] || [ -n "$trailing" ]; then
+      printf 'The release checksum does not name the expected archive.\n' >&2
+      exit 1
+    fi
+    printf '%s  %s\n' "$expected" "$archive" | sha256sum --check -
+  } < "$checksum"
+)
+tar -C "$temporary" -xzf "$temporary/$archive"
+
+candidate=$temporary/$package/boomux
+if [ ! -f "$candidate" ] || [ -L "$candidate" ] || [ ! -x "$candidate" ]; then
+  printf 'The verified release archive did not contain the expected Boomux binary.\n' >&2
+  exit 1
+fi
+actual=$("$candidate" --version)
+if [ "$actual" != "boomux ${tag#v}" ]; then
+  printf 'Expected boomux %s, got %s.\n' "${tag#v}" "$actual" >&2
+  exit 1
+fi
+
+staged=$(mktemp "$bin_directory/.boomux-install.XXXXXX")
+install -m755 "$candidate" "$staged"
+if ! ln -T "$staged" "$destination"; then
+  printf 'Boomux was not installed because the destination now exists: %s\n' \
+    "$destination" >&2
+  exit 1
+fi
+rm -f "$staged"
+staged=
+printf '\nBoomux %s installed at %s\n' "${tag#v}" "$destination"
+
+next_step() {
+  printf 'Next: %s setup\n' "$destination"
+}
+
+if [ "$run_setup" != true ]; then
+  next_step
+  exit 0
+fi
+
+if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  printf '\nRun the guided setup now? [Y/n] ' >/dev/tty
+  response=
+  IFS= read -r response </dev/tty || response=n
+  case $response in
+    ''|y|Y|yes|YES|Yes)
+      if ! "$destination" setup </dev/tty >/dev/tty 2>/dev/tty; then
+        printf '\nBoomux is installed, but setup did not complete.\n' >&2
+        next_step >&2
+        exit 1
+      fi
+      ;;
+    *) next_step ;;
+  esac
+else
+  next_step
+fi

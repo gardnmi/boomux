@@ -3,6 +3,10 @@ set -euo pipefail
 
 tag=${1:?usage: upload-release-assets.sh TAG ASSET...}
 shift
+if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  printf 'release tag must be strict vMAJOR.MINOR.PATCH: %s\n' "$tag" >&2
+  exit 1
+fi
 
 if (($# == 0)); then
   printf 'no release assets supplied\n' >&2
@@ -16,6 +20,7 @@ if [[ -z "$repo" ]]; then
 fi
 
 declare -A expected_assets=()
+expected_assets[boomux-installer.sh]=1
 for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
   archive="boomux-${tag}-${target}.tar.gz"
   expected_assets["$archive"]=1
@@ -59,8 +64,28 @@ for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
     sha256sum --check "$(basename "${local_assets[${archive}.sha256]}")"
   )
 done
+installer=${local_assets[boomux-installer.sh]}
+sh -n "$installer"
+if ! grep -Fq "tag='$tag'" "$installer"; then
+  printf 'release installer does not target %s\n' "$tag" >&2
+  exit 1
+fi
+if ! grep -Fq "repository='https://github.com/gardnmi/boomux'" "$installer" \
+  || grep -Fq 'BOOMUX_INSTALL_BASE_URL' "$installer" \
+  || ! grep -Fq 'Run the guided setup now? [Y/n]' "$installer"; then
+  printf 'release installer does not preserve the reviewed origin and setup handoff\n' >&2
+  exit 1
+fi
 
-release_id=$(gh api "repos/${repo}/releases/tags/${tag}" --jq .id)
+release_id=$(gh api "repos/${repo}/releases/tags/${tag}" --jq .id 2>/dev/null || true)
+if [[ -z "$release_id" ]]; then
+  release_id=$(gh api --paginate "repos/${repo}/releases?per_page=100" \
+    --jq ".[] | select(.tag_name == \"$tag\") | .id")
+fi
+if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+  printf 'could not resolve one release for %s\n' "$tag" >&2
+  exit 1
+fi
 declare -A remote_digests=()
 declare -A remote_ids=()
 
