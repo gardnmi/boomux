@@ -930,7 +930,12 @@ replacement consent. The optional Agent Skill remains a separate owned asset.
 On an Omarchy installation, setup executes only bounded exact-argument `omarchy`
 commands. Plugin inventory comes from `omarchy plugin list --json`; installation
 uses the fixed `gardnmi/omarchy-boomux` HTTPS repository and Omarchy retains
-plugin lifecycle ownership. Boomux never edits `/usr/share/omarchy`. The full
+plugin lifecycle ownership. A Cargo-private executable without a corresponding
+`~/.local/bin/boomux` is rejected before desktop mutation because it may be
+absent from the graphical session's `PATH`. After installing or enabling the
+plugin, setup runs bounded `omarchy restart shell` so the running shell loads it.
+Reruns offer the same reload for an already-enabled but potentially stale plugin.
+Boomux never edits `/usr/share/omarchy`. The full
 desktop binding profile is one marked block in the current user's
 `~/.config/hypr/bindings.lua`. Setup reports conflicts before consent, preserves
 all bytes outside that block, rejects symlinked, special, non-owned, oversized,

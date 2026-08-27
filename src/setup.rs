@@ -372,6 +372,7 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
         "Omarchy",
         String::from_utf8_lossy(&version.stdout).trim(),
     );
+    ensure_omarchy_can_resolve_boomux()?;
     let hyprland_active =
         env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|value| !value.is_empty());
     status(
@@ -386,42 +387,53 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
     );
 
     let plugins = omarchy_plugins(&omarchy)?;
-    let plugin_enabled = match plugins.iter().find(|plugin| plugin.id == OMARCHY_PLUGIN_ID) {
-        Some(plugin) if plugin.enabled => {
-            status("ok", "32", "omarchy-boomux", "installed and enabled");
-            true
-        }
-        Some(_) => {
-            status("!!", "33", "omarchy-boomux", "installed but disabled");
-            if confirm("Enable omarchy-boomux?")? {
-                run_command(
-                    &omarchy,
-                    &["plugin", "enable", OMARCHY_PLUGIN_ID],
-                    COMMAND_TIMEOUT,
-                )?;
-                status("ok", "32", "omarchy-boomux", "enabled");
-                true
-            } else {
-                false
-            }
-        }
-        None => {
-            status("->", "36", "omarchy-boomux", "not installed");
-            detail("Plugins run as unsandboxed code inside the Omarchy shell.");
-            detail(format!("Source: {OMARCHY_PLUGIN_URL}"));
-            if confirm("Install and enable omarchy-boomux?")? {
-                run_command(
-                    &omarchy,
-                    &["plugin", "add", OMARCHY_PLUGIN_URL, "--enable", "--yes"],
-                    PLUGIN_INSTALL_TIMEOUT,
-                )?;
+    let (plugin_enabled, plugin_changed) =
+        match plugins.iter().find(|plugin| plugin.id == OMARCHY_PLUGIN_ID) {
+            Some(plugin) if plugin.enabled => {
                 status("ok", "32", "omarchy-boomux", "installed and enabled");
-                true
-            } else {
-                false
+                detail("Reload the shell if the plugin was installed after Omarchy Shell started.");
+                (
+                    true,
+                    confirm("Restart Omarchy Shell and reload omarchy-boomux?")?,
+                )
             }
-        }
-    };
+            Some(_) => {
+                status("!!", "33", "omarchy-boomux", "installed but disabled");
+                detail("Enabling the plugin also restarts Omarchy Shell so it is loaded.");
+                if confirm("Enable and load omarchy-boomux?")? {
+                    run_command(
+                        &omarchy,
+                        &["plugin", "enable", OMARCHY_PLUGIN_ID],
+                        COMMAND_TIMEOUT,
+                    )?;
+                    status("ok", "32", "omarchy-boomux", "enabled");
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
+            None => {
+                status("->", "36", "omarchy-boomux", "not installed");
+                detail("Plugins run as unsandboxed code inside the Omarchy shell.");
+                detail(format!("Source: {OMARCHY_PLUGIN_URL}"));
+                detail("Installation also restarts Omarchy Shell so the plugin is loaded.");
+                if confirm("Install, enable, and load omarchy-boomux?")? {
+                    run_command(
+                        &omarchy,
+                        &["plugin", "add", OMARCHY_PLUGIN_URL, "--enable", "--yes"],
+                        PLUGIN_INSTALL_TIMEOUT,
+                    )?;
+                    status("ok", "32", "omarchy-boomux", "installed and enabled");
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
+        };
+    if plugin_changed {
+        run_command(&omarchy, &["restart", "shell"], PLUGIN_INSTALL_TIMEOUT)?;
+        status("ok", "32", "Omarchy Shell", "restarted with plugin loaded");
+    }
     if !plugin_enabled {
         status("--", "2", "Keybindings", "skipped; plugin is not enabled");
         return Ok(());
@@ -529,6 +541,33 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn ensure_omarchy_can_resolve_boomux() -> io::Result<()> {
+    let home = required_home()?;
+    let cargo_home = env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".cargo"));
+    let executable = env::current_exe()?;
+    let desktop_executable = home.join(".local/bin/boomux");
+    if executable.starts_with(cargo_home.join("bin")) && !is_executable_file(&desktop_executable) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{} is available to this shell but Omarchy may not include {} in its graphical PATH; install the official Boomux release at {} before configuring desktop integration",
+                executable.display(),
+                cargo_home.join("bin").display(),
+                desktop_executable.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 fn validate_hyprland_config(hyprctl: &Path) -> io::Result<()> {
     run_command(hyprctl, &["reload"], COMMAND_TIMEOUT)?;
     let errors = run_command(hyprctl, &["configerrors"], COMMAND_TIMEOUT)?;
@@ -557,9 +596,7 @@ fn confirm(prompt: &str) -> io::Result<bool> {
 fn executable_on_path(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH")?).find_map(|directory| {
         let candidate = directory.join(name);
-        fs::metadata(&candidate)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-            .then_some(candidate)
+        is_executable_file(&candidate).then_some(candidate)
     })
 }
 
