@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::error::ErrorKind as ClapErrorKind;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use boomux::protocol::{
@@ -1948,10 +1948,16 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             Ok(())
         }
         Some(Commands::BootstrapActivate { .. }) => unreachable!(),
-        None => dashboard(cli.terminal.as_deref()),
+        None => print_cli_help(),
     };
     result?;
     Ok(CliExit::Success)
+}
+
+fn print_cli_help() -> Result<(), Box<dyn Error>> {
+    Cli::command().print_help()?;
+    println!();
+    Ok(())
 }
 
 fn remote_connect(target: &str, terminal: Option<&str>) -> Result<(), Box<dyn Error>> {

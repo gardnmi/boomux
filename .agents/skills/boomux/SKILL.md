@@ -485,14 +485,14 @@ path opening. Selection otherwise follows Boomux configuration and then normal
 Open the dashboard or run diagnostics with:
 
 ```console
-boomux
 boomux ui
 boomux web
 boomux doctor
 ```
 
-`boomux` and `boomux ui` must run from a fresh host terminal; they are rejected
-when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
+`boomux ui` must run from a fresh host terminal; it is rejected when
+`BOOMUX_SHELL_ID` is set. Bare `boomux` prints command help. `boomux doctor` can
+run in either context.
 
 `boomux web` serves an experimental read-only Agent PWA on
 `127.0.0.1:3737`. Use `--port` to change the loopback port. `--tailscale` is an

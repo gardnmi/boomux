@@ -139,7 +139,7 @@ existing Boomux Shell.
 Open the native dashboard at any time:
 
 ```console
-boomux
+boomux ui
 ```
 
 ## Core Concepts
@@ -236,7 +236,7 @@ Use `boomux --help` and `boomux <command> --help` for the complete current CLI.
 
 ## Native Dashboard
 
-Run `boomux` in a terminal. The dashboard provides four primary views:
+Run `boomux ui` in a terminal. The dashboard provides four primary views:
 
 - **Workspaces**: coordinated tasks, placement state, attention, and ownership.
 - **Agents**: current Agent lifecycle and canonical Sessions.

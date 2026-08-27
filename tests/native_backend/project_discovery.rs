@@ -4,6 +4,34 @@ use std::process::Command;
 use uuid::Uuid;
 
 #[test]
+fn bare_cli_prints_command_help_without_starting_the_daemon() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-bare-help-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let runtime = root.join("runtime");
+    fs::create_dir_all(&runtime).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_boomux"))
+        .env("HOME", &root)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", root.join("state"))
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Usage:"), "{stdout}");
+    assert!(stdout.contains("Commands:"), "{stdout}");
+    assert!(stdout.contains("ui"), "{stdout}");
+    assert!(!runtime.join("boomux/daemon.sock").exists());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn project_list_is_local_and_has_a_stable_json_envelope() {
     let root = std::env::temp_dir().join(format!(
         "boomux-project-discovery-{}-{}",
