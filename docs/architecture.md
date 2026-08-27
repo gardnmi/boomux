@@ -944,11 +944,16 @@ reporting, and `integration uninstall` safely removes one or all managed assets.
 
 The human-only top-level `boomux setup` command composes these existing local
 primitives without adding protocol or durable setup state. It requires terminal
-input and output, connects to or starts the local daemon during its system check,
-probes every bundled harness, and offers installation only for harness executables
-found on the current `PATH`. Each harness mutation has a separate default-no
-prompt; modified assets are identified and require explicit replacement consent.
-The optional Agent Skill remains a separate owned asset.
+input and output, prints its active configuration path, and completes read-only
+terminal, daemon, harness, and Omarchy inspection before presenting a concise
+machine-specific plan. A missing `xdg-terminal-exec` is a blocker before any
+mutation. Harness and modified-asset prompts remain default-no. Setup starts or
+confirms the local daemon only during final verification, then reinspects current
+assets and prints a readiness receipt, exact restart guidance, and one primary
+next action. The in-memory receipt retains current, changed, skipped, warning,
+and failed outcomes; failures include a step-specific recovery command, while
+reinspection reports any earlier committed desktop state. The optional Agent
+Skill remains a separate owned asset.
 
 On an Omarchy installation, setup executes only bounded exact-argument `omarchy`
 commands. Plugin inventory comes from `omarchy plugin list --json`; installation
@@ -956,14 +961,16 @@ uses the fixed `gardnmi/omarchy-boomux` HTTPS repository and Omarchy retains
 plugin lifecycle ownership. A Cargo-private executable without a corresponding
 `~/.local/bin/boomux` is rejected before desktop mutation because it may be
 absent from the graphical session's `PATH`. After installing or enabling the
-plugin, setup runs bounded `omarchy restart shell` so the running shell loads it.
-Reruns offer the same reload for an already-enabled but potentially stale plugin.
+plugin, setup runs bounded `omarchy restart shell` so the running shell loads it,
+then rechecks that the fixed plugin identity is enabled. Current enabled plugins
+and current or compatible user-managed keybindings produce no rerun prompt.
 The plugin is presented as the recommended core Omarchy experience rather than
 an incidental integration. Once it is enabled, setup separately offers to enable
 the default-off Hyprland Workspace layer by updating only
 `desktop.workspace_layer` in the active configuration layer through the same
 owner validation, baseline revalidation, and atomic commit boundary as
-`boomux config edit`. Declining either prompt preserves the current state.
+`boomux config edit`. The fixed plugin and Workspace-layer prompts are visibly
+recommended and default to yes; declining either preserves the current state.
 After a guided local Boomux update commits, the updater revalidates an installed
 companion plugin, delegates its update to the fixed exact-argument Omarchy CLI,
 and restarts Omarchy Shell when the plugin is enabled. Omarchy remains the plugin

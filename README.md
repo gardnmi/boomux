@@ -44,10 +44,12 @@ Workspaces, Shells, Agents, and Nodes.
 - Use the project-folder button to create a same-named Workspace at a configured
   project path.
 
-`boomux setup` detects supported Agent harnesses, starts the local daemon, and
-prompts before installing or replacing integrations and the Boomux Agent Skill.
-Prompts default to no, and rerunning setup preserves modified or user-owned
-assets unless replacement is explicitly confirmed.
+`boomux setup` inspects the machine before making changes, detects supported
+Agent harnesses, starts the local daemon during verification, and prints a final
+readiness receipt with exact recovery commands for failures. The recommended
+Omarchy plugin and Workspace layer default to yes; integrations, keybindings,
+replacements, and modified assets default to no. Reruns skip current assets and
+preserve modified or user-owned content unless replacement is explicitly confirmed.
 
 Omarchy's graphical environment must be able to resolve `boomux`; official
 release installations use `~/.local/bin`. See the

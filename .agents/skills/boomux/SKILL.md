@@ -133,17 +133,22 @@ boomux integration status codex --json
 ```
 
 When the user explicitly asks for first-run local configuration, `boomux setup`
-is the interactive end-to-end workflow. It discovers installed harnesses, offers
-their lifecycle assets individually, starts the local daemon when needed,
-optionally installs this Agent Skill, and can configure the Omarchy companion
-plugin and Boomux-owned Hyprland bindings.
+is the interactive end-to-end workflow. It inspects the machine first, shows a
+plan, discovers installed harnesses, offers their lifecycle assets individually,
+starts the local daemon during final verification, optionally installs this
+Agent Skill, and can configure the Omarchy companion plugin and Boomux-owned
+Hyprland bindings.
+Its final receipt distinguishes current, changed, skipped, warning, and failed
+steps and prints exact recovery commands for failures.
 It rejects Cargo-private desktop setup when Omarchy cannot resolve `boomux` from
 its graphical environment and restarts Omarchy Shell after changing the plugin.
 It recognizes and preserves a complete compatible user-managed binding profile.
-It requires a terminal, starts the daemon automatically, and defaults every
-configuration mutation prompt to no. Do not run it for inspection alone or
-without explicit authorization; use the JSON status and dry-run commands below
-instead.
+It requires a terminal and treats missing `xdg-terminal-exec` as a blocker. The
+recommended fixed Omarchy plugin and Workspace layer default to yes; harness
+assets, keybindings, replacements, and modified assets default to no. Current
+assets are not offered for redundant reinstall or reload. Do not run setup for
+inspection alone or without explicit authorization; use the JSON status and
+dry-run commands below instead.
 
 Mutation commands include:
 

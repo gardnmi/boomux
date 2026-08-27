@@ -205,7 +205,8 @@ const READ_BYTES: usize = 1024 * 1024;
 #[command(
     version,
     about = "Native persistent terminal workspaces",
-    subcommand_value_name = "SUBCOMMAND"
+    subcommand_value_name = "SUBCOMMAND",
+    after_help = "First run: boomux setup"
 )]
 struct Cli {
     /// Emit the stable boomux.cli/v1 envelope for commands advertised by capabilities
@@ -10184,6 +10185,7 @@ fn install_skill(force: bool) -> Result<(), Box<dyn Error>> {
 
 fn install_skill_at(home: &Path, force: bool) -> Result<(), Box<dyn Error>> {
     require_absolute_root(home, "HOME")?;
+    preflight_legacy_skill_migration(home)?;
     let directory = ensure_safe_directory(&home.join(".agents/skills/boomux"))?;
     let path = skill_install_path(home);
     let outcome = install_asset_at(&directory, &path, BOOMUX_SKILL, force)?;
@@ -10197,7 +10199,7 @@ fn install_skill_at(home: &Path, force: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn migrate_legacy_skill(home: &Path) -> Result<(), Box<dyn Error>> {
+fn preflight_legacy_skill_migration(home: &Path) -> Result<(), Box<dyn Error>> {
     let directory = home.join(".agents/skills/boomux-shells");
     match fs::symlink_metadata(&directory) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -10210,6 +10212,21 @@ fn migrate_legacy_skill(home: &Path) -> Result<(), Box<dyn Error>> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
+    }
+    let path = legacy_skill_install_path(home);
+    if let Some(content_matches) = regular_file_matches(&path, LEGACY_BOOMUX_SHELLS_SKILL)? {
+        let entries = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+        let _untouched =
+            content_matches && entries.len() == 1 && entries[0].file_name() == "SKILL.md";
+    }
+    Ok(())
+}
+
+pub(crate) fn migrate_legacy_skill(home: &Path) -> Result<(), Box<dyn Error>> {
+    preflight_legacy_skill_migration(home)?;
+    let directory = home.join(".agents/skills/boomux-shells");
+    if !directory.exists() {
+        return Ok(());
     }
     let path = legacy_skill_install_path(home);
     if let Some(content_matches) = regular_file_matches(&path, LEGACY_BOOMUX_SHELLS_SKILL)? {
@@ -14821,6 +14838,17 @@ mod tests {
         assert_eq!(fs::read_to_string(&outside).unwrap(), "do not replace");
         fs::remove_dir_all(&home).unwrap();
         fs::remove_file(&outside).unwrap();
+
+        let home = test_skill_home("legacy-symlink");
+        let outside = test_skill_home("legacy-symlink-target");
+        fs::create_dir_all(home.join(".agents/skills")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, home.join(".agents/skills/boomux-shells")).unwrap();
+
+        assert!(install_skill_at(&home, false).is_err());
+        assert!(!skill_install_path(&home).exists());
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     fn test_skill_home(label: &str) -> PathBuf {
