@@ -78,17 +78,6 @@ install -Dm755 "boomux-$version-$target/boomux" ~/.local/bin/boomux
 boomux doctor
 ```
 
-To install the current development branch instead of a published release:
-
-```console
-cargo install --git https://github.com/gardnmi/boomux --locked --root "$HOME/.local"
-```
-
-This installs `boomux` at `~/.local/bin/boomux`, matching the release recipe.
-Ensure `~/.local/bin` is in `PATH`, then run `boomux setup`. Source installations
-may include unreleased changes; use `boomux --version` and
-`boomux capabilities --json` to inspect the installed build.
-
 ### Update
 
 Official release binaries installed at `~/.local/bin/boomux` have an explicit
