@@ -251,6 +251,65 @@ function canOpenWebTerminal(agent) {
   return agent.node_local && agent.node_current && agent.run_current;
 }
 
+function followVisibleTerminalViewport(dialog, terminalViewport) {
+  const visualViewport = window.visualViewport;
+  let followingTail = true;
+  let layoutFrame = 0;
+  let tailFrame = 0;
+  const isAtTail = () => terminalViewport.scrollHeight - terminalViewport.scrollTop - terminalViewport.clientHeight <= 2;
+  const revealTail = () => {
+    followingTail = true;
+    terminalViewport.scrollTop = terminalViewport.scrollHeight;
+  };
+  const applyLayout = () => {
+    layoutFrame = 0;
+    const viewport = visualViewport || {
+      offsetLeft: 0,
+      offsetTop: 0,
+      width: window.innerWidth,
+      height: window.innerHeight,
+    };
+    const keepTailVisible = followingTail || isAtTail();
+    dialog.style.setProperty("--terminal-visible-left", `${viewport.offsetLeft}px`);
+    dialog.style.setProperty("--terminal-visible-top", `${viewport.offsetTop}px`);
+    dialog.style.setProperty("--terminal-visible-width", `${viewport.width}px`);
+    dialog.style.setProperty("--terminal-visible-height", `${viewport.height}px`);
+    if (keepTailVisible) {
+      cancelAnimationFrame(tailFrame);
+      tailFrame = requestAnimationFrame(revealTail);
+    }
+  };
+  const scheduleLayout = () => {
+    cancelAnimationFrame(layoutFrame);
+    layoutFrame = requestAnimationFrame(applyLayout);
+  };
+  const handleUserScroll = () => {
+    cancelAnimationFrame(tailFrame);
+    tailFrame = requestAnimationFrame(() => { followingTail = isAtTail(); });
+  };
+
+  terminalViewport.addEventListener("touchmove", handleUserScroll, { passive: true });
+  terminalViewport.addEventListener("wheel", handleUserScroll, { passive: true });
+  visualViewport?.addEventListener("resize", scheduleLayout);
+  visualViewport?.addEventListener("scroll", scheduleLayout);
+  window.addEventListener("resize", scheduleLayout);
+  scheduleLayout();
+
+  return {
+    isFollowingTail: () => followingTail || isAtTail(),
+    revealTail,
+    dispose: () => {
+      cancelAnimationFrame(layoutFrame);
+      cancelAnimationFrame(tailFrame);
+      terminalViewport.removeEventListener("touchmove", handleUserScroll);
+      terminalViewport.removeEventListener("wheel", handleUserScroll);
+      visualViewport?.removeEventListener("resize", scheduleLayout);
+      visualViewport?.removeEventListener("scroll", scheduleLayout);
+      window.removeEventListener("resize", scheduleLayout);
+    },
+  };
+}
+
 async function openWebTerminal(agent) {
   state.activeTerminal?.close();
   const dialog = el("dialog", "terminal-dialog");
@@ -263,6 +322,7 @@ async function openWebTerminal(agent) {
   dialog.append(shell);
   document.body.append(dialog);
   dialog.showModal();
+  const visibleViewport = followVisibleTerminalViewport(dialog, viewport);
   const historyId = crypto.randomUUID();
 
   let socket = null;
@@ -271,6 +331,11 @@ async function openWebTerminal(agent) {
   const sendJson = (message) => {
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
   };
+  const resizeTerminal = (message) => {
+    const keepTailVisible = visibleViewport.isFollowingTail();
+    terminal.resize(message);
+    if (keepTailVisible) visibleViewport.revealTail();
+  };
   const close = () => {
     if (closed) return;
     closed = true;
@@ -278,6 +343,7 @@ async function openWebTerminal(agent) {
     window.removeEventListener("popstate", close);
     sendJson({ type: "detach" });
     socket?.close(1000, "terminal closed");
+    visibleViewport.dispose();
     terminal?.dispose();
     if (dialog.open) dialog.close();
     dialog.remove();
@@ -309,6 +375,7 @@ async function openWebTerminal(agent) {
       return;
     }
     state.activeTerminal.terminal = terminal;
+    visibleViewport.revealTail();
     history.pushState({ ...history.state, boomuxTerminal: historyId }, "", "#web-terminal");
     const authorization = await fetch("/api/terminal/authorize", {
       method: "POST",
@@ -341,11 +408,11 @@ async function openWebTerminal(agent) {
       }
       const message = JSON.parse(event.data);
       if (message.type === "attached") {
-        terminal.resize(message);
+        resizeTerminal(message);
         notice.textContent = message.warning || "This browser has terminal control. Closing it leaves the Agent running.";
         if (message.warning) terminal.write(`\r\n${message.warning}\r\n`);
       } else if (message.type === "resize") {
-        terminal.resize(message);
+        resizeTerminal(message);
       } else if (message.type === "reconnecting") {
         notice.textContent = "Reconnecting to the same Agent terminal.";
       } else if (message.type === "closed" || message.type === "error") {

@@ -758,8 +758,11 @@ then translates only bounded PTY input/output, resize, focus, detach, and daemon
 reconnect frames. Browser viewport changes cannot resize the PTY or alter the
 local logical grid. The renderer initializes from the primary terminal profile,
 follows later primary resize frames, and permits viewport scrolling when that
-grid exceeds the phone display. It never exposes the daemon attachment token or
-arbitrary daemon protocol. The self-hosted `ghostty-web` canvas renderer uses Ghostty's
+grid exceeds the phone display. On-screen keyboard changes resize and offset the
+browser's visible terminal viewport, keeping its tail available without changing
+the authoritative grid; deliberate scrollback remains locally scrollable. It
+never exposes the daemon attachment token or arbitrary daemon protocol. The
+self-hosted `ghostty-web` canvas renderer uses Ghostty's
 WASM VT implementation and a self-hosted terminal font; the Agent handoff is a
 terminal-only browser history entry, and direct terminal focus is its only input
 surface. Browser Back or page backgrounding releases only that collaborator.

@@ -1884,6 +1884,27 @@ mod tests {
     }
 
     #[test]
+    fn web_terminal_tracks_the_visible_mobile_keyboard_viewport() {
+        assert!(INDEX_HTML.contains("interactive-widget=resizes-content"));
+        assert!(APP_JS.contains("function followVisibleTerminalViewport"));
+        assert!(APP_JS.contains("window.visualViewport"));
+        assert!(APP_JS.contains("visualViewport?.addEventListener(\"resize\""));
+        assert!(APP_JS.contains("visualViewport?.addEventListener(\"scroll\""));
+        assert!(APP_JS.contains("visualViewport?.removeEventListener(\"resize\""));
+        assert!(APP_JS.contains("visibleViewport.dispose()"));
+        assert!(APP_JS.contains("terminalViewport.addEventListener(\"touchmove\""));
+        assert!(APP_JS.contains("terminalViewport.addEventListener(\"wheel\""));
+        assert!(APP_JS.contains("const keepTailVisible = visibleViewport.isFollowingTail()"));
+        assert!(STYLES_CSS.contains("--terminal-visible-height"));
+        assert!(
+            STYLES_CSS
+                .contains(".terminal-shell { position: relative; width: 100%; height: 100%; }")
+        );
+        assert!(TERMINAL_JS.contains("scrollToBottom"));
+        assert!(SERVICE_WORKER.contains("boomux-agent-watch-v40"));
+    }
+
+    #[test]
     fn terminal_grant_accepts_any_current_local_harness_and_requires_the_exact_run() {
         let request = TerminalAuthorizationRequest {
             node_id: "00000000-0000-0000-0000-000000000001".into(),
