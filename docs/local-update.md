@@ -12,8 +12,10 @@ or contact the daemon. `--json` uses the stable `boomux.cli/v1` command
 
 `boomux update` is human-only. It requires an interactive terminal, prints the
 current and latest versions and exact install path, and requires explicit `yes`
-confirmation. It has no `--yes`, `--force`, automatic, scheduled, JSON mutation,
-or remote mode. Integrations may inspect `update.status` and open the same guided
+confirmation. When the fixed `io.github.gardnmi.boomux` Omarchy plugin is
+installed, that confirmation also names and authorizes its post-install update.
+The command has no `--yes`, `--force`, automatic, scheduled, JSON mutation, or
+remote mode. Integrations may inspect `update.status` and open the same guided
 command in a native terminal; they must not download, authorize, or replace
 Boomux themselves.
 
@@ -112,6 +114,19 @@ even when directory synchronization also fails, and combined failures are
 reported. Once candidate activation and daemon verification succeed, cleanup
 failure cannot truthfully roll back the committed update; Boomux reports a
 bounded warning and may leave the hidden backup for manual inspection.
+
+After the executable update commits, an installed companion Omarchy plugin is
+revalidated through `omarchy plugin list --json` and updated only by the fixed
+exact-argument command `omarchy plugin update io.github.gardnmi.boomux --yes`.
+Omarchy retains plugin lifecycle ownership. If the plugin is enabled, Boomux
+then runs `omarchy restart shell` so the new plugin code is loaded. A plugin or
+shell-restart failure is reported as a partial failure after clearly stating
+that the Boomux executable update committed; it cannot roll back the committed
+executable. A failed or timed-out Omarchy update command is reported as an
+unknown plugin outcome because it may have mutated the plugin checkout before
+failing. Missing Omarchy or an uninstalled plugin causes no plugin mutation.
+An uninspectable optional plugin inventory is warned about and skipped rather
+than blocking the Boomux executable update.
 
 ## Release And Package Channels
 

@@ -112,6 +112,15 @@ struct CommandOutput {
     stderr: Vec<u8>,
 }
 
+pub(crate) enum OmarchyPluginUpdateOutcome {
+    NotInstalled,
+    Updated,
+    UpdatedAndReloaded,
+    UpdateOutcomeUnknown(io::Error),
+    UpdatedButReloadStateUnknown(io::Error),
+    UpdatedButReloadFailed(io::Error),
+}
+
 struct BindingsPlan {
     path: PathBuf,
     baseline: Option<Vec<u8>>,
@@ -653,6 +662,39 @@ pub(crate) fn remove_omarchy_plugin(executable: &Path) -> io::Result<bool> {
         COMMAND_TIMEOUT,
     )?;
     Ok(true)
+}
+
+pub(crate) fn update_omarchy_plugin(executable: &Path) -> io::Result<OmarchyPluginUpdateOutcome> {
+    let Some(_) = omarchy_plugins(executable)?
+        .into_iter()
+        .find(|plugin| plugin.id == OMARCHY_PLUGIN_ID)
+    else {
+        return Ok(OmarchyPluginUpdateOutcome::NotInstalled);
+    };
+    if let Err(error) = run_command(
+        executable,
+        &["plugin", "update", OMARCHY_PLUGIN_ID, "--yes"],
+        PLUGIN_INSTALL_TIMEOUT,
+    ) {
+        return Ok(OmarchyPluginUpdateOutcome::UpdateOutcomeUnknown(error));
+    }
+    let plugin = match omarchy_plugins(executable) {
+        Ok(plugins) => plugins
+            .into_iter()
+            .find(|plugin| plugin.id == OMARCHY_PLUGIN_ID),
+        Err(error) => {
+            return Ok(OmarchyPluginUpdateOutcome::UpdatedButReloadStateUnknown(
+                error,
+            ));
+        }
+    };
+    if plugin.is_some_and(|plugin| plugin.enabled) {
+        return match run_command(executable, &["restart", "shell"], PLUGIN_INSTALL_TIMEOUT) {
+            Ok(_) => Ok(OmarchyPluginUpdateOutcome::UpdatedAndReloaded),
+            Err(error) => Ok(OmarchyPluginUpdateOutcome::UpdatedButReloadFailed(error)),
+        };
+    }
+    Ok(OmarchyPluginUpdateOutcome::Updated)
 }
 
 fn run_command(
@@ -1236,5 +1278,115 @@ mod tests {
         assert!(remove_omarchy_plugin(&executable).unwrap());
         assert!(executable.with_extension("removed").exists());
         assert!(!remove_omarchy_plugin(&executable).unwrap());
+    }
+
+    #[test]
+    fn omarchy_plugin_update_rechecks_inventory_and_restarts_an_enabled_plugin() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("omarchy");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\nlog=$0.log\nfor argument do printf '<%s>\\n' \"$argument\" >> \"$log\"; done\nprintf '%s\\n' -- >> \"$log\"\ncase \"$*\" in\n  'plugin list --json') printf '[{\"id\":\"io.github.gardnmi.boomux\",\"enabled\":true}]\\n' ;;\n  'plugin update io.github.gardnmi.boomux --yes') ;;\n  'restart shell') ;;\n  *) exit 97 ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(
+            update_omarchy_plugin(&executable).unwrap(),
+            OmarchyPluginUpdateOutcome::UpdatedAndReloaded
+        ));
+        assert_eq!(
+            fs::read_to_string(executable.with_extension("log")).unwrap(),
+            "<plugin>\n<list>\n<--json>\n--\n<plugin>\n<update>\n<io.github.gardnmi.boomux>\n<--yes>\n--\n<plugin>\n<list>\n<--json>\n--\n<restart>\n<shell>\n--\n"
+        );
+    }
+
+    #[test]
+    fn omarchy_plugin_update_skips_absent_plugin() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("omarchy");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\ncase \"$*\" in\n  'plugin list --json') printf '[]\\n' ;;\n  *) exit 97 ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(
+            update_omarchy_plugin(&executable).unwrap(),
+            OmarchyPluginUpdateOutcome::NotInstalled
+        ));
+    }
+
+    #[test]
+    fn omarchy_plugin_update_does_not_restart_a_disabled_plugin() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("omarchy");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\nlog=$0.log\nprintf '%s\\n' \"$*\" >> \"$log\"\ncase \"$*\" in\n  'plugin list --json') printf '[{\"id\":\"io.github.gardnmi.boomux\",\"enabled\":false}]\\n' ;;\n  'plugin update io.github.gardnmi.boomux --yes') ;;\n  *) exit 97 ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(
+            update_omarchy_plugin(&executable).unwrap(),
+            OmarchyPluginUpdateOutcome::Updated
+        ));
+        assert_eq!(
+            fs::read_to_string(executable.with_extension("log")).unwrap(),
+            "plugin list --json\nplugin update io.github.gardnmi.boomux --yes\nplugin list --json\n"
+        );
+    }
+
+    #[test]
+    fn omarchy_plugin_update_rechecks_enabled_state_after_update() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("omarchy");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\nmarker=$0.updated\ncase \"$*\" in\n  'plugin list --json')\n    if [ -e \"$marker\" ]; then enabled=true; else enabled=false; fi\n    printf '[{\"id\":\"io.github.gardnmi.boomux\",\"enabled\":%s}]\\n' \"$enabled\" ;;\n  'plugin update io.github.gardnmi.boomux --yes') : > \"$marker\" ;;\n  'restart shell') ;;\n  *) exit 97 ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(
+            update_omarchy_plugin(&executable).unwrap(),
+            OmarchyPluginUpdateOutcome::UpdatedAndReloaded
+        ));
+    }
+
+    #[test]
+    fn omarchy_plugin_update_distinguishes_a_reload_failure() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("omarchy");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\ncase \"$*\" in\n  'plugin list --json') printf '[{\"id\":\"io.github.gardnmi.boomux\",\"enabled\":true}]\\n' ;;\n  'plugin update io.github.gardnmi.boomux --yes') ;;\n  'restart shell') exit 42 ;;\n  *) exit 97 ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(
+            update_omarchy_plugin(&executable).unwrap(),
+            OmarchyPluginUpdateOutcome::UpdatedButReloadFailed(_)
+        ));
+    }
+
+    #[test]
+    fn omarchy_plugin_update_preserves_an_unknown_command_outcome() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("omarchy");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\ncase \"$*\" in\n  'plugin list --json') printf '[{\"id\":\"io.github.gardnmi.boomux\",\"enabled\":true}]\\n' ;;\n  'plugin update io.github.gardnmi.boomux --yes') exit 42 ;;\n  *) exit 97 ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(
+            update_omarchy_plugin(&executable).unwrap(),
+            OmarchyPluginUpdateOutcome::UpdateOutcomeUnknown(_)
+        ));
     }
 }

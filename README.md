@@ -101,9 +101,11 @@ boomux doctor
 
 The updater verifies the selected GitHub release asset and checksum before
 replacing an eligible official installation. Compatible running daemons use
-graceful handoff so managed processes and PTYs survive. Other installation types
-must be updated through their original installer. Boomux never silently
-downgrades or enables automatic updates.
+graceful handoff so managed processes and PTYs survive. If the Omarchy companion
+plugin is installed, the same confirmation authorizes updating it after Boomux
+and reloading it when enabled. Other installation types must be updated through
+their original installer. Boomux never silently downgrades or enables automatic
+updates.
 
 > [!CAUTION]
 > Upgrading from v0.32 to v1.x crosses an incompatible protocol and state
