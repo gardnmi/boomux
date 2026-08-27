@@ -62,6 +62,8 @@ use crate::protocol::{
     WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, SshTarget};
+#[cfg(debug_assertions)]
+use crate::state_store::state_directory_from_environment;
 use crate::state_store::{
     PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
     PersistedWorkspaceLauncher, StateStore,
@@ -459,6 +461,13 @@ fn run_daemon(
         .import_handoff(transferred.opencode_runtime)?;
     registry.import_claude_remote_control_bindings(transferred.claude_remote_control_bindings)?;
     registry.import_kiro_launch_holders(transferred.kiro_launch_holders)?;
+    #[cfg(debug_assertions)]
+    if live_handoff
+        && registry.native_test_hooks_enabled()
+        && consume_native_test_handoff_import_failure()?
+    {
+        return Err(io::Error::other("native test rejected handoff import"));
+    }
     if let Some(channel) = committed {
         {
             registry.events.transaction()?.reserve(1)?;
@@ -604,6 +613,16 @@ fn run_daemon(
     drop(socket_cleanup);
     drop(daemon_lock);
     result
+}
+
+#[cfg(debug_assertions)]
+fn consume_native_test_handoff_import_failure() -> io::Result<bool> {
+    let marker = state_directory_from_environment()?.join(".native-test-fail-handoff-import");
+    match fs::remove_file(marker) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 struct RestartRequest {
@@ -8779,6 +8798,8 @@ impl DaemonService {
                 expected_global_revision,
                 "global Workspace",
             )?;
+            #[cfg(debug_assertions)]
+            self.wait_for_native_first_resource_barrier(operation_id)?;
             if global.closing {
                 return Err(DaemonError::lifecycle(
                     ErrorCode::Busy,
@@ -9973,6 +9994,30 @@ impl DaemonService {
             .variables
             .iter()
             .any(|variable| variable.name == b"BOOMUX_NATIVE_TEST_HOOKS" && variable.value == b"1")
+    }
+
+    #[cfg(debug_assertions)]
+    fn wait_for_native_first_resource_barrier(&self, operation_id: &str) -> DaemonResult<()> {
+        if !self.native_test_hooks_enabled() {
+            return Ok(());
+        }
+        let barrier =
+            state_directory_from_environment()?.join(".native-test-first-resource-barrier");
+        if !barrier.is_dir() {
+            return Ok(());
+        }
+        fs::write(barrier.join(operation_id), b"")?;
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        while Instant::now() < deadline {
+            if fs::read_dir(&barrier)?.count() >= 2 {
+                return Ok(());
+            }
+            thread::sleep(IO_RETRY_DELAY);
+        }
+        Err(DaemonError::lifecycle(
+            ErrorCode::Timeout,
+            "native first-resource barrier timed out",
+        ))
     }
 
     fn resumable_agent(

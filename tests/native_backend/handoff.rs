@@ -581,16 +581,19 @@ fn graceful_restart_transfers_live_kiro_holder_authority_and_rolls_back_safely()
         .parse::<libc::pid_t>()
         .unwrap();
 
-    let state_path = daemon.runtime_dir.join("state/boomux/state.json");
-    let valid_state = fs::read(&state_path).unwrap();
-    fs::write(&state_path, b"invalid Kiro holder handoff state").unwrap();
+    fs::write(
+        daemon
+            .runtime_dir
+            .join("state/boomux/.native-test-fail-handoff-import"),
+        b"",
+    )
+    .unwrap();
     let failed = daemon
         .command()
         .args(["daemon", "restart"])
         .output()
         .unwrap();
     assert!(!failed.status.success());
-    fs::write(&state_path, valid_state).unwrap();
     fs::write(&phase_one, b"").unwrap();
     wait_until(
         || kiro_agent_state(&daemon, "handoff-session") == Some(AgentState::Unknown),

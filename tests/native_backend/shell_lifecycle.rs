@@ -10,8 +10,8 @@ use boomux::protocol::{
 use uuid::Uuid;
 
 use crate::support::{
-    TestDaemon, assert_remote_code, contains, profile, read_until, wait_for_attach_with_profile,
-    wait_until,
+    TestDaemon, assert_remote_code, contains, profile, read_until, read_until_after,
+    wait_for_attach_with_profile, wait_until,
 };
 
 #[test]
@@ -727,7 +727,8 @@ fn attach_environment_is_ephemeral_and_authoritative_for_initial_and_restarted_r
         false,
         environment_for_shell(&client_shell, &first_secret),
     );
-    let first_output = read_until(&mut first.stream, b"|bytes= ff fe");
+    let first_reconstruction = std::mem::take(&mut first.reconstruction);
+    let first_output = read_until_after(&mut first.stream, b"|bytes= ff fe", first_reconstruction);
     assert!(contains(&first_output, first_secret.as_bytes()));
     assert!(contains(&first_output, b"daemon=unset"));
     assert!(contains(&first_output, b"term=attachment-term"));
@@ -753,7 +754,9 @@ fn attach_environment_is_ephemeral_and_authoritative_for_initial_and_restarted_r
         true,
         environment_for_shell(&client_shell, &second_secret),
     );
-    let second_output = read_until(&mut second.stream, b"|bytes= ff fe");
+    let second_reconstruction = std::mem::take(&mut second.reconstruction);
+    let second_output =
+        read_until_after(&mut second.stream, b"|bytes= ff fe", second_reconstruction);
     assert!(contains(&second_output, second_secret.as_bytes()));
     assert!(contains(&second_output, b"daemon=unset"));
     assert!(contains(&second_output, b"term=attachment-term"));
