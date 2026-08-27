@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.3](https://github.com/gardnmi/boomux/compare/v1.5.2...v1.5.3) (2026-08-27)
+
+
+### Bug Fixes
+
+* **release:** create tags for draft releases ([a335d6a](https://github.com/gardnmi/boomux/commit/a335d6a2e04eb875dcc7f1298bb238f8569bb56e))
+
 ## [1.5.2](https://github.com/gardnmi/boomux/compare/v1.5.1...v1.5.2) (2026-08-27)
 
 
