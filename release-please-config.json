@@ -20,7 +20,7 @@
       "package-name": "boomux",
       "include-component-in-tag": false,
       "draft": true,
-      "force-tag-creation": true
+      "force-tag-creation": false
     }
   }
 }

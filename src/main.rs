@@ -245,7 +245,7 @@ struct Cli {
 enum Commands {
     /// Open the interactive workspace dashboard
     Ui,
-    /// Serve the read-only mobile Agent dashboard on loopback
+    /// Serve the mobile Agent dashboard and exact-run terminals on loopback
     Web {
         #[command(subcommand)]
         command: Option<WebCommands>,

@@ -30,7 +30,9 @@ Run the same checks as CI:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --lib --bins --locked -- --test-threads=1
+cargo test --test config_cli --locked -- --test-threads=1
 cargo test --test native_backend --locked -- --test-threads=1
+cargo deny check
 bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
 ```
 
@@ -109,6 +111,8 @@ exercise process, socket, PTY, and daemon lifecycle behavior.
   version.
 - Squash-merge PRs into `main` so the conventional PR title becomes the
   main-branch commit consumed by Release Please.
+- Normal Release Please runs are triggered only after CI succeeds for the exact
+  `main` commit. Manual tag dispatch is reserved for explicit release recovery.
 - Before merging, update the PR title if its release type or scope changed.
 - If a PR contains existing non-conventional commits, add a Release Please
   commit override to the PR body and squash-merge it:

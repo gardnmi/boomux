@@ -1,9 +1,11 @@
 name: Release Please
 
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       tag:
@@ -22,6 +24,10 @@ concurrency:
 
 jobs:
   release-please:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.head_branch == github.event.repository.default_branch) }}
     runs-on: ubuntu-latest
     outputs:
       release-created: ${{ steps.release.outputs.release_created }}
@@ -29,6 +35,20 @@ jobs:
       release-sha: ${{ steps.release.outputs.sha }}
       source-ref: ${{ steps.dispatch-release.outputs.source-ref || steps.release.outputs.sha }}
     steps:
+      - name: Verify triggering CI commit is current
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current_sha=$(gh api "repos/$GH_REPO/commits/$DEFAULT_BRANCH" --jq .sha)
+          if [[ "$current_sha" != "$VALIDATED_SHA" ]]; then
+            printf 'CI validated %s, but %s is now %s\n' "$VALIDATED_SHA" "$DEFAULT_BRANCH" "$current_sha" >&2
+            exit 1
+          fi
+
       - name: Check for pending draft release
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
         id: pending-draft
@@ -54,6 +74,17 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Verify release source passed triggering CI
+        if: ${{ github.event_name == 'workflow_run' && steps.release.outputs.release_created == 'true' }}
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ "$RELEASE_SHA" != "$VALIDATED_SHA" ]]; then
+            printf 'release source %s was not the CI-validated commit %s\n' "$RELEASE_SHA" "$VALIDATED_SHA" >&2
+            exit 1
+          fi
 
       - name: Resolve dispatched release source
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}

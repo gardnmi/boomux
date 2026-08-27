@@ -76,8 +76,8 @@
   accepted federation boundary: one owning Node remains authoritative, SSH is a
   route, and local cached projections never authorize mutation or lifecycle
   inference. Ad hoc bootstrap and verified transport are implemented; durable
-  registration and background reduced projection synchronization are
-  implemented; routed management remains tracked by #173.
+  registration, background reduced projection synchronization, and the typed
+  routed management described by the current protocol history are implemented.
 
 ## Product Boundary
 
@@ -551,7 +551,7 @@ Baseline launching requires no emulator-specific adapter or compositor window
 ID. The local desktop layer defaults to `disabled`; an explicit
 `desktop.workspace_layer = "hyprland-special"` enables it. On Omarchy,
 `boomux setup` recommends the companion plugin and offers this configuration as
-separate default-no consent. When enabled, the local
+separate default-yes consent. When enabled, the local
 client decorates initial titles for coordinated Workspace opens, desktop-layer
 presentation, and coordinated create-and-open with exact Node and Shell
 identity. Direct Shell, dashboard Shell/item, path, and Session opens retain
@@ -1275,7 +1275,8 @@ handshake version 1 is emitted by the hidden `__federation-stdio` helper only
 after the helper's state-root identity matches the identity returned on the exact
 daemon socket subsequently used for inner protocol bytes. Protocol-28 peers keep
 stable identity queries but cannot open that channel. The SSH launcher/bootstrap,
-registration, and projection protocols remain unimplemented under #173.
+registration, and projection capabilities were introduced by the later protocol
+versions below under #173.
 
 Protocol 30 adds expected-ID-conditional Node rekey. The daemon excludes restart,
 shutdown, and concurrent rekey transitions, closes federation admission, and

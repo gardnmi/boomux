@@ -1,9 +1,9 @@
 # Remote Node Federation
 
-> **Status: Accepted design contract; implementation in progress.** This document
-> defines the authority, identity, privacy, compatibility, and failure semantics
-> delivered by [#174](https://github.com/gardnmi/boomux/issues/174) under tracking
-> epic [#173](https://github.com/gardnmi/boomux/issues/173). Current source and
+> **Status: Current contract.** This document defines the implemented authority,
+> identity, privacy, compatibility, and failure semantics delivered incrementally
+> under [#174](https://github.com/gardnmi/boomux/issues/174) and tracking epic
+> [#173](https://github.com/gardnmi/boomux/issues/173). Current source and
 > compatibility tests remain authoritative for shipped behavior. Protocol 28
 > implements stable local Node identity; protocol 29, handshake version 1, and
 > the hidden stdio helper establish the verified same-socket bridge boundary.
