@@ -24,36 +24,35 @@ native windows.
 
 ## Quick Start
 
-After [installing Boomux](#install-and-update), configure local integrations and
-create a coordinated Workspace from the current directory:
+After [installing Boomux](#install-and-update), run the guided setup:
 
 ```console
 boomux setup
-boomux workspace create my-project --node local --cwd . --open
 ```
 
-The second command atomically creates the Workspace, its local placement, and its
-first Shell. Boomux may prepare the native terminal while creation commits, but
-attachment remains gated until creation succeeds. Omit `my-project` to generate
-the Workspace and Shell names. Open the dashboard with:
+On Omarchy, confirm the prompts to install and enable the
+[Boomux plugin](https://github.com/gardnmi/omarchy-boomux) and, if wanted, its
+managed keybindings. Setup restarts Omarchy Shell after plugin changes. The
+plugin adds a Boomux icon to the bar and opens a persistent side pane for
+Workspaces, Shells, Agents, and Nodes.
 
-```console
-boomux ui
-```
+- Click the bar icon to open or close the pane.
+- With the managed bindings, `Super+B` toggles the pane and `Super+A` toggles
+  keyboard focus.
+- Use `+` to create a generated local Workspace and first Shell at `$HOME`.
+- Use the project-folder button to create a same-named Workspace at a configured
+  project path.
 
 `boomux setup` detects supported Agent harnesses, starts the local daemon, and
 prompts before installing or replacing integrations and the Boomux Agent Skill.
-On Omarchy, it can also install the companion plugin and managed keybindings.
 Prompts default to no, and rerunning setup preserves modified or user-owned
 assets unless replacement is explicitly confirmed.
 
 Omarchy's graphical environment must be able to resolve `boomux`; official
-release installations use `~/.local/bin`.
-
-For stable automation, use supported `integration status`, `integration install`,
-and `integration uninstall` commands with `--json`. `skill install` is
-human-output-only. `boomux setup` requires an interactive terminal and rejects
-`--json`.
+release installations use `~/.local/bin`. See the
+[plugin README](https://github.com/gardnmi/omarchy-boomux#readme) for its complete
+controls and safety behavior. For CLI-only creation, continue to
+[Workspace Creation](#workspace-creation).
 
 ## Install And Update
 
