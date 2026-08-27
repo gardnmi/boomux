@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/gardnmi/boomux/compare/v1.1.0...v1.2.0) (2026-08-27)
+
+
+### Features
+
+* add guided setup and atomic workspace creation ([#287](https://github.com/gardnmi/boomux/issues/287)) ([e4feb89](https://github.com/gardnmi/boomux/commit/e4feb89e7358e232b5a11588c6008e3b52c5f2c8))
+
 ## [1.1.0](https://github.com/gardnmi/boomux/compare/v1.0.2...v1.1.0) (2026-08-26)
 
 
