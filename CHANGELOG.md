@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.2](https://github.com/gardnmi/boomux/compare/v1.5.1...v1.5.2) (2026-08-27)
+
+
+### Bug Fixes
+
+* **release:** preserve draft tag during publication ([374cd87](https://github.com/gardnmi/boomux/commit/374cd87d47031d15f5d30c2a2d49d7fe3c309dd0))
+
 ## [1.5.1](https://github.com/gardnmi/boomux/compare/v1.5.0...v1.5.1) (2026-08-27)
 
 
