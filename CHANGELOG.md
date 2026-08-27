@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/gardnmi/boomux/compare/v1.3.0...v1.4.0) (2026-08-27)
+
+
+### Features
+
+* **setup:** recommend the Omarchy desktop experience ([#292](https://github.com/gardnmi/boomux/issues/292)) ([d491286](https://github.com/gardnmi/boomux/commit/d491286820bdc22b3be9304b32fb5a460a0848ef))
+
 ## [1.3.0](https://github.com/gardnmi/boomux/compare/v1.2.0...v1.3.0) (2026-08-27)
 
 
