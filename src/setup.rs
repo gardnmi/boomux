@@ -385,13 +385,7 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
         },
     );
 
-    let plugins = run_command(&omarchy, &["plugin", "list", "--json"], COMMAND_TIMEOUT)?;
-    let plugins: Vec<OmarchyPlugin> = serde_json::from_slice(&plugins.stdout).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Omarchy returned invalid plugin inventory: {error}"),
-        )
-    })?;
+    let plugins = omarchy_plugins(&omarchy)?;
     let plugin_enabled = match plugins.iter().find(|plugin| plugin.id == OMARCHY_PLUGIN_ID) {
         Some(plugin) if plugin.enabled => {
             status("ok", "32", "omarchy-boomux", "installed and enabled");
@@ -567,6 +561,41 @@ fn executable_on_path(name: &str) -> Option<PathBuf> {
             .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
             .then_some(candidate)
     })
+}
+
+fn omarchy_plugins(executable: &Path) -> io::Result<Vec<OmarchyPlugin>> {
+    let output = run_command(executable, &["plugin", "list", "--json"], COMMAND_TIMEOUT)?;
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Omarchy returned invalid plugin inventory: {error}"),
+        )
+    })
+}
+
+pub(crate) fn installed_omarchy_plugin() -> io::Result<Option<PathBuf>> {
+    let Some(executable) = executable_on_path("omarchy") else {
+        return Ok(None);
+    };
+    Ok(omarchy_plugins(&executable)?
+        .iter()
+        .any(|plugin| plugin.id == OMARCHY_PLUGIN_ID)
+        .then_some(executable))
+}
+
+pub(crate) fn remove_omarchy_plugin(executable: &Path) -> io::Result<bool> {
+    if !omarchy_plugins(executable)?
+        .iter()
+        .any(|plugin| plugin.id == OMARCHY_PLUGIN_ID)
+    {
+        return Ok(false);
+    }
+    run_command(
+        executable,
+        &["plugin", "remove", OMARCHY_PLUGIN_ID, "--yes"],
+        COMMAND_TIMEOUT,
+    )?;
+    Ok(true)
 }
 
 fn run_command(
@@ -1134,5 +1163,21 @@ mod tests {
                 b"".as_slice(),
             ]
         );
+    }
+
+    #[test]
+    fn omarchy_plugin_removal_rechecks_inventory_and_uses_the_exact_id() {
+        let directory = TestDirectory::new();
+        let executable = directory.0.join("omarchy");
+        fs::write(
+            &executable,
+            b"#!/bin/sh\nmarker=$0.removed\ncase \"$*\" in\n  'plugin list --json')\n    if [ -e \"$marker\" ]; then printf '[]\\n'; else printf '[{\"id\":\"io.github.gardnmi.boomux\",\"enabled\":true}]\\n'; fi ;;\n  'plugin remove io.github.gardnmi.boomux --yes') : > \"$marker\" ;;\n  *) exit 97 ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(remove_omarchy_plugin(&executable).unwrap());
+        assert!(executable.with_extension("removed").exists());
+        assert!(!remove_omarchy_plugin(&executable).unwrap());
     }
 }

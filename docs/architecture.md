@@ -940,8 +940,9 @@ reloaded and checked with `hyprctl configerrors`; otherwise the bindings take
 effect at the next session. The complete historical user-managed Boomux profile
 is recognized by its exact panel, focus-release, desktop, Shell-create, and
 focused-close actions and remains user-owned without adding a managed block.
-Local uninstall removes only an unchanged managed binding block and leaves the
-independently managed Omarchy plugin installed.
+Local uninstall removes an unchanged managed binding block and, when detected in
+a bounded rechecked inventory, removes the exact Omarchy plugin through the
+Omarchy CLI after the overall uninstall confirmation.
 
 Observed host compatibility and provider-dependent gaps are recorded in
 [`lifecycle-validation.md`](lifecycle-validation.md). Focused unit fixtures

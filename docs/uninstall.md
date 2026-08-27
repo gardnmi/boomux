@@ -46,10 +46,11 @@ are never removed.
 An unchanged keybinding block installed by `boomux setup` is also a Boomux-owned
 asset and is removed while preserving every other byte in
 `~/.config/hypr/bindings.lua`. A modified, malformed, symlinked, special, or
-uninspectable binding target is preserved and reported. The external
-`io.github.gardnmi.boomux` Omarchy plugin remains owned by Omarchy and is not
-removed implicitly; uninstall prints its explicit `omarchy plugin remove`
-command.
+uninspectable binding target is preserved and reported. When Omarchy is
+available, uninstall checks its bounded JSON inventory for the exact
+`io.github.gardnmi.boomux` plugin ID. A detected plugin is included in the
+uninstall plan and removed through `omarchy plugin remove ... --yes` after the
+overall confirmation. An absent or uninspectable plugin is not mutated.
 
 ## Process And Data Safety
 

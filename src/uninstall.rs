@@ -50,6 +50,10 @@ pub(crate) fn guided_uninstall(purge: bool) -> Result<(), Box<dyn std::error::Er
             Some(error.to_string()),
         ),
     };
+    let (omarchy_plugin, omarchy_plugin_error) = match setup::installed_omarchy_plugin() {
+        Ok(plugin) => (plugin, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let purge_directories = purge
         .then(|| Ok::<_, io::Error>((state_directory(&home)?, config_directory(&home)?)))
         .transpose()?;
@@ -95,9 +99,13 @@ pub(crate) fn guided_uninstall(purge: bool) -> Result<(), Box<dyn std::error::Er
         ),
         None => {}
     }
-    println!(
-        "The Omarchy plugin remains independently managed; remove it with: omarchy plugin remove io.github.gardnmi.boomux"
-    );
+    if omarchy_plugin.is_some() {
+        println!(
+            "Desktop integration: the installed io.github.gardnmi.boomux Omarchy plugin will be removed"
+        );
+    } else if let Some(error) = &omarchy_plugin_error {
+        println!("Preserving uninspectable omarchy-boomux plugin: {error}");
+    }
     if purge {
         let (state_directory, config_directory) = purge_directories
             .as_ref()
@@ -176,6 +184,11 @@ pub(crate) fn guided_uninstall(purge: bool) -> Result<(), Box<dyn std::error::Er
                 bindings_path.display()
             ),
         }
+    }
+    if let Some(omarchy) = &omarchy_plugin
+        && setup::remove_omarchy_plugin(omarchy)?
+    {
+        println!("Removed io.github.gardnmi.boomux Omarchy plugin");
     }
     if purge {
         let (state_directory, config_directory) = purge_directories
