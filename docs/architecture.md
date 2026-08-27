@@ -545,8 +545,10 @@ owner's corresponding event remains owner-local and is excluded from reduced
 projection transitions.
 
 Baseline launching requires no emulator-specific adapter or compositor window
-ID. The local desktop layer defaults to `hyprland-special`; an explicit
-`desktop.workspace_layer = "disabled"` opts out. When enabled, the local
+ID. The local desktop layer defaults to `disabled`; an explicit
+`desktop.workspace_layer = "hyprland-special"` enables it. On Omarchy,
+`boomux setup` recommends the companion plugin and offers this configuration as
+separate default-no consent. When enabled, the local
 client decorates initial titles for coordinated Workspace opens, desktop-layer
 presentation, and coordinated create-and-open with exact Node and Shell
 identity. Direct Shell, dashboard Shell/item, path, and Session opens retain
@@ -956,6 +958,12 @@ plugin lifecycle ownership. A Cargo-private executable without a corresponding
 absent from the graphical session's `PATH`. After installing or enabling the
 plugin, setup runs bounded `omarchy restart shell` so the running shell loads it.
 Reruns offer the same reload for an already-enabled but potentially stale plugin.
+The plugin is presented as the recommended core Omarchy experience rather than
+an incidental integration. Once it is enabled, setup separately offers to enable
+the default-off Hyprland Workspace layer by updating only
+`desktop.workspace_layer` in the active configuration layer through the same
+owner validation, baseline revalidation, and atomic commit boundary as
+`boomux config edit`. Declining either prompt preserves the current state.
 After a guided local Boomux update commits, the updater revalidates an installed
 companion plugin, delegates its update to the fixed exact-argument Omarchy CLI,
 and restarts Omarchy Shell when the plugin is enabled. Omarchy remains the plugin

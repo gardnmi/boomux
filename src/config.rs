@@ -30,7 +30,7 @@ pub(crate) const CONFIG_TEMPLATE: &str = r#"# Boomux configuration
 # follow_focused_terminal = true
 
 [desktop]
-# workspace_layer = "disabled"
+# workspace_layer = "hyprland-special"
 
 [notifications]
 # enabled = false
@@ -417,7 +417,50 @@ pub(crate) fn validate() -> Result<ConfigSnapshot, Box<dyn Error>> {
 pub(crate) fn edit() -> Result<(), Box<dyn Error>> {
     let paths = ConfigPaths::from_environment()?;
     let editor = editor_argv()?;
-    edit_with(&paths, |working| run_editor(&editor, working), || {})
+    edit_with(
+        &paths,
+        |working| {
+            let status = run_editor(&editor, working)?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(ConfigError(format!("editor exited with {status}")).into())
+            }
+        },
+        || {},
+    )
+}
+
+pub(crate) fn enable_hyprland_workspace_layer() -> Result<PathBuf, Box<dyn Error>> {
+    let paths = ConfigPaths::from_environment()?;
+    enable_hyprland_workspace_layer_with(&paths)
+}
+
+fn enable_hyprland_workspace_layer_with(paths: &ConfigPaths) -> Result<PathBuf, Box<dyn Error>> {
+    let target = paths.active()?.to_owned();
+    edit_with(
+        paths,
+        |working| {
+            let source = read_bounded(working)?;
+            let source = std::str::from_utf8(&source).map_err(|error| {
+                ConfigError(format!("invalid config {}: {error}", working.display()))
+            })?;
+            let mut document = source.parse::<toml_edit::DocumentMut>().map_err(|error| {
+                ConfigError(format!("invalid config {}: {error}", working.display()))
+            })?;
+            document["desktop"]["workspace_layer"] = toml_edit::value("hyprland-special");
+            let candidate = document.to_string();
+            let mut file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(working)?;
+            file.write_all(candidate.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        },
+        || {},
+    )?;
+    Ok(target)
 }
 
 fn editor_argv() -> Result<Vec<OsString>, Box<dyn Error>> {
@@ -463,7 +506,7 @@ fn run_editor(editor: &[OsString], working: &Path) -> Result<ExitStatus, Box<dyn
 
 fn edit_with(
     paths: &ConfigPaths,
-    run: impl FnOnce(&Path) -> Result<ExitStatus, Box<dyn Error>>,
+    run: impl FnOnce(&Path) -> Result<(), Box<dyn Error>>,
     before_commit: impl FnOnce(),
 ) -> Result<(), Box<dyn Error>> {
     let target = paths.active()?;
@@ -490,10 +533,7 @@ fn edit_with(
     working_file.sync_all()?;
     drop(working_file);
 
-    let status = run(working.path())?;
-    if !status.success() {
-        return Err(ConfigError(format!("editor exited with {status}")).into());
-    }
+    run(working.path())?;
     let candidate_metadata = fs::symlink_metadata(working.path())?;
     validate_regular_owner(working.path(), &candidate_metadata, "edited config")?;
     let candidate = read_bounded(working.path())?;
@@ -786,7 +826,7 @@ fn resolve(raw: RawConfig, path: Option<PathBuf>) -> Result<Config, Box<dyn Erro
                 .desktop
                 .unwrap_or_default()
                 .workspace_layer
-                .unwrap_or(DesktopWorkspaceLayer::HyprlandSpecial),
+                .unwrap_or(DesktopWorkspaceLayer::Disabled),
         },
     })
 }
@@ -928,25 +968,89 @@ mod tests {
     }
 
     #[test]
-    fn desktop_workspace_layer_defaults_on_and_can_be_disabled_independently() {
+    fn desktop_workspace_layer_defaults_off_and_can_be_enabled_independently() {
         let default = resolve(RawConfig::default(), None).expect("resolved default config");
         assert_eq!(
             default.desktop.workspace_layer,
-            DesktopWorkspaceLayer::HyprlandSpecial
+            DesktopWorkspaceLayer::Disabled
         );
 
         let mut base: RawConfig = toml::from_str("[projects]\nmax_depth = 2").expect("valid base");
-        let next: RawConfig =
-            toml::from_str("[desktop]\nworkspace_layer = \"disabled\"").expect("valid override");
+        let next: RawConfig = toml::from_str("[desktop]\nworkspace_layer = \"hyprland-special\"")
+            .expect("valid override");
         merge(&mut base, next);
         let config = resolve(base, None).expect("resolved config");
         assert_eq!(
             config.desktop.workspace_layer,
-            DesktopWorkspaceLayer::Disabled
+            DesktopWorkspaceLayer::HyprlandSpecial
         );
         assert_eq!(config.projects.max_depth, 2);
         assert!(toml::from_str::<RawConfig>("[desktop]\nunknown = true").is_err());
         assert!(toml::from_str::<RawConfig>("[desktop]\nworkspace_layer = \"sway\"").is_err());
+    }
+
+    #[test]
+    fn setup_enablement_preserves_config_formatting_and_unrelated_settings() {
+        let directory = TestDirectory::new();
+        let target = directory.0.join("config.toml");
+        fs::write(
+            &target,
+            "# keep this comment\n[projects]\nmax_depth = 4\n\n[desktop]\nworkspace_layer = \"disabled\" # setup may replace this\n",
+        )
+        .unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let paths = ConfigPaths {
+            global: Some(target.clone()),
+            environment: None,
+        };
+
+        assert_eq!(
+            enable_hyprland_workspace_layer_with(&paths).unwrap(),
+            target
+        );
+        let content = fs::read_to_string(&target).unwrap();
+        assert!(content.contains("# keep this comment"));
+        assert!(content.contains("max_depth = 4"));
+        assert!(content.contains("workspace_layer = \"hyprland-special\""));
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let (raw, _, _) = load_raw_from_paths(&paths, None).unwrap();
+        assert_eq!(
+            resolve(raw, Some(target)).unwrap().desktop.workspace_layer,
+            DesktopWorkspaceLayer::HyprlandSpecial
+        );
+    }
+
+    #[test]
+    fn setup_enablement_updates_only_the_active_environment_layer() {
+        let directory = TestDirectory::new();
+        let global = directory.0.join("global.toml");
+        let environment = directory.0.join("environment.toml");
+        let global_content = "# inherited\n[projects]\nmax_depth = 4\n";
+        fs::write(&global, global_content).unwrap();
+        fs::write(&environment, "# active override\n").unwrap();
+        let paths = ConfigPaths {
+            global: Some(global.clone()),
+            environment: Some(environment.clone()),
+        };
+
+        assert_eq!(
+            enable_hyprland_workspace_layer_with(&paths).unwrap(),
+            environment
+        );
+        assert_eq!(fs::read_to_string(global).unwrap(), global_content);
+        let environment_content = fs::read_to_string(&environment).unwrap();
+        assert!(environment_content.contains("# active override"));
+        assert!(environment_content.contains("workspace_layer = \"hyprland-special\""));
+        let (raw, _, _) = load_raw_from_paths(&paths, None).unwrap();
+        let config = resolve(raw, Some(environment)).unwrap();
+        assert_eq!(config.projects.max_depth, 4);
+        assert_eq!(
+            config.desktop.workspace_layer,
+            DesktopWorkspaceLayer::HyprlandSpecial
+        );
     }
 
     #[test]

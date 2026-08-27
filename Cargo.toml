@@ -19,6 +19,7 @@ semver = "1"
 sha2 = "0.10"
 shell-words = "1"
 toml = "0.9"
+toml_edit = "0.25"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1", features = ["v4", "v5"] }
 unicode-width = "0.2"
