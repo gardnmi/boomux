@@ -22,6 +22,12 @@ if [[ " $* " == *' --method PATCH '* ]]; then
   updates=$(<"$RELEASE_UPDATES")
   printf '%s' "$((updates + 1))" > "$RELEASE_UPDATES"
 elif [[ " $* " == *' --jq .id '* ]]; then
+  if [[ ${RELEASE_TAG_LOOKUP_FAIL:-0} == 1 ]]; then
+    printf '{"message":"Not Found"}\n'
+    exit 1
+  fi
+  printf '42\n'
+elif [[ "$*" == *'releases?per_page=100'* ]]; then
   printf '42\n'
 elif [[ " $* " == *' --include '* ]]; then
   printf 'HTTP/2 200\netag: "fixture-%s"\n\n' "$(<"$RELEASE_UPDATES")"
@@ -32,10 +38,15 @@ fi
 EOF
 chmod 755 "$root/bin/gh"
 
-for _ in first second; do
+for pass in first second; do
+  tag_lookup_fail=0
+  if [[ $pass == first ]]; then
+    tag_lookup_fail=1
+  fi
   GH_REPO=gardnmi/boomux \
     RELEASE_BODY="$root/body" \
     RELEASE_UPDATES="$root/updates" \
+    RELEASE_TAG_LOOKUP_FAIL="$tag_lookup_fail" \
     PATH="$root/bin:/usr/bin:/bin" \
     bash .github/scripts/update-release-notes.sh v1.2.3 >/dev/null
 done
