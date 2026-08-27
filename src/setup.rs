@@ -131,6 +131,89 @@ struct BindingsPlan {
     compatible_unmanaged: bool,
 }
 
+struct SetupReadiness {
+    complete: bool,
+    plugin_enabled: bool,
+    keybindings_ready: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupOutcomeKind {
+    Current,
+    Changed,
+    Skipped,
+    Warning,
+    Failed,
+}
+
+struct SetupOutcome {
+    kind: SetupOutcomeKind,
+    label: String,
+    message: String,
+    recovery: Option<String>,
+}
+
+impl SetupOutcome {
+    fn new(kind: SetupOutcomeKind, label: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            label: label.into(),
+            message: message.into(),
+            recovery: None,
+        }
+    }
+
+    fn failed(
+        label: impl Into<String>,
+        error: impl std::fmt::Display,
+        recovery: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: SetupOutcomeKind::Failed,
+            label: label.into(),
+            message: error.to_string(),
+            recovery: Some(recovery.into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ApplyOutcome {
+    Current,
+    Changed,
+    Skipped,
+}
+
+#[derive(Default)]
+struct DesktopSetupOutcomes {
+    plugin: Option<ApplyOutcome>,
+    workspace_layer: Option<ApplyOutcome>,
+    keybindings: Option<ApplyOutcome>,
+}
+
+struct DesktopSetupPlan {
+    workspace_enabled: bool,
+    bindings_ready: bool,
+    bindings_path: PathBuf,
+    conflicts: Vec<String>,
+}
+
+#[derive(Debug)]
+struct DesktopPartialFailure {
+    message: String,
+    committed_message: &'static str,
+    failure_label: &'static str,
+    recovery: &'static str,
+}
+
+impl std::fmt::Display for DesktopPartialFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for DesktopPartialFailure {}
+
 fn colors_enabled() -> bool {
     io::stdout().is_terminal()
         && env::var_os("NO_COLOR").is_none()
@@ -172,45 +255,68 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
-    println!("{}", paint("1;35", "BOOMUX SETUP"));
+    println!("{}", paint("1;35", "BOOMUX"));
+    println!("{}", paint("1", "Set up this machine"));
     println!(
         "{}",
         paint(
             "2",
-            "Discover harnesses, lifecycle integrations, and desktop support."
+            format!(
+                "v{}  |  config {}",
+                env!("CARGO_PKG_VERSION"),
+                crate::config::active_path()?.display()
+            )
         )
     );
     println!(
         "{}",
         paint(
             "2",
-            "Daemon readiness is automatic; configuration changes require confirmation."
+            "Inspect first, confirm every change, then verify the finished setup."
         )
     );
 
-    section("System Check");
-    if let Some(terminal_resolver) = executable_on_path("xdg-terminal-exec") {
-        status(
-            "ok",
-            "32",
-            "Terminal resolver",
-            terminal_resolver.display().to_string(),
-        );
-    } else {
-        status("!!", "33", "Terminal resolver", "not found on PATH");
-    }
-    let daemon_was_running = client::connect().is_ok();
-    client::connect_or_start()?;
+    section("Inspecting System");
+    let Some(terminal_resolver) = executable_on_path("xdg-terminal-exec") else {
+        status("xx", "31", "Terminal resolver", "not found on PATH");
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "xdg-terminal-exec is required; install it and rerun `boomux setup`",
+        )
+        .into());
+    };
     status(
         "ok",
         "32",
+        "Terminal resolver",
+        terminal_resolver.display().to_string(),
+    );
+    let daemon_was_running = client::connect().is_ok();
+    status(
+        if daemon_was_running { "ok" } else { "--" },
+        if daemon_was_running { "32" } else { "2" },
         "Daemon",
         if daemon_was_running {
             "already running"
         } else {
-            "started"
+            "will start during verification"
         },
     );
+
+    let omarchy_plan = if let Some(omarchy) = executable_on_path("omarchy") {
+        let version = run_command(&omarchy, &["version"], COMMAND_TIMEOUT)?;
+        ensure_omarchy_can_resolve_boomux()?;
+        status(
+            "ok",
+            "32",
+            "Desktop",
+            String::from_utf8_lossy(&version.stdout).trim(),
+        );
+        Some(omarchy_plugins(&omarchy)?)
+    } else {
+        status("--", "2", "Desktop", "Omarchy not detected");
+        None
+    };
 
     let environment = integration_management::Environment::from_process();
     let statuses = IntegrationId::all()
@@ -226,12 +332,179 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         .filter(|(_, status)| status.host.state != HostState::Missing)
         .count();
 
+    for (integration, integration_status) in &statuses {
+        if integration_status.host.state != HostState::Missing
+            && matches!(
+                integration_status.asset.state,
+                AssetState::Missing | AssetState::Modified
+            )
+        {
+            integration_management::plan_install(
+                *integration,
+                &environment,
+                integration_status.asset.state == AssetState::Modified,
+            )?;
+        }
+    }
+    let skill_before = if detected > 0 {
+        let skill = required_home()?.join(".agents/skills/boomux/SKILL.md");
+        Some(integration_management::regular_file_matches(
+            &skill,
+            crate::BOOMUX_SKILL,
+        )?)
+    } else {
+        None
+    };
+    let (desktop_plan, desktop_plan_error) = if omarchy_plan.is_some() {
+        let omarchy = executable_on_path("omarchy")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "omarchy disappeared"))?;
+        match inspect_omarchy_desktop_plan(&omarchy) {
+            Ok(plan) => (Some(plan), None),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+
+    section("Setup Plan");
+    if let Some(plugins) = omarchy_plan.as_deref() {
+        let plugin = plugins.iter().find(|plugin| plugin.id == OMARCHY_PLUGIN_ID);
+        status(
+            if plugin.is_some_and(|plugin| plugin.enabled) {
+                "ok"
+            } else {
+                "->"
+            },
+            if plugin.is_some_and(|plugin| plugin.enabled) {
+                "32"
+            } else {
+                "36"
+            },
+            "Companion pane",
+            match plugin {
+                Some(plugin) if plugin.enabled => "plugin enabled",
+                Some(_) => "enable recommended plugin",
+                None => "install and enable recommended plugin",
+            },
+        );
+        detail(format!("source: {OMARCHY_PLUGIN_URL}"));
+        let workspace_enabled = desktop_plan
+            .as_ref()
+            .is_some_and(|plan| plan.workspace_enabled);
+        status(
+            if workspace_enabled { "ok" } else { "->" },
+            if workspace_enabled { "32" } else { "36" },
+            "Workspace layer",
+            if workspace_enabled {
+                "enabled"
+            } else {
+                "enable recommended Hyprland presentation"
+            },
+        );
+        detail(format!(
+            "config: {}",
+            crate::config::active_path()?.display()
+        ));
+        let bindings_ready = desktop_plan
+            .as_ref()
+            .is_some_and(|plan| plan.bindings_ready);
+        status(
+            if bindings_ready { "ok" } else { "--" },
+            if bindings_ready { "32" } else { "2" },
+            "Keybindings",
+            if bindings_ready {
+                "current compatible profile"
+            } else {
+                "optional; install only with confirmation"
+            },
+        );
+        if let Some(desktop_plan) = desktop_plan.as_ref() {
+            detail(format!("path: {}", desktop_plan.bindings_path.display()));
+            for conflict in &desktop_plan.conflicts {
+                detail(format!("conflict: {conflict}"));
+            }
+        } else {
+            detail(format!(
+                "desktop plan unavailable: {}",
+                desktop_plan_error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+    } else {
+        status("--", "2", "Companion pane", "Omarchy not detected");
+    }
+    for (integration_id, integration) in &statuses {
+        if integration.host.state == HostState::Missing {
+            continue;
+        }
+        let (marker, color, plan) = match integration.asset.state {
+            AssetState::Current => ("ok", "32", "integration current"),
+            AssetState::Missing => ("->", "36", "install integration"),
+            AssetState::Modified => ("!!", "33", "replace only with confirmation"),
+            AssetState::Unavailable => ("xx", "31", "inspection must be repaired"),
+        };
+        status(marker, color, integration.display_name, plan);
+        if let Some(path) = integration.asset.path.as_deref() {
+            detail(format!("path: {path}"));
+        } else if matches!(
+            integration.asset.state,
+            AssetState::Missing | AssetState::Modified
+        ) {
+            let force = integration.asset.state == AssetState::Modified;
+            let plan = integration_management::plan_install(*integration_id, &environment, force)?;
+            detail(format!("path: {}", plan.path));
+        }
+    }
+    if detected == 0 {
+        status(
+            "--",
+            "2",
+            "Agent lifecycle",
+            "no supported harnesses detected",
+        );
+    } else if let Some(skill) = skill_before {
+        let (marker, color, plan) = match skill {
+            Some(true) => ("ok", "32", "Agent Skill current"),
+            Some(false) => ("!!", "33", "replace Agent Skill only with confirmation"),
+            None => ("->", "36", "offer Agent Skill installation"),
+        };
+        status(marker, color, "Agent Skill", plan);
+        detail(format!(
+            "path: {}",
+            required_home()?
+                .join(".agents/skills/boomux/SKILL.md")
+                .display()
+        ));
+    }
+    status(
+        "->",
+        "36",
+        "Verification",
+        "start or confirm the local daemon",
+    );
+    detail("Recommended Omarchy choices default to yes.");
+    detail("Modified assets, replacements, and optional keybindings default to no.");
+
+    let skip_desktop = if let Some(error) = desktop_plan_error.as_deref() {
+        status("!!", "33", "Desktop blocker", error);
+        detail("No desktop change will be attempted unless inspection succeeds.");
+        if confirm_recommended("Skip unavailable optional desktop setup and continue?")? {
+            true
+        } else {
+            return Err(io::Error::other(format!(
+                "desktop setup inspection failed: {error}; fix it and rerun `boomux setup`"
+            ))
+            .into());
+        }
+    } else {
+        false
+    };
+
     section("Agent Harnesses");
     if detected == 0 {
         status("--", "2", "Harnesses", "none found on PATH");
     }
-    let mut failures = Vec::new();
-    let mut changed_harnesses = 0usize;
+    let mut outcomes = Vec::new();
+    let mut changed_harnesses = Vec::new();
     for (integration, integration_status) in statuses {
         if integration_status.host.state == HostState::Missing {
             continue;
@@ -259,17 +532,28 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
             ));
         }
         if integration_status.asset.state == AssetState::Current {
+            outcomes.push(SetupOutcome::new(
+                SetupOutcomeKind::Current,
+                integration_status.display_name,
+                "integration current",
+            ));
             continue;
         }
         if integration_status.asset.state == AssetState::Unavailable {
-            failures.push(format!(
-                "{} integration could not be inspected: {}",
+            outcomes.push(SetupOutcome::failed(
                 integration_status.display_name,
-                integration_status
-                    .asset
-                    .error
-                    .as_deref()
-                    .unwrap_or("unknown error")
+                format!(
+                    "integration could not be inspected: {}",
+                    integration_status
+                        .asset
+                        .error
+                        .as_deref()
+                        .unwrap_or("unknown error")
+                ),
+                format!(
+                    "`boomux integration status {} --json`",
+                    integration.spec().key
+                ),
             ));
             continue;
         }
@@ -277,23 +561,36 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         let plan = match integration_management::plan_install(integration, &environment, force) {
             Ok(plan) => plan,
             Err(error) => {
-                failures.push(format!(
-                    "{} integration: {error}",
-                    integration_status.display_name
+                outcomes.push(SetupOutcome::failed(
+                    integration_status.display_name,
+                    error,
+                    format!(
+                        "`boomux integration status {} --json`",
+                        integration.spec().key
+                    ),
                 ));
                 continue;
             }
         };
-        let action = match plan.action {
-            InstallAction::Install => "Install",
-            InstallAction::Replace => "Replace modified",
+        let (action, prompt) = match plan.action {
+            InstallAction::Install => (
+                "Install",
+                format!(
+                    "Install the {} integration?",
+                    integration_status.display_name
+                ),
+            ),
+            InstallAction::Replace => (
+                "Replace modified",
+                format!(
+                    "Replace the modified {} integration?",
+                    integration_status.display_name
+                ),
+            ),
             InstallAction::Unchanged => continue,
         };
         detail(format!("Plan: {action} asset at {}", plan.path));
-        if confirm(&format!(
-            "{action} the {} integration?",
-            integration_status.display_name
-        ))? {
+        if confirm(&prompt)? {
             match integration_management::install(integration, &environment, force) {
                 Ok(result) => {
                     status(
@@ -303,60 +600,479 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
                         "integration installed",
                     );
                     detail(format!("path: {}", result.path));
+                    outcomes.push(SetupOutcome::new(
+                        SetupOutcomeKind::Changed,
+                        integration_status.display_name,
+                        "integration installed",
+                    ));
                     if result.restart_required {
-                        changed_harnesses += 1;
+                        changed_harnesses.push(integration_status.display_name);
                         detail(integration.installation().reload_message);
                     }
                 }
-                Err(error) => failures.push(format!(
-                    "{} integration: {error}",
-                    integration_status.display_name
+                Err(error) => outcomes.push(SetupOutcome::failed(
+                    integration_status.display_name,
+                    error,
+                    format!("`boomux integration install {}`", integration.spec().key),
                 )),
             }
         } else {
             status("--", "2", integration_status.display_name, "skipped");
+            outcomes.push(SetupOutcome::new(
+                SetupOutcomeKind::Skipped,
+                integration_status.display_name,
+                "integration skipped",
+            ));
         }
     }
 
-    if detected > 0
-        && let Err(error) = setup_agent_skill()
-    {
-        failures.push(format!("Agent Skill: {error}"));
+    if detected > 0 {
+        match setup_agent_skill() {
+            Ok(outcome) => outcomes.push(apply_outcome(
+                "Agent Skill",
+                outcome,
+                "current",
+                "installed",
+                "skipped",
+            )),
+            Err(error) => {
+                outcomes.push(SetupOutcome::failed("Agent Skill", error, "`boomux setup`"))
+            }
+        }
     }
 
-    if let Err(error) = setup_omarchy() {
-        failures.push(format!("Omarchy desktop setup: {error}"));
+    let desktop_result = if skip_desktop {
+        if omarchy_plan.as_deref().is_some_and(|plugins| {
+            plugins
+                .iter()
+                .any(|plugin| plugin.id == OMARCHY_PLUGIN_ID && plugin.enabled)
+        }) {
+            outcomes.push(SetupOutcome::new(
+                SetupOutcomeKind::Warning,
+                "Omarchy plugin",
+                "enabled; later desktop verification skipped",
+            ));
+        }
+        outcomes.push(SetupOutcome::new(
+            SetupOutcomeKind::Skipped,
+            "Omarchy desktop",
+            "skipped because read-only inspection failed",
+        ));
+        Ok(DesktopSetupOutcomes::default())
+    } else {
+        setup_omarchy()
+    };
+    match desktop_result {
+        Ok(desktop) => {
+            if let Some(outcome) = desktop.plugin {
+                outcomes.push(apply_outcome(
+                    "Omarchy plugin",
+                    outcome,
+                    "enabled",
+                    "installed and loaded",
+                    "skipped",
+                ));
+            }
+            if let Some(outcome) = desktop.workspace_layer {
+                outcomes.push(apply_outcome(
+                    "Workspace layer",
+                    outcome,
+                    "enabled",
+                    "enabled",
+                    "skipped",
+                ));
+            }
+            if let Some(outcome) = desktop.keybindings {
+                outcomes.push(apply_outcome(
+                    "Keybindings",
+                    outcome,
+                    "current compatible profile",
+                    "installed",
+                    "skipped",
+                ));
+            }
+        }
+        Err(error) => {
+            if let Some(partial) = error.downcast_ref::<DesktopPartialFailure>() {
+                outcomes.push(SetupOutcome::new(
+                    SetupOutcomeKind::Changed,
+                    "Omarchy plugin",
+                    partial.committed_message,
+                ));
+                outcomes.push(SetupOutcome::failed(
+                    partial.failure_label,
+                    partial,
+                    partial.recovery,
+                ));
+            } else {
+                outcomes.push(SetupOutcome::failed(
+                    "Omarchy desktop",
+                    error,
+                    "run `omarchy plugin list --json`, then `boomux setup`",
+                ));
+            }
+        }
     }
 
-    section("Summary");
-    if failures.is_empty() {
-        status("ok", "32", "Setup", "completed without errors");
-        if changed_harnesses > 0 {
-            detail("Restart changed harnesses before verifying lifecycle reporting.");
+    section("Verification");
+    let daemon_ready = match client::connect_or_start() {
+        Ok(_) => {
+            status(
+                "ok",
+                "32",
+                "Daemon",
+                if daemon_was_running {
+                    "running"
+                } else {
+                    "started"
+                },
+            );
+            outcomes.push(SetupOutcome::new(
+                if daemon_was_running {
+                    SetupOutcomeKind::Current
+                } else {
+                    SetupOutcomeKind::Changed
+                },
+                "Daemon",
+                if daemon_was_running {
+                    "running"
+                } else {
+                    "started"
+                },
+            ));
+            true
+        }
+        Err(error) => {
+            status("xx", "31", "Daemon", "could not be started");
+            outcomes.push(SetupOutcome::failed(
+                "Daemon",
+                error,
+                "run `boomux doctor`, then `boomux setup`",
+            ));
+            false
+        }
+    };
+
+    let recommended_ready = render_setup_receipt(
+        &environment,
+        detected,
+        &changed_harnesses,
+        daemon_ready,
+        skip_desktop,
+        &mut outcomes,
+    );
+
+    let failures = outcomes
+        .iter()
+        .filter(|outcome| outcome.kind == SetupOutcomeKind::Failed)
+        .count();
+    if failures == 0 {
+        section("Next");
+        if recommended_ready.plugin_enabled {
+            if recommended_ready.keybindings_ready {
+                detail("Press Super+B to open Boomux, then press + to create a Workspace.");
+            } else {
+                detail("Open Boomux from the Omarchy bar, then press + to create a Workspace.");
+            }
+            detail("If the pane is not visible yet, run `omarchy restart shell` once.");
         } else {
-            detail("No harness restart is required.");
+            detail("Run `boomux` to open the dashboard and create your first Workspace.");
+        }
+        detail("Run `boomux doctor` at any time to check system health.");
+        if !recommended_ready.complete {
+            detail("Run `boomux setup` again to finish skipped recommended steps.");
         }
         return Ok(());
     }
-    for failure in &failures {
-        eprintln!("  {} {failure}", paint("31", "[xx]"));
+    for failure in outcomes
+        .iter()
+        .filter(|outcome| outcome.kind == SetupOutcomeKind::Failed)
+    {
+        eprintln!(
+            "  {} {}: {}",
+            paint("31", "[xx]"),
+            failure.label,
+            failure.message
+        );
+        if let Some(recovery) = &failure.recovery {
+            eprintln!("       Recovery: {recovery}");
+        }
     }
     Err(io::Error::other(format!(
         "setup completed with {} failure{}",
-        failures.len(),
-        if failures.len() == 1 { "" } else { "s" }
+        failures,
+        if failures == 1 { "" } else { "s" }
     ))
     .into())
 }
 
-fn setup_agent_skill() -> Result<(), Box<dyn Error>> {
+fn apply_outcome(
+    label: impl Into<String>,
+    outcome: ApplyOutcome,
+    current: impl Into<String>,
+    changed: impl Into<String>,
+    skipped: impl Into<String>,
+) -> SetupOutcome {
+    let label = label.into();
+    match outcome {
+        ApplyOutcome::Current => SetupOutcome::new(SetupOutcomeKind::Current, label, current),
+        ApplyOutcome::Changed => SetupOutcome::new(SetupOutcomeKind::Changed, label, changed),
+        ApplyOutcome::Skipped => SetupOutcome::new(SetupOutcomeKind::Skipped, label, skipped),
+    }
+}
+
+fn render_setup_receipt(
+    environment: &integration_management::Environment,
+    detected: usize,
+    changed_harnesses: &[&str],
+    daemon_ready: bool,
+    skip_desktop: bool,
+    outcomes: &mut Vec<SetupOutcome>,
+) -> SetupReadiness {
+    let installed_integrations = IntegrationId::all()
+        .map(|integration| integration_management::inspect(integration, environment, None))
+        .filter(|integration| {
+            integration.host.state == HostState::Available
+                && integration.asset.state == AssetState::Current
+        })
+        .count();
+    let integrations_ready =
+        detected == 0 || installed_integrations == detected && changed_harnesses.is_empty();
+    if detected == 0 {
+        outcomes.push(SetupOutcome::new(
+            SetupOutcomeKind::Skipped,
+            "Agent lifecycle",
+            "no harnesses detected",
+        ));
+    } else if installed_integrations != detected
+        && changed_harnesses.is_empty()
+        && !outcomes
+            .iter()
+            .any(|outcome| outcome.kind == SetupOutcomeKind::Failed)
+    {
+        outcomes.push(SetupOutcome::new(
+            SetupOutcomeKind::Warning,
+            "Agent lifecycle",
+            format!("{installed_integrations} of {detected} integrations verified"),
+        ));
+    }
+    if !changed_harnesses.is_empty() {
+        outcomes.push(SetupOutcome::new(
+            SetupOutcomeKind::Warning,
+            "Harness restart",
+            format!("restart to load {}", changed_harnesses.join(", ")),
+        ));
+    }
+
+    let skill_ready = if detected == 0 {
+        true
+    } else {
+        match required_home()
+            .map(|home| home.join(".agents/skills/boomux/SKILL.md"))
+            .and_then(|path| {
+                integration_management::regular_file_matches(&path, crate::BOOMUX_SKILL)
+                    .map_err(|error| io::Error::other(error.to_string()))
+            }) {
+            Ok(Some(true)) => true,
+            Ok(_) => false,
+            Err(error) => {
+                outcomes.push(SetupOutcome::failed(
+                    "Agent Skill verification",
+                    error,
+                    "`boomux setup`",
+                ));
+                false
+            }
+        }
+    };
+    let mut plugin_enabled = false;
+    let mut workspace_layer_enabled = false;
+    let mut keybindings_ready = false;
+    let omarchy = executable_on_path("omarchy");
+    if skip_desktop {
+        plugin_enabled = outcomes.iter().any(|outcome| {
+            outcome.label == "Omarchy plugin"
+                && matches!(
+                    outcome.kind,
+                    SetupOutcomeKind::Current
+                        | SetupOutcomeKind::Changed
+                        | SetupOutcomeKind::Warning
+                )
+        });
+    } else if let Some(omarchy) = omarchy.as_deref() {
+        plugin_enabled = match omarchy_plugins(omarchy) {
+            Ok(plugins) => plugins
+                .iter()
+                .any(|plugin| plugin.id == OMARCHY_PLUGIN_ID && plugin.enabled),
+            Err(error) => {
+                outcomes.push(SetupOutcome::failed(
+                    "Omarchy plugin verification",
+                    error,
+                    "run `omarchy plugin list --json`, then `boomux setup`",
+                ));
+                false
+            }
+        };
+        let desktop_failed = outcomes.iter().any(|outcome| {
+            outcome.kind == SetupOutcomeKind::Failed && outcome.label == "Omarchy desktop"
+        });
+        if plugin_enabled
+            && !outcomes
+                .iter()
+                .any(|outcome| outcome.label == "Omarchy plugin")
+        {
+            outcomes.push(SetupOutcome::new(
+                if desktop_failed {
+                    SetupOutcomeKind::Warning
+                } else {
+                    SetupOutcomeKind::Current
+                },
+                "Omarchy plugin",
+                if desktop_failed {
+                    "enabled before a later desktop step failed"
+                } else {
+                    "installed and enabled"
+                },
+            ));
+        }
+        if plugin_enabled {
+            workspace_layer_enabled = match crate::config::load() {
+                Ok(config) => {
+                    config.desktop.workspace_layer
+                        == crate::config::DesktopWorkspaceLayer::HyprlandSpecial
+                }
+                Err(error) => {
+                    outcomes.push(SetupOutcome::failed(
+                        "Workspace layer verification",
+                        error,
+                        "run `boomux config validate`, then `boomux setup`",
+                    ));
+                    false
+                }
+            };
+            if workspace_layer_enabled
+                && !outcomes
+                    .iter()
+                    .any(|outcome| outcome.label == "Workspace layer")
+            {
+                outcomes.push(SetupOutcome::new(
+                    if desktop_failed {
+                        SetupOutcomeKind::Warning
+                    } else {
+                        SetupOutcomeKind::Current
+                    },
+                    "Workspace layer",
+                    if desktop_failed {
+                        "enabled before a later desktop step failed"
+                    } else {
+                        "enabled"
+                    },
+                ));
+            }
+            let keybindings = match bindings_plan() {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    outcomes.push(SetupOutcome::failed(
+                        "Keybindings verification",
+                        error,
+                        "`boomux setup`",
+                    ));
+                    None
+                }
+            };
+            keybindings_ready = keybindings.as_ref().is_some_and(|plan| !plan.changed);
+            let compatible_unmanaged = keybindings
+                .as_ref()
+                .is_some_and(|plan| plan.compatible_unmanaged);
+            if keybindings_ready
+                && !outcomes
+                    .iter()
+                    .any(|outcome| outcome.label == "Keybindings")
+            {
+                outcomes.push(SetupOutcome::new(
+                    if desktop_failed {
+                        SetupOutcomeKind::Warning
+                    } else {
+                        SetupOutcomeKind::Current
+                    },
+                    "Keybindings",
+                    if desktop_failed {
+                        "compatible state preserved after a later failure"
+                    } else if compatible_unmanaged {
+                        "compatible user-managed profile"
+                    } else {
+                        "managed profile ready"
+                    },
+                ));
+            }
+        }
+    } else {
+        outcomes.push(SetupOutcome::new(
+            SetupOutcomeKind::Skipped,
+            "Omarchy desktop",
+            "not detected",
+        ));
+    }
+
+    let desktop_ready =
+        skip_desktop || omarchy.is_none() || plugin_enabled && workspace_layer_enabled;
+    let failed = outcomes
+        .iter()
+        .any(|outcome| outcome.kind == SetupOutcomeKind::Failed);
+    let complete = daemon_ready && !failed && integrations_ready && skill_ready && desktop_ready;
+
+    println!(
+        "\n{}",
+        paint(
+            if complete { "1;32" } else { "1;36" },
+            if complete {
+                "BOOMUX IS READY"
+            } else {
+                "BOOMUX SETUP RECEIPT"
+            }
+        )
+    );
+    for outcome in outcomes.iter() {
+        let (marker, color) = match outcome.kind {
+            SetupOutcomeKind::Current | SetupOutcomeKind::Changed => ("ok", "32"),
+            SetupOutcomeKind::Skipped => ("--", "2"),
+            SetupOutcomeKind::Warning => ("!!", "33"),
+            SetupOutcomeKind::Failed => ("xx", "31"),
+        };
+        status(marker, color, &outcome.label, &outcome.message);
+        if let Some(recovery) = &outcome.recovery {
+            detail(format!("Recovery: {recovery}"));
+        }
+    }
+    status(
+        if complete { "ok" } else { "!!" },
+        if complete { "32" } else { "33" },
+        "Setup",
+        if complete {
+            "this machine is ready"
+        } else if !failed {
+            "recommended steps remain"
+        } else {
+            "completed with failures"
+        },
+    );
+
+    SetupReadiness {
+        complete,
+        plugin_enabled,
+        keybindings_ready,
+    }
+}
+
+fn setup_agent_skill() -> Result<ApplyOutcome, Box<dyn Error>> {
     let home = required_home()?;
     let path = home.join(".agents/skills/boomux/SKILL.md");
     match integration_management::regular_file_matches(&path, crate::BOOMUX_SKILL)? {
         Some(true) => {
             status("ok", "32", "Agent Skill", "current");
             detail(path.display().to_string());
-            Ok(())
+            crate::migrate_legacy_skill(&home)?;
+            Ok(ApplyOutcome::Current)
         }
         state => {
             let modified = state == Some(false);
@@ -370,10 +1086,11 @@ fn setup_agent_skill() -> Result<(), Box<dyn Error>> {
                 "Install the Boomux Agent Skill?"
             };
             if confirm(prompt)? {
-                crate::install_skill(modified)
+                crate::install_skill(modified)?;
+                Ok(ApplyOutcome::Changed)
             } else {
                 status("--", "2", "Agent Skill", "skipped");
-                Ok(())
+                Ok(ApplyOutcome::Skipped)
             }
         }
     }
@@ -387,12 +1104,12 @@ fn required_home() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "HOME must be absolute"))
 }
 
-fn setup_omarchy() -> Result<(), Box<dyn Error>> {
+fn setup_omarchy() -> Result<DesktopSetupOutcomes, Box<dyn Error>> {
     section("Desktop Integration");
     let Some(omarchy) = executable_on_path("omarchy") else {
         status("--", "2", "Omarchy", "not detected");
         detail("Desktop plugin and keybindings were skipped.");
-        return Ok(());
+        return Ok(DesktopSetupOutcomes::default());
     };
     let version = run_command(&omarchy, &["version"], COMMAND_TIMEOUT)?;
     status(
@@ -416,7 +1133,7 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
     );
 
     let plugins = omarchy_plugins(&omarchy)?;
-    let (plugin_enabled, plugin_changed) = match plugins
+    let (plugin_enabled, plugin_changed, plugin_outcome) = match plugins
         .iter()
         .find(|plugin| plugin.id == OMARCHY_PLUGIN_ID)
     {
@@ -427,11 +1144,8 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
                 "omarchy-boomux",
                 "recommended core experience installed and enabled",
             );
-            detail("Reload the shell if the plugin was installed after Omarchy Shell started.");
-            (
-                true,
-                confirm("Restart Omarchy Shell and reload omarchy-boomux?")?,
-            )
+            detail("Enabled in the Omarchy plugin inventory; no change is needed.");
+            (true, false, ApplyOutcome::Current)
         }
         Some(_) => {
             status(
@@ -441,16 +1155,17 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
                 "recommended core experience is disabled",
             );
             detail("Enabling the plugin also restarts Omarchy Shell so it is loaded.");
-            if confirm("Enable and load the recommended omarchy-boomux plugin?")? {
+            if confirm_recommended("Enable and load the recommended omarchy-boomux plugin?")? {
+                preflight_omarchy_desktop(&omarchy)?;
                 run_command(
                     &omarchy,
                     &["plugin", "enable", OMARCHY_PLUGIN_ID],
                     COMMAND_TIMEOUT,
                 )?;
                 status("ok", "32", "omarchy-boomux", "enabled");
-                (true, true)
+                (true, true, ApplyOutcome::Changed)
             } else {
-                (false, false)
+                (false, false, ApplyOutcome::Skipped)
             }
         }
         None => {
@@ -464,29 +1179,65 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
             detail("Plugins run as unsandboxed code inside the Omarchy shell.");
             detail(format!("Source: {OMARCHY_PLUGIN_URL}"));
             detail("Installation also restarts Omarchy Shell so the plugin is loaded.");
-            if confirm("Install, enable, and load the recommended omarchy-boomux plugin?")? {
+            if confirm_recommended(
+                "Install, enable, and load the recommended omarchy-boomux plugin?",
+            )? {
+                preflight_omarchy_desktop(&omarchy)?;
                 run_command(
                     &omarchy,
                     &["plugin", "add", OMARCHY_PLUGIN_URL, "--enable", "--yes"],
                     PLUGIN_INSTALL_TIMEOUT,
                 )?;
                 status("ok", "32", "omarchy-boomux", "installed and enabled");
-                (true, true)
+                (true, true, ApplyOutcome::Changed)
             } else {
-                (false, false)
+                (false, false, ApplyOutcome::Skipped)
             }
         }
     };
     if plugin_changed {
-        run_command(&omarchy, &["restart", "shell"], PLUGIN_INSTALL_TIMEOUT)?;
+        run_command(&omarchy, &["restart", "shell"], PLUGIN_INSTALL_TIMEOUT).map_err(|error| {
+            Box::new(DesktopPartialFailure {
+                message: format!("plugin is enabled, but Omarchy Shell did not restart: {error}"),
+                committed_message: "enabled before shell reload failed",
+                failure_label: "Omarchy Shell reload",
+                recovery: "`omarchy restart shell`",
+            }) as Box<dyn Error>
+        })?;
         status("ok", "32", "Omarchy Shell", "restarted with plugin loaded");
+        let plugins = omarchy_plugins(&omarchy).map_err(|error| {
+            Box::new(DesktopPartialFailure {
+                message: format!(
+                    "plugin was enabled and the shell restarted, but inventory verification failed: {error}"
+                ),
+                committed_message: "enabled and shell reloaded before verification failed",
+                failure_label: "Omarchy plugin verification",
+                recovery: "run `omarchy plugin list --json`, then `omarchy restart shell` if the plugin is not visible",
+            }) as Box<dyn Error>
+        })?;
+        if !plugins
+            .iter()
+            .any(|plugin| plugin.id == OMARCHY_PLUGIN_ID && plugin.enabled)
+        {
+            return Err(Box::new(DesktopPartialFailure {
+                message: "Omarchy did not report the companion plugin as enabled after the change"
+                    .into(),
+                committed_message: "enabled and shell reloaded before verification failed",
+                failure_label: "Omarchy plugin verification",
+                recovery: "run `omarchy plugin list --json`, then `omarchy restart shell`",
+            }));
+        }
     }
     if !plugin_enabled {
         status("--", "2", "Keybindings", "skipped; plugin is not enabled");
-        return Ok(());
+        return Ok(DesktopSetupOutcomes {
+            plugin: Some(plugin_outcome),
+            workspace_layer: None,
+            keybindings: None,
+        });
     }
 
-    setup_hyprland_workspace_layer()?;
+    let workspace_layer = setup_hyprland_workspace_layer()?;
 
     let plan = bindings_plan()?;
     if !plan.changed {
@@ -516,10 +1267,12 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
             status("ok", "32", "Keybindings", "current managed profile");
         }
 
-        if !confirm("Reinstall the standard Boomux keybinding profile?")? {
-            status("--", "2", "Keybindings", "kept unchanged");
-            return Ok(());
-        }
+        detail("No changes are needed.");
+        return Ok(DesktopSetupOutcomes {
+            plugin: Some(plugin_outcome),
+            workspace_layer: Some(workspace_layer),
+            keybindings: Some(ApplyOutcome::Current),
+        });
     } else {
         let inventory = run_command(
             &omarchy,
@@ -545,7 +1298,11 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
         };
         if !confirm(prompt)? {
             status("--", "2", "Keybindings", "skipped");
-            return Ok(());
+            return Ok(DesktopSetupOutcomes {
+                plugin: Some(plugin_outcome),
+                workspace_layer: Some(workspace_layer),
+                keybindings: Some(ApplyOutcome::Skipped),
+            });
         }
     }
     commit_bindings(&plan)?;
@@ -587,15 +1344,19 @@ fn setup_omarchy() -> Result<(), Box<dyn Error>> {
     if hyprland_active {
         status("ok", "32", "Hyprland config", "reloaded without errors");
     }
-    Ok(())
+    Ok(DesktopSetupOutcomes {
+        plugin: Some(plugin_outcome),
+        workspace_layer: Some(workspace_layer),
+        keybindings: Some(ApplyOutcome::Changed),
+    })
 }
 
-fn setup_hyprland_workspace_layer() -> Result<(), Box<dyn Error>> {
+fn setup_hyprland_workspace_layer() -> Result<ApplyOutcome, Box<dyn Error>> {
     if crate::config::load()?.desktop.workspace_layer
         == crate::config::DesktopWorkspaceLayer::HyprlandSpecial
     {
         status("ok", "32", "Workspace layer", "enabled");
-        return Ok(());
+        return Ok(ApplyOutcome::Current);
     }
 
     status(
@@ -605,15 +1366,52 @@ fn setup_hyprland_workspace_layer() -> Result<(), Box<dyn Error>> {
         "recommended for the core Omarchy experience",
     );
     detail("Present coordinated Boomux Workspaces as named Hyprland special Workspaces.");
-    if !confirm("Enable the recommended Hyprland Workspace layer?")? {
+    if !confirm_recommended("Enable the recommended Hyprland Workspace layer?")? {
         status("--", "2", "Workspace layer", "kept disabled");
-        return Ok(());
+        return Ok(ApplyOutcome::Skipped);
     }
 
     let path = crate::config::enable_hyprland_workspace_layer()?;
     status("ok", "32", "Workspace layer", "enabled");
     detail(format!("config: {}", path.display()));
-    Ok(())
+    Ok(ApplyOutcome::Changed)
+}
+
+fn preflight_omarchy_desktop(omarchy: &Path) -> Result<(), Box<dyn Error>> {
+    inspect_omarchy_desktop_plan(omarchy).map(|_| ())
+}
+
+fn inspect_omarchy_desktop_plan(omarchy: &Path) -> Result<DesktopSetupPlan, Box<dyn Error>> {
+    let workspace_enabled = crate::config::load()?.desktop.workspace_layer
+        == crate::config::DesktopWorkspaceLayer::HyprlandSpecial;
+    let bindings = bindings_plan()?;
+    let conflicts = if bindings.changed || bindings.compatible_unmanaged {
+        let inventory = run_command(
+            omarchy,
+            &["menu", "keybindings", "--print"],
+            COMMAND_TIMEOUT,
+        )?;
+        binding_conflicts(&String::from_utf8_lossy(&inventory.stdout))
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if bindings.changed && env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+        executable_on_path("hyprctl").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "HYPRLAND_INSTANCE_SIGNATURE is set but hyprctl is unavailable",
+            )
+        })?;
+    }
+    Ok(DesktopSetupPlan {
+        workspace_enabled,
+        bindings_ready: !bindings.changed,
+        bindings_path: bindings.path,
+        conflicts,
+    })
 }
 
 fn ensure_omarchy_can_resolve_boomux() -> io::Result<()> {
@@ -658,14 +1456,37 @@ fn validate_hyprland_config(hyprctl: &Path) -> io::Result<()> {
 }
 
 fn confirm(prompt: &str) -> io::Result<bool> {
-    print!("  {} {} ", paint("1;33", prompt), paint("2", "[y/N]"));
+    confirm_with_default(prompt, false)
+}
+
+fn confirm_recommended(prompt: &str) -> io::Result<bool> {
+    confirm_with_default(prompt, true)
+}
+
+fn confirm_with_default(prompt: &str, default_yes: bool) -> io::Result<bool> {
+    print!(
+        "  {} {} ",
+        paint("1;33", prompt),
+        paint("2", if default_yes { "[Y/n]" } else { "[y/N]" })
+    );
     io::stdout().flush()?;
+    read_confirmation(&mut io::stdin().lock(), default_yes)
+}
+
+fn read_confirmation(reader: &mut impl io::BufRead, default_yes: bool) -> io::Result<bool> {
     let mut response = String::new();
-    io::stdin().read_line(&mut response)?;
-    Ok(matches!(
-        response.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    if reader.read_line(&mut response)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "confirmation input closed before a choice was made",
+        ));
+    }
+    let response = response.trim().to_ascii_lowercase();
+    Ok(if response.is_empty() {
+        default_yes
+    } else {
+        matches!(response.as_str(), "y" | "yes")
+    })
 }
 
 fn executable_on_path(name: &str) -> Option<PathBuf> {
@@ -1308,6 +2129,13 @@ mod tests {
                 b"".as_slice(),
             ]
         );
+    }
+
+    #[test]
+    fn recommended_confirmation_accepts_enter_but_rejects_eof() {
+        assert!(read_confirmation(&mut io::Cursor::new(b"\n"), true).unwrap());
+        let error = read_confirmation(&mut io::Cursor::new([]), true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
