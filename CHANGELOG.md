@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.0](https://github.com/gardnmi/boomux/compare/v1.4.0...v1.5.0) (2026-08-27)
+
+
+### Features
+
+* **install:** add verified guided installer ([#295](https://github.com/gardnmi/boomux/issues/295)) ([#297](https://github.com/gardnmi/boomux/issues/297)) ([fcb90e5](https://github.com/gardnmi/boomux/commit/fcb90e5a72a75930988a97188f3c265361fbef8f))
+* **setup:** polish first-run onboarding ([#294](https://github.com/gardnmi/boomux/issues/294)) ([7da2d34](https://github.com/gardnmi/boomux/commit/7da2d34aefc7d19d9b47922f5b73a434babdec15))
+
 ## [1.4.0](https://github.com/gardnmi/boomux/compare/v1.3.0...v1.4.0) (2026-08-27)
 
 
