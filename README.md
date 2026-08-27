@@ -2,10 +2,10 @@
 
 **Persistent Workspaces for native terminal windows.**
 
-Boomux keeps Shells and commands running after terminal windows close. It groups
-related work into coordinated Workspaces that can span independently
-authoritative Nodes while continuing to use Ghostty, Alacritty, or another XDG
-terminal as ordinary native windows.
+Boomux keeps terminal processes running after native terminal windows close. It
+groups durable Shells into coordinated Workspaces that can span multiple Nodes
+while continuing to use Ghostty, Alacritty, or another XDG terminal as ordinary
+native windows.
 
 > [!IMPORTANT]
 > The Omarchy side pane shown below is provided by
@@ -18,59 +18,66 @@ terminal as ordinary native windows.
 </p>
 
 > [!WARNING]
-> Human-facing commands and presentation may evolve. Supported automation output
-> uses the stable `boomux.cli/v1` contract.
+> For scripts, use only commands advertised by `boomux capabilities --json` and
+> parse their `boomux.cli/v1` output. Human-readable output is not a compatibility
+> contract.
 
-## Get Started
+## Quick Start
 
-After installing the Boomux binary using one of the methods below, run the
-guided setup:
+After [installing Boomux](#install-and-update), run the guided setup:
 
 ```console
 boomux setup
 ```
 
-This is the recommended way to configure Boomux. The wizard discovers supported
-Agent harnesses on `PATH`, offers each missing or modified lifecycle integration
-separately, starts the local Boomux daemon when needed, and can install the
-Boomux Agent Skill when it finds a harness. On Omarchy it can install, enable,
-and load `omarchy-boomux`, analyze existing keybindings, warn which bindings
-would be overridden, and install the full desktop profile. Desktop setup requires
-`boomux` to be available to Omarchy's graphical environment; the official release
-installation uses `~/.local/bin`.
+On Omarchy, confirm the prompts to install and enable the
+[Boomux plugin](https://github.com/gardnmi/omarchy-boomux) and, if wanted, its
+managed keybindings. Setup restarts Omarchy Shell after plugin changes. The
+plugin adds a Boomux icon to the bar and opens a persistent side pane for
+Workspaces, Shells, Agents, and Nodes.
 
-Every configuration prompt defaults to no and modified assets require explicit
-replacement. Daemon startup is automatic. Rerunning setup is safe: compatible
-user-managed bindings are recognized, their reinstall impact is shown, and they
-remain unchanged unless you confirm the managed profile installation.
+- Click the bar icon to open or close the pane.
+- With the managed bindings, `Super+B` toggles the pane and `Super+A` toggles
+  keyboard focus.
+- Use `+` to create a generated local Workspace and first Shell at `$HOME`.
+- Use the project-folder button to create a same-named Workspace at a configured
+  project path.
 
-For automation, use the individual `integration status`, `integration install`,
-and `skill install` commands instead. `boomux setup` intentionally requires an
-interactive terminal and does not support `--json`.
+`boomux setup` detects supported Agent harnesses, starts the local daemon, and
+prompts before installing or replacing integrations and the Boomux Agent Skill.
+Prompts default to no, and rerunning setup preserves modified or user-owned
+assets unless replacement is explicitly confirmed.
+
+Omarchy's graphical environment must be able to resolve `boomux`; official
+release installations use `~/.local/bin`. See the
+[plugin README](https://github.com/gardnmi/omarchy-boomux#readme) for its complete
+controls and safety behavior. For CLI-only creation, continue to
+[Workspace Creation](#workspace-creation).
 
 ## Install And Update
 
 ### Requirements
 
-- Unix or Linux with an absolute `XDG_RUNTIME_DIR`.
+- A Unix-like system with an absolute `XDG_RUNTIME_DIR`. Official v1.2.0 binaries
+  are available only for x86_64 and aarch64 GNU/Linux.
 - `xdg-terminal-exec` and an available terminal desktop entry.
 
-Git is optional at runtime; without it, repository metadata is empty. The default
-desktop Workspace layer additionally requires an active Hyprland session and
-compatible `hyprctl`. Outside Hyprland, ordinary Boomux terminal opens remain
-native windows.
+Git is optional for core session persistence; without it, repository metadata is
+empty. `boomux doctor` currently reports missing Git as a failed dependency
+check. The default desktop Workspace layer additionally requires an active
+Hyprland session and compatible `hyprctl`. Outside Hyprland, ordinary Boomux
+terminal opens remain native windows.
 
 The release recipe below requires GitHub CLI (`gh`), `sha256sum`, `tar`, and
-`install`. Installing from Git requires Git and a Rust toolchain; compiling an
-existing source tree requires only the Rust toolchain.
+`install`.
 
 ### Latest Release
 
 ```console
-case "$(uname -m)" in
-  x86_64) target=x86_64-unknown-linux-gnu ;;
-  aarch64) target=aarch64-unknown-linux-gnu ;;
-  *) printf 'unsupported architecture\n' >&2; exit 1 ;;
+case "$(uname -s):$(uname -m)" in
+  Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
+  Linux:aarch64) target=aarch64-unknown-linux-gnu ;;
+  *) printf 'unsupported operating system or architecture\n' >&2; exit 1 ;;
 esac
 version=$(gh release view --repo gardnmi/boomux --json tagName --jq .tagName)
 gh release download "$version" --repo gardnmi/boomux \
@@ -78,7 +85,7 @@ gh release download "$version" --repo gardnmi/boomux \
 sha256sum --check "boomux-$version-$target.tar.gz.sha256"
 tar -xzf "boomux-$version-$target.tar.gz"
 install -Dm755 "boomux-$version-$target/boomux" ~/.local/bin/boomux
-boomux doctor
+~/.local/bin/boomux doctor
 ```
 
 ### Update
@@ -92,12 +99,11 @@ boomux update
 boomux doctor
 ```
 
-The updater verifies the fixed GitHub release, exact architecture asset, and
-SHA-256 checksum before replacing the executable. If the daemon is running, it
-uses graceful handoff so managed processes and PTYs survive. Package-manager,
-source, development, root-owned, custom-path, and unsafe installations are never
-self-replaced, and Boomux never silently downgrades. Automatic updates are not
-enabled.
+The updater verifies the selected GitHub release asset and checksum before
+replacing an eligible official installation. Compatible running daemons use
+graceful handoff so managed processes and PTYs survive. Other installation types
+must be updated through their original installer. Boomux never silently
+downgrades or enables automatic updates.
 
 > [!CAUTION]
 > Upgrading from v0.32 to v1.x crosses an incompatible protocol and state
@@ -113,19 +119,18 @@ To remove an official release installation, use `boomux uninstall`. Add
 `boomux node uninstall NODE` for an identity-verified remote uninstall. See
 [Uninstall](docs/uninstall.md) for ownership and preservation guarantees.
 
-## Create Your First Workspace
+## Workspace Creation
 
 Create a coordinated Workspace and its first Shell from a project directory:
 
 ```console
-boomux workspace create my-project --node LOCAL_NODE_ID --cwd . --open
+boomux workspace create my-project --node local --cwd . --open
 ```
 
-This atomically creates the coordinated Workspace, its exact local placement,
-and its first Shell before opening the native terminal. Obtain the stable local
-Node ID from `boomux node snapshot --json`. Omit `my-project` to let Boomux
-generate both Workspace and Shell names. In Hyprland, the default desktop
-adapter places the terminal in the Workspace's named Boomux special Workspace.
+This is the same atomic creation used in the quick start. Use the exact local
+Node ID from `boomux node snapshot --json` only if `local` is ambiguous with a
+registered alias. In Hyprland, the default desktop adapter places the terminal
+in the Workspace's named Boomux special Workspace.
 
 `boomux workspace create my-project` remains the empty-Workspace form. Add its
 first Shell later with `boomux shell create my-project --cwd . --open`.
@@ -152,13 +157,14 @@ boomux ui
 
 | Term | Meaning |
 | --- | --- |
-| **Node** | A durable host-local authority with stable identity, implemented by a replaceable Boomux daemon. |
-| **Workspace** | A durable task grouping. A coordinated Workspace explicitly links owner-Node placements. |
-| **Desktop Workspace Layer** | Local presentation of a coordinated Workspace as a Hyprland special Workspace derived from its immutable coordinator ID. It owns no durable resources. |
+| **Node** | A durable host-local authority with stable identity, independent of the route used to reach it. |
+| **Workspace** | A coordinator-owned task grouping whose placements reference exact Node-local Workspaces. It is not an execution location or default Node. |
+| **Desktop Workspace Layer** | Optional local presentation of a coordinated Workspace as a Hyprland special Workspace derived from its coordinator ID. It owns no durable resources. |
 | **Shell** | A durable Workspace slot with at most one current process run. Each live run owns its PTY; closing its terminal attachment does not close the Shell. |
-| **Command** | A Shell with stored exact arguments instead of an interactive login command. |
-| **Launcher** | A detached exact-argument command invoked by an explicit Workspace open or restore. Desktop navigation alone never invokes it. |
+| **Command** | The dashboard presentation of a Shell whose stored startup argument vector is nonempty. |
+| **Launcher** | A durable exact-argument command invoked on every explicit Workspace open or restore. Each invocation is detached, ephemeral, and has no PTY. |
 | **Agent Instance** | A durable identity for one external Agent session associated with one Shell run; process exit alone never establishes completion. |
+| **Agent Session** | An external conversation projected from Agent Instances or host history. It owns no process, PTY, or lifecycle observation. |
 
 Boomux preserves exact argument vectors and does not add shell interpolation to
 launchers or adapters.
@@ -167,13 +173,12 @@ launchers or adapters.
 
 | Action | Result |
 | --- | --- |
-| Close a terminal window | Its managed Shell run keeps running. |
-| Quit the native dashboard | Managed processes keep running. |
+| Close a terminal window or quit the dashboard | Managed Shell runs keep running. |
 | Close a Shell | Its current run is terminated and the Shell is removed. |
-| Close a Workspace | Its managed Shells terminate and its launchers are removed. Unresolved remote placement removal leaves the Workspace visibly closing for explicit retry. |
+| Close a Workspace | Its managed Shells terminate and its Launcher definitions are removed; previously launched detached processes are unaffected. Unresolved remote placement removal leaves the Workspace visibly closing for explicit retry. |
 | Restart the daemon gracefully | A compatible replacement preserves managed processes through handoff; failure rolls back to the old daemon. |
 | Stop the daemon | Every managed process is terminated. |
-| Crash or reboot | Live processes are lost. Durable definitions remain, and later opens start new runs. |
+| Crash or reboot | Managed Shell runs and PTYs are lost. Durable definitions and run history remain; recovered Shells are pending until reopened. Eligible Agent recovery may use the integration's native resume command. |
 
 ## Hyprland Workspace Layer
 
@@ -212,8 +217,12 @@ following to reveal a layer and perform normal Workspace restore semantics:
 boomux workspace open <workspace-name-or-id> --show
 ```
 
-See [Architecture](docs/architecture.md) for exact navigation, placement, and
-restore semantics.
+`desktop close` permanently closes the focused Boomux Shell; outside the Boomux
+layer it closes the ordinary active window. `pop`, `return`, and `gather`
+rearrange terminal windows without changing Shell ownership.
+
+Use `boomux desktop --help` for command behavior. See
+[Architecture](docs/architecture.md) for exact placement and restore invariants.
 
 ## Common Workflows
 
@@ -224,6 +233,9 @@ boomux workspace select my-project
 # Create and open a Shell using that selection
 boomux shell create --name dev --cwd . --open
 
+# Change where future local Shells start
+boomux workspace set-default-cwd my-project --node local --cwd .
+
 # Store an exact detached launcher
 boomux launcher create editor --cwd . -- zeditor .
 
@@ -233,6 +245,10 @@ boomux read dev --lines 200
 # Close a Shell permanently
 boomux shell close dev --workspace my-project
 ```
+
+Changing a placement default affects future Shell creation only when `--cwd` is
+omitted. Existing Shell and Launcher working directories do not change, and new
+Launchers do not inherit this default.
 
 `shell create --open` may prepare a terminal while durable creation commits, but
 attachment remains gated until creation succeeds. A failed create cannot start a
@@ -270,6 +286,10 @@ Serve the installable Agent dashboard on loopback:
 ```console
 boomux web
 ```
+
+When OpenCode is available, Boomux also starts OpenCode Web on loopback by
+default. Use `--no-opencode-web` to disable it, or `--opencode-web-url URL` to
+advertise an existing authenticated server.
 
 Run it detached or inspect/stop it explicitly:
 
@@ -329,8 +349,9 @@ boomux node upgrade <node>
 boomux node reauthenticate <node>
 ```
 
-Setup verifies remote identity and requires confirmation before installation or
-replacement. JSON and noninteractive requests never authorize installation.
+`boomux node add` verifies the remote identity and requires confirmation before
+installing or replacing Boomux. JSON and noninteractive requests never authorize
+remote installation.
 Forgetting a registration removes only the local route; it does not contact or
 delete the remote Node.
 
@@ -352,9 +373,8 @@ boomux config validate
 boomux config edit
 ```
 
-`config edit` uses owner-only temporary files, validates the merged result, and
-atomically replaces an owner-validated target; new files use mode `0600`. These
-local human-only commands do not mutate remote Node configuration.
+`config edit` validates and atomically writes the active local configuration
+layer. These commands never mutate remote Node configuration.
 
 Common settings:
 
@@ -377,9 +397,10 @@ resume_agents = true
 persist_terminal_history = false
 ```
 
-Terminal history persistence is disabled by default because output can contain
-secrets. Notifications default conservatively. Daemon-owned settings require
-`boomux daemon restart`; local desktop presentation settings do not.
+Desktop and sound notifications are disabled by default. Terminal history
+persistence is also disabled because output can contain secrets. Daemon-owned
+settings require `boomux daemon restart`; local desktop presentation settings do
+not.
 
 ## Security And Privacy
 
@@ -399,11 +420,10 @@ boomux capabilities --json
 ```
 
 Capabilities inspect the installed CLI without starting or contacting the daemon.
-They report its version, supported daemon protocol version, static features,
-stable JSON commands, and validated integration host versions. Use
-`boomux daemon status` and Node views for observed runtime compatibility.
-Supported automation commands emit the `boomux.cli/v1` envelope; human-only
-interactive and compositor commands reject `--json`.
+They report its version, supported protocol, static features, stable JSON
+commands, and validated integration host versions. Use `boomux daemon status`
+and Node views for observed runtime compatibility. Supported commands emit the
+`boomux.cli/v1` envelope when invoked with `--json`.
 
 The Hyprland layer is local presentation built on coordinated Workspaces. It adds
 no compositor identity to durable state, the daemon protocol, or `boomux.cli/v1`.
@@ -414,10 +434,9 @@ versions, downgrade behavior, and protocol history.
 
 - Boomux does not preserve a terminal emulator's tabs, panes, or window layout.
 - Shells are not containers; they retain the privileges of their owner account.
-- Agent completion is run-scoped and is never inferred solely from process exit.
-- Remote cached state can be stale and is clearly marked non-actionable.
 - Browser terminal control is limited to exact current local Agent runs.
-- Boomux currently targets Unix/Linux desktop sessions.
+- Official releases currently target x86_64 and aarch64 GNU/Linux desktop
+  sessions.
 
 ## Further Documentation
 
