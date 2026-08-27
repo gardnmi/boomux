@@ -57,6 +57,10 @@ export async function createTerminal(container, callbacks) {
   const textarea = terminal.textarea;
   let dimensionsLocked = false;
   let composing = false;
+  const revealTail = () => {
+    terminal.scrollToBottom();
+    container.scrollTop = container.scrollHeight;
+  };
   const handleCompositionStart = () => { composing = true; };
   const handleCompositionEnd = () => {
     composing = false;
@@ -64,12 +68,14 @@ export async function createTerminal(container, callbacks) {
   };
   const handleInput = () => {
     if (!textarea || composing || !textarea.value) return;
+    revealTail();
     terminal.input(textarea.value.replace(/\r\n|\n/g, "\r"), true);
     textarea.value = "";
   };
   const handleKeyDown = (event) => {
     if (event.defaultPrevented || event.key !== "Enter") return;
     event.preventDefault();
+    revealTail();
     terminal.input("\r", true);
   };
   if (textarea) {
@@ -106,6 +112,7 @@ export async function createTerminal(container, callbacks) {
       terminal.resize(cols, rows);
     },
     focus: () => textarea?.focus() || terminal.focus(),
+    revealTail,
     write: (data) => terminal.write(data),
     dispose: () => {
       disposed = true;
