@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.1](https://github.com/gardnmi/boomux/compare/v1.5.0...v1.5.1) (2026-08-27)
+
+
+### Bug Fixes
+
+* **release:** harden draft publication ([#301](https://github.com/gardnmi/boomux/issues/301)) ([f2c0939](https://github.com/gardnmi/boomux/commit/f2c0939a21b4fab9d12f2f7c9c64f8ca3b897c29))
+* **release:** use release token for draft publication ([#299](https://github.com/gardnmi/boomux/issues/299)) ([3f8b9ba](https://github.com/gardnmi/boomux/commit/3f8b9ba23a80504126a096d6d4ae13fd4134ff4c))
+
 ## [1.5.0](https://github.com/gardnmi/boomux/compare/v1.4.0...v1.5.0) (2026-08-27)
 
 
