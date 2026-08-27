@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 48;
+pub const PROTOCOL_VERSION: u32 = 49;
 pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -178,6 +178,10 @@ define_protocol_features! {
     NodeUninstallCoordination => (48, "Node uninstall coordination", [
         "protocol_48",
         "node_uninstall_coordination",
+    ]),
+    WorkspacePlacementDefaultCwd => (49, "Workspace placement default cwd mutation", [
+        "protocol_49",
+        "workspace_placement_default_cwd",
     ]),
 }
 
@@ -749,6 +753,18 @@ pub struct GlobalWorkspaceOperationResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct WorkspaceDefaultCwdResult {
+    pub workspace_id: String,
+    pub node_id: String,
+    pub owner_workspace_id: String,
+    pub default_cwd: PathBuf,
+    pub global_revision: u64,
+    pub owner_revision: u64,
+    pub result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CombinedNode {
     pub node_id: String,
     pub alias: String,
@@ -1014,6 +1030,11 @@ pub enum RoutedOperation {
     GetWorkspace {
         workspace_id: String,
     },
+    SetWorkspaceDefaultCwd {
+        workspace_id: String,
+        expected_revision: u64,
+        default_cwd: PathBuf,
+    },
     GetShell {
         shell_id: String,
     },
@@ -1102,7 +1123,8 @@ impl RoutedOperation {
                 guard: ExactId,
                 ambiguity: RetrySameRequest,
             },
-            Self::RenameWorkspace { .. }
+            Self::SetWorkspaceDefaultCwd { .. }
+            | Self::RenameWorkspace { .. }
             | Self::RenameShell { .. }
             | Self::RenameLauncher { .. }
             | Self::CloseWorkspace { .. }
@@ -1132,7 +1154,8 @@ impl RoutedOperation {
     pub fn ambiguity_probe(&self) -> Option<Request> {
         match self {
             Self::CreateWorkspaceShell { .. } | Self::CreateWorkspaceLauncher { .. } => None,
-            Self::RenameWorkspace { workspace_id, .. }
+            Self::SetWorkspaceDefaultCwd { workspace_id, .. }
+            | Self::RenameWorkspace { workspace_id, .. }
             | Self::CloseWorkspace { workspace_id, .. } => Some(Request::GetWorkspace {
                 workspace_id: workspace_id.clone(),
             }),
@@ -1179,6 +1202,15 @@ impl RoutedOperation {
                 spec,
             },
             Self::GetWorkspace { workspace_id } => Request::GetWorkspace { workspace_id },
+            Self::SetWorkspaceDefaultCwd {
+                workspace_id,
+                expected_revision,
+                default_cwd,
+            } => Request::GuardedSetWorkspaceDefaultCwd {
+                workspace_id,
+                expected_revision,
+                default_cwd,
+            },
             Self::GetShell { shell_id } => Request::GetShell { shell_id },
             Self::GetLauncher { launcher_id } => Request::GetLauncher { launcher_id },
             Self::GetAgent { agent_id } => Request::GetAgent { agent_id },
@@ -1274,6 +1306,10 @@ pub enum DaemonEventKind {
     WorkspaceRenamed {
         workspace_id: String,
         name: String,
+    },
+    WorkspaceDefaultCwdChanged {
+        workspace_id: String,
+        default_cwd: PathBuf,
     },
     WorkspaceClosed {
         workspace_id: String,
@@ -1574,6 +1610,15 @@ pub enum Request {
         launcher_id: String,
         spec: WorkspaceLauncherSpec,
     },
+    SetGlobalWorkspaceDefaultCwd {
+        operation_id: String,
+        global_workspace_id: String,
+        expected_global_revision: u64,
+        node_id: String,
+        owner_workspace_id: String,
+        expected_owner_revision: u64,
+        default_cwd: PathBuf,
+    },
     RouteNodeOperation {
         node_id: String,
         operation: RoutedOperation,
@@ -1754,6 +1799,11 @@ pub enum Request {
         name: String,
         expected_revision: u64,
     },
+    GuardedSetWorkspaceDefaultCwd {
+        workspace_id: String,
+        expected_revision: u64,
+        default_cwd: PathBuf,
+    },
     RenameShell {
         shell_id: String,
         name: String,
@@ -1886,6 +1936,12 @@ impl Request {
             | Self::CreateGlobalWorkspaceShell { .. }
             | Self::CreateGlobalWorkspaceWithShell { .. }
             | Self::CreateGlobalWorkspaceLauncher { .. } => Some(ProtocolFeature::GlobalWorkspaces),
+            Self::SetGlobalWorkspaceDefaultCwd { .. }
+            | Self::GuardedSetWorkspaceDefaultCwd { .. }
+            | Self::RouteNodeOperation {
+                operation: RoutedOperation::SetWorkspaceDefaultCwd { .. },
+                ..
+            } => Some(ProtocolFeature::WorkspacePlacementDefaultCwd),
             Self::CreateWorkspaceShell { .. }
             | Self::CreateWorkspaceLauncher { .. }
             | Self::RouteNodeOperation {
@@ -2036,6 +2092,9 @@ pub enum Response {
     GlobalWorkspaceResource {
         workspace: GlobalWorkspaceSnapshot,
         resource: RoutedOperationResult,
+    },
+    WorkspaceDefaultCwd {
+        result: WorkspaceDefaultCwdResult,
     },
     RoutedNodeOperation {
         result: RoutedOperationResult,
@@ -2514,8 +2573,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_eight_with_forty_seven_floor() {
-        assert_eq!(PROTOCOL_VERSION, 48);
+    fn protocol_version_is_forty_nine_with_forty_seven_floor() {
+        assert_eq!(PROTOCOL_VERSION, 49);
         assert_eq!(MIN_PROTOCOL_VERSION, 47);
     }
 
@@ -3241,6 +3300,61 @@ mod tests {
     }
 
     #[test]
+    fn protocol_forty_nine_guards_workspace_placement_default_cwd() {
+        let operation = RoutedOperation::SetWorkspaceDefaultCwd {
+            workspace_id: "owner-1".into(),
+            expected_revision: 7,
+            default_cwd: "/owner/next".into(),
+        };
+        assert_eq!(
+            operation.classification().guard,
+            RoutedGuard::ResourceRevision
+        );
+        assert!(!operation.is_retryable());
+        assert_eq!(
+            operation.ambiguity_probe(),
+            Some(Request::GetWorkspace {
+                workspace_id: "owner-1".into(),
+            })
+        );
+        assert_eq!(
+            operation.owner_request(),
+            Request::GuardedSetWorkspaceDefaultCwd {
+                workspace_id: "owner-1".into(),
+                expected_revision: 7,
+                default_cwd: "/owner/next".into(),
+            }
+        );
+        let request = Request::SetGlobalWorkspaceDefaultCwd {
+            operation_id: "operation-1".into(),
+            global_workspace_id: "global-1".into(),
+            expected_global_revision: 3,
+            node_id: "node-1".into(),
+            owner_workspace_id: "owner-1".into(),
+            expected_owner_revision: 7,
+            default_cwd: "/owner/next".into(),
+        };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::WorkspacePlacementDefaultCwd)
+        );
+        assert_eq!(request.minimum_protocol_version(), 49);
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+        let routed = Request::RouteNodeOperation {
+            node_id: "node-1".into(),
+            operation,
+        };
+        assert_eq!(routed.minimum_protocol_version(), 49);
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&routed).unwrap()).unwrap(),
+            routed
+        );
+    }
+
+    #[test]
     fn terminal_preview_styles_round_trip() {
         let preview = TerminalPreview {
             lines: vec![TerminalPreviewLine {
@@ -3667,6 +3781,18 @@ mod tests {
                     },
                 ],
             ),
+            (
+                49,
+                vec![Request::SetGlobalWorkspaceDefaultCwd {
+                    operation_id: "operation-1".into(),
+                    global_workspace_id: "global-1".into(),
+                    expected_global_revision: 1,
+                    node_id: "node-1".into(),
+                    owner_workspace_id: "owner-1".into(),
+                    expected_owner_revision: 1,
+                    default_cwd: "/owner/work".into(),
+                }],
+            ),
         ];
 
         for (expected, requests) in groups {
@@ -3809,6 +3935,7 @@ mod tests {
             (46, &["protocol_46", "kiro_stop_idle"][..]),
             (47, &["protocol_47"][..]),
             (48, &["protocol_48", "node_uninstall_coordination"][..]),
+            (49, &["protocol_49", "workspace_placement_default_cwd"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

@@ -263,11 +263,21 @@ pub(crate) fn ensure_test_opencode_runtime(
 }
 
 pub(crate) fn read_until(stream: &mut UnixStream, needle: &[u8]) -> Vec<u8> {
+    read_until_after(stream, needle, Vec::new())
+}
+
+pub(crate) fn read_until_after(
+    stream: &mut UnixStream,
+    needle: &[u8],
+    mut output: Vec<u8>,
+) -> Vec<u8> {
+    if contains(&output, needle) {
+        return output;
+    }
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
     let deadline = Instant::now() + TIMEOUT;
-    let mut output = Vec::new();
     while Instant::now() < deadline {
         match AttachFrame::read_from(stream) {
             Ok(AttachFrame::Output(bytes)) => {

@@ -47,6 +47,13 @@ not appear in `json_commands`, and do not provide remote configuration mutation.
 `config validate` covers the complete global plus optional `BOOMUX_CONFIG`
 layered result without starting the daemon.
 
+`boomux setup` is a human-only local discovery and mutation workflow. It requires
+an interactive terminal, does not support `--json`, and is absent from
+`json_commands`. Automation must compose the advertised integration status,
+install, and uninstall commands instead. The static `guided_setup` feature means
+the binary contains this workflow; it does not claim that a supported harness,
+Omarchy, Hyprland, `hyprctl`, or the companion plugin is currently available.
+
 `boomux desktop toggle`, `desktop show TARGET`, `desktop next`, `desktop previous`, `desktop terminal`,
 `desktop close`, `desktop pop`, `desktop return`, and `desktop gather` are also
 human-only. They orchestrate the default local Hyprland
@@ -61,6 +68,10 @@ The static `local_update_status`, `guided_local_update`, and
 `guided_local_uninstall` features advertise the local release-management
 surfaces. They do not claim that the current executable is an eligible official
 release installation or that a newer release exists.
+The static `atomic_workspace_shell_creation` feature advertises the
+`workspace.create` JSON command and its optional durable terminal gate. Runtime
+use additionally requires the advertised protocol-38 `global_workspaces`
+feature from the daemon.
 
 ### Accepted Remote Node Compatibility
 
@@ -241,6 +252,8 @@ The following commands support `--json`:
 - `boomux project list`
 - `boomux workspace list`
 - `boomux workspace inspect`
+- `boomux workspace create [NAME] --node NODE --cwd DIRECTORY`
+- `boomux workspace set-default-cwd GLOBAL_WORKSPACE --node NODE --cwd DIRECTORY`
 - `boomux node add`
 - `boomux node list`
 - `boomux node inspect`
@@ -316,6 +329,19 @@ Command payloads are:
 - `workspace.inspect`: on protocol 38, a global target returns coordinator
   `id`, `revision`, `name`, `closing`, and explicit placements. External or
   older local targets retain the owner Workspace inspection shape.
+- `workspace.create`: available only for the atomic `--node`/`--cwd` form. It
+  returns `workspace` with exact `id`, `name`, and `revision`; `placement` with
+  exact `node_id`, `owner_workspace_id`, and owner-resolved `default_cwd`; and
+  `shell` with exact `id`, generated `name`, `node_id`, and owner-resolved
+  `cwd`. Nullable `presentation_warning` is normally null. With `--open`, a
+  terminal gate failure after durable commit returns success with a bounded
+  warning string instead of misreporting the committed mutation as failed. The
+  positional name may be omitted, in which case Boomux returns the concrete
+  generated Workspace name.
+- `workspace.set-default-cwd`: exact `workspace_id`, `node_id`,
+  `owner_workspace_id`, owner-resolved `default_cwd`, resulting
+  `global_revision`, resulting `owner_revision`, and `result`, which is
+  `updated` or `unchanged`.
 - `node.list`: an alias-then-Node-ID ordered array of registration objects.
 - `node.add`, `node.inspect`, `node.rename`, `node.retarget`, and `node.forget`:
   one registration object with `alias`, exact `target`, pinned `node_id`,
@@ -462,8 +488,8 @@ Protocol 45 adds `protocol_45` and `kiro_exact_launch_holders`. Holder acquire,
 hook report, and release are private local protocol messages and add no public
 CLI JSON field, snapshot field, event, or remote Node projection field.
 Protocol 46 added `protocol_46` and `kiro_stop_idle`; its Kiro hook report wire
-shape was unchanged. Protocol 47 advertises `protocol_47` and is both the current
-and minimum supported protocol, so the historical protocol-45/46 downgrade path
+shape was unchanged. Protocol 47 advertises `protocol_47` and is the minimum
+supported protocol, so the historical protocol-45/46 downgrade path
 is no longer negotiated.
 Protocol 47 also removes Agent Schedule and Scheduled Execution commands, JSON
 payloads, capabilities, snapshot fields, and event types. Historical schedule
@@ -471,9 +497,22 @@ request shapes are not part of the protocol-47 wire contract.
 Protocol 48 adds `protocol_48` and `node_uninstall_coordination`. The completion
 request is local coordinator state and adds no JSON mutation command, remote
 projection field, or arbitrary routed operation.
+Protocol 49 adds `protocol_49` and `workspace_placement_default_cwd` plus the
+`workspace.set-default-cwd` JSON command. The operation requires one exact
+coordinated Workspace, exact existing Node placement, fresh global and owner
+Workspace revisions, and an owner-resolved existing directory. Repeating the
+same path returns `unchanged` without incrementing either revision.
 
-Protocol-38 `workspace create` creates empty coordinator metadata without a
-default Node or cwd. First global `shell create` or `launcher create` resolves
+Protocol-38 `workspace create NAME` without placement flags creates empty
+coordinator metadata without a default Node or cwd and remains human-only.
+`workspace create [NAME] --node NODE --cwd DIRECTORY [--open] [--json]`
+instead uses the existing protocol-38 atomic Workspace-with-Shell operation.
+Both placement flags are required together, `--node` is always explicit, and
+the path is resolved by that exact eligible owner. Boomux collision-excludes
+generated Workspace and Shell names; omission of `NAME` generates the
+Workspace name. `--open` prepares the exact Shell terminal but releases its
+attachment gate only after the owner and coordinator commit succeeds.
+First global `shell create` or `launcher create` resolves
 `--node` against eligible owners. If exactly one
 owner is eligible it may be used without `--node`; zero or multiple eligible
 owners return a typed selection error listing disabled health reasons. The
@@ -485,9 +524,8 @@ local records.
 and `workspace retry GLOBAL` expose guarded adoption, linking, and unresolved
 close retry without requiring the TUI. Repeating `workspace close` for a closing
 global Workspace also uses the retry operation. Dashboard project suggestions
-contribute only the Workspace name; they create the same empty coordinator
-metadata as by-name creation. Node and path selection begins with first-resource
-creation.
+use the same atomic Workspace-with-Shell primitive with an explicit local Node
+and project path. Arbitrary by-name creation remains empty.
 An explicit `--node` on `shell create` or `launcher create` never falls back to
 local mutation. It fails with `unsupported_version` when global Workspaces are
 unavailable and with `invalid_argument` when the target is not coordinated.
@@ -505,6 +543,14 @@ Adoption and linking fetch a fresh
 protocol-38 combined local snapshot over the admitted identity-pinned route and
 require its runtime `global_workspaces` capability before using the owner revision;
 cached eligibility cannot authorize them.
+Placement default-cwd mutation likewise durably prepares its operation UUID
+before owner mutation and retains it across ambiguous transport or coordinator
+persistence outcomes. Recovery accepts only an exact owner Workspace ID, target
+cwd, and either the guarded owner revision for a no-op or its single successor
+for an update. Existing Shell and launcher cwd values never change. Future Shell
+creation with omitted `--cwd` inherits the new placement default; launcher
+creation retains its existing explicit/default `--cwd .` behavior because that
+CLI currently has no distinct cwd-omission representation.
 
 Node snapshot health is `unobserved`, `online`, `reconnecting`, `stale`,
 `unreachable`, `authentication_required`, `identity_changed`,

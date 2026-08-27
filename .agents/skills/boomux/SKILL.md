@@ -132,6 +132,19 @@ boomux integration status opencode --json
 boomux integration status codex --json
 ```
 
+When the user explicitly asks for first-run local configuration, `boomux setup`
+is the interactive end-to-end workflow. It discovers installed harnesses, offers
+their lifecycle assets individually, starts the local daemon when needed,
+optionally installs this Agent Skill, and can configure the Omarchy companion
+plugin and Boomux-owned Hyprland bindings.
+It rejects Cargo-private desktop setup when Omarchy cannot resolve `boomux` from
+its graphical environment and restarts Omarchy Shell after changing the plugin.
+It recognizes and preserves a complete compatible user-managed binding profile.
+It requires a terminal, starts the daemon automatically, and defaults every
+configuration mutation prompt to no. Do not run it for inspection alone or
+without explicit authorization; use the JSON status and dry-run commands below
+instead.
+
 Mutation commands include:
 
 ```console
@@ -476,14 +489,14 @@ path opening. Selection otherwise follows Boomux configuration and then normal
 Open the dashboard or run diagnostics with:
 
 ```console
-boomux
 boomux ui
 boomux web
 boomux doctor
 ```
 
-`boomux` and `boomux ui` must run from a fresh host terminal; they are rejected
-when `BOOMUX_SHELL_ID` is set. `boomux doctor` can run in either context.
+`boomux ui` must run from a fresh host terminal; it is rejected when
+`BOOMUX_SHELL_ID` is set. Bare `boomux` prints command help. `boomux doctor` can
+run in either context.
 
 `boomux web` serves an experimental read-only Agent PWA on
 `127.0.0.1:3737`. Use `--port` to change the loopback port. `--tailscale` is an

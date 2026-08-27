@@ -466,6 +466,12 @@ fn concurrent_first_resources_with_distinct_requested_owners_replay_canonical_su
         .create_global_workspace("concurrent-first")
         .unwrap();
     let node_id = daemon.client.node_identity().unwrap();
+    fs::create_dir(
+        daemon
+            .runtime_dir
+            .join("state/boomux/.native-test-first-resource-barrier"),
+    )
+    .unwrap();
     let barrier = Arc::new(Barrier::new(3));
     let mut requests = Vec::new();
     let mut handles = Vec::new();

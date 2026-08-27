@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::integration_management::{self, AssetState};
-use crate::{BOOMUX_SKILL, client, mobile_web, tailscale_serve, update};
+use crate::{BOOMUX_SKILL, client, mobile_web, setup, tailscale_serve, update};
 
 const MAX_PURGE_ENTRIES: usize = 16_384;
 const MAX_WEB_GATEWAYS: usize = 256;
@@ -42,6 +42,18 @@ pub(crate) fn guided_uninstall(purge: bool) -> Result<(), Box<dyn std::error::Er
     let home = required_home()?;
     let skill_path = home.join(".agents/skills/boomux/SKILL.md");
     let skill_state = integration_management::regular_file_matches(&skill_path, BOOMUX_SKILL)?;
+    let (bindings_path, bindings_state, bindings_error) = match setup::managed_bindings_status() {
+        Ok((path, state)) => (path, state, None),
+        Err(error) => (
+            home.join(".config/hypr/bindings.lua"),
+            Some(false),
+            Some(error.to_string()),
+        ),
+    };
+    let (omarchy_plugin, omarchy_plugin_error) = match setup::installed_omarchy_plugin() {
+        Ok(plugin) => (plugin, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let purge_directories = purge
         .then(|| Ok::<_, io::Error>((state_directory(&home)?, config_directory(&home)?)))
         .transpose()?;
@@ -71,6 +83,28 @@ pub(crate) fn guided_uninstall(purge: bool) -> Result<(), Box<dyn std::error::Er
             "Preserving modified Boomux Agent Skill at {}",
             skill_path.display()
         );
+    }
+    match bindings_state {
+        Some(true) => println!(
+            "Owned desktop assets: Boomux managed keybindings at {} will be removed",
+            bindings_path.display()
+        ),
+        Some(false) => println!(
+            "Preserving modified or uninspectable Boomux managed keybindings at {}{}",
+            bindings_path.display(),
+            bindings_error
+                .as_deref()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        ),
+        None => {}
+    }
+    if omarchy_plugin.is_some() {
+        println!(
+            "Desktop integration: the installed io.github.gardnmi.boomux Omarchy plugin will be removed"
+        );
+    } else if let Some(error) = &omarchy_plugin_error {
+        println!("Preserving uninspectable omarchy-boomux plugin: {error}");
     }
     if purge {
         let (state_directory, config_directory) = purge_directories
@@ -132,6 +166,29 @@ pub(crate) fn guided_uninstall(purge: bool) -> Result<(), Box<dyn std::error::Er
             "Preserving Boomux Agent Skill because it changed after authorization: {}",
             skill_path.display()
         );
+    }
+    if bindings_state == Some(true) {
+        match setup::managed_bindings_status() {
+            Ok((_, Some(true))) => match setup::remove_managed_bindings() {
+                Ok(true) => println!(
+                    "Removed Boomux managed keybindings from {}",
+                    bindings_path.display()
+                ),
+                _ => println!(
+                    "Preserving Boomux managed keybindings because they changed after authorization: {}",
+                    bindings_path.display()
+                ),
+            },
+            _ => println!(
+                "Preserving Boomux managed keybindings because they changed after authorization: {}",
+                bindings_path.display()
+            ),
+        }
+    }
+    if let Some(omarchy) = &omarchy_plugin
+        && setup::remove_omarchy_plugin(omarchy)?
+    {
+        println!("Removed io.github.gardnmi.boomux Omarchy plugin");
     }
     if purge {
         let (state_directory, config_directory) = purge_directories

@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::error::ErrorKind as ClapErrorKind;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use boomux::protocol::{
@@ -50,6 +50,7 @@ mod mobile_web;
 mod process_adapter;
 mod projects;
 mod session_projection;
+mod setup;
 mod tailscale_serve;
 mod terminal;
 mod tui;
@@ -146,6 +147,7 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "integration_management",
     "persistent_workspace_selection",
     "create_and_open_shell",
+    "atomic_workspace_shell_creation",
     "hyprland_special_workspaces",
     "contextual_desktop_terminal",
     "coordinated_shell_desktop_placement",
@@ -154,6 +156,7 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "local_update_status",
     "guided_local_update",
     "guided_local_uninstall",
+    "guided_setup",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -265,6 +268,8 @@ enum Commands {
     },
     /// Check that Boomux's dependencies and daemon are available
     Doctor,
+    /// Discover and configure local Agent harnesses and desktop integration
+    Setup,
     /// Report stable integration capabilities without starting the daemon
     Capabilities,
     /// List all managed shells
@@ -587,8 +592,20 @@ enum WorkspaceCommands {
     Current,
     /// Clear the persistently selected CLI workspace
     Clear,
-    /// Create an empty workspace
-    Create { name: String },
+    /// Create an empty workspace, or atomically create its first Shell with --node and --cwd
+    Create {
+        #[arg(required_unless_present = "node")]
+        name: Option<String>,
+        /// Exact eligible Node alias or Node ID for the first Shell
+        #[arg(long, requires = "cwd")]
+        node: Option<String>,
+        /// Owner-resolved directory for the placement default and first Shell
+        #[arg(long, requires = "node")]
+        cwd: Option<PathBuf>,
+        /// Open the created Shell after the atomic creation commits
+        #[arg(long, requires = "node")]
+        open: bool,
+    },
     /// Open terminal windows and invoke launchers
     Open {
         /// Coordinated Workspace name/ID, or exact owner Workspace ID with --node
@@ -605,6 +622,17 @@ enum WorkspaceCommands {
     Inspect { target: String },
     /// Rename a workspace
     Rename { target: String, name: String },
+    /// Change one placement's default working directory for future resources
+    SetDefaultCwd {
+        #[arg(value_name = "GLOBAL_WORKSPACE")]
+        target: String,
+        /// Exact Node alias or Node ID for an existing placement
+        #[arg(long)]
+        node: String,
+        /// Owner-resolved default directory
+        #[arg(long)]
+        cwd: PathBuf,
+    },
     /// Adopt an unlinked Node-local Workspace as a new coordinated Workspace
     Adopt {
         #[arg(value_name = "EXTERNAL_WORKSPACE")]
@@ -1178,6 +1206,7 @@ command_keys! {
     WebStatus => ("web.status", Json),
     WebStop => ("web.stop", Json),
     Doctor => ("doctor", HumanOnly),
+    Setup => ("setup", HumanOnly),
     Capabilities => ("capabilities", Json),
     List => ("list", Json),
     Shells => ("shells", Json),
@@ -1193,6 +1222,8 @@ command_keys! {
     ProjectList => ("project.list", Json),
     WorkspaceList => ("workspace.list", Json),
     WorkspaceInspect => ("workspace.inspect", Json),
+    WorkspaceCreate => ("workspace.create", Json),
+    WorkspaceSetDefaultCwd => ("workspace.set-default-cwd", Json),
     Workspace => ("workspace", HumanOnly),
     Desktop => ("desktop", HumanOnly),
     NodeAdd => ("node.add", Json),
@@ -1300,6 +1331,12 @@ impl Cli {
             Some(Commands::Workspace {
                 command: WorkspaceCommands::Inspect { .. },
             }) => CommandKey::WorkspaceInspect,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Create { node: Some(_), .. },
+            }) => CommandKey::WorkspaceCreate,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::SetDefaultCwd { .. },
+            }) => CommandKey::WorkspaceSetDefaultCwd,
             Some(Commands::Node {
                 command: NodeCommands::Add { .. },
             }) => CommandKey::NodeAdd,
@@ -1441,6 +1478,7 @@ impl Cli {
             }) => CommandKey::Daemon,
             Some(Commands::Ui) | None => CommandKey::Ui,
             Some(Commands::Doctor) => CommandKey::Doctor,
+            Some(Commands::Setup) => CommandKey::Setup,
             Some(Commands::Close { .. }) => CommandKey::Close,
             Some(Commands::Skill {
                 command: SkillCommands::Install { .. },
@@ -1776,6 +1814,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Ui) => dashboard(cli.terminal.as_deref()),
         Some(Commands::Web { .. }) => unreachable!(),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
+        Some(Commands::Setup) => setup::guided_setup(),
         Some(Commands::Capabilities) => capabilities(cli.json),
         Some(Commands::List) => list_shells(cli.json),
         Some(Commands::Shells) => list_workspace_shells(cli.json),
@@ -1941,10 +1980,16 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             Ok(())
         }
         Some(Commands::BootstrapActivate { .. }) => unreachable!(),
-        None => dashboard(cli.terminal.as_deref()),
+        None => print_cli_help(),
     };
     result?;
     Ok(CliExit::Success)
+}
+
+fn print_cli_help() -> Result<(), Box<dyn Error>> {
+    Cli::command().print_help()?;
+    println!();
+    Ok(())
 }
 
 fn remote_connect(target: &str, terminal: Option<&str>) -> Result<(), Box<dyn Error>> {
@@ -5297,6 +5342,17 @@ fn generated_shell_name<'a>(
     })
 }
 
+fn generated_workspace_name<'a>(
+    unavailable: impl IntoIterator<Item = &'a str>,
+) -> Result<String, Box<dyn Error>> {
+    generated_names::random_excluding(unavailable).ok_or_else(|| {
+        cli_output::failure(
+            "already_exists",
+            "all generated Workspace names are already in use",
+        )
+    })
+}
+
 fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let node = match &command {
         IntegrationCommands::List => None,
@@ -7055,8 +7111,135 @@ fn workspace_command(
             println!("Selected workspace {} ({})", workspace.name, workspace.id);
         }
         WorkspaceCommands::Clear => unreachable!(),
-        WorkspaceCommands::Create { name } => {
-            let name = cli_name(name, "workspace")?;
+        WorkspaceCommands::Create {
+            name,
+            node,
+            cwd,
+            open,
+        } => {
+            if let (Some(node), Some(cwd)) = (node, cwd) {
+                require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
+                let combined = client.combined_node_snapshot(None)?;
+                let selected_node = select_eligible_workspace_owner(&combined.nodes, Some(&node))?;
+                let cwd = resolve_owner_directory(&client, &selected_node, cwd)?;
+                let explicit_name = name.map(|name| cli_name(name, "workspace")).transpose()?;
+                let mut rejected_names = BTreeSet::new();
+                let (workspace, shell, gate) = loop {
+                    let workspace_name = match &explicit_name {
+                        Some(name) => name.clone(),
+                        None => generated_workspace_name(
+                            combined
+                                .workspaces
+                                .iter()
+                                .map(|workspace| workspace.name.as_str())
+                                .chain(rejected_names.iter().map(String::as_str)),
+                        )?,
+                    };
+                    let shell_name = generated_shell_name(std::iter::empty())?;
+                    let shell_id = Uuid::new_v4().to_string();
+                    let global_workspace_id = Uuid::new_v4().to_string();
+                    let title = if selected_node.local {
+                        format!("{workspace_name} - {shell_name}")
+                    } else {
+                        format!("[{}] {workspace_name} - {shell_name}", selected_node.alias)
+                    };
+                    let gate = if open {
+                        if hyprland_special_workspaces_enabled()? {
+                            Some(terminal::open_waiting_placed(
+                                terminal_override,
+                                (!selected_node.local).then_some(selected_node.node_id.as_str()),
+                                &selected_node.node_id,
+                                &global_workspace_id,
+                                &shell_id,
+                                &title,
+                            )?)
+                        } else {
+                            Some(terminal::open_waiting(
+                                terminal_override,
+                                (!selected_node.local).then_some(selected_node.node_id.as_str()),
+                                &shell_id,
+                                &title,
+                            )?)
+                        }
+                    } else {
+                        None
+                    };
+                    match client.create_global_workspace_with_shell(
+                        Uuid::new_v4().to_string(),
+                        &global_workspace_id,
+                        &workspace_name,
+                        &selected_node.node_id,
+                        Uuid::new_v4().to_string(),
+                        cwd.clone(),
+                        shell_id,
+                        shell_spec(shell_name, &cwd, &[]),
+                    ) {
+                        Ok((workspace, shell)) => break (workspace, shell, gate),
+                        Err(client::ClientError::Remote(error))
+                            if explicit_name.is_none()
+                                && error.code == Some(protocol::ErrorCode::AlreadyExists) =>
+                        {
+                            rejected_names.insert(workspace_name);
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                let placement = workspace
+                    .placements
+                    .iter()
+                    .find(|placement| placement.node_id == selected_node.node_id)
+                    .ok_or_else(|| {
+                        cli_output::failure(
+                            "internal",
+                            "created Workspace response omitted the requested placement",
+                        )
+                    })?;
+                let presentation_warning = gate.and_then(|gate| {
+                    gate.release().err().map(|error| {
+                        format!(
+                            "Shell {} was created but its terminal could not attach: {error}",
+                            shell.id
+                        )
+                    })
+                });
+                if json {
+                    return print_json(
+                        CommandKey::WorkspaceCreate,
+                        serde_json::json!({
+                            "workspace": {
+                                "id": workspace.id,
+                                "name": workspace.name,
+                                "revision": workspace.revision,
+                            },
+                            "placement": {
+                                "node_id": placement.node_id,
+                                "owner_workspace_id": placement.workspace_id,
+                                "default_cwd": placement.default_cwd,
+                            },
+                            "shell": {
+                                "id": shell.id,
+                                "name": shell.name,
+                                "node_id": selected_node.node_id,
+                                "cwd": shell.cwd,
+                            },
+                            "presentation_warning": presentation_warning,
+                        }),
+                    );
+                }
+                println!(
+                    "Created workspace {} ({}) with shell {} ({}) on Node {}",
+                    workspace.name, workspace.id, shell.name, shell.id, selected_node.alias
+                );
+                if let Some(warning) = presentation_warning {
+                    eprintln!("boomux: warning: {warning}");
+                }
+                return Ok(());
+            }
+
+            let name = cli_name(
+                name.expect("clap requires a name without --node"),
+                "workspace",
+            )?;
             if client.supports(protocol::ProtocolFeature::GlobalWorkspaces)? {
                 let workspace = client.create_global_workspace(name)?;
                 println!("Created workspace {} ({})", workspace.name, workspace.id);
@@ -7321,6 +7504,81 @@ fn workspace_command(
             let workspace = resolve_workspace_target(&snapshot.workspaces, &target)?;
             client.rename_workspace(&workspace.id, &name)?;
             println!("Renamed workspace {} to {name}", workspace.name);
+        }
+        WorkspaceCommands::SetDefaultCwd { target, node, cwd } => {
+            require_protocol_feature(
+                &client,
+                protocol::ProtocolFeature::WorkspacePlacementDefaultCwd,
+            )?;
+            let combined = client.combined_node_snapshot(None)?;
+            let workspace = resolve_global_workspace_target(&combined.workspaces, &target)
+                .ok_or_else(|| {
+                    cli_output::failure("not_found", format!("Workspace not found: {target}"))
+                })?;
+            let selected_node = resolve_combined_node(&combined.nodes, &node)?;
+            let placement = workspace
+                .placements
+                .iter()
+                .find(|placement| placement.node_id == selected_node.node_id)
+                .ok_or_else(|| {
+                    cli_output::failure(
+                        "not_found",
+                        "Workspace has no placement on the selected Node",
+                    )
+                })?;
+            let local_node_id = combined
+                .nodes
+                .iter()
+                .find(|candidate| candidate.local)
+                .map(|candidate| candidate.node_id.as_str())
+                .unwrap_or_default();
+            let owner = routed_dashboard_workspace(
+                &client,
+                &protocol::QualifiedIdentity::new(&placement.node_id, &placement.workspace_id),
+                local_node_id,
+            )
+            .map_err(io::Error::other)?;
+            if owner.revision != placement.owner_revision {
+                return Err(cli_output::failure(
+                    "revision_changed",
+                    "owner Workspace changed since the coordinator placement was published",
+                ));
+            }
+            let cwd = resolve_owner_directory(&client, selected_node, cwd)?;
+            let result = client.set_global_workspace_default_cwd(
+                Uuid::new_v4().to_string(),
+                &workspace.id,
+                workspace.revision,
+                &placement.node_id,
+                &placement.workspace_id,
+                owner.revision,
+                cwd,
+            )?;
+            if json {
+                return print_json(
+                    CommandKey::WorkspaceSetDefaultCwd,
+                    serde_json::json!({
+                        "workspace_id": result.workspace_id,
+                        "node_id": result.node_id,
+                        "owner_workspace_id": result.owner_workspace_id,
+                        "default_cwd": result.default_cwd,
+                        "global_revision": result.global_revision,
+                        "owner_revision": result.owner_revision,
+                        "result": result.result,
+                    }),
+                );
+            }
+            println!(
+                "{} default cwd for workspace {} on Node {} to {}",
+                if result.result == "updated" {
+                    "Updated"
+                } else {
+                    "Kept"
+                },
+                workspace.name,
+                selected_node.alias,
+                result.default_cwd.display()
+            );
         }
         WorkspaceCommands::Adopt { target, node } => {
             require_protocol_feature(&client, protocol::ProtocolFeature::GlobalWorkspaces)?;
@@ -11295,6 +11553,14 @@ mod tests {
     }
 
     #[test]
+    fn guided_setup_is_human_only() {
+        let cli = Cli::try_parse_from(["boomux", "setup"]).unwrap();
+        assert!(matches!(cli.command.as_ref(), Some(Commands::Setup)));
+        assert_eq!(cli.command_descriptor().key, "setup");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+    }
+
+    #[test]
     fn node_add_supports_explicit_and_guided_inputs() {
         let explicit = Cli::try_parse_from(["boomux", "node", "add", "work", "user@host"]).unwrap();
         assert!(matches!(
@@ -11659,6 +11925,25 @@ mod tests {
 
     #[test]
     fn parses_public_workspace_adopt_link_and_retry_commands() {
+        let set = Cli::try_parse_from([
+            "boomux",
+            "--json",
+            "workspace",
+            "set-default-cwd",
+            "global",
+            "--node",
+            "work",
+            "--cwd",
+            "/project",
+        ])
+        .unwrap();
+        assert_eq!(set.command_descriptor().key, "workspace.set-default-cwd");
+        assert!(matches!(
+            set.command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::SetDefaultCwd { target, node, cwd }
+            }) if target == "global" && node == "work" && cwd == Path::new("/project")
+        ));
         assert!(matches!(
             Cli::try_parse_from(["boomux", "workspace", "adopt", "owner", "--node", "work"])
                 .unwrap()
@@ -11827,6 +12112,19 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["boomux", "workspace", "create", "test", "--json"]).unwrap();
         assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "workspace",
+            "create",
+            "--node",
+            "local-node",
+            "--cwd",
+            "/tmp",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(cli.command_descriptor().key, "workspace.create");
+        assert_eq!(cli.command_descriptor().output, OutputMode::Json);
         let cli = Cli::try_parse_from(["boomux", "opencode", "install", "--json"]).unwrap();
         assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
         assert!(
@@ -11896,13 +12194,51 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Commands::Workspace {
-                command: WorkspaceCommands::Create { name }
+                command: WorkspaceCommands::Create { name: Some(name), node: None, .. }
             }) if name == "project"
         ));
+        assert!(Cli::try_parse_from(["boomux", "workspace", "create"]).is_err());
         assert!(
             Cli::try_parse_from(["boomux", "workspace", "create", "project", "--cwd", "/tmp"])
                 .is_err()
         );
+        assert!(
+            Cli::try_parse_from([
+                "boomux",
+                "workspace",
+                "create",
+                "project",
+                "--node",
+                "local-node"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["boomux", "workspace", "create", "project", "--open"]).is_err()
+        );
+        assert!(matches!(
+            Cli::try_parse_from([
+                "boomux",
+                "workspace",
+                "create",
+                "--node",
+                "local-node",
+                "--cwd",
+                "/tmp",
+                "--open",
+                "--json",
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Workspace {
+                command: WorkspaceCommands::Create {
+                    name: None,
+                    node: Some(node),
+                    cwd: Some(cwd),
+                    open: true,
+                }
+            }) if node == "local-node" && cwd == Path::new("/tmp")
+        ));
         let cli = Cli::try_parse_from([
             "boomux",
             "launcher",
@@ -13987,6 +14323,8 @@ mod tests {
     fn capabilities_advertise_phase_two_agent_integration_surface() {
         let json_commands = json_commands().collect::<Vec<_>>();
         assert!(json_commands.contains(&"shell.suggest-name"));
+        assert!(json_commands.contains(&"workspace.create"));
+        assert!(NON_PROTOCOL_FEATURES.contains(&"atomic_workspace_shell_creation"));
         for command in [
             "agent.register",
             "agent.ensure",
@@ -14060,7 +14398,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 48);
+        assert_eq!(protocol::PROTOCOL_VERSION, 49);
     }
 
     #[test]
@@ -14119,6 +14457,8 @@ mod tests {
                 "project.list",
                 "workspace.list",
                 "workspace.inspect",
+                "workspace.create",
+                "workspace.set-default-cwd",
                 "node.add",
                 "node.list",
                 "node.inspect",
