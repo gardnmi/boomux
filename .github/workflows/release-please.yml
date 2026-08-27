@@ -26,6 +26,8 @@ jobs:
     outputs:
       release-created: ${{ steps.release.outputs.release_created }}
       tag-name: ${{ inputs.tag || steps.release.outputs.tag_name }}
+      release-sha: ${{ steps.release.outputs.sha }}
+      source-ref: ${{ steps.dispatch-release.outputs.source-ref || steps.release.outputs.sha }}
     steps:
       - name: Run Release Please
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
@@ -35,6 +37,34 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Resolve dispatched release source
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+        id: dispatch-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            printf 'release tag must be strict vMAJOR.MINOR.PATCH: %s\n' "$TAG" >&2
+            exit 1
+          fi
+          release_id=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .id 2>/dev/null || true)
+          if [[ -z "$release_id" ]]; then
+            release_id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .id")
+          fi
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            printf 'could not resolve one release for %s\n' "$TAG" >&2
+            exit 1
+          fi
+          draft=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .draft)
+          if [[ "$draft" == true ]]; then
+            source_ref=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .target_commitish)
+          else
+            source_ref=$TAG
+          fi
+          printf 'source-ref=%s\n' "$source_ref" >> "$GITHUB_OUTPUT"
 
   build-release:
     name: Build Linux ${{ matrix.arch }} release
@@ -56,11 +86,12 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
       TARGET: ${{ matrix.target }}
       TAG: ${{ needs.release-please.outputs.tag-name }}
+      SOURCE_REF: ${{ needs.release-please.outputs.source-ref }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ env.SOURCE_REF }}
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
@@ -88,11 +119,12 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.release-please.outputs.tag-name }}
+      SOURCE_REF: ${{ needs.release-please.outputs.source-ref }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ env.SOURCE_REF }}
 
       - name: Download release artifacts
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
@@ -101,5 +133,21 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Render release installer
+        run: packaging/render-installer.sh "$TAG" dist/boomux-installer.sh
+
       - name: Upload assets to GitHub Release
         run: bash .github/scripts/upload-release-assets.sh "$TAG" dist/*
+
+      - name: Add installation handoff to release notes
+        run: bash .github/scripts/update-release-notes.sh "$TAG"
+
+      - name: Publish completed release
+        run: |
+          release_id=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .id 2>/dev/null || true)
+          if [[ -z "$release_id" ]]; then
+            release_id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .id")
+          fi
+          if [[ $(gh api "repos/$GH_REPO/releases/$release_id" --jq .draft) == true ]]; then
+            gh release edit "$TAG" --draft=false --repo "$GH_REPO"
+          fi

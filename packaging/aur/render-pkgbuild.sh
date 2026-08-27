@@ -58,6 +58,7 @@ srcinfo_tmp="${output_dir}/.SRCINFO.tmp.$$"
 trap 'rm -f "$pkgbuild_tmp" "$srcinfo_tmp"' EXIT
 printf '%s\n' "$rendered" > "$pkgbuild_tmp"
 mv "$pkgbuild_tmp" "${output_dir}/PKGBUILD"
+cp "${script_dir}/boomux-bin.install" "${output_dir}/boomux-bin.install"
 (
   cd "$output_dir"
   makepkg --printsrcinfo > "$srcinfo_tmp"

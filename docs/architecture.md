@@ -66,6 +66,9 @@
 - **Local update ownership:** [`local-update.md`](local-update.md) defines the
   official-release eligibility, package-manager refusal, no-downgrade rule,
   atomic replacement, and graceful daemon handoff boundary.
+- **Official first installation:** [`install.md`](install.md) defines the
+  release-pinned installer, checksum verification, existing-target refusal, and
+  interactive setup handoff.
 - **Local uninstall ownership:** [`uninstall.md`](uninstall.md) reuses the
   official-release ownership boundary, preserves modified assets and user data
   by default, and removes the executable only after process cleanup.
