@@ -42,7 +42,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
         id: dispatch-release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
         run: |
@@ -116,7 +116,7 @@ jobs:
       - build-release
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.release-please.outputs.tag-name }}
       SOURCE_REF: ${{ needs.release-please.outputs.source-ref }}
