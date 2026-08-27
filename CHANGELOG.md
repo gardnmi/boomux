@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/gardnmi/boomux/compare/v1.5.3...v1.6.0) (2026-08-27)
+
+
+### Features
+
+* **web:** keep terminal visible above mobile keyboard ([6292622](https://github.com/gardnmi/boomux/commit/6292622105a2390ad196b7b1c49314b489b56d9a))
+
 ## [1.5.3](https://github.com/gardnmi/boomux/compare/v1.5.2...v1.5.3) (2026-08-27)
 
 
