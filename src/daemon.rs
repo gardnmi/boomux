@@ -10697,14 +10697,13 @@ impl DaemonService {
     }
 
     fn reconcile_dead_kiro_holders(&self) -> DaemonResult<()> {
-        if lock(&self.kiro.state)?.is_empty() {
-            return Ok(());
-        }
         let holders = self.durable_mutation_outcome(|undo| {
             let state = lock(&self.kiro.state)?;
             let mut holders = KiroHoldersMutation::new(state);
             let removed = prune_dead_kiro_holders(&mut holders.state);
-            let events = self.inactivate_released_kiro_sessions(undo, &holders.state, removed)?;
+            let mut events =
+                self.inactivate_released_kiro_sessions(undo, &holders.state, removed)?;
+            events.extend(self.inactivate_unowned_kiro_agents(undo, &holders.state)?);
             if events.is_empty() {
                 Ok(DurableMutation::Unchanged(holders))
             } else {
@@ -10713,6 +10712,55 @@ impl DaemonService {
         })?;
         holders.commit();
         Ok(())
+    }
+
+    fn inactivate_unowned_kiro_agents(
+        &self,
+        undo: &mut DurableUndoLog,
+        holders: &HashMap<String, KiroLaunchHolder>,
+    ) -> DaemonResult<Vec<DaemonEventKind>> {
+        let owned = holders
+            .values()
+            .flat_map(|holder| holder.sessions.values().cloned())
+            .collect::<HashSet<_>>();
+        let candidates = lock(&self.durable.state)?
+            .agents
+            .values()
+            .filter(|agent| agent.integration == "kiro" && !owned.contains(&agent.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for agent in candidates {
+            let should_inactivate = {
+                let state = lock(&agent.state)?;
+                state.ended_at_ms.is_none()
+                    && state.observation.authority == AgentAuthority::LifecycleIntegration
+                    && !matches!(
+                        state.observation.state,
+                        AgentState::Inactive | AgentState::Done
+                    )
+            };
+            if !should_inactivate {
+                continue;
+            }
+            let report = AgentReport {
+                state: AgentState::Inactive,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "Kiro launch authority unavailable".into(),
+                confidence: 100,
+            };
+            let (agent, changed, completed) =
+                self.report_agent_mutation(undo, &agent.id, &agent.run_id, report)?;
+            debug_assert!(!completed);
+            if changed {
+                events.push(DaemonEventKind::AgentStateChanged {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent,
+                });
+            }
+        }
+        Ok(events)
     }
 
     fn export_kiro_launch_holders(&self) -> io::Result<Vec<handoff::KiroLaunchHolderManifest>> {
@@ -16740,6 +16788,71 @@ mod tests {
                 "accepted unsupported Kiro state {state:?}"
             );
         }
+
+        process.kill().unwrap();
+        process.wait().unwrap();
+    }
+
+    #[test]
+    fn kiro_reconciliation_inactivates_agents_without_live_holder_authority() {
+        let registry = DaemonService::default();
+        let (_, shell, _) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent: orphan } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: AgentRegistrationSpec {
+                    name: "legacy Kiro".into(),
+                    integration: "kiro".into(),
+                    external_session_id: Some("legacy-session".into()),
+                    report: kiro_report(AgentState::Idle),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("expected registered Kiro Agent");
+        };
+        let (holder_id, mut process) = test_kiro_holder(&registry, &shell.id, &run_id);
+        let owned = report_test_kiro(&registry, &holder_id, "owned-session");
+
+        registry.fail_after_mutation.store(true, Ordering::Release);
+        assert!(registry.reconcile_dead_kiro_holders().is_err());
+        assert_eq!(
+            registry
+                .durable
+                .agent(&orphan.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Idle
+        );
+
+        registry.reconcile_dead_kiro_holders().unwrap();
+        let orphan = registry
+            .durable
+            .agent(&orphan.id)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(orphan.observation.state, AgentState::Inactive);
+        assert_eq!(
+            orphan.observation.evidence,
+            "Kiro launch authority unavailable"
+        );
+        assert_eq!(
+            registry
+                .durable
+                .agent(&owned.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Working
+        );
 
         process.kill().unwrap();
         process.wait().unwrap();
