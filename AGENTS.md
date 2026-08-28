@@ -2,7 +2,8 @@
 
 ## Start Here
 
-Use repository documentation in this order:
+Use `DEVELOPMENT.md` for the human development lifecycle and local build loop.
+Use product documentation in this order:
 
 1. `CONTEXT.md` defines canonical product terms and distinctions. Preserve those
    semantics when names in code are less precise.
