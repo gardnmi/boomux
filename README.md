@@ -437,6 +437,7 @@ versions, downgrade behavior, and protocol history.
 
 ## Further Documentation
 
+- [Development Guide](DEVELOPMENT.md)
 - [Architecture](docs/architecture.md)
 - [Security Policy](SECURITY.md)
 - [CLI JSON contract](docs/cli-json.md)
@@ -450,17 +451,9 @@ versions, downgrade behavior, and protocol history.
 
 ## Development
 
-Run the core repository checks:
-
-```console
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --lib --bins --locked -- --test-threads=1
-cargo test --test config_cli --locked -- --test-threads=1
-cargo test --test native_backend --locked -- --test-threads=1
-cargo deny check
-bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
-```
+See the [Development Guide](DEVELOPMENT.md) for prerequisites, isolated local
+builds, the edit-build-run loop, testing requirements, pull requests, and the
+release lifecycle.
 
 ## License
 
