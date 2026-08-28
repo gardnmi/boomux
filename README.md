@@ -372,6 +372,17 @@ delete the remote Node.
 Cached remote projections are presentation-only. Mutations require a live,
 identity-verified owner connection and are never queued for later.
 
+Open an exact projected Agent Session in a native terminal with:
+
+```console
+boomux session open <session-id>
+boomux session open <session-id> --node <node>
+```
+
+Current Sessions open their exact current ShellRun with takeover. Historical
+Sessions resume on their exact owning Node. Invalid or changed targets fail
+closed rather than substituting another Shell, run, Session, path, or Node.
+
 See [Remote Nodes](docs/remote-nodes.md) for routing, bootstrap, upgrade, and
 failure semantics.
 

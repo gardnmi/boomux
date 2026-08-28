@@ -47,6 +47,15 @@ not appear in `json_commands`, and do not provide remote configuration mutation.
 `config validate` covers the complete global plus optional `BOOMUX_CONFIG`
 layered result without starting the daemon.
 
+`boomux session open SESSION_ID [--node NODE]` is also human-only and absent
+from `json_commands`. The static `exact_session_open` feature advertises this
+CLI orchestration surface, not a new daemon request. It launches a terminal that
+opens an exact current ShellRun with expected-run attachment and takeover, or
+uses exact owner-routed resume for a historical Session; done, missing,
+ambiguous, unavailable, and changed targets fail closed. A successful command
+exit confirms terminal launch, while owner-side attachment or resume errors
+remain visible in that terminal and never fall back to another target.
+
 `boomux setup` is a human-only local discovery and mutation workflow. It requires
 an interactive terminal, does not support `--json`, and is absent from
 `json_commands`. Automation must compose the advertised integration status,
@@ -780,8 +789,8 @@ exact ID returned by `session.list` resolves; external IDs, descriptions, shell
 IDs, and Agent IDs never resolve through `session.inspect`.
 All session commands require a negotiated daemon protocol of at least 12 and return
 `unsupported_version` before projection against an older daemon.
-`session list`, `session inspect`, and human-only `session resume` accept
-`--node SELECTOR` under protocol 36. Remote JSON responses add the exact
+`session list`, `session inspect`, and human-only `session open` and `session
+resume` accept `--node SELECTOR` under protocol 36. Remote JSON responses add the exact
 `node_id`. Resume opens a local native terminal but resolves the opaque ID and
 executes the integration argv only on the owner; it creates no ordinary
 Workspace or Shell.

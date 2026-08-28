@@ -854,6 +854,15 @@ resume service. Done, unavailable, missing-cwd, or otherwise invalid selections
 fail visibly and never substitute another Shell, Node, path, harness, or Session.
 This presentation reuses existing protocol-36 host services and existing durable
 Agent state; it changes neither protocol nor persistence versions.
+The public human-only `boomux session open SESSION_ID [--node NODE]` command
+uses that same core activation path. Current Sessions revalidate one exact
+current owner ShellRun and launch a terminal with expected-run attachment and
+takeover; historical Sessions validate owner cwd and launch the existing exact
+owner-routed resume. Done, missing, ambiguous, unavailable, and concurrently
+changed targets fail closed. Command success reports terminal launch; a later
+owner-side rejection remains visible in that terminal without substitution. The
+static CLI capability is `exact_session_open`; no JSON command, wire request,
+protocol bump, or persistence change is added.
 The integration descriptor registry is the authority for integration keys,
 display names, and optional typed capabilities. A title capability selects its
 host adapter and independently declares catalog support. The shared title layer
