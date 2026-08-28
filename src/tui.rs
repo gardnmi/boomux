@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -6,11 +7,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::agent_attention_projection::AgentStateCounts;
 use crate::protocol::{
-    NodeProjectionHealthCode, QualifiedIdentity, TerminalColor, TerminalPreview,
-    TerminalPreviewLine, TerminalStyle,
+    AgentInstanceSnapshot, NodeProjectionHealthCode, QualifiedIdentity, TerminalColor,
+    TerminalPreview, TerminalPreviewLine, TerminalStyle,
 };
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use ratatui::Frame;
@@ -51,6 +53,7 @@ const BOOMUX_SMOKE: [&str; 5] = [
 const TERMINAL_PREVIEW_ROWS: usize = 16;
 const TERMINAL_PREVIEW_SCROLL_STEP: usize = 12;
 const PREVIEW_RESERVED_ITEM_HEIGHT: u16 = 6;
+const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const AGENT_TABLE_HEADERS: [&str; 9] = [
     "STATUS",
     "UPDATED",
@@ -215,6 +218,49 @@ pub(crate) struct DashboardState {
     pub(crate) node_reauthentication: bool,
     pub(crate) focused_terminal: Option<FocusedTerminalView>,
     pub(crate) reset_focus_revision: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionNodeView {
+    pub(crate) id: String,
+    pub(crate) alias: String,
+    pub(crate) local: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DashboardSessionView {
+    pub(crate) node_id: String,
+    pub(crate) node_alias: String,
+    pub(crate) session_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) workspace_name: String,
+    pub(crate) title: String,
+    pub(crate) integration: String,
+    pub(crate) state: AgentDisplayState,
+    pub(crate) state_is_current: bool,
+    pub(crate) started_at_ms: u64,
+    pub(crate) last_at_ms: u64,
+    pub(crate) occurrence_count: usize,
+}
+
+impl DashboardSessionView {
+    fn identity(&self) -> QualifiedIdentity {
+        QualifiedIdentity::new(self.node_id.clone(), self.session_id.clone())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DashboardSessionDetails {
+    pub(crate) session: DashboardSessionView,
+    pub(crate) source_cwd: Option<PathBuf>,
+    pub(crate) occurrences: Vec<AgentInstanceSnapshot>,
+    pub(crate) action: Result<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionLoadResult {
+    pub(crate) sessions: Vec<DashboardSessionView>,
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -701,6 +747,11 @@ pub(crate) enum DashboardEffect {
     RefreshNode(String),
     RestoreDismissedShells(String),
     Refresh,
+    LoadSessions {
+        nodes: Vec<SessionNodeView>,
+    },
+    InspectSession(QualifiedIdentity),
+    ActivateSession(QualifiedIdentity),
     ReadTerminalPreview {
         shell_id: QualifiedIdentity,
         run_id: Option<String>,
@@ -716,6 +767,8 @@ impl DashboardEffect {
                 | Self::CheckForUpdates
                 | Self::RefreshNode(_)
                 | Self::Refresh
+                | Self::LoadSessions { .. }
+                | Self::InspectSession(_)
                 | Self::ReadTerminalPreview { .. }
         )
     }
@@ -727,6 +780,10 @@ pub(crate) enum DashboardEvent {
         modifiers: KeyModifiers,
     },
     RefreshElapsed,
+    MousePressed {
+        event: MouseEvent,
+        area: Rect,
+    },
     PreviewRequested,
     UpdateCheckCompleted,
     OperationCompleted(Result<String, String>),
@@ -737,6 +794,11 @@ pub(crate) enum DashboardEvent {
     },
     ShellCreationCompleted(Result<String, String>),
     RefreshCompleted(Result<DashboardState, String>),
+    SessionsLoaded(Result<SessionLoadResult, String>),
+    SessionInspected {
+        identity: QualifiedIdentity,
+        result: Result<DashboardSessionDetails, String>,
+    },
     TextPasted(String),
     TerminalPreviewCompleted {
         shell_id: String,
@@ -761,16 +823,31 @@ where
 
 struct DashboardRuntime {
     effects: Sender<DashboardEffect>,
+    session_effects: Sender<DashboardEffect>,
     completions: Receiver<(DashboardEffect, DashboardEvent)>,
     update_check_in_flight: bool,
     preview_in_flight: bool,
+    session_load_in_flight: bool,
+    session_effects_in_flight: usize,
+    pending_session_activations: HashSet<QualifiedIdentity>,
     operations_in_flight: usize,
 }
 
 impl DashboardRuntime {
-    fn spawn(mut backend: impl DashboardBackend + Send + 'static) -> Self {
+    fn spawn(backend: impl DashboardBackend + Send + 'static) -> Self {
+        Self::spawn_with_session_backend(backend, |effect| {
+            panic!("unexpected session effect: {effect:?}")
+        })
+    }
+
+    fn spawn_with_session_backend(
+        mut backend: impl DashboardBackend + Send + 'static,
+        mut session_backend: impl DashboardBackend + Send + 'static,
+    ) -> Self {
         let (effect_sender, effect_receiver) = mpsc::channel::<DashboardEffect>();
+        let (session_effect_sender, session_effect_receiver) = mpsc::channel::<DashboardEffect>();
         let (completion_sender, completion_receiver) = mpsc::channel();
+        let session_completion_sender = completion_sender.clone();
         thread::spawn(move || {
             while let Ok(effect) = effect_receiver.recv() {
                 let completed_effect = effect.clone();
@@ -780,11 +857,27 @@ impl DashboardRuntime {
                 }
             }
         });
+        thread::spawn(move || {
+            while let Ok(effect) = session_effect_receiver.recv() {
+                let completed_effect = effect.clone();
+                let event = session_backend.execute(effect);
+                if session_completion_sender
+                    .send((completed_effect, event))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             effects: effect_sender,
+            session_effects: session_effect_sender,
             completions: completion_receiver,
             update_check_in_flight: false,
             preview_in_flight: false,
+            session_load_in_flight: false,
+            session_effects_in_flight: 0,
+            pending_session_activations: HashSet::new(),
             operations_in_flight: 0,
         }
     }
@@ -800,20 +893,40 @@ impl DashboardRuntime {
             if (effect == DashboardEffect::CheckForUpdates && self.update_check_in_flight)
                 || (matches!(effect, DashboardEffect::ReadTerminalPreview { .. })
                     && self.preview_in_flight)
+                || (matches!(effect, DashboardEffect::LoadSessions { .. })
+                    && self.session_load_in_flight)
+            {
+                continue;
+            }
+            if let DashboardEffect::ActivateSession(identity) = &effect
+                && !self.pending_session_activations.insert(identity.clone())
             {
                 continue;
             }
             match &effect {
                 DashboardEffect::CheckForUpdates => self.update_check_in_flight = true,
                 DashboardEffect::ReadTerminalPreview { .. } => self.preview_in_flight = true,
+                DashboardEffect::LoadSessions { .. } => self.session_load_in_flight = true,
                 _ => {}
+            }
+            if is_session_effect(&effect) {
+                self.session_effects_in_flight += 1;
             }
             if effect.must_finish_before_quit() {
                 self.operations_in_flight += 1;
             }
-            self.effects.send(effect).map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "dashboard backend stopped")
-            })?;
+            let sender = if is_session_effect(&effect) {
+                &self.session_effects
+            } else {
+                &self.effects
+            };
+            if let Err(error) = sender.send(effect) {
+                self.complete_effect(&error.0);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "dashboard backend stopped",
+                ));
+            }
         }
         Ok(false)
     }
@@ -822,16 +935,7 @@ impl DashboardRuntime {
         loop {
             match self.completions.try_recv() {
                 Ok((effect, event)) => {
-                    match effect {
-                        DashboardEffect::CheckForUpdates => self.update_check_in_flight = false,
-                        DashboardEffect::ReadTerminalPreview { .. } => {
-                            self.preview_in_flight = false;
-                        }
-                        _ => {}
-                    }
-                    if effect.must_finish_before_quit() {
-                        self.operations_in_flight = self.operations_in_flight.saturating_sub(1);
-                    }
+                    self.complete_effect(&effect);
                     let effects = app.update(event);
                     if self.dispatch(effects)? {
                         return Ok(true);
@@ -839,6 +943,12 @@ impl DashboardRuntime {
                 }
                 Err(TryRecvError::Empty) => return Ok(false),
                 Err(TryRecvError::Disconnected) => {
+                    self.update_check_in_flight = false;
+                    self.preview_in_flight = false;
+                    self.session_load_in_flight = false;
+                    self.session_effects_in_flight = 0;
+                    self.pending_session_activations.clear();
+                    self.operations_in_flight = 0;
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "dashboard backend stopped",
@@ -849,12 +959,46 @@ impl DashboardRuntime {
     }
 
     fn has_in_flight_effect(&self) -> bool {
-        self.update_check_in_flight || self.preview_in_flight || self.operations_in_flight > 0
+        self.update_check_in_flight
+            || self.preview_in_flight
+            || self.session_effects_in_flight > 0
+            || self.operations_in_flight > 0
     }
 
     fn can_quit(&self) -> bool {
         self.operations_in_flight == 0
     }
+
+    fn complete_effect(&mut self, effect: &DashboardEffect) {
+        match effect {
+            DashboardEffect::CheckForUpdates => self.update_check_in_flight = false,
+            DashboardEffect::ReadTerminalPreview { .. } => self.preview_in_flight = false,
+            DashboardEffect::LoadSessions { .. } => {
+                self.session_load_in_flight = false;
+                self.session_effects_in_flight = self.session_effects_in_flight.saturating_sub(1);
+            }
+            DashboardEffect::ActivateSession(identity) => {
+                self.pending_session_activations.remove(identity);
+                self.session_effects_in_flight = self.session_effects_in_flight.saturating_sub(1);
+            }
+            effect if is_session_effect(effect) => {
+                self.session_effects_in_flight = self.session_effects_in_flight.saturating_sub(1);
+            }
+            _ => {}
+        }
+        if effect.must_finish_before_quit() {
+            self.operations_in_flight = self.operations_in_flight.saturating_sub(1);
+        }
+    }
+}
+
+fn is_session_effect(effect: &DashboardEffect) -> bool {
+    matches!(
+        effect,
+        DashboardEffect::LoadSessions { .. }
+            | DashboardEffect::InspectSession(_)
+            | DashboardEffect::ActivateSession(_)
+    )
 }
 
 struct App {
@@ -867,6 +1011,10 @@ struct App {
     item_state: TableState,
     global_state: TableState,
     node_state: TableState,
+    session_state: TableState,
+    sessions: Vec<DashboardSessionView>,
+    session_load: SessionLoadState,
+    last_session_load: Option<Instant>,
     primary_tab: PrimaryTab,
     focus: Focus,
     mode: Mode,
@@ -879,6 +1027,13 @@ struct App {
     selection_pinned: bool,
     selected_workspace_id: Option<String>,
     observed_focus_revision: Option<u64>,
+}
+
+enum SessionLoadState {
+    NotLoaded,
+    Loading,
+    Loaded { warnings: Vec<String> },
+    Failed(String),
 }
 
 struct TerminalPreviewState {
@@ -899,17 +1054,25 @@ enum Focus {
 enum PrimaryTab {
     Workspaces,
     Agents,
+    Sessions,
     Shells,
     Nodes,
 }
 
 impl PrimaryTab {
-    const ALL: [Self; 4] = [Self::Workspaces, Self::Agents, Self::Shells, Self::Nodes];
+    const ALL: [Self; 5] = [
+        Self::Workspaces,
+        Self::Agents,
+        Self::Sessions,
+        Self::Shells,
+        Self::Nodes,
+    ];
 
     fn kind(self) -> Option<ItemKind> {
         match self {
             Self::Workspaces => None,
             Self::Agents => Some(ItemKind::Agent),
+            Self::Sessions => None,
             Self::Shells => Some(ItemKind::Shell),
             Self::Nodes => None,
         }
@@ -919,6 +1082,7 @@ impl PrimaryTab {
         match self {
             Self::Workspaces => "WORKSPACES",
             Self::Agents => "AGENTS",
+            Self::Sessions => "SESSIONS",
             Self::Shells => "SHELLS",
             Self::Nodes => "NODES",
         }
@@ -1004,6 +1168,8 @@ enum Mode {
     SelectWorkspaceNode(WorkspaceNodePicker),
     LinkWorkspace(LinkWorkspacePicker),
     InspectNode(NodeView),
+    InspectSessionLoading(QualifiedIdentity),
+    InspectSession(DashboardSessionDetails),
     RetargetNode {
         node_id: String,
         expected_revision: u64,
@@ -1682,6 +1848,10 @@ impl App {
             item_state,
             global_state: TableState::default(),
             node_state: TableState::default().with_selected(has_nodes.then_some(0)),
+            session_state: TableState::default(),
+            sessions: Vec::new(),
+            session_load: SessionLoadState::NotLoaded,
+            last_session_load: None,
             primary_tab: PrimaryTab::Workspaces,
             focus: Focus::Workspaces,
             mode: Mode::Normal,
@@ -1796,6 +1966,9 @@ impl App {
     }
 
     fn selected_item_location(&self) -> Option<(usize, usize)> {
+        if self.primary_tab == PrimaryTab::Sessions {
+            return None;
+        }
         if self.primary_tab == PrimaryTab::Workspaces {
             let workspace_index = self.workspace_state.selected()?;
             let ordinal = self.item_state.selected()?;
@@ -1838,6 +2011,9 @@ impl App {
         if self.primary_tab == PrimaryTab::Nodes {
             return self.nodes.len();
         }
+        if self.primary_tab == PrimaryTab::Sessions {
+            return self.sessions.len();
+        }
         let Some(kind) = self.primary_tab.kind() else {
             return 0;
         };
@@ -1861,13 +2037,26 @@ impl App {
             self.message = None;
             return;
         }
+        if tab == PrimaryTab::Sessions {
+            self.focus = Focus::Items;
+            self.session_state.select(
+                (!self.sessions.is_empty()).then_some(
+                    self.session_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.sessions.len().saturating_sub(1)),
+                ),
+            );
+            self.message = None;
+            return;
+        }
         self.focus = Focus::Items;
         self.global_state
             .select((self.global_item_count() > 0).then_some(0));
         self.message = None;
     }
 
-    fn cycle_tab(&mut self, backwards: bool) {
+    fn cycle_tab(&mut self, backwards: bool) -> Option<DashboardEffect> {
         let index = PrimaryTab::ALL
             .iter()
             .position(|tab| *tab == self.primary_tab)
@@ -1878,6 +2067,13 @@ impl App {
             (index + 1) % PrimaryTab::ALL.len()
         };
         self.select_tab(PrimaryTab::ALL[next]);
+        self.session_load_on_entry()
+    }
+
+    fn session_load_on_entry(&mut self) -> Option<DashboardEffect> {
+        (self.primary_tab == PrimaryTab::Sessions
+            && matches!(self.session_load, SessionLoadState::NotLoaded))
+        .then(|| self.load_sessions())
     }
 
     fn next(&mut self) {
@@ -1890,6 +2086,17 @@ impl App {
                         .map_or(0, |index| (index + 1) % self.nodes.len());
                     self.node_state.select(Some(next));
                 }
+                return;
+            }
+            if self.primary_tab == PrimaryTab::Sessions {
+                if !self.sessions.is_empty() {
+                    let next = self
+                        .session_state
+                        .selected()
+                        .map_or(0, |index| (index + 1) % self.sessions.len());
+                    self.session_state.select(Some(next));
+                }
+                self.message = None;
                 return;
             }
             let item_count = self.global_item_count();
@@ -1944,6 +2151,20 @@ impl App {
                     });
                     self.node_state.select(Some(previous));
                 }
+                return;
+            }
+            if self.primary_tab == PrimaryTab::Sessions {
+                if !self.sessions.is_empty() {
+                    let previous = self.session_state.selected().map_or(0, |index| {
+                        if index == 0 {
+                            self.sessions.len() - 1
+                        } else {
+                            index - 1
+                        }
+                    });
+                    self.session_state.select(Some(previous));
+                }
+                self.message = None;
                 return;
             }
             let item_count = self.global_item_count();
@@ -2345,6 +2566,48 @@ impl App {
         Some(DashboardEffect::Open(target))
     }
 
+    fn selected_session(&self) -> Option<&DashboardSessionView> {
+        self.session_state
+            .selected()
+            .and_then(|index| self.sessions.get(index))
+    }
+
+    fn session_nodes(&self) -> Vec<SessionNodeView> {
+        self.nodes
+            .iter()
+            .filter(|node| {
+                node.local
+                    || (node.current
+                        && !node.stale
+                        && node.health == NodeProjectionHealthCode::Online)
+            })
+            .map(|node| SessionNodeView {
+                id: node.id.clone(),
+                alias: node.alias.clone(),
+                local: node.local,
+            })
+            .collect()
+    }
+
+    fn load_sessions(&mut self) -> DashboardEffect {
+        self.session_load = SessionLoadState::Loading;
+        DashboardEffect::LoadSessions {
+            nodes: self.session_nodes(),
+        }
+    }
+
+    fn inspect_selected_session(&mut self) -> Option<DashboardEffect> {
+        let identity = self.selected_session()?.identity();
+        self.mode = Mode::InspectSessionLoading(identity.clone());
+        Some(DashboardEffect::InspectSession(identity))
+    }
+
+    fn activate_selected_session(&self) -> Option<DashboardEffect> {
+        Some(DashboardEffect::ActivateSession(
+            self.selected_session()?.identity(),
+        ))
+    }
+
     fn activate_selected_item(&mut self) -> Option<DashboardEffect> {
         self.open_selected_item()
     }
@@ -2483,7 +2746,21 @@ impl App {
             DashboardEvent::KeyPressed { code, modifiers } => {
                 return self.update_key(code, modifiers).into_iter().collect();
             }
-            DashboardEvent::RefreshElapsed => return vec![DashboardEffect::CheckForUpdates],
+            DashboardEvent::RefreshElapsed => {
+                let mut effects = vec![DashboardEffect::CheckForUpdates];
+                if self.primary_tab == PrimaryTab::Sessions
+                    && !matches!(self.session_load, SessionLoadState::Loading)
+                    && self
+                        .last_session_load
+                        .is_some_and(|loaded| loaded.elapsed() >= SESSION_REFRESH_INTERVAL)
+                {
+                    effects.push(self.load_sessions());
+                }
+                return effects;
+            }
+            DashboardEvent::MousePressed { event, area } => {
+                return self.update_mouse(event, area).into_iter().collect();
+            }
             DashboardEvent::PreviewRequested => {
                 return self.terminal_preview_effect().into_iter().collect();
             }
@@ -2512,6 +2789,27 @@ impl App {
             }
             DashboardEvent::RefreshCompleted(result) => {
                 self.apply_refresh(result);
+            }
+            DashboardEvent::SessionsLoaded(result) => self.apply_sessions(result),
+            DashboardEvent::SessionInspected { identity, result } => {
+                if matches!(&self.mode, Mode::InspectSessionLoading(expected) if *expected == identity)
+                {
+                    match result {
+                        Ok(mut details) => {
+                            if let Some(session) = self.sessions.iter().find(|session| {
+                                session.node_id == identity.node_id
+                                    && session.session_id == identity.inner_id
+                            }) {
+                                details.session.node_alias = session.node_alias.clone();
+                            }
+                            self.mode = Mode::InspectSession(details);
+                        }
+                        Err(text) => {
+                            self.mode = Mode::Normal;
+                            self.message = Some(Message { text, error: true });
+                        }
+                    }
+                }
             }
             DashboardEvent::TextPasted(_) => {}
             DashboardEvent::TerminalPreviewCompleted {
@@ -2572,6 +2870,9 @@ impl App {
                     self.inspect_selected_node();
                     return None;
                 }
+                if self.primary_tab == PrimaryTab::Sessions {
+                    return self.activate_selected_session();
+                }
                 return if self.primary_tab != PrimaryTab::Workspaces {
                     self.open_selected_item()
                 } else {
@@ -2589,6 +2890,9 @@ impl App {
                     .filter(|node| !node.local)
                     .map(|node| DashboardEffect::RefreshNode(node.id.clone()))
                     .or(Some(DashboardEffect::Refresh));
+            }
+            KeyCode::Char('r') if self.primary_tab == PrimaryTab::Sessions => {
+                return Some(self.load_sessions());
             }
             KeyCode::Char('r') => return Some(DashboardEffect::Refresh),
             KeyCode::Char('u') if self.primary_tab == PrimaryTab::Nodes => {
@@ -2632,6 +2936,9 @@ impl App {
                 self.link_selected_external();
             }
             KeyCode::Char('e') => return self.request_rename(),
+            KeyCode::Char('i') if self.primary_tab == PrimaryTab::Sessions => {
+                return self.inspect_selected_session();
+            }
             KeyCode::Char('t') if self.primary_tab == PrimaryTab::Nodes => {
                 self.retarget_selected_node();
             }
@@ -2639,18 +2946,97 @@ impl App {
             KeyCode::Char('/' | ':') => self.open_palette(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Tab => {
-                self.cycle_tab(false);
+                return self.cycle_tab(false);
             }
             KeyCode::BackTab => {
-                self.cycle_tab(true);
+                return self.cycle_tab(true);
             }
             KeyCode::Char(key) if shortcut_tab(key).is_some() => {
                 self.select_tab(shortcut_tab(key).expect("validated tab shortcut"));
+                return self.session_load_on_entry();
             }
             key if self.handle_focus_key(key) => {}
             _ => {}
         }
         None
+    }
+
+    fn update_mouse(&mut self, event: MouseEvent, area: Rect) -> Option<DashboardEffect> {
+        if self.primary_tab != PrimaryTab::Sessions
+            || !matches!(self.mode, Mode::Normal)
+            || event.kind != MouseEventKind::Down(MouseButton::Left)
+        {
+            return None;
+        }
+        let dashboard = Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(2),
+        );
+        let (table, _) = session_content_areas(dashboard, self.session_warning().is_some());
+        let data_top = table.y.saturating_add(1);
+        if event.column < table.x
+            || event.column >= table.right()
+            || event.row < data_top
+            || event.row >= table.bottom()
+        {
+            return None;
+        }
+        let index = self
+            .session_state
+            .offset()
+            .saturating_add(usize::from(event.row - data_top));
+        if index >= self.sessions.len() {
+            return None;
+        }
+        if self.session_state.selected() == Some(index) {
+            return self.activate_selected_session();
+        }
+        self.session_state.select(Some(index));
+        self.message = None;
+        None
+    }
+
+    fn session_warning(&self) -> Option<&str> {
+        match &self.session_load {
+            SessionLoadState::Loaded { warnings } => warnings.first().map(String::as_str),
+            SessionLoadState::NotLoaded
+            | SessionLoadState::Loading
+            | SessionLoadState::Failed(_) => None,
+        }
+    }
+
+    fn apply_sessions(&mut self, result: Result<SessionLoadResult, String>) {
+        self.last_session_load = Some(Instant::now());
+        match result {
+            Ok(mut loaded) => {
+                let selected = self.selected_session().map(DashboardSessionView::identity);
+                loaded.sessions.sort_by(|left, right| {
+                    right
+                        .last_at_ms
+                        .cmp(&left.last_at_ms)
+                        .then_with(|| left.node_id.cmp(&right.node_id))
+                        .then_with(|| left.workspace_id.cmp(&right.workspace_id))
+                        .then_with(|| left.session_id.cmp(&right.session_id))
+                });
+                self.sessions = loaded.sessions;
+                self.session_state.select(
+                    selected
+                        .and_then(|identity| {
+                            self.sessions.iter().position(|session| {
+                                session.node_id == identity.node_id
+                                    && session.session_id == identity.inner_id
+                            })
+                        })
+                        .or_else(|| (!self.sessions.is_empty()).then_some(0)),
+                );
+                self.session_load = SessionLoadState::Loaded {
+                    warnings: loaded.warnings,
+                };
+            }
+            Err(error) => self.session_load = SessionLoadState::Failed(error),
+        }
     }
 
     fn apply_refresh(&mut self, result: Result<DashboardState, String>) {
@@ -3024,13 +3410,14 @@ fn item_pending_removal(
     })
 }
 
-pub(crate) fn run<B: DashboardBackend + Send + 'static>(
+pub(crate) fn run<B: DashboardBackend + Send + 'static, S: DashboardBackend + Send + 'static>(
     state: DashboardState,
     selected_workspace_id: Option<String>,
     follow_focused_terminal: bool,
     project_context: ProjectContext,
     play_intro: bool,
     backend: B,
+    session_backend: S,
 ) -> io::Result<()> {
     let mut terminal = ratatui::try_init().map_err(|error| {
         io::Error::new(
@@ -3038,7 +3425,7 @@ pub(crate) fn run<B: DashboardBackend + Send + 'static>(
             format!("dashboard requires an interactive terminal: {error}"),
         )
     })?;
-    if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+    if let Err(error) = enable_dashboard_terminal_modes(&mut io::stdout()) {
         let _ = ratatui::try_restore();
         return Err(error);
     }
@@ -3052,15 +3439,31 @@ pub(crate) fn run<B: DashboardBackend + Send + 'static>(
         app.enable_focus_following(state.focused_terminal.as_ref());
     }
     let result = if play_intro {
-        play_bomb_animation(&mut terminal).and_then(|()| run_loop(&mut terminal, app, backend))
+        play_bomb_animation(&mut terminal)
+            .and_then(|()| run_loop(&mut terminal, app, backend, session_backend))
     } else {
-        run_loop(&mut terminal, app, backend)
+        run_loop(&mut terminal, app, backend, session_backend)
     };
-    let paste_result = execute!(io::stdout(), DisableBracketedPaste);
+    let mode_result = disable_dashboard_terminal_modes(&mut io::stdout());
     let restore_result = ratatui::try_restore();
-    paste_result?;
+    mode_result?;
     restore_result?;
     result
+}
+
+fn enable_dashboard_terminal_modes(writer: &mut impl io::Write) -> io::Result<()> {
+    execute!(writer, EnableBracketedPaste)?;
+    if let Err(error) = execute!(writer, EnableMouseCapture) {
+        let _ = execute!(writer, DisableBracketedPaste);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn disable_dashboard_terminal_modes(writer: &mut impl io::Write) -> io::Result<()> {
+    let mouse = execute!(writer, DisableMouseCapture);
+    let paste = execute!(writer, DisableBracketedPaste);
+    mouse.and(paste)
 }
 
 fn play_bomb_animation(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
@@ -3080,11 +3483,17 @@ fn play_bomb_animation(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()
     }
 }
 
-fn run_loop<B>(terminal: &mut ratatui::DefaultTerminal, mut app: App, backend: B) -> io::Result<()>
+fn run_loop<B, S>(
+    terminal: &mut ratatui::DefaultTerminal,
+    mut app: App,
+    backend: B,
+    session_backend: S,
+) -> io::Result<()>
 where
     B: DashboardBackend + Send + 'static,
+    S: DashboardBackend + Send + 'static,
 {
-    let mut runtime = DashboardRuntime::spawn(backend);
+    let mut runtime = DashboardRuntime::spawn_with_session_backend(backend, session_backend);
     let mut last_refresh = Instant::now();
     loop {
         if runtime.drain(&mut app)? {
@@ -3119,6 +3528,10 @@ where
                 })
             }
             Event::Paste(text) => app.update(DashboardEvent::TextPasted(text)),
+            Event::Mouse(event) => app.update(DashboardEvent::MousePressed {
+                event,
+                area: terminal.size()?.into(),
+            }),
             _ => continue,
         };
         if effects.contains(&DashboardEffect::Quit) {
@@ -3423,6 +3836,20 @@ fn handle_mode_key(
                 None
             }
         },
+        Mode::InspectSessionLoading(identity) => match key {
+            KeyCode::Esc => None,
+            _ => {
+                app.mode = Mode::InspectSessionLoading(identity);
+                None
+            }
+        },
+        Mode::InspectSession(details) => match key {
+            KeyCode::Esc => None,
+            _ => {
+                app.mode = Mode::InspectSession(details);
+                None
+            }
+        },
         Mode::RetargetNode {
             node_id,
             expected_revision,
@@ -3507,6 +3934,8 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_tabs(frame, tabs_area, app);
     if app.primary_tab == PrimaryTab::Nodes {
         render_nodes(frame, dashboard_area, app);
+    } else if app.primary_tab == PrimaryTab::Sessions {
+        render_sessions(frame, dashboard_area, app);
     } else if app.primary_tab != PrimaryTab::Workspaces {
         render_global_items(frame, dashboard_area, app);
     } else if dashboard_area.width >= 114 {
@@ -3529,10 +3958,114 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::SelectWorkspaceNode(picker) => render_workspace_node_picker(frame, area, picker),
         Mode::LinkWorkspace(picker) => render_link_workspace_picker(frame, area, picker),
         Mode::InspectNode(node) => render_node_inspection(frame, area, node),
+        Mode::InspectSessionLoading(identity) => render_session_loading(frame, area, identity),
+        Mode::InspectSession(details) => render_session_inspection(frame, area, details),
         Mode::RetargetNode { input, .. } => render_node_retarget(frame, area, input),
         Mode::ConfirmForgetNode(node) => render_node_forget_confirmation(frame, area, node),
         Mode::Normal | Mode::Rename { .. } => {}
     }
+}
+
+fn session_content_areas(area: Rect, has_warning: bool) -> (Rect, Option<Rect>) {
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if !has_warning || inner.height == 0 {
+        return (inner, None);
+    }
+    let [table, warning] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    (table, Some(warning))
+}
+
+fn render_session_loading(frame: &mut Frame, area: Rect, identity: &QualifiedIdentity) {
+    let popup = if area.width < 90 {
+        area
+    } else {
+        centered_rect(area, 76, 70)
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Inspecting exact Session {} on Node {}...\n\nesc close",
+            short_id(&identity.inner_id),
+            short_id(&identity.node_id)
+        ))
+        .block(
+            Block::bordered()
+                .title(" Session details ")
+                .border_style(Style::new().fg(TEAL)),
+        ),
+        popup,
+    );
+}
+
+fn render_session_inspection(frame: &mut Frame, area: Rect, details: &DashboardSessionDetails) {
+    let popup = if area.width < 90 {
+        area
+    } else {
+        centered_rect(area, 76, 78)
+    };
+    let session = &details.session;
+    let action = match &details.action {
+        Ok(action) => Span::styled(action.clone(), Style::new().fg(GREEN)),
+        Err(error) => Span::styled(error.clone(), Style::new().fg(RED)),
+    };
+    let lines = vec![
+        preview_field("TITLE", session.title.clone()),
+        preview_field(
+            "NODE",
+            format!("{} ({})", session.node_alias, session.node_id),
+        ),
+        preview_field(
+            "WORKSPACE",
+            format!("{} ({})", session.workspace_name, session.workspace_id),
+        ),
+        preview_field("HARNESS", integration_display_name(&session.integration)),
+        preview_field(
+            "STATE",
+            format!(
+                "{} ({})",
+                session.state.label(),
+                if session.state_is_current {
+                    "current"
+                } else {
+                    "historical"
+                }
+            ),
+        ),
+        preview_field("STARTED", timestamp_detail(session.started_at_ms)),
+        preview_field("LAST", timestamp_detail(session.last_at_ms)),
+        preview_field(
+            "SOURCE CWD",
+            details
+                .source_cwd
+                .as_deref()
+                .map_or_else(|| "-".into(), |cwd| cwd.display().to_string()),
+        ),
+        preview_field("OCCURRENCES", details.occurrences.len().to_string()),
+        Line::from(vec![preview_label("ACTION"), action]),
+        Line::from(""),
+        Line::styled("esc close", Style::new().fg(SUBTEXT)),
+    ];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .title(" Session details ")
+                    .border_style(Style::new().fg(TEAL)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn timestamp_detail(timestamp_ms: u64) -> String {
+    format!("{timestamp_ms} ({})", compact_recency(timestamp_ms))
 }
 
 fn render_node_inspection(frame: &mut Frame, area: Rect, node: &NodeView) {
@@ -4283,7 +4816,7 @@ fn help_lines(app: &App) -> Vec<Line<'static>> {
         Line::from("  attention filter palette results to outstanding durable attention"),
         Line::from("  Enter    restore a workspace or open an item"),
         Line::from("  a/e/x    add, rename, or request confirmed close/remove"),
-        Line::from("  Tab/1-4 change view; h/l change pane; j/k navigate"),
+        Line::from("  Tab/1-5 change view; h/l change pane; j/k navigate"),
         Line::from(""),
         Line::from(Span::styled(
             "SELECTED CONTEXT",
@@ -4506,6 +5039,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                         .flat_map(|workspace| &workspace.items)
                         .filter(|item| item.kind() == ItemKind::Agent)
                         .count(),
+                    PrimaryTab::Sessions => app.sessions.len(),
                     PrimaryTab::Shells => {
                         app.workspaces.iter().map(WorkspaceView::shell_count).sum()
                     }
@@ -4524,6 +5058,124 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
             }),
     );
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_sessions(frame: &mut Frame, area: Rect, app: &mut App) {
+    let status = match &app.session_load {
+        SessionLoadState::NotLoaded => "not loaded; enter tab or press r",
+        SessionLoadState::Loading if app.sessions.is_empty() => "loading live Session lists...",
+        SessionLoadState::Loading => "refreshing live Session lists...",
+        SessionLoadState::Loaded { warnings } if !warnings.is_empty() => "partial results",
+        SessionLoadState::Loaded { .. } => "live",
+        SessionLoadState::Failed(_) => "load failed",
+    };
+    let block = Block::bordered()
+        .title(format!(" Sessions ({}) - {status} ", app.sessions.len()))
+        .border_style(Style::new().fg(TEAL));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.sessions.is_empty() {
+        let message = match &app.session_load {
+            SessionLoadState::NotLoaded => "Sessions have not been loaded.",
+            SessionLoadState::Loading => "Loading local and online Node Sessions...",
+            SessionLoadState::Loaded { warnings } if warnings.is_empty() => {
+                "No Agent Sessions were found."
+            }
+            SessionLoadState::Loaded { warnings } => warnings
+                .first()
+                .map(String::as_str)
+                .unwrap_or("No Sessions loaded."),
+            SessionLoadState::Failed(error) => error,
+        };
+        frame.render_widget(
+            Paragraph::new(message).style(Style::new().fg(match app.session_load {
+                SessionLoadState::Failed(_) => RED,
+                SessionLoadState::Loaded { ref warnings } if !warnings.is_empty() => YELLOW,
+                _ => SUBTEXT,
+            })),
+            inner,
+        );
+        return;
+    }
+
+    let (table_area, warning_area) = session_content_areas(area, app.session_warning().is_some());
+    let wide_state = table_area.width >= 75;
+    let wide_owner = table_area.width >= 105;
+    let wide_occurrences = table_area.width >= 135;
+    let mut headers = vec!["AGE", "HARNESS", "TITLE"];
+    let mut widths = vec![
+        Constraint::Length(9),
+        Constraint::Length(12),
+        Constraint::Fill(1),
+    ];
+    if wide_state {
+        headers.insert(2, "STATE");
+        widths.insert(2, Constraint::Length(17));
+    }
+    if wide_owner {
+        let title_index = headers.len() - 1;
+        headers.insert(title_index, "NODE");
+        headers.insert(title_index + 1, "WORKSPACE");
+        widths.insert(title_index, Constraint::Length(14));
+        widths.insert(title_index + 1, Constraint::Length(20));
+    }
+    if wide_occurrences {
+        let title_index = headers.len() - 1;
+        headers.insert(title_index, "OCC");
+        widths.insert(title_index, Constraint::Length(5));
+    }
+    let rows = app.sessions.iter().map(|session| {
+        let mut cells = vec![
+            Cell::from(compact_recency(session.last_at_ms)),
+            Cell::from(integration_display_name(&session.integration)),
+            Cell::from(session.title.clone()),
+        ];
+        if wide_state {
+            cells.insert(
+                2,
+                Cell::from(format!(
+                    "{} {}",
+                    session.state.label(),
+                    if session.state_is_current {
+                        "current"
+                    } else {
+                        "historical"
+                    }
+                )),
+            );
+        }
+        if wide_owner {
+            let title_index = cells.len() - 1;
+            cells.insert(title_index, Cell::from(session.node_alias.clone()));
+            cells.insert(title_index + 1, Cell::from(session.workspace_name.clone()));
+        }
+        if wide_occurrences {
+            let title_index = cells.len() - 1;
+            cells.insert(
+                title_index,
+                Cell::from(session.occurrence_count.to_string()),
+            );
+        }
+        Row::new(cells)
+    });
+    let table = Table::new(rows, widths)
+        .header(Row::new(headers).style(Style::new().fg(BLUE).add_modifier(Modifier::BOLD)))
+        .column_spacing(1)
+        .row_highlight_style(
+            Style::new()
+                .fg(TEXT)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        )
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(table, table_area, &mut app.session_state);
+
+    if let (Some(warning), Some(warning_area)) = (app.session_warning(), warning_area) {
+        frame.render_widget(
+            Paragraph::new(format!("Warning: {warning}")).style(Style::new().fg(YELLOW)),
+            warning_area,
+        );
+    }
 }
 
 fn render_nodes(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -5762,6 +6414,17 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             format!(" {}", message.text),
             Style::new().fg(if message.error { RED } else { GREEN }),
         ))
+    } else if app.primary_tab == PrimaryTab::Sessions {
+        Line::from(vec![
+            Span::styled("enter", Style::new().fg(GREEN)),
+            Span::styled(" open exact  ", Style::new().fg(SUBTEXT)),
+            Span::styled("i", Style::new().fg(TEAL)),
+            Span::styled(" details  ", Style::new().fg(SUBTEXT)),
+            Span::styled("r", Style::new().fg(BLUE)),
+            Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
+            Span::styled("q", Style::new().fg(RED)),
+            Span::styled(" quit", Style::new().fg(SUBTEXT)),
+        ])
     } else {
         let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
         let offline_shell_selected =
@@ -5819,7 +6482,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 Span::styled(" forget  ", Style::new().fg(SUBTEXT)),
                 Span::styled("tab/shift-tab", Style::new().fg(TEAL)),
                 Span::styled(" views  ", Style::new().fg(SUBTEXT)),
-                Span::styled("1-4", Style::new().fg(TEAL)),
+                Span::styled("1-5", Style::new().fg(TEAL)),
                 Span::styled(" select view  ", Style::new().fg(SUBTEXT)),
                 Span::styled("/", Style::new().fg(TEAL)),
                 Span::styled(" palette  ", Style::new().fg(SUBTEXT)),
@@ -5835,7 +6498,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 if app.primary_tab == PrimaryTab::Workspaces {
                     " navigate  tab/shift-tab views  h/l panes  "
                 } else {
-                    " navigate  tab/shift-tab views  1-4 select view  "
+                    " navigate  tab/shift-tab views  1-5 select view  "
                 },
                 Style::new().fg(SUBTEXT),
             ),
@@ -7384,7 +8047,11 @@ mod tests {
         app.cycle_tab(false);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(false);
+        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
+        app.cycle_tab(false);
         assert_eq!(app.primary_tab, PrimaryTab::Shells);
+        app.cycle_tab(true);
+        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
         app.cycle_tab(true);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(true);
@@ -7490,14 +8157,18 @@ mod tests {
 
         assert!(text.contains("WORKSPACES 1"));
         assert!(text.contains("AGENTS 1"));
-        assert!(!text.contains("SESSIONS"));
+        assert!(text.contains("SESSIONS 0"));
         assert!(!text.contains("LAUNCHERS 1"));
         assert!(text.contains("SHELLS 1"));
         assert!(!text.contains("COMMANDS 1"));
         assert!(!text.contains("active agents"));
         let workspace_tab = text.find("WORKSPACES 1").expect("workspace tab");
         let agent_tab = text.find("AGENTS 1").expect("agent tab");
+        let session_tab = text.find("SESSIONS 0").expect("Session tab");
+        let shell_tab = text.find("SHELLS 1").expect("Shell tab");
         assert!(workspace_tab < agent_tab);
+        assert!(agent_tab < session_tab);
+        assert!(session_tab < shell_tab);
         assert!(!text.contains("NODES:"));
         assert!(!text.contains("NODE:all"));
         assert!(lines.iter().any(|line| line.contains("> mixed")));
@@ -9798,5 +10469,543 @@ mod tests {
         assert!(text.contains("FROM PROJECT"));
         assert!(text.contains("Create a workspace by name"));
         assert!(text.contains("alpha"));
+    }
+
+    fn dashboard_session(node_id: &str, session_id: &str, last_at_ms: u64) -> DashboardSessionView {
+        DashboardSessionView {
+            node_id: node_id.into(),
+            node_alias: format!("node-{node_id}"),
+            session_id: session_id.into(),
+            workspace_id: format!("workspace-{session_id}"),
+            workspace_name: format!("work-{session_id}"),
+            title: format!("Session {session_id}"),
+            integration: "opencode".into(),
+            state: AgentDisplayState::Idle,
+            state_is_current: false,
+            started_at_ms: last_at_ms.saturating_sub(100),
+            last_at_ms,
+            occurrence_count: 2,
+        }
+    }
+
+    #[test]
+    fn sessions_are_the_third_tab_and_first_entry_starts_one_live_load() {
+        let mut app = app();
+        app.nodes[0].id = "local-node".into();
+
+        let effect = app.update_key(KeyCode::Char('3'), KeyModifiers::NONE);
+
+        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
+        assert!(matches!(
+            effect,
+            Some(DashboardEffect::LoadSessions { nodes })
+                if nodes == vec![SessionNodeView {
+                    id: "local-node".into(),
+                    alias: "local".into(),
+                    local: true,
+                }]
+        ));
+        assert_eq!(app.update_key(KeyCode::Char('3'), KeyModifiers::NONE), None);
+    }
+
+    #[test]
+    fn session_results_sort_deterministically_and_preserve_qualified_selection() {
+        let mut app = app();
+        app.select_tab(PrimaryTab::Sessions);
+        app.apply_sessions(Ok(SessionLoadResult {
+            sessions: vec![
+                dashboard_session("b", "same", 20),
+                dashboard_session("a", "older", 10),
+                dashboard_session("a", "same", 20),
+            ],
+            warnings: Vec::new(),
+        }));
+        assert_eq!(
+            app.sessions
+                .iter()
+                .map(|session| (session.node_id.as_str(), session.session_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("a", "same"), ("b", "same"), ("a", "older")]
+        );
+        app.session_state.select(Some(1));
+
+        app.apply_sessions(Ok(SessionLoadResult {
+            sessions: vec![
+                dashboard_session("a", "same", 30),
+                dashboard_session("b", "same", 5),
+            ],
+            warnings: Vec::new(),
+        }));
+
+        assert_eq!(app.selected_session().unwrap().node_id, "b");
+        assert_eq!(app.selected_session().unwrap().session_id, "same");
+    }
+
+    #[test]
+    fn session_table_progressively_adds_owner_state_and_occurrences() {
+        let mut app = app();
+        app.select_tab(PrimaryTab::Sessions);
+        app.apply_sessions(Ok(SessionLoadResult {
+            sessions: vec![dashboard_session("alpha", "review", current_time_ms())],
+            warnings: vec!["Node beta: unavailable".into()],
+        }));
+
+        let narrow = rendered_text(&mut app, 70, 20);
+        assert!(narrow.contains("AGE"));
+        assert!(narrow.contains("HARNESS"));
+        assert!(narrow.contains("TITLE"));
+        assert!(narrow.contains("OpenCode"));
+        assert!(narrow.contains("Session review"));
+        assert!(!narrow.contains("node-alpha"));
+        assert!(!narrow.contains("work-review"));
+        assert!(!narrow.contains("historical"));
+
+        let wide = rendered_text(&mut app, 160, 24);
+        for expected in [
+            "STATE",
+            "NODE",
+            "WORKSPACE",
+            "OCC",
+            "historical",
+            "node-alpha",
+            "work-review",
+            "Warning: Node beta: unavailable",
+        ] {
+            assert!(wide.contains(expected), "missing {expected}: {wide}");
+        }
+    }
+
+    #[test]
+    fn session_empty_loading_and_failure_present_distinct_states() {
+        let mut app = app();
+        app.select_tab(PrimaryTab::Sessions);
+        assert!(rendered_text(&mut app, 80, 20).contains("not loaded"));
+        app.session_load = SessionLoadState::Loading;
+        assert!(rendered_text(&mut app, 80, 20).contains("Loading local and online"));
+        app.session_load = SessionLoadState::Failed("catalog failed".into());
+        assert!(rendered_text(&mut app, 80, 20).contains("catalog failed"));
+        app.session_load = SessionLoadState::Loaded {
+            warnings: Vec::new(),
+        };
+        assert!(rendered_text(&mut app, 80, 20).contains("No Agent Sessions"));
+    }
+
+    #[test]
+    fn session_enter_and_details_use_exact_node_qualified_identity() {
+        let mut app = app();
+        app.select_tab(PrimaryTab::Sessions);
+        app.apply_sessions(Ok(SessionLoadResult {
+            sessions: vec![dashboard_session("owner", "exact", 20)],
+            warnings: Vec::new(),
+        }));
+        assert_eq!(
+            app.update_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(DashboardEffect::ActivateSession(QualifiedIdentity::new(
+                "owner", "exact"
+            )))
+        );
+        assert_eq!(
+            app.update_key(KeyCode::Char('i'), KeyModifiers::NONE),
+            Some(DashboardEffect::InspectSession(QualifiedIdentity::new(
+                "owner", "exact"
+            )))
+        );
+        let identity = QualifiedIdentity::new("owner", "exact");
+        app.update(DashboardEvent::SessionInspected {
+            identity,
+            result: Ok(DashboardSessionDetails {
+                session: dashboard_session("owner", "exact", 20),
+                source_cwd: Some("/tmp/exact".into()),
+                occurrences: Vec::new(),
+                action: Ok("resume exact historical Session".into()),
+            }),
+        });
+        let rendered = rendered_text(&mut app, 140, 30);
+        for expected in [
+            "Session details",
+            "node-owner",
+            "work-exact",
+            "OpenCode",
+            "historical",
+            "/tmp/exact",
+            "OCCURRENCES",
+            "resume exact historical Session",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+        app.update_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn session_mouse_first_selects_and_second_click_opens_same_row() {
+        let mut app = app();
+        app.select_tab(PrimaryTab::Sessions);
+        app.apply_sessions(Ok(SessionLoadResult {
+            sessions: vec![
+                dashboard_session("a", "first", 20),
+                dashboard_session("b", "second", 10),
+            ],
+            warnings: Vec::new(),
+        }));
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(app.update_mouse(event, Rect::new(0, 0, 80, 24)), None);
+        assert_eq!(app.selected_session().unwrap().session_id, "second");
+        assert_eq!(
+            app.update_mouse(event, Rect::new(0, 0, 80, 24)),
+            Some(DashboardEffect::ActivateSession(QualifiedIdentity::new(
+                "b", "second"
+            )))
+        );
+        let border = MouseEvent { row: 1, ..event };
+        assert_eq!(app.update_mouse(border, Rect::new(0, 0, 80, 24)), None);
+    }
+
+    #[test]
+    fn partial_warning_reserves_saturated_table_row_and_is_not_mouse_actionable() {
+        let mut app = app();
+        app.select_tab(PrimaryTab::Sessions);
+        app.apply_sessions(Ok(SessionLoadResult {
+            sessions: vec![
+                dashboard_session("a", "visible", 30),
+                dashboard_session("b", "hidden", 20),
+                dashboard_session("c", "also-hidden", 10),
+            ],
+            warnings: vec!["Node offline".into()],
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(80, 7)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let lines = (0..7)
+            .map(|row| {
+                (0..80)
+                    .map(|column| terminal.backend().buffer()[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(lines[3].contains("Session visible"), "{}", lines[3]);
+        assert!(!lines[3].contains("Session hidden"), "{}", lines[3]);
+        assert!(lines[4].contains("Warning: Node offline"), "{}", lines[4]);
+        let warning_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            app.update_mouse(warning_click, Rect::new(0, 0, 80, 7)),
+            None
+        );
+        assert_eq!(app.selected_session().unwrap().session_id, "visible");
+    }
+
+    #[test]
+    fn mouse_capture_commands_are_enabled_and_cleaned_up() {
+        let mut output = Vec::new();
+        enable_dashboard_terminal_modes(&mut output).unwrap();
+        disable_dashboard_terminal_modes(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("?1000h"));
+        assert!(output.contains("?1000l"));
+        assert!(output.contains("?2004h"));
+        assert!(output.contains("?2004l"));
+    }
+
+    #[test]
+    fn blocked_session_load_does_not_block_mutation_worker_and_is_single_flight() {
+        let (session_started_tx, session_started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (mutation_tx, mutation_rx) = mpsc::channel();
+        let mut runtime = DashboardRuntime::spawn_with_session_backend(
+            move |effect: DashboardEffect| {
+                mutation_tx.send(effect).unwrap();
+                DashboardEvent::OperationCompleted(Ok("mutated".into()))
+            },
+            move |effect: DashboardEffect| {
+                session_started_tx.send(effect).unwrap();
+                release_rx.recv().unwrap();
+                DashboardEvent::SessionsLoaded(Ok(SessionLoadResult {
+                    sessions: Vec::new(),
+                    warnings: Vec::new(),
+                }))
+            },
+        );
+        let load = DashboardEffect::LoadSessions { nodes: Vec::new() };
+        runtime.dispatch(vec![load.clone(), load]).unwrap();
+        session_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        runtime
+            .dispatch(vec![DashboardEffect::Rename {
+                target: RenameTarget::Workspace("workspace".into()),
+                name: "changed".into(),
+            }])
+            .unwrap();
+        assert!(matches!(
+            mutation_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DashboardEffect::Rename { .. }
+        ));
+        assert!(matches!(
+            session_started_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn inspection_queues_behind_session_load_instead_of_being_discarded() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut runtime = DashboardRuntime::spawn_with_session_backend(
+            |_| DashboardEvent::UpdateCheckCompleted,
+            move |effect: DashboardEffect| {
+                started_tx.send(effect.clone()).unwrap();
+                match effect {
+                    DashboardEffect::LoadSessions { .. } => {
+                        release_rx.recv().unwrap();
+                        DashboardEvent::SessionsLoaded(Ok(SessionLoadResult {
+                            sessions: Vec::new(),
+                            warnings: Vec::new(),
+                        }))
+                    }
+                    DashboardEffect::InspectSession(identity) => DashboardEvent::SessionInspected {
+                        identity,
+                        result: Err("inspection complete".into()),
+                    },
+                    effect => panic!("unexpected effect: {effect:?}"),
+                }
+            },
+        );
+        let identity = QualifiedIdentity::new("owner", "session");
+        runtime
+            .dispatch(vec![DashboardEffect::LoadSessions { nodes: Vec::new() }])
+            .unwrap();
+        assert!(matches!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DashboardEffect::LoadSessions { .. }
+        ));
+        runtime
+            .dispatch(vec![DashboardEffect::InspectSession(identity.clone())])
+            .unwrap();
+        assert!(matches!(
+            started_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DashboardEffect::InspectSession(identity)
+        );
+    }
+
+    #[test]
+    fn activation_queues_behind_session_load_instead_of_being_discarded() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut runtime = DashboardRuntime::spawn_with_session_backend(
+            |_| DashboardEvent::UpdateCheckCompleted,
+            move |effect: DashboardEffect| {
+                started_tx.send(effect.clone()).unwrap();
+                match effect {
+                    DashboardEffect::LoadSessions { .. } => {
+                        release_rx.recv().unwrap();
+                        DashboardEvent::SessionsLoaded(Ok(SessionLoadResult {
+                            sessions: Vec::new(),
+                            warnings: Vec::new(),
+                        }))
+                    }
+                    DashboardEffect::ActivateSession(_) => {
+                        DashboardEvent::OperationCompleted(Ok("opened".into()))
+                    }
+                    effect => panic!("unexpected effect: {effect:?}"),
+                }
+            },
+        );
+        let identity = QualifiedIdentity::new("owner", "session");
+        runtime
+            .dispatch(vec![DashboardEffect::LoadSessions { nodes: Vec::new() }])
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        runtime
+            .dispatch(vec![DashboardEffect::ActivateSession(identity.clone())])
+            .unwrap();
+        assert!(matches!(
+            started_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            DashboardEffect::ActivateSession(identity)
+        );
+    }
+
+    #[test]
+    fn repeated_exact_activation_is_deduplicated_while_queued_and_allowed_after_completion() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut runtime = DashboardRuntime::spawn_with_session_backend(
+            |effect| match effect {
+                DashboardEffect::Refresh => DashboardEvent::RefreshCompleted(Err("ignored".into())),
+                effect => panic!("unexpected ordinary effect: {effect:?}"),
+            },
+            move |effect: DashboardEffect| {
+                started_tx.send(effect.clone()).unwrap();
+                match effect {
+                    DashboardEffect::LoadSessions { .. } => {
+                        release_rx.recv().unwrap();
+                        DashboardEvent::SessionsLoaded(Ok(SessionLoadResult {
+                            sessions: Vec::new(),
+                            warnings: Vec::new(),
+                        }))
+                    }
+                    DashboardEffect::ActivateSession(_) => {
+                        DashboardEvent::OperationCompleted(Ok("opened".into()))
+                    }
+                    effect => panic!("unexpected Session effect: {effect:?}"),
+                }
+            },
+        );
+        let identity = QualifiedIdentity::new("owner", "session");
+        let activation = DashboardEffect::ActivateSession(identity.clone());
+        runtime
+            .dispatch(vec![DashboardEffect::LoadSessions { nodes: Vec::new() }])
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        runtime
+            .dispatch(vec![
+                activation.clone(),
+                activation.clone(),
+                activation.clone(),
+            ])
+            .unwrap();
+        assert_eq!(runtime.pending_session_activations.len(), 1);
+        assert_eq!(runtime.session_effects_in_flight, 2);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            activation
+        );
+        assert!(matches!(
+            started_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let mut app = app();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.pending_session_activations.is_empty() && Instant::now() < deadline {
+            runtime.drain(&mut app).unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.pending_session_activations.is_empty());
+        runtime.dispatch(vec![activation.clone()]).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            activation
+        );
+    }
+
+    #[test]
+    fn failed_session_send_and_completion_disconnect_clear_activation_admission() {
+        let (effects, _effect_receiver) = mpsc::channel();
+        let (session_effects, session_receiver) = mpsc::channel();
+        drop(session_receiver);
+        let (_completion_sender, completions) = mpsc::channel();
+        let mut runtime = DashboardRuntime {
+            effects,
+            session_effects,
+            completions,
+            update_check_in_flight: false,
+            preview_in_flight: false,
+            session_load_in_flight: false,
+            session_effects_in_flight: 0,
+            pending_session_activations: HashSet::new(),
+            operations_in_flight: 0,
+        };
+        let identity = QualifiedIdentity::new("owner", "session");
+        assert!(
+            runtime
+                .dispatch(vec![DashboardEffect::ActivateSession(identity.clone())])
+                .is_err()
+        );
+        assert!(runtime.pending_session_activations.is_empty());
+        assert_eq!(runtime.session_effects_in_flight, 0);
+        assert_eq!(runtime.operations_in_flight, 0);
+
+        runtime.pending_session_activations.insert(identity);
+        drop(_completion_sender);
+        assert!(runtime.drain(&mut app()).is_err());
+        assert!(runtime.pending_session_activations.is_empty());
+        assert_eq!(runtime.session_effects_in_flight, 0);
+        assert_eq!(runtime.operations_in_flight, 0);
+    }
+
+    #[test]
+    fn refresh_queued_during_activation_clears_session_loading_state() {
+        let (activation_tx, activation_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (load_tx, load_rx) = mpsc::channel();
+        let mut runtime = DashboardRuntime::spawn_with_session_backend(
+            |effect| match effect {
+                DashboardEffect::Refresh => {
+                    DashboardEvent::RefreshCompleted(Err("snapshot unavailable".into()))
+                }
+                effect => panic!("unexpected ordinary effect: {effect:?}"),
+            },
+            move |effect| match effect {
+                DashboardEffect::ActivateSession(_) => {
+                    activation_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    DashboardEvent::OperationCompleted(Ok("opened".into()))
+                }
+                DashboardEffect::LoadSessions { .. } => {
+                    load_tx.send(()).unwrap();
+                    DashboardEvent::SessionsLoaded(Ok(SessionLoadResult {
+                        sessions: vec![dashboard_session("owner", "session", 30)],
+                        warnings: Vec::new(),
+                    }))
+                }
+                effect => panic!("unexpected Session effect: {effect:?}"),
+            },
+        );
+        let mut app = app();
+        app.select_tab(PrimaryTab::Sessions);
+        app.apply_sessions(Ok(SessionLoadResult {
+            sessions: vec![dashboard_session("owner", "session", 20)],
+            warnings: Vec::new(),
+        }));
+        runtime
+            .dispatch(vec![app.activate_selected_session().unwrap()])
+            .unwrap();
+        activation_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let refresh = app
+            .update_key(KeyCode::Char('r'), KeyModifiers::NONE)
+            .unwrap();
+        assert!(matches!(app.session_load, SessionLoadState::Loading));
+        runtime.dispatch(vec![refresh]).unwrap();
+        assert!(matches!(load_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        release_tx.send(()).unwrap();
+        load_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.has_in_flight_effect() && Instant::now() < deadline {
+            runtime.drain(&mut app).unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!runtime.has_in_flight_effect());
+        assert!(matches!(
+            app.session_load,
+            SessionLoadState::Loaded { ref warnings } if warnings.is_empty()
+        ));
     }
 }

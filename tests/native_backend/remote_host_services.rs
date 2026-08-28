@@ -176,6 +176,42 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
             },
         )
         .unwrap();
+    let current_sessions = local
+        .client
+        .route_node_host_service(
+            &owner_id,
+            HostServiceOperation::ListAgentSessions {
+                workspace_id: Some(session_workspace.id.clone()),
+            },
+        )
+        .unwrap();
+    let HostServiceResult::AgentSessions {
+        sessions: current_sessions,
+    } = current_sessions
+    else {
+        panic!("unexpected current Agent Session response");
+    };
+    assert_eq!(current_sessions.len(), 1);
+    assert!(current_sessions[0].state_is_current);
+    let current_inspection = local
+        .client
+        .route_node_host_service(
+            &owner_id,
+            HostServiceOperation::InspectAgentSession {
+                session_id: current_sessions[0].id.clone(),
+            },
+        )
+        .unwrap();
+    let HostServiceResult::AgentSession {
+        session: current_inspection,
+    } = current_inspection
+    else {
+        panic!("unexpected current Agent Session inspection response");
+    };
+    assert_eq!(current_inspection.occurrences.len(), 1);
+    assert_eq!(current_inspection.occurrences[0].shell_id, shell_id);
+    assert_eq!(current_inspection.occurrences[0].run_id, run_id);
+    assert!(local.client.snapshot().unwrap().workspaces.is_empty());
     owner
         .client
         .report_agent(

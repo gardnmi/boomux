@@ -254,19 +254,37 @@ Use `boomux --help` and `boomux <command> --help` for the complete current CLI.
 
 ## Native Dashboard
 
-Run `boomux ui` in a terminal. The dashboard provides four primary views:
+Run `boomux ui` in a terminal. The dashboard provides five primary views:
 
 - **Workspaces**: coordinated tasks, placement state, attention, and ownership.
-- **Agents**: current Agent lifecycle and canonical Sessions.
+- **Agents**: current ShellRun-bound Agent lifecycle.
+- **Sessions**: canonical Agent Sessions across harnesses and live Nodes.
 - **Shells**: durable Shell slots, commands, and exact run state.
 - **Nodes**: registration, route health, compatibility, and upgrade actions.
+
+The Sessions view is a projection of existing Agent Instances and host history,
+not a renamed Agent view or a new durable identity. It combines local Sessions
+with live catalogs from online registered Nodes, keeps identity qualified by
+owning Node, and reports per-Node failures without giving stale remote
+projections authority. Rows are ordered by last activity for presentation only;
+timestamps do not establish causal order across Nodes. Every row names its
+harness, and columns adapt from the compact age, harness, and title view to add
+state, Node, Workspace, and occurrence information as space permits.
+
+`Enter` opens the selected Session. A current Session opens its exact managed
+Shell; historical resume runs the exact owner-side harness. An unavailable,
+missing-cwd, done, or otherwise invalid Session reports an error and never opens
+a substitute. OpenCode and Codex may contribute catalog-only history; Pi,
+Claude, and Kiro appear only after Boomux has durably observed an Agent Instance.
+Press `i` for Session details and `Esc` to return. With the mouse, the first click
+selects a Session row and a second click on that selected row opens it.
 
 Core keys:
 
 | Keys | Action |
 | --- | --- |
 | Arrow keys or `h/j/k/l` | Navigate |
-| `Tab`, `Shift-Tab`, `1`-`4` | Change view |
+| `Tab`, `Shift-Tab`, `1`-`5` | Change view |
 | `Enter` | Open or activate the selected item |
 | `a`, `e`, `x` | Add, rename/edit, or close/remove where available |
 | `/` or `:` | Open the command palette |
