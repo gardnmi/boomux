@@ -7,12 +7,6 @@ groups durable Shells into coordinated Workspaces that can span multiple Nodes
 while continuing to use Ghostty, Alacritty, or another XDG terminal as ordinary
 native windows.
 
-> [!IMPORTANT]
-> The Omarchy side pane shown below is provided by
-> [omarchy-boomux](https://github.com/gardnmi/omarchy-boomux). Install both
-> projects for that desktop integration. Boomux's CLI and native TUI work
-> independently.
-
 <p align="center">
   <img src="assets/boomux-workspace-desktop.png" width="100%" alt="Boomux persistent side pane beside an active tiled Workspace">
 </p>
