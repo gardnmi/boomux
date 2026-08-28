@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/gardnmi/boomux/compare/v1.6.0...v1.6.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **deps:** update lru to resolve RUSTSEC-2026-0253 ([d66ee4b](https://github.com/gardnmi/boomux/commit/d66ee4ba95abd75d7cba09f7434198f298136857))
+
 ## [1.6.0](https://github.com/gardnmi/boomux/compare/v1.5.3...v1.6.0) (2026-08-27)
 
 
