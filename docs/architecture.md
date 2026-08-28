@@ -1097,11 +1097,14 @@ observation cadence. Holder operations and graceful handoff reconcile
 immediately. Reconciliation uses the ordinary durable mutation coordinator, so
 Inactive persistence precedes event publication and wakes event waiters. Failed
 release after graceful replacement is therefore eventually observed by the
-replacement daemon without another Kiro launch. Routine checks read only exact
-PID/start identity; acquire and import retain strict argv and environment checks.
-Acquire revalidates the exact current
-ShellRun and unchanged process start identity inside that same mutation gate
-immediately before insertion. Handoff import independently requires a live
+replacement daemon without another Kiro launch. Reconciliation also reports an
+active Kiro Agent without any live holder association as Inactive. This clears
+authority after cold recovery and when a pre-protocol-45 Kiro process survives a
+Boomux upgrade without weakening holder admission. Routine checks read only
+exact PID/start identity; acquire and import retain strict argv and environment
+checks. Acquire revalidates the exact current ShellRun and unchanged process
+start identity inside that same mutation gate immediately before insertion.
+Handoff import independently requires a live
 process, a current running ShellRun, and active exact Kiro Agent associations.
 
 The launcher installs Linux `PR_SET_PDEATHSIG` on the exact Kiro child before

@@ -203,6 +203,56 @@ fn codex_hook_requires_run_scoped_launch_and_reuses_exact_thread_agent() {
 }
 
 #[test]
+fn kiro_agent_without_live_holder_becomes_inactive() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "holderless-kiro",
+            vec![ShellSpec {
+                name: "kiro".into(),
+                command: vec!["/bin/sleep".into(), "300".into()],
+                cwd: std::env::temp_dir(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let agent = daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "Kiro CLI".into(),
+                integration: "kiro".into(),
+                external_session_id: Some("pre-holder-session".into()),
+                report: AgentReport {
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "Kiro session idle".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+
+    wait_until(
+        || {
+            daemon.client.get_agent(&agent.id).is_ok_and(|agent| {
+                agent.observation.state == AgentState::Inactive
+                    && agent.observation.evidence == "Kiro launch authority unavailable"
+            })
+        },
+        "holderless Kiro Agent remained active",
+    );
+
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
