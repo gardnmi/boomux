@@ -171,6 +171,23 @@ bun test integrations/opencode/boomux.test.js \
   integrations/pi/boomux.test.js
 ```
 
+## Performance Benchmarks
+
+Use [`BENCHMARKING.md`](BENCHMARKING.md) for the benchmark tiers, fixture policy,
+local commands, and interpretation rules. Before changing a benchmarked hot path,
+save a local Criterion baseline on the same machine. Before opening a code PR, run
+the deterministic benchmark fixtures and smoke suite:
+
+```console
+cargo test --test benchmark_harness --features benchmark-internals --locked
+cargo check --benches --all-features --locked
+cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
+cargo bench --bench wire --locked -- --test
+```
+
+Criterion timing on shared runners is evidence, not a merge gate. Gungraun provides
+the deterministic instruction-count tier and requires Valgrind for execution.
+
 ## Complete Validation
 
 Before opening a pull request that changes code, configuration, packaging, or
@@ -182,6 +199,10 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --lib --bins --locked -- --test-threads=1
 cargo test --test config_cli --locked -- --test-threads=1
 cargo test --test native_backend --locked -- --test-threads=1
+cargo test --test benchmark_harness --features benchmark-internals --locked
+cargo check --benches --all-features --locked
+cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
+cargo bench --bench wire --locked -- --test
 cargo deny check
 bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
 ```

@@ -350,6 +350,332 @@ fn stable_session_id(workspace_id: &str, integration: &str, identity: &str) -> S
     Uuid::new_v5(&SESSION_ID_NAMESPACE, &name).to_string()
 }
 
+#[cfg(any(test, feature = "benchmark-internals"))]
+pub mod benchmark_support {
+    use super::*;
+    use boomux::protocol::{AgentAuthority, ShellRunSnapshot, ShellSnapshot};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SessionSummary {
+        pub sessions: usize,
+        pub occurrences: usize,
+        pub current: usize,
+        pub checksum: u64,
+    }
+
+    pub struct SessionFixture {
+        workspaces: Vec<WorkspaceSnapshot>,
+        catalog: Vec<HostSession>,
+    }
+
+    pub struct SessionProjectionResult(Vec<SessionProjection>);
+
+    impl SessionProjectionResult {
+        pub fn summary(&self) -> SessionSummary {
+            SessionSummary {
+                sessions: self.0.len(),
+                occurrences: self.0.iter().map(|session| session.occurrences.len()).sum(),
+                current: self
+                    .0
+                    .iter()
+                    .filter(|session| session.state_is_current)
+                    .count(),
+                checksum: self.0.iter().fold(0, checksum_session),
+            }
+        }
+    }
+
+    impl SessionFixture {
+        pub fn durable(
+            workspace_count: usize,
+            shells_per_workspace: usize,
+            agents_per_shell: usize,
+        ) -> Self {
+            let workspaces = (0..workspace_count)
+                .map(|workspace_index| {
+                    let workspace_id = format!("workspace-{workspace_index}");
+                    let directory = PathBuf::from(format!("/benchmark/{workspace_id}"));
+                    let shells = (0..shells_per_workspace)
+                        .map(|shell_index| {
+                            shell(
+                                &workspace_id,
+                                shell_index,
+                                directory.clone(),
+                                agents_per_shell,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let agents = shells
+                        .iter()
+                        .flat_map(|shell| {
+                            (0..agents_per_shell).map(|agent_index| {
+                                agent(&workspace_id, shell, agent_index, directory.clone())
+                            })
+                        })
+                        .collect();
+                    WorkspaceSnapshot {
+                        id: workspace_id.clone(),
+                        revision: 1,
+                        name: workspace_id,
+                        default_cwd: Some(directory),
+                        shells,
+                        launchers: Vec::new(),
+                        agents,
+                    }
+                })
+                .collect();
+            Self {
+                workspaces,
+                catalog: Vec::new(),
+            }
+        }
+
+        pub fn catalog(workspace_count: usize, record_count: usize, shared: bool) -> Self {
+            let shared_directory = PathBuf::from("/benchmark/shared");
+            let workspaces = (0..workspace_count)
+                .map(|workspace_index| {
+                    let workspace_id = format!("workspace-{workspace_index}");
+                    let directory = if shared {
+                        shared_directory.clone()
+                    } else {
+                        PathBuf::from(format!("/benchmark/{workspace_id}"))
+                    };
+                    WorkspaceSnapshot {
+                        id: workspace_id.clone(),
+                        revision: 1,
+                        name: workspace_id.clone(),
+                        default_cwd: Some(directory.clone()),
+                        shells: vec![shell(&workspace_id, 0, directory, 0)],
+                        launchers: Vec::new(),
+                        agents: Vec::new(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let catalog = (0..record_count)
+                .map(|record_index| HostSession {
+                    integration: "opencode".into(),
+                    root_id: format!("catalog-{record_index}"),
+                    title: format!("Catalog session {record_index}"),
+                    directory: if shared {
+                        shared_directory.clone()
+                    } else {
+                        PathBuf::from(format!(
+                            "/benchmark/workspace-{}",
+                            record_index % workspace_count
+                        ))
+                    },
+                    created_at_ms: record_index as u64,
+                    updated_at_ms: record_index as u64 + 1,
+                })
+                .collect();
+            Self {
+                workspaces,
+                catalog,
+            }
+        }
+
+        pub fn project(&self) -> SessionProjectionResult {
+            SessionProjectionResult(project_workspaces_with_catalog(
+                &self.workspaces,
+                (!self.catalog.is_empty()).then_some(self.catalog.as_slice()),
+            ))
+        }
+    }
+
+    fn shell(
+        workspace_id: &str,
+        shell_index: usize,
+        directory: PathBuf,
+        agents_per_shell: usize,
+    ) -> ShellSnapshot {
+        let shell_id = format!("{workspace_id}-shell-{shell_index}");
+        ShellSnapshot {
+            id: shell_id.clone(),
+            revision: 1,
+            workspace_id: workspace_id.into(),
+            name: format!("shell-{shell_index}"),
+            cwd: directory,
+            command: Vec::new(),
+            status: ShellStatus::Running,
+            run: Some(ShellRunSnapshot {
+                id: format!("{shell_id}-run"),
+                generation: 1,
+                started_at_ms: 1,
+                ended_at_ms: None,
+                exit_reason: None,
+                output_revision: agents_per_shell as u64,
+                environment_has_run_id: true,
+            }),
+            recovered_agent_id: None,
+            foreground_process: None,
+        }
+    }
+
+    fn agent(
+        workspace_id: &str,
+        shell: &ShellSnapshot,
+        agent_index: usize,
+        directory: PathBuf,
+    ) -> AgentInstanceSnapshot {
+        let run_id = shell
+            .run
+            .as_ref()
+            .expect("benchmark shell has a run")
+            .id
+            .clone();
+        let id = format!("{}-agent-{agent_index}", shell.id);
+        AgentInstanceSnapshot {
+            id: id.clone(),
+            workspace_id: workspace_id.into(),
+            shell_id: shell.id.clone(),
+            run_id,
+            name: id.clone(),
+            integration: "opencode".into(),
+            external_session_id: Some(id),
+            cwd: Some(directory),
+            started_at_ms: agent_index as u64 + 1,
+            ended_at_ms: None,
+            observation: AgentObservationSnapshot {
+                revision: 1,
+                state: if agent_index.is_multiple_of(2) {
+                    AgentState::Working
+                } else {
+                    AgentState::Idle
+                },
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "benchmark fixture".into(),
+                confidence: 100,
+                observed_at_ms: agent_index as u64 + 2,
+            },
+            attention: None,
+        }
+    }
+
+    fn checksum_session(mut checksum: u64, session: &SessionProjection) -> u64 {
+        checksum = checksum_string(checksum, &session.id);
+        checksum = checksum_string(checksum, &session.workspace_id);
+        checksum = checksum_string(checksum, &session.workspace_name);
+        checksum = checksum_string(checksum, &session.integration);
+        checksum = checksum_optional_string(checksum, session.external_session_id.as_deref());
+        checksum = checksum_string(checksum, &session.description);
+        checksum = checksum_agent_state(checksum, session.state);
+        checksum = checksum_value(checksum, u64::from(session.state_is_current));
+        checksum = checksum_value(checksum, session.started_at_ms);
+        checksum = checksum_value(checksum, session.last_at_ms);
+        checksum = checksum_optional_path(checksum, session.source_cwd.as_deref());
+        checksum = checksum_value(checksum, session.occurrences.len() as u64);
+        for occurrence in &session.occurrences {
+            checksum = checksum_string(checksum, &occurrence.agent_id);
+            checksum = checksum_string(checksum, &occurrence.shell_id);
+            checksum = checksum_string(checksum, &occurrence.run_id);
+            checksum = checksum_value(checksum, occurrence.started_at_ms);
+            checksum = checksum_optional_u64(checksum, occurrence.ended_at_ms);
+            checksum = checksum_value(checksum, occurrence.observation.revision);
+            checksum = checksum_agent_state(checksum, occurrence.observation.state);
+            checksum = checksum_authority(checksum, occurrence.observation.authority);
+            checksum = checksum_string(checksum, &occurrence.observation.evidence);
+            checksum = checksum_value(checksum, u64::from(occurrence.observation.confidence));
+            checksum = checksum_value(checksum, occurrence.observation.observed_at_ms);
+            checksum = checksum_value(checksum, u64::from(occurrence.is_current));
+            checksum =
+                checksum_optional_string(checksum, occurrence.retained_shell_name.as_deref());
+            checksum = checksum_optional_path(checksum, occurrence.retained_shell_cwd.as_deref());
+            checksum = checksum_optional_path(checksum, occurrence.source_cwd.as_deref());
+        }
+        checksum
+    }
+
+    fn checksum_string(checksum: u64, value: &str) -> u64 {
+        let mut checksum = checksum_value(checksum, value.len() as u64);
+        for byte in value.bytes() {
+            checksum = checksum_value(checksum, u64::from(byte));
+        }
+        checksum
+    }
+
+    fn checksum_optional_string(checksum: u64, value: Option<&str>) -> u64 {
+        match value {
+            Some(value) => checksum_string(checksum_value(checksum, 1), value),
+            None => checksum_value(checksum, 0),
+        }
+    }
+
+    fn checksum_optional_path(checksum: u64, value: Option<&Path>) -> u64 {
+        match value {
+            Some(value) => checksum_string(
+                checksum_value(checksum, 1),
+                value.to_string_lossy().as_ref(),
+            ),
+            None => checksum_value(checksum, 0),
+        }
+    }
+
+    fn checksum_optional_u64(checksum: u64, value: Option<u64>) -> u64 {
+        match value {
+            Some(value) => checksum_value(checksum_value(checksum, 1), value),
+            None => checksum_value(checksum, 0),
+        }
+    }
+
+    fn checksum_agent_state(checksum: u64, state: AgentState) -> u64 {
+        checksum_value(
+            checksum,
+            match state {
+                AgentState::Unknown => 0,
+                AgentState::Working => 1,
+                AgentState::Blocked => 2,
+                AgentState::Idle => 3,
+                AgentState::Inactive => 4,
+                AgentState::Done => 5,
+            },
+        )
+    }
+
+    fn checksum_authority(checksum: u64, authority: AgentAuthority) -> u64 {
+        checksum_value(
+            checksum,
+            match authority {
+                AgentAuthority::LifecycleIntegration => 0,
+                AgentAuthority::ProcessAdapter => 1,
+                AgentAuthority::TerminalHeuristic => 2,
+                AgentAuthority::DaemonLifecycle => 3,
+            },
+        )
+    }
+
+    fn checksum_value(checksum: u64, value: u64) -> u64 {
+        checksum.wrapping_mul(0x100_0000_01b3).wrapping_add(value)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn benchmark_session_fixtures_have_stable_complete_summaries() {
+            let durable = SessionFixture::durable(64, 8, 2);
+            let summary = durable.project().summary();
+            assert_eq!(
+                (summary.sessions, summary.occurrences, summary.current),
+                (1_024, 1_024, 1_024)
+            );
+            assert_ne!(summary.checksum, 0);
+            assert_eq!(summary.checksum, 1_011_118_191_847_967_550);
+            assert_eq!(durable.project().summary(), summary);
+
+            let unique = SessionFixture::catalog(64, 400, false).project().summary();
+            assert_eq!(unique.sessions, 400);
+            assert_ne!(unique.checksum, 0);
+            assert_eq!(unique.checksum, 8_601_524_830_593_867_508);
+
+            let shared = SessionFixture::catalog(32, 400, true).project().summary();
+            assert_eq!((shared.sessions, shared.occurrences), (12_800, 0));
+            assert_ne!(shared.checksum, 0);
+            assert_eq!(shared.checksum, 6_725_822_761_224_353_157);
+        }
+    }
+}
+
 fn state_priority(state: AgentState) -> u8 {
     match state {
         AgentState::Blocked => 0,

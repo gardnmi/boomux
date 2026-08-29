@@ -108,6 +108,41 @@ jobs:
         if: env.RUN_CODE == 'true'
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
+  benchmarks:
+    name: Benchmark smoke
+    needs: changes
+    if: always()
+    runs-on: ubuntu-24.04
+    env:
+      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Skip benchmark checks for Markdown-only changes
+        if: env.RUN_CODE != 'true'
+        run: printf 'Benchmark checks are not required for Markdown-only changes.\n'
+
+      - name: Check out repository
+        if: env.RUN_CODE == 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust toolchain
+        if: env.RUN_CODE == 'true'
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Validate deterministic benchmark fixtures
+        if: env.RUN_CODE == 'true'
+        run: cargo test --test benchmark_harness --features benchmark-internals --locked
+
+      - name: Compile every benchmark target
+        if: env.RUN_CODE == 'true'
+        run: cargo check --benches --all-features --locked
+
+      - name: Smoke test Criterion benchmarks
+        if: env.RUN_CODE == 'true'
+        run: |
+          cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
+          cargo bench --bench wire --locked -- --test
+
   integrations:
     name: Integrations
     needs: changes

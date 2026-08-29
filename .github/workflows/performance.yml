@@ -1,0 +1,176 @@
+name: Performance
+
+on:
+  schedule:
+    - cron: "37 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  LC_ALL: C.UTF-8
+  RUSTUP_TOOLCHAIN: stable
+  TZ: UTC
+
+jobs:
+  criterion:
+    name: Wall-clock trends
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Record benchmark environment
+        run: |
+          rustc -Vv | tee benchmark-rustc.txt
+          uname -a | tee benchmark-uname.txt
+          lscpu | tee benchmark-cpu.txt
+          printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion" | tee benchmark-runner.txt
+          {
+            printf '## Benchmark environment\n\n```text\n'
+            cat benchmark-rustc.txt benchmark-uname.txt benchmark-cpu.txt benchmark-runner.txt
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run Criterion suites
+        id: criterion
+        run: |
+          set -o pipefail
+          cargo bench --bench core_cpu --features benchmark-internals --locked 2>&1 | tee criterion-core.txt
+          cargo bench --bench wire --locked 2>&1 | tee criterion-wire.txt
+
+      - name: Upload Criterion reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: criterion-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/criterion/
+            criterion-core.txt
+            criterion-wire.txt
+            benchmark-rustc.txt
+            benchmark-uname.txt
+            benchmark-cpu.txt
+            benchmark-runner.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summarize Criterion run
+        if: always()
+        env:
+          RESULT: ${{ steps.criterion.outcome }}
+        run: |
+          printf '## Wall-clock trends\n\nCriterion suites: `%s`\n' "$RESULT" >> "$GITHUB_STEP_SUMMARY"
+
+  instructions:
+    name: Deterministic instruction counts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GUNGRAUN_HOME: target/gungraun
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install Gungraun runner
+        run: |
+          cargo install gungraun-runner --version 0.19.4 --locked
+          gungraun-runner --version | tee gungraun-runner.txt
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes valgrind
+          valgrind --version | tee gungraun-valgrind.txt
+
+      - name: Record instruction benchmark environment
+        run: |
+          rustc -Vv | tee gungraun-rustc.txt
+          uname -a | tee gungraun-uname.txt
+          lscpu | tee gungraun-cpu.txt
+          printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion" | tee gungraun-runner-image.txt
+
+      - name: Resolve comparison base
+        id: comparison
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          git fetch --no-tags origin main
+          if [[ "$HEAD_SHA" == "$(git rev-parse origin/main)" ]]; then
+            base_sha=$(git rev-parse "$HEAD_SHA^")
+          else
+            base_sha=$(git merge-base "$HEAD_SHA" origin/main)
+          fi
+          printf 'base_sha=%s\n' "$base_sha" >> "$GITHUB_OUTPUT"
+          if git cat-file -e "$base_sha:benches/core_instructions.rs" 2>/dev/null; then
+            printf 'available=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'available=false\n' >> "$GITHUB_OUTPUT"
+            printf 'The comparison commit predates the instruction benchmark; this run establishes the first result.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Measure comparison base
+        id: base
+        if: steps.comparison.outputs.available == 'true'
+        env:
+          BASE_SHA: ${{ steps.comparison.outputs.base_sha }}
+        run: |
+          set -o pipefail
+          git checkout --detach "$BASE_SHA"
+          cargo bench --bench core_instructions --features benchmark-internals --locked -- --save-baseline=base 2>&1 | tee gungraun-base.txt
+
+      - name: Measure current revision
+        id: head
+        env:
+          HAS_BASELINE: ${{ steps.comparison.outputs.available }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          git checkout --detach "$HEAD_SHA"
+          if [[ "$HAS_BASELINE" == true ]]; then
+            cargo bench --bench core_instructions --features benchmark-internals --locked -- --baseline=base 2>&1 | tee gungraun-head.txt
+          else
+            cargo bench --bench core_instructions --features benchmark-internals --locked 2>&1 | tee gungraun-head.txt
+          fi
+
+      - name: Upload instruction-count reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gungraun-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/gungraun/
+            gungraun-base.txt
+            gungraun-head.txt
+            gungraun-runner.txt
+            gungraun-valgrind.txt
+            gungraun-rustc.txt
+            gungraun-uname.txt
+            gungraun-cpu.txt
+            gungraun-runner-image.txt
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Summarize instruction-count run
+        if: always()
+        env:
+          BASE_RESULT: ${{ steps.base.outcome }}
+          HEAD_RESULT: ${{ steps.head.outcome }}
+        run: |
+          printf '## Deterministic instruction counts\n\nBase measurement: `%s`  \nCurrent measurement: `%s`\n' \
+            "$BASE_RESULT" "$HEAD_RESULT" >> "$GITHUB_STEP_SUMMARY"

@@ -4,6 +4,9 @@ version = "1.7.1"
 edition = "2024"
 license = "MIT"
 
+[features]
+benchmark-internals = []
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
@@ -26,4 +29,28 @@ unicode-width = "0.2"
 vt100 = "=0.16.2"
 
 [dev-dependencies]
+criterion = "0.8.2"
+gungraun = "0.19.4"
 tungstenite = "0.29"
+
+[profile.bench]
+debug = true
+
+[[bench]]
+name = "core_cpu"
+harness = false
+required-features = ["benchmark-internals"]
+
+[[bench]]
+name = "core_instructions"
+harness = false
+required-features = ["benchmark-internals"]
+
+[[bench]]
+name = "wire"
+harness = false
+
+[[test]]
+name = "benchmark_harness"
+path = "tests/benchmark_harness.rs"
+required-features = ["benchmark-internals"]
