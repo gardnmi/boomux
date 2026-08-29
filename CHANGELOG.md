@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.7.0](https://github.com/gardnmi/boomux/compare/v1.6.1...v1.7.0) (2026-08-29)
+
+
+### Features
+
+* **session:** add cross-harness session navigation ([#319](https://github.com/gardnmi/boomux/issues/319)) ([81a4c95](https://github.com/gardnmi/boomux/commit/81a4c95013e8138799fdaf77bc6922819fab1a0a))
+
+
+### Bug Fixes
+
+* **kiro:** inactivate agents without live holders ([#315](https://github.com/gardnmi/boomux/issues/315)) ([b848746](https://github.com/gardnmi/boomux/commit/b8487461487b445a7af6d817c4b2e961f5de92ee))
+* **kiro:** release holders after workspace removal ([#320](https://github.com/gardnmi/boomux/issues/320)) ([f603a7b](https://github.com/gardnmi/boomux/commit/f603a7b55f9728930301a2f15c2e85cfba3db032))
+
 ## [1.6.1](https://github.com/gardnmi/boomux/compare/v1.6.0...v1.6.1) (2026-08-28)
 
 
