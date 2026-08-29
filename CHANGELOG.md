@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.7.1](https://github.com/gardnmi/boomux/compare/v1.7.0...v1.7.1) (2026-08-29)
+
+
+### Bug Fixes
+
+* **release:** separate draft creation from proposals ([#322](https://github.com/gardnmi/boomux/issues/322)) ([c357dde](https://github.com/gardnmi/boomux/commit/c357ddef7703b97877f460e17f9d2438990b3d25))
+
 ## [1.7.0](https://github.com/gardnmi/boomux/compare/v1.6.1...v1.7.0) (2026-08-29)
 
 
