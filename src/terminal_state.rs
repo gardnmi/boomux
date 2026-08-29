@@ -283,6 +283,176 @@ impl TerminalSnapshot {
     }
 }
 
+#[cfg(any(test, feature = "benchmark-internals"))]
+pub mod benchmark_support {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TerminalSummary {
+        pub preview_lines: usize,
+        pub preview_spans: usize,
+        pub preview_bytes: usize,
+        pub preview_checksum: u64,
+        pub reconstruction_bytes: usize,
+        pub reconstruction_checksum: u64,
+    }
+
+    pub struct TerminalFixture {
+        state: TerminalState,
+    }
+
+    impl TerminalFixture {
+        pub fn empty(rows: u16, cols: u16) -> Self {
+            Self {
+                state: TerminalState::new(rows, cols),
+            }
+        }
+
+        pub fn from_transcript(rows: u16, cols: u16, transcript: &[u8]) -> Self {
+            let mut fixture = Self::empty(rows, cols);
+            fixture.process(transcript);
+            fixture
+        }
+
+        pub fn from_chunked_transcript(
+            rows: u16,
+            cols: u16,
+            transcript: &[u8],
+            chunk_bytes: usize,
+        ) -> Self {
+            assert!(chunk_bytes > 0);
+            let mut fixture = Self::empty(rows, cols);
+            for chunk in transcript.chunks(chunk_bytes) {
+                fixture.process(chunk);
+            }
+            fixture
+        }
+
+        pub fn process(&mut self, bytes: &[u8]) {
+            self.state.process(bytes);
+        }
+
+        pub fn preview(
+            &self,
+            max_bytes: usize,
+            max_lines: usize,
+            max_spans: usize,
+        ) -> TerminalPreview {
+            self.state
+                .snapshot()
+                .preview(max_bytes, max_lines, max_spans)
+        }
+
+        pub fn reconstruction(&self) -> Vec<u8> {
+            self.state.reconstruction()
+        }
+
+        pub fn summary(&self) -> TerminalSummary {
+            let preview = self.preview(1024 * 1024, 16, 20_000);
+            let reconstruction = self.reconstruction();
+            TerminalSummary {
+                preview_lines: preview.lines.len(),
+                preview_spans: preview.lines.iter().map(|line| line.spans.len()).sum(),
+                preview_bytes: preview
+                    .lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .map(|span| span.text.len())
+                    .sum(),
+                preview_checksum: checksum_preview(&preview),
+                reconstruction_bytes: reconstruction.len(),
+                reconstruction_checksum: checksum_bytes(&reconstruction),
+            }
+        }
+    }
+
+    pub fn terminal_transcript(lines: usize, line_bytes: usize) -> Vec<u8> {
+        let mut transcript =
+            Vec::with_capacity(lines.saturating_mul(line_bytes.saturating_add(24)));
+        for line in 0..lines {
+            transcript.extend_from_slice(format!("\x1b[3{}mline-{line:05} ", line % 8).as_bytes());
+            let payload = line_bytes.saturating_sub(12);
+            transcript.extend(std::iter::repeat_n(b'a' + (line % 26) as u8, payload));
+            transcript.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        transcript
+    }
+
+    fn checksum_bytes(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0, |checksum, byte| {
+            checksum_value(checksum, u64::from(*byte))
+        })
+    }
+
+    fn checksum_preview(preview: &TerminalPreview) -> u64 {
+        let mut checksum = checksum_value(0, preview.lines.len() as u64);
+        for line in &preview.lines {
+            checksum = checksum_value(checksum, line.spans.len() as u64);
+            for span in &line.spans {
+                checksum = checksum_value(checksum, span.text.len() as u64);
+                for byte in span.text.bytes() {
+                    checksum = checksum_value(checksum, u64::from(byte));
+                }
+                checksum = checksum_color(checksum, span.style.foreground);
+                checksum = checksum_color(checksum, span.style.background);
+                for value in [
+                    span.style.bold,
+                    span.style.dim,
+                    span.style.italic,
+                    span.style.underline,
+                    span.style.inverse,
+                ] {
+                    checksum = checksum_value(checksum, u64::from(value));
+                }
+            }
+        }
+        checksum
+    }
+
+    fn checksum_color(checksum: u64, color: TerminalColor) -> u64 {
+        match color {
+            TerminalColor::Default => checksum_value(checksum, 0),
+            TerminalColor::Indexed(index) => {
+                checksum_value(checksum_value(checksum, 1), u64::from(index))
+            }
+            TerminalColor::Rgb { red, green, blue } => {
+                let checksum = checksum_value(checksum, 2);
+                let checksum = checksum_value(checksum, u64::from(red));
+                let checksum = checksum_value(checksum, u64::from(green));
+                checksum_value(checksum, u64::from(blue))
+            }
+        }
+    }
+
+    fn checksum_value(checksum: u64, value: u64) -> u64 {
+        checksum.wrapping_mul(0x100_0000_01b3).wrapping_add(value)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn benchmark_terminal_fixture_has_a_stable_bounded_summary() {
+            let transcript = terminal_transcript(2_048, 128);
+            let terminal = TerminalFixture::from_transcript(24, 80, &transcript);
+            let summary = terminal.summary();
+            assert_eq!(summary.preview_lines, 16);
+            assert!(summary.preview_spans >= summary.preview_lines);
+            assert!(summary.preview_bytes > 0);
+            assert_ne!(summary.preview_checksum, 0);
+            assert_eq!(summary.preview_checksum, 10_375_648_925_095_483_392);
+            assert!(summary.reconstruction_bytes <= 1024 * 1024);
+            assert_ne!(summary.reconstruction_checksum, 0);
+            assert_eq!(summary.reconstruction_checksum, 12_069_107_278_816_405_535);
+            assert_eq!(terminal.summary(), summary);
+
+            let chunked = TerminalFixture::from_chunked_transcript(24, 80, &transcript, 16 * 1024);
+            assert_eq!(chunked.summary(), summary);
+        }
+    }
+}
+
 fn plain_row(screen: &vt100::Screen, row: u16, cols: u16, wrapping: bool) -> String {
     let mut text = String::new();
     let mut next_col = 0;

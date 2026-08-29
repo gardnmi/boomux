@@ -4224,6 +4224,326 @@ fn projection_transitions(
     (NodeProjectionSyncMode::Resumed, transitions)
 }
 
+#[cfg(any(test, feature = "benchmark-internals"))]
+#[doc(hidden)]
+pub mod benchmark_support {
+    use super::*;
+
+    const STREAM_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct EventPageSummary {
+        pub count: usize,
+        pub first_id: u64,
+        pub last_id: u64,
+        pub checksum: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TransitionSummary {
+        pub baseline: bool,
+        pub count: usize,
+        pub checksum: u64,
+    }
+
+    pub struct EventFixture {
+        stream: EventStream,
+        retained: usize,
+    }
+
+    pub struct EventPageResult(Response);
+
+    impl EventPageResult {
+        pub fn summary(&self) -> EventPageSummary {
+            let Response::Events { events, .. } = &self.0 else {
+                panic!("benchmark event read returned a non-event response");
+            };
+            EventPageSummary {
+                count: events.len(),
+                first_id: events.first().map_or(0, |event| event.id),
+                last_id: events.last().map_or(0, |event| event.id),
+                checksum: events.iter().fold(0, checksum_event),
+            }
+        }
+    }
+
+    pub struct TransitionResult {
+        mode: NodeProjectionSyncMode,
+        transitions: Vec<NodeProjectionTransition>,
+    }
+
+    impl TransitionResult {
+        pub fn summary(&self) -> TransitionSummary {
+            TransitionSummary {
+                baseline: self.mode == NodeProjectionSyncMode::Baseline,
+                count: self.transitions.len(),
+                checksum: self.transitions.iter().fold(0, checksum_transition),
+            }
+        }
+    }
+
+    pub struct EventAppendFixture {
+        state: EventStreamState,
+        kinds: Vec<DaemonEventKind>,
+    }
+
+    pub struct EventAppendResult(EventStreamState);
+
+    impl EventAppendResult {
+        pub fn summary(&self) -> EventPageSummary {
+            summarize_events(&self.0.events)
+        }
+    }
+
+    impl Clone for EventAppendFixture {
+        fn clone(&self) -> Self {
+            Self {
+                state: EventStreamState {
+                    stream_id: self.state.stream_id.clone(),
+                    latest_id: self.state.latest_id,
+                    events: self.state.events.clone(),
+                },
+                kinds: self.kinds.clone(),
+            }
+        }
+    }
+
+    impl EventFixture {
+        pub fn retained(count: usize) -> Self {
+            assert!(count <= MAX_RETAINED_EVENTS);
+            let events = (1..=count)
+                .map(|index| DaemonEvent {
+                    id: index as u64,
+                    at_ms: 1_000_000 + index as u64,
+                    kind: DaemonEventKind::WorkspaceClosed {
+                        workspace_id: format!("workspace-{index}"),
+                    },
+                })
+                .collect();
+            Self {
+                stream: EventStream::from_transfer(Some(handoff::EventStreamManifest {
+                    stream_id: STREAM_ID.into(),
+                    latest_id: count as u64,
+                    events,
+                })),
+                retained: count,
+            }
+        }
+
+        pub fn read_page(&self, distance_from_tail: usize, limit: usize) -> EventPageResult {
+            assert!(distance_from_tail <= self.retained);
+            let cursor = EventCursor {
+                stream_id: STREAM_ID.into(),
+                event_id: (self.retained - distance_from_tail) as u64,
+            };
+            EventPageResult(
+                self.stream
+                    .read_after(&cursor, limit, 0, || false)
+                    .expect("benchmark event cursor remains valid"),
+            )
+        }
+
+        pub fn projection_cut(&self, distance_from_tail: usize) -> TransitionResult {
+            assert!(distance_from_tail <= self.retained);
+            let state = lock(&self.stream.state).expect("benchmark event state lock");
+            let through = EventCursor {
+                stream_id: STREAM_ID.into(),
+                event_id: self.retained as u64,
+            };
+            let after = EventCursor {
+                stream_id: STREAM_ID.into(),
+                event_id: (self.retained - distance_from_tail) as u64,
+            };
+            let (mode, transitions) = projection_transitions(&state, Some(&after), &through);
+            TransitionResult { mode, transitions }
+        }
+    }
+
+    impl EventAppendFixture {
+        pub fn retained_with_batch(retained: usize, batch: usize) -> Self {
+            let fixture = EventFixture::retained(retained);
+            let state = lock(&fixture.stream.state)
+                .expect("benchmark event state lock")
+                .to_owned_for_benchmark();
+            let kinds = (0..batch)
+                .map(|index| DaemonEventKind::WorkspaceClosed {
+                    workspace_id: format!("appended-workspace-{index}"),
+                })
+                .collect();
+            Self { state, kinds }
+        }
+
+        pub fn append(mut self) -> EventAppendResult {
+            EventStream::append_batch_locked(&mut self.state, self.kinds);
+            EventAppendResult(self.state)
+        }
+    }
+
+    impl EventStreamState {
+        fn to_owned_for_benchmark(&self) -> Self {
+            Self {
+                stream_id: self.stream_id.clone(),
+                latest_id: self.latest_id,
+                events: self.events.clone(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct RuntimeEventFixture {
+        events: Vec<DaemonEventKind>,
+    }
+
+    pub struct RuntimeEventResult(TransitionState);
+
+    impl RuntimeEventResult {
+        pub fn summary(&self) -> EventPageSummary {
+            let checksum = self
+                .0
+                .pending_runtime_events
+                .iter()
+                .fold(0_u64, |checksum, event| match event {
+                    DaemonEventKind::NodeProjectionChanged {
+                        node_id,
+                        cache_generation,
+                    } => checksum_bytes(
+                        mix_checksum(checksum, *cache_generation),
+                        node_id.as_bytes(),
+                    ),
+                    DaemonEventKind::FocusedTerminalPresentationChanged => {
+                        mix_checksum(checksum, u64::MAX)
+                    }
+                    _ => checksum,
+                });
+            EventPageSummary {
+                count: self.0.pending_runtime_events.len(),
+                first_id: 0,
+                last_id: 0,
+                checksum,
+            }
+        }
+    }
+
+    impl RuntimeEventFixture {
+        pub fn invalidations(nodes: usize, revisions: usize) -> Self {
+            let mut events =
+                Vec::with_capacity(nodes.saturating_mul(revisions).saturating_add(revisions));
+            for revision in 1..=revisions {
+                for node in 0..nodes {
+                    events.push(DaemonEventKind::NodeProjectionChanged {
+                        node_id: format!("node-{node}"),
+                        cache_generation: revision as u64,
+                    });
+                }
+                events.push(DaemonEventKind::FocusedTerminalPresentationChanged);
+            }
+            Self { events }
+        }
+
+        pub fn coalesce(self) -> RuntimeEventResult {
+            let mut transition = TransitionState {
+                persistence_in_flight: true,
+                ..TransitionState::default()
+            };
+            for event in self.events {
+                transition.queue_runtime_event(event);
+            }
+            RuntimeEventResult(transition)
+        }
+    }
+
+    fn summarize_events(events: &VecDeque<DaemonEvent>) -> EventPageSummary {
+        EventPageSummary {
+            count: events.len(),
+            first_id: events.front().map_or(0, |event| event.id),
+            last_id: events.back().map_or(0, |event| event.id),
+            checksum: events.iter().fold(0, checksum_event_without_time),
+        }
+    }
+
+    fn checksum_event(checksum: u64, event: &DaemonEvent) -> u64 {
+        checksum_workspace_event(
+            mix_checksum(mix_checksum(checksum, event.id), event.at_ms),
+            &event.kind,
+        )
+    }
+
+    fn checksum_event_without_time(checksum: u64, event: &DaemonEvent) -> u64 {
+        checksum_workspace_event(mix_checksum(checksum, event.id), &event.kind)
+    }
+
+    fn checksum_workspace_event(checksum: u64, kind: &DaemonEventKind) -> u64 {
+        let DaemonEventKind::WorkspaceClosed { workspace_id } = kind else {
+            panic!("benchmark event fixture contains an unexpected event kind");
+        };
+        checksum_bytes(checksum, workspace_id.as_bytes())
+    }
+
+    fn checksum_transition(checksum: u64, transition: &NodeProjectionTransition) -> u64 {
+        let checksum = mix_checksum(
+            mix_checksum(checksum, transition.event_id),
+            transition.at_ms,
+        );
+        let NodeProjectionTransitionKind::Workspace { workspace_id } = &transition.kind else {
+            panic!("benchmark transition fixture contains an unexpected transition kind");
+        };
+        checksum_bytes(checksum, workspace_id.as_bytes())
+    }
+
+    fn checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
+        for byte in bytes {
+            checksum = mix_checksum(checksum, u64::from(*byte));
+        }
+        checksum
+    }
+
+    fn mix_checksum(checksum: u64, value: u64) -> u64 {
+        checksum.wrapping_mul(0x100_0000_01b3).wrapping_add(value)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn benchmark_event_fixtures_have_stable_bounded_results() {
+            let events = EventFixture::retained(MAX_RETAINED_EVENTS);
+            let page = events.read_page(256, 256).summary();
+            assert_eq!(
+                (page.count, page.first_id, page.last_id),
+                (256, 7_937, 8_192)
+            );
+            assert_ne!(page.checksum, 0);
+            assert_eq!(page.checksum, 14_253_501_652_687_160_347);
+            assert_eq!(events.read_page(256, 256).summary(), page);
+
+            let resumed = events.projection_cut(256).summary();
+            assert!(!resumed.baseline);
+            assert_eq!(resumed.count, 256);
+            assert_ne!(resumed.checksum, 0);
+            assert_eq!(resumed.checksum, 14_253_501_652_687_160_347);
+            assert_eq!(events.projection_cut(256).summary(), resumed);
+            assert!(events.projection_cut(257).summary().baseline);
+
+            let appended = EventAppendFixture::retained_with_batch(MAX_RETAINED_EVENTS, 256)
+                .append()
+                .summary();
+            assert_eq!(
+                (appended.count, appended.first_id, appended.last_id),
+                (MAX_RETAINED_EVENTS, 257, 8_448)
+            );
+            assert_ne!(appended.checksum, 0);
+            assert_eq!(appended.checksum, 8_051_509_862_202_861_121);
+
+            let coalesced = RuntimeEventFixture::invalidations(128, 64)
+                .coalesce()
+                .summary();
+            assert_eq!(coalesced.count, 129);
+            assert_eq!(coalesced.checksum, 9_953_927_640_701_513_843);
+        }
+    }
+}
+
 fn reduce_projection_transition(event: &DaemonEvent) -> Option<NodeProjectionTransition> {
     let kind = match &event.kind {
         DaemonEventKind::WorkspaceCreated { workspace_id, .. }

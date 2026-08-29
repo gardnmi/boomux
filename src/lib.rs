@@ -1,6 +1,9 @@
 extern crate self as boomux;
 
 pub mod attach;
+#[cfg(feature = "benchmark-internals")]
+#[doc(hidden)]
+pub mod benchmark_support;
 pub mod client;
 pub mod daemon;
 mod desktop_notifications;

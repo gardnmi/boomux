@@ -33,6 +33,10 @@ cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --lib --bins --locked -- --test-threads=1
 cargo test --test config_cli --locked -- --test-threads=1
 cargo test --test native_backend --locked -- --test-threads=1
+cargo test --test benchmark_harness --features benchmark-internals --locked
+cargo check --benches --all-features --locked
+cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
+cargo bench --bench wire --locked -- --test
 cargo deny check
 bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
 ```
@@ -50,6 +54,7 @@ exercise process, socket, PTY, and daemon lifecycle behavior.
 | PTY, attachment, or process lifecycle | Colocated unit tests plus serial `native_backend` scenarios |
 | Graceful handoff | Serial native tests covering rollback, reconnect, PID preservation, and later cleanup |
 | TUI state or rendering | Focused `tui.rs` model, input, and rendering tests |
+| Performance hot path or benchmark | Semantic tests, deterministic benchmark fixtures, benchmark smoke, and before/after evidence from the same machine |
 | OpenCode, Pi, Claude, Codex, or Kiro reducer | The corresponding focused reducer tests, including `boomux-tui.test.js` for OpenCode TUI claims |
 | Host compatibility claim | Focused fixtures plus an update to `docs/lifecycle-validation.md` when validated live |
 
