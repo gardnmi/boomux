@@ -66,14 +66,31 @@ jobs:
             printf 'exists=false\n' >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run Release Please
-        if: ${{ (github.event_name != 'workflow_dispatch' || inputs.tag == '') && steps.pending-draft.outputs.exists != 'true' }}
+      # A draft created in this run is not discoverable as the latest release.
+      # Keep proposal generation out of the release-creation invocation.
+      - name: Create merged release
+        if: >-
+          ${{ (github.event_name != 'workflow_dispatch' || inputs.tag == '') &&
+              steps.pending-draft.outputs.exists != 'true' }}
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+      - name: Update release proposal
+        if: >-
+          ${{ (github.event_name != 'workflow_dispatch' || inputs.tag == '') &&
+              steps.pending-draft.outputs.exists != 'true' &&
+              steps.release.outputs.release_created != 'true' }}
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
 
       - name: Verify release source passed triggering CI
         if: ${{ github.event_name == 'workflow_run' && steps.release.outputs.release_created == 'true' }}
