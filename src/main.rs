@@ -895,6 +895,9 @@ enum SessionCommands {
         /// Exact registered Node alias or Node ID
         #[arg(long)]
         node: Option<String>,
+        /// Coordinated Workspace to use for optional desktop placement
+        #[arg(long, value_name = "COORDINATED_WORKSPACE")]
+        workspace: Option<String>,
     },
     /// Resume one exact projected session in a native terminal
     Resume {
@@ -4072,7 +4075,7 @@ fn dashboard_session_effect(
             tui::DashboardEvent::SessionInspected { identity, result }
         }
         tui::DashboardEffect::ActivateSession(identity) => tui::DashboardEvent::OperationCompleted(
-            open_exact_session(&identity, local_node_id, terminal_entry),
+            open_exact_session(&identity, local_node_id, terminal_entry, None),
         ),
         effect => panic!("unexpected effect on Session worker: {effect:?}"),
     }
@@ -4368,50 +4371,237 @@ fn open_exact_session(
     identity: &protocol::QualifiedIdentity,
     local_node_id: &str,
     terminal_entry: Option<&str>,
+    coordinated_workspace: Option<&str>,
 ) -> Result<String, String> {
     let inspection = inspect_session_on_node(identity, local_node_id)?;
+    session_open_action(&inspection)?;
     let summary = &inspection.summary;
     let remote = identity.node_id != local_node_id && !identity.node_id.is_empty();
-    let workspace = if summary.state_is_current {
+    let (workspace, source_cwd) = if summary.state_is_current {
         let client = client::connect().map_err(|error| error.to_string())?;
-        Some(if remote {
-            match client
-                .route_node_operation(
-                    &identity.node_id,
-                    protocol::RoutedOperation::GetWorkspace {
-                        workspace_id: summary.workspace_id.clone(),
-                    },
-                )
-                .map_err(|error| error.to_string())?
-            {
-                protocol::RoutedOperationResult::Workspace { workspace } => workspace,
-                _ => return Err("Node returned an unexpected Workspace response".into()),
-            }
-        } else {
-            client
-                .get_workspace(&summary.workspace_id)
-                .map_err(|error| error.to_string())?
-        })
+        (
+            Some(if remote {
+                match client
+                    .route_node_operation(
+                        &identity.node_id,
+                        protocol::RoutedOperation::GetWorkspace {
+                            workspace_id: summary.workspace_id.clone(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?
+                {
+                    protocol::RoutedOperationResult::Workspace { workspace } => workspace,
+                    _ => return Err("Node returned an unexpected Workspace response".into()),
+                }
+            } else {
+                client
+                    .get_workspace(&summary.workspace_id)
+                    .map_err(|error| error.to_string())?
+            }),
+            None,
+        )
     } else {
-        validate_session_cwd(identity, local_node_id, &inspection)?;
-        None
+        (
+            None,
+            Some(validate_session_cwd(identity, local_node_id, &inspection)?),
+        )
     };
+    if !summary.state_is_current
+        && let Some(target) = coordinated_workspace
+    {
+        open_managed_historical_session(
+            identity,
+            &inspection,
+            source_cwd.as_deref().expect("historical Session cwd"),
+            target,
+            terminal_entry,
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(format!(
+            "Opened managed terminal for historical Session {}",
+            summary.description
+        ));
+    }
+    let placement = coordinated_workspace
+        .map(|target| {
+            let client = client::connect().map_err(|error| error.to_string())?;
+            prepare_session_desktop_placement(&client, target).map_err(|error| error.to_string())
+        })
+        .transpose()?
+        .flatten();
     let plan = session_open_plan(identity, local_node_id, &inspection, workspace.as_ref())?;
     dispatch_session_open(
         &plan,
         |shell_id, run_id, title| {
-            terminal::open_exact_run(terminal_entry, shell_id, run_id, title, true)
-                .map_err(|error| error.to_string())
+            if let Some(workspace_id) = placement.as_deref() {
+                terminal::open_exact_run_placed(
+                    terminal_entry,
+                    shell_id,
+                    run_id,
+                    title,
+                    true,
+                    terminal::HyprlandPlacement {
+                        workspace_id,
+                        node_id: local_node_id,
+                        shell_id,
+                    },
+                )
+            } else {
+                terminal::open_exact_run(terminal_entry, shell_id, run_id, title, true)
+            }
+            .map_err(|error| error.to_string())
         },
         |node_id, shell_id, run_id, title| {
-            terminal::open_remote_exact_run(terminal_entry, node_id, shell_id, run_id, title, true)
-                .map_err(|error| error.to_string())
+            if let Some(workspace_id) = placement.as_deref() {
+                terminal::open_remote_exact_run_placed(
+                    terminal_entry,
+                    node_id,
+                    shell_id,
+                    run_id,
+                    title,
+                    true,
+                    workspace_id,
+                )
+            } else {
+                terminal::open_remote_exact_run(
+                    terminal_entry,
+                    node_id,
+                    shell_id,
+                    run_id,
+                    title,
+                    true,
+                )
+            }
+            .map_err(|error| error.to_string())
         },
         |node_id, session_id, title| {
             terminal::open_agent_session(terminal_entry, node_id, session_id, title)
                 .map_err(|error| error.to_string())
         },
     )
+}
+
+fn open_managed_historical_session(
+    identity: &protocol::QualifiedIdentity,
+    inspection: &protocol::HostAgentSessionInspection,
+    cwd: &Path,
+    coordinated_workspace: &str,
+    terminal_entry: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let summary = &inspection.summary;
+    let external_session_id = summary.external_session_id.as_deref().ok_or_else(|| {
+        cli_output::failure("invalid_argument", "Session has no canonical external ID")
+    })?;
+    let integration = boomux::integrations::by_key(&summary.integration)
+        .ok_or_else(|| cli_output::failure("invalid_argument", "unknown Agent integration"))?;
+    let resume = integration.resume.ok_or_else(|| {
+        cli_output::failure(
+            "invalid_argument",
+            "integration does not support exact Session resume",
+        )
+    })?;
+    let resume_command = resume.command(&[], external_session_id).ok_or_else(|| {
+        cli_output::failure(
+            "invalid_argument",
+            "could not build exact Session resume argv",
+        )
+    })?;
+    let client = client::connect()?;
+    let context = WorkspaceCreationContext::load(&client)?;
+    let selection = context
+        .coordinated_owner(coordinated_workspace, Some(&identity.node_id))?
+        .ok_or_else(|| {
+            cli_output::failure(
+                "not_found",
+                format!("coordinated Workspace not found: {coordinated_workspace}"),
+            )
+        })?;
+    let boomux_executable = if selection.node.local {
+        env::current_exe()?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "Boomux executable path is not valid UTF-8")?
+    } else {
+        "boomux".into()
+    };
+    let command = supervised_session_resume_command(
+        &boomux_executable,
+        integration.display_name,
+        integration.key,
+        external_session_id,
+        &resume_command,
+    );
+    let shell_id = Uuid::new_v4().to_string();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let name = format!("{}-session-{}", summary.integration, &suffix[..8]);
+    let title = if selection.node.local {
+        format!("{} - {name}", selection.workspace.name)
+    } else {
+        format!(
+            "[{}] {} - {name}",
+            selection.node.alias, selection.workspace.name
+        )
+    };
+    let gate = if hyprland_special_workspaces_enabled()? {
+        terminal::open_waiting_placed(
+            terminal_entry,
+            (!selection.node.local).then_some(selection.node.node_id.as_str()),
+            &selection.node.node_id,
+            &selection.workspace.id,
+            &shell_id,
+            &title,
+        )?
+    } else {
+        terminal::open_waiting(
+            terminal_entry,
+            (!selection.node.local).then_some(selection.node.node_id.as_str()),
+            &shell_id,
+            &title,
+        )?
+    };
+    let owner_default_cwd = selection
+        .default_cwd
+        .clone()
+        .or_else(|| Some(cwd.to_path_buf()));
+    let (_, shell) = client.create_global_workspace_shell(
+        Uuid::new_v4().to_string(),
+        &selection.workspace.id,
+        selection.workspace.revision,
+        &selection.node.node_id,
+        selection.owner_workspace_id,
+        owner_default_cwd,
+        shell_id,
+        shell_spec(name, cwd, &command),
+    )?;
+    gate.release().map_err(|error| {
+        format!(
+            "Shell {} was created but its terminal could not attach: {error}",
+            shell.id
+        )
+    })?;
+    Ok(())
+}
+
+fn supervised_session_resume_command(
+    boomux_executable: &str,
+    agent_name: &str,
+    integration: &str,
+    external_session_id: &str,
+    resume_command: &[String],
+) -> Vec<String> {
+    let mut command = vec![
+        boomux_executable.to_owned(),
+        "agent".into(),
+        "supervise".into(),
+        agent_name.to_owned(),
+        "--integration".into(),
+        integration.to_owned(),
+        "--external-session-id".into(),
+        external_session_id.to_owned(),
+        "--".into(),
+    ];
+    command.extend_from_slice(resume_command);
+    command
 }
 
 fn assign_local_workspace_node(workspaces: &mut [tui::WorkspaceView], node: &tui::NodeView) {
@@ -8842,7 +9032,12 @@ fn session_command(
 ) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     validate_session_protocol(client.protocol_version()?)?;
-    if let SessionCommands::Open { session_id, node } = &command {
+    if let SessionCommands::Open {
+        session_id,
+        node,
+        workspace,
+    } = &command
+    {
         let local_node_id = client.node_identity()?;
         let owner_node_id = match node {
             Some(node) => client.node_registration(node)?.node_id,
@@ -8853,6 +9048,7 @@ fn session_command(
             &protocol::QualifiedIdentity::new(owner_node_id, session_id),
             &local_node_id,
             terminal.as_deref(),
+            workspace.as_deref(),
         )
         .map_err(io::Error::other)?;
         println!("{message}");
@@ -8875,24 +9071,15 @@ fn session_command(
                 .as_deref()
                 .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
                 .transpose()?;
-            let catalog = selected_workspace.map_or_else(
-                || discover_host_catalog(&snapshot.workspaces),
-                |workspace| discover_host_catalog(std::slice::from_ref(workspace)),
-            );
-            let sessions =
-                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
             let workspace_id = selected_workspace.map(|workspace| workspace.id.as_str());
-            let sessions = sessions
-                .iter()
-                .filter(|session| {
-                    workspace_id.is_none_or(|workspace_id| session.workspace_id == workspace_id)
-                })
-                .collect::<Vec<_>>();
+            let result =
+                client.host_service(protocol::HostServiceOperation::ListAgentSessions {
+                    workspace_id: workspace_id.map(str::to_owned),
+                })?;
+            let protocol::HostServiceResult::AgentSessions { sessions } = result else {
+                return Err("daemon returned an unexpected Session-list response".into());
+            };
             if json {
-                let sessions = sessions
-                    .iter()
-                    .map(|session| cli_output::session_summary(session))
-                    .collect::<Vec<_>>();
                 return print_json(
                     CommandKey::SessionList,
                     serde_json::json!({ "sessions": sessions }),
@@ -8915,7 +9102,7 @@ fn session_command(
                         "last-known"
                     },
                     session.last_at_ms,
-                    session.occurrences.len()
+                    session.occurrence_count
                 );
             }
         }
@@ -10516,6 +10703,34 @@ fn prepare_shell_desktop_placement(
         owner_workspace_id,
         &combined.workspaces,
     )
+}
+
+fn prepare_session_desktop_placement(
+    client: &client::Client,
+    target: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let combined = client.combined_node_snapshot(None)?;
+    let workspace =
+        resolve_global_workspace_target(&combined.workspaces, target).ok_or_else(|| {
+            cli_output::failure(
+                "not_found",
+                format!("coordinated Workspace not found: {target}"),
+            )
+        })?;
+    if workspace.closing {
+        return Err(cli_output::failure(
+            "invalid_argument",
+            "the selected coordinated Workspace is closing",
+        ));
+    }
+    if !hyprland_special_workspaces_enabled()? {
+        return Ok(None);
+    }
+    if hyprland::active_boomux_workspace()?.as_deref() != Some(workspace.id.as_str()) {
+        hyprland::toggle_special(&workspace.id)?;
+    }
+    select_desktop_workspace(workspace)?;
+    Ok(Some(workspace.id.clone()))
 }
 
 fn prepare_shell_desktop_placement_from_snapshot(
@@ -13213,16 +13428,25 @@ mod tests {
         assert_eq!(inspect.command_descriptor().key, "session.inspect");
         assert_eq!(inspect.command_descriptor().output, OutputMode::Json);
 
-        let open =
-            Cli::try_parse_from(["boomux", "session", "open", "opaque", "--node", "workbox"])
-                .unwrap();
+        let open = Cli::try_parse_from([
+            "boomux",
+            "session",
+            "open",
+            "opaque",
+            "--node",
+            "workbox",
+            "--workspace",
+            "active",
+        ])
+        .unwrap();
         assert_eq!(open.command_descriptor().key, "session.open");
         assert_eq!(open.command_descriptor().output, OutputMode::HumanOnly);
         assert!(matches!(
             open.command,
             Some(Commands::Session {
-                command: SessionCommands::Open { session_id, node }
+                command: SessionCommands::Open { session_id, node, workspace }
             }) if session_id == "opaque" && node.as_deref() == Some("workbox")
+                && workspace.as_deref() == Some("active")
         ));
 
         let json_open =
@@ -15612,6 +15836,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resumed.into_inner(), vec![(None, "exact-session".into())]);
+    }
+
+    #[test]
+    fn managed_historical_session_supervision_preserves_exact_identity_and_argv() {
+        let command = supervised_session_resume_command(
+            "/opt/boomux",
+            "OpenCode",
+            "opencode",
+            "ses_exact; literal",
+            &[
+                "opencode".into(),
+                "--session".into(),
+                "ses_exact; literal".into(),
+            ],
+        );
+        assert_eq!(
+            command,
+            [
+                "/opt/boomux",
+                "agent",
+                "supervise",
+                "OpenCode",
+                "--integration",
+                "opencode",
+                "--external-session-id",
+                "ses_exact; literal",
+                "--",
+                "opencode",
+                "--session",
+                "ses_exact; literal",
+            ]
+        );
+        let parsed = Cli::try_parse_from(command).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Agent {
+                command: AgentCommands::Supervise(AgentSuperviseArgs {
+                    name: Some(name),
+                    integration,
+                    external_session_id,
+                    command,
+                    ..
+                })
+            }) if name == "OpenCode"
+                && integration == "opencode"
+                && external_session_id == "ses_exact; literal"
+                && command == ["opencode", "--session", "ses_exact; literal"]
+        ));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Stdio;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use boomux::client::Client;
 use boomux::protocol::{
@@ -444,16 +444,20 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
 
 #[test]
 fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
-    let mut daemon = TestDaemon::start();
-    let bin = daemon.runtime_dir.join("codex-catalog-bin");
-    fs::create_dir(&bin).unwrap();
-    let codex = bin.join("codex");
-    fs::write(
-        &codex,
-        "#!/bin/sh\n[ \"$1\" = app-server ] || exit 64\nIFS= read -r line || exit 65\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nIFS= read -r line || exit 66\nIFS= read -r line || exit 67\nprintf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"id\":\"codex-history\",\"name\":\"Historical Codex thread\",\"preview\":\"fallback\",\"ephemeral\":false,\"createdAt\":10,\"updatedAt\":20}],\"nextCursor\":null}}'\n",
-    )
-    .unwrap();
-    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("codex-catalog-bin");
+        fs::create_dir(&bin).unwrap();
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            "#!/bin/sh\nprintf x >> \"$CODEX_CATALOG_COUNT\"\n/bin/sleep 1\n[ \"$1\" = app-server ] || exit 64\nIFS= read -r line || exit 65\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nIFS= read -r line || exit 66\nIFS= read -r line || exit 67\nprintf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"id\":\"codex-history\",\"name\":\"Historical Codex thread\",\"preview\":\"fallback\",\"ephemeral\":false,\"createdAt\":10,\"updatedAt\":20}],\"nextCursor\":null}}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+        command
+            .env("PATH", &bin)
+            .env("CODEX_CATALOG_COUNT", runtime_dir.join("catalog-count"));
+    });
     let workspace = daemon
         .client
         .create_workspace(
@@ -462,12 +466,13 @@ fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
         )
         .unwrap();
 
+    let list_started = Instant::now();
     let output = daemon
         .command()
         .args(["session", "list", "--workspace", &workspace.id, "--json"])
-        .env("PATH", &bin)
         .output()
         .unwrap();
+    let list_elapsed = list_started.elapsed();
     assert!(
         output.status.success(),
         "{}",
@@ -481,6 +486,34 @@ fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
     assert_eq!(sessions[0]["description"], "Historical Codex thread");
     assert_eq!(sessions[0]["state"], "unknown");
     assert_eq!(sessions[0]["occurrence_count"], 0);
+    let session_id = sessions[0]["id"].as_str().unwrap();
+    let inspect_started = Instant::now();
+    assert!(matches!(
+        daemon
+            .client
+            .request(Request::HostService {
+                operation: protocol::HostServiceOperation::InspectAgentSession {
+                    session_id: session_id.into(),
+                },
+            })
+            .unwrap(),
+        Response::HostService {
+            result: protocol::HostServiceResult::AgentSession { .. }
+        }
+    ));
+    let inspect_elapsed = inspect_started.elapsed();
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("catalog-count")).unwrap(),
+        b"x"
+    );
+    assert!(list_elapsed >= Duration::from_millis(900));
+    assert!(
+        inspect_elapsed < Duration::from_millis(250),
+        "cached Session inspection took {inspect_elapsed:?}"
+    );
+    eprintln!(
+        "cold Session catalog took {list_elapsed:?}; cached inspection took {inspect_elapsed:?}"
+    );
 
     daemon.stop_with_cli();
 }
@@ -1031,6 +1064,90 @@ fn cold_recovery_attaches_opencode_session_to_shared_runtime_and_new_run() {
     );
 
     drop(recovered_attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn supervised_opencode_resume_attaches_to_warm_shared_runtime_without_cold_start() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let runtime_bin = runtime_dir.join("bin");
+        fs::create_dir(&runtime_bin).unwrap();
+        let opencode = runtime_bin.join("opencode");
+        fs::write(
+            &opencode,
+            "#!/bin/sh\ncase \"${1-}\" in\n  serve) exec python3 -c 'import socket,sys,time; s=socket.socket(); s.bind((\"127.0.0.1\", int(sys.argv[5]))); s.listen(); time.sleep(60)' \"$@\" ;;\n  attach) { for arg do printf 'arg:%s\\n' \"$arg\"; done; printf 'generation:%s\\nshell:%s\\nrun:%s\\n' \"$BOOMUX_OPENCODE_SHARED_GENERATION\" \"$BOOMUX_SHELL_ID\" \"$BOOMUX_RUN_ID\"; } > \"$CAPTURE\"; while :; do sleep 60; done ;;\n  *) printf 'standalone:%s\\n' \"$*\" > \"$STANDALONE_CAPTURE\"; while :; do sleep 60; done ;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&opencode, fs::Permissions::from_mode(0o700)).unwrap();
+        command
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    runtime_bin.display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("CAPTURE", runtime_dir.join("shared-resume"))
+            .env("STANDALONE_CAPTURE", runtime_dir.join("standalone-resume"));
+    });
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let runtime = ensure_test_opencode_runtime(&daemon, port).unwrap();
+    let session_id = "ses_managed_resume_exact";
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "managed-shared-opencode",
+            vec![ShellSpec {
+                name: "opencode-session".into(),
+                command: vec![
+                    daemon.executable.display().to_string(),
+                    "agent".into(),
+                    "supervise".into(),
+                    "OpenCode".into(),
+                    "--integration".into(),
+                    "opencode".into(),
+                    "--external-session-id".into(),
+                    session_id.into(),
+                    "--".into(),
+                    "opencode".into(),
+                    "--session".into(),
+                    session_id.into(),
+                ],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let capture = daemon.runtime_dir.join("shared-resume");
+    let standalone_capture = daemon.runtime_dir.join("standalone-resume");
+
+    let started = Instant::now();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    wait_until(
+        || capture.is_file(),
+        "supervised OpenCode resume did not attach to the shared runtime",
+    );
+    let elapsed = started.elapsed();
+    let shell = daemon.client.get_shell(&shell_id).unwrap();
+    let run = shell.run.unwrap();
+    let captured = fs::read_to_string(capture).unwrap();
+    assert!(captured.contains("arg:attach\n"));
+    assert!(captured.contains(&format!("arg:{}\n", runtime.url)));
+    assert!(captured.contains(&format!("arg:--session\narg:{session_id}\n")));
+    assert!(captured.contains(&format!("generation:{}\n", runtime.generation_id)));
+    assert!(captured.contains(&format!("shell:{shell_id}\n")));
+    assert!(captured.contains(&format!("run:{}\n", run.id)));
+    assert!(!standalone_capture.exists());
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "warm shared resume took {elapsed:?}"
+    );
+    eprintln!("warm shared OpenCode resume attached in {elapsed:?}");
+
+    drop(attachment);
     daemon.stop_with_cli();
 }
 

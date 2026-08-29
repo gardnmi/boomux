@@ -89,6 +89,7 @@ const MAX_NAME_BYTES: usize = 256;
 const MAX_AGENT_EVIDENCE_BYTES: usize = 4 * 1024;
 const MAX_HOST_SERVICE_PREVIEWS: usize = 64;
 const HOST_SERVICE_PREVIEW_TTL: Duration = Duration::from_secs(300);
+const HOST_SESSION_CATALOG_TTL: Duration = Duration::from_secs(30);
 const MAX_TERMINAL_ROWS: u16 = 1_000;
 const MAX_TERMINAL_COLS: u16 = 1_000;
 const MAX_TERMINAL_PREVIEW_LINES: usize = 500;
@@ -1260,6 +1261,42 @@ fn resolve_executable(
 
 fn opencode_shim_eligible(shell: &Shell, effective_command: &[String]) -> bool {
     shell.command.is_empty() && effective_command.is_empty()
+}
+
+fn supervised_opencode_session(effective_command: &[String]) -> Option<&str> {
+    if effective_command.len() != 12 {
+        return None;
+    }
+    let external_session_id = &effective_command[7];
+    let session_id = &effective_command[11];
+    (Path::new(&effective_command[0]).file_name()?.to_str()? == "boomux"
+        && effective_command[1] == "agent"
+        && effective_command[2] == "supervise"
+        && effective_command[4] == "--integration"
+        && effective_command[5] == "opencode"
+        && effective_command[6] == "--external-session-id"
+        && effective_command[8] == "--"
+        && Path::new(&effective_command[9]).file_name()?.to_str()? == "opencode"
+        && effective_command[10] == "--session"
+        && !session_id.is_empty()
+        && session_id == external_session_id)
+        .then_some(session_id.as_str())
+}
+
+fn supervised_shared_opencode_command(
+    effective_command: &[String],
+    boomux: &str,
+) -> Option<Vec<String>> {
+    let session_id = supervised_opencode_session(effective_command)?;
+    let mut command = effective_command[..9].to_vec();
+    command.extend([
+        boomux.into(),
+        "opencode".into(),
+        "shared".into(),
+        "--session".into(),
+        session_id.into(),
+    ]);
+    Some(command)
 }
 
 fn codex_launch_eligible(_shell: &Shell, effective_command: &[String]) -> bool {
@@ -2913,6 +2950,7 @@ struct DaemonService {
     claude_remote_control: ClaudeRemoteControlBindings,
     remote_attachments: RemoteAttachmentManager,
     host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
+    host_session_catalog: Mutex<Option<HostSessionCatalog>>,
     workspace_operation_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     mutation_lock: Mutex<()>,
     notification_settings: NotificationDeliverySettings,
@@ -2926,6 +2964,12 @@ struct DaemonService {
 struct HostServicePreview {
     created_at: Instant,
     prepared: PreparedIntegrationMutation,
+}
+
+struct HostSessionCatalog {
+    directories: Vec<PathBuf>,
+    sessions: Vec<crate::host_session_titles::HostSession>,
+    inspected_at: Instant,
 }
 
 #[derive(Default)]
@@ -6332,6 +6376,7 @@ impl Default for DaemonService {
             claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
+            host_session_catalog: Mutex::new(None),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
@@ -8299,6 +8344,31 @@ impl DaemonService {
         }
     }
 
+    fn host_sessions(
+        &self,
+        snapshot: &Snapshot,
+    ) -> DaemonResult<Vec<crate::session_projection::SessionProjection>> {
+        let directories = host_services::session_catalog_directories(snapshot);
+        let mut cached = lock(&self.host_session_catalog)?;
+        if cached.as_ref().is_none_or(|catalog| {
+            catalog.directories != directories
+                || catalog.inspected_at.elapsed() >= HOST_SESSION_CATALOG_TTL
+        }) {
+            *cached = Some(HostSessionCatalog {
+                sessions: host_services::session_catalog(&directories),
+                directories,
+                inspected_at: Instant::now(),
+            });
+        }
+        Ok(host_services::sessions_with_catalog(
+            snapshot,
+            &cached
+                .as_ref()
+                .expect("Session catalog was inserted")
+                .sessions,
+        ))
+    }
+
     fn host_service(&self, operation: HostServiceOperation) -> DaemonResult<HostServiceResult> {
         match operation {
             HostServiceOperation::DiscoverProjects => Ok(HostServiceResult::Projects {
@@ -8404,7 +8474,9 @@ impl DaemonService {
                 run_id,
             }),
             HostServiceOperation::ListAgentSessions { workspace_id } => {
-                let sessions = host_services::sessions(&self.snapshot()?)
+                let snapshot = self.snapshot()?;
+                let sessions = self
+                    .host_sessions(&snapshot)?
                     .into_iter()
                     .filter(|session| {
                         workspace_id
@@ -8416,9 +8488,15 @@ impl DaemonService {
                 Ok(HostServiceResult::AgentSessions { sessions })
             }
             HostServiceOperation::InspectAgentSession { session_id } => {
+                let snapshot = self.snapshot()?;
+                let sessions = self.host_sessions(&snapshot)?;
                 Ok(HostServiceResult::AgentSession {
-                    session: host_services::inspect_session(&self.snapshot()?, &session_id)
-                        .map_err(DaemonError::from)?,
+                    session: host_services::inspect_projected_session(
+                        &snapshot,
+                        &sessions,
+                        &session_id,
+                    )
+                    .map_err(DaemonError::from)?,
                 })
             }
             HostServiceOperation::ResolveAgentSession {
@@ -12071,6 +12149,7 @@ impl DaemonService {
             claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
+            host_session_catalog: Mutex::new(None),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
@@ -14045,6 +14124,7 @@ impl ShellRuntimeManager {
             .unwrap_or_else(capture_current_environment);
         let mut child_environment = sanitize_opencode_shim_environment(&original_environment);
         let mut shared_recovery_command = None;
+        let mut supervised_shared_command = None;
         let mut codex_launch_command = None;
         let mut kiro_launch_command = None;
         if let Some(session_id) = recovery.opencode_session_id
@@ -14077,6 +14157,19 @@ impl ShellRuntimeManager {
                     "--session".into(),
                     session_id.into(),
                 ]);
+            }
+        } else if supervised_opencode_session(selected_command).is_some()
+            && let Ok(injected) =
+                inject_opencode_shim_environment(&child_environment, claude_remote_control)
+        {
+            child_environment = injected;
+            if let Some(executable) =
+                environment_value(&child_environment, b"BOOMUX_SHIM_EXECUTABLE")
+            {
+                supervised_shared_command = supervised_shared_opencode_command(
+                    selected_command,
+                    &executable.to_string_lossy(),
+                );
             }
         } else if codex_launch
             && let Ok(injected) =
@@ -14150,6 +14243,7 @@ impl ShellRuntimeManager {
         }
         let selected_command = shared_recovery_command
             .as_deref()
+            .or(supervised_shared_command.as_deref())
             .or(codex_launch_command.as_deref())
             .or(kiro_launch_command.as_deref())
             .unwrap_or(selected_command);
@@ -16058,6 +16152,52 @@ mod tests {
         )
         .unwrap();
         assert!(!opencode_shim_eligible(&command, &command.command));
+    }
+
+    #[test]
+    fn supervised_opencode_resume_is_exactly_recognized_for_shared_launch() {
+        let command = vec![
+            "/opt/boomux".into(),
+            "agent".into(),
+            "supervise".into(),
+            "OpenCode".into(),
+            "--integration".into(),
+            "opencode".into(),
+            "--external-session-id".into(),
+            "session-exact".into(),
+            "--".into(),
+            "/opt/opencode".into(),
+            "--session".into(),
+            "session-exact".into(),
+        ];
+        assert_eq!(supervised_opencode_session(&command), Some("session-exact"));
+        assert_eq!(
+            supervised_shared_opencode_command(&command, "/new/boomux").unwrap(),
+            [
+                "/opt/boomux",
+                "agent",
+                "supervise",
+                "OpenCode",
+                "--integration",
+                "opencode",
+                "--external-session-id",
+                "session-exact",
+                "--",
+                "/new/boomux",
+                "opencode",
+                "shared",
+                "--session",
+                "session-exact",
+            ]
+        );
+
+        let mut mismatched = command.clone();
+        mismatched[11] = "different-session".into();
+        assert_eq!(supervised_opencode_session(&mismatched), None);
+
+        let mut argument_bearing = command;
+        argument_bearing.push("--fork".into());
+        assert_eq!(supervised_opencode_session(&argument_bearing), None);
     }
 
     #[test]

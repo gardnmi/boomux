@@ -47,7 +47,7 @@ not appear in `json_commands`, and do not provide remote configuration mutation.
 `config validate` covers the complete global plus optional `BOOMUX_CONFIG`
 layered result without starting the daemon.
 
-`boomux session open SESSION_ID [--node NODE]` is also human-only and absent
+`boomux session open SESSION_ID [--node NODE] [--workspace WORKSPACE]` is also human-only and absent
 from `json_commands`. The static `exact_session_open` feature advertises this
 CLI orchestration surface, not a new daemon request. It launches a terminal that
 opens an exact current ShellRun with expected-run attachment and takeover, or
@@ -55,6 +55,14 @@ uses exact owner-routed resume for a historical Session; done, missing,
 ambiguous, unavailable, and changed targets fail closed. A successful command
 exit confirms terminal launch, while owner-side attachment or resume errors
 remain visible in that terminal and never fall back to another target.
+When `--workspace` names a non-closing coordinated Workspace, Boomux presents that
+desktop Workspace and places an exact current ShellRun terminal there without
+changing durable Shell membership. For a historical Session, it creates a
+managed command-backed Shell on the Session's owning Node in the selected
+Workspace and runs the exact harness resume argv through `agent supervise`.
+The supervisor immediately registers the exact Session as an unknown Agent;
+lifecycle integration then supersedes it with authoritative state. Without `--workspace`, the legacy
+unmanaged historical resume remains available.
 
 `boomux setup` is a human-only local discovery and mutation workflow. It requires
 an interactive terminal, does not support `--json`, and is absent from

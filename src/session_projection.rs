@@ -243,6 +243,7 @@ fn merge_catalog(
                     && session.integration == record.integration
                     && session.external_session_id.as_deref() == Some(record.root_id.as_str())
             }) {
+                session.description = record.title.clone();
                 if session.source_cwd.is_none() {
                     session.source_cwd = Some(record_directory.clone());
                 }
@@ -615,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_merges_durable_identity_and_keeps_stable_id_and_durable_source() {
+    fn catalog_merges_durable_identity_with_title_and_keeps_durable_lifecycle() {
         let durable = workspace("w1", &["a1"]);
         let durable_only = project_workspaces(std::slice::from_ref(&durable));
         let mut record = catalog_session("external", "/tmp/project");
@@ -626,7 +627,7 @@ mod tests {
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, durable_only[0].id);
-        assert_eq!(merged[0].description, durable_only[0].description);
+        assert_eq!(merged[0].description, "Catalog external");
         assert_eq!(merged[0].state, AgentState::Working);
         assert!(merged[0].state_is_current);
         assert_eq!(merged[0].occurrences.len(), 1);
