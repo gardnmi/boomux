@@ -26,6 +26,13 @@ enum PumpOutcome {
     Reconnect,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconnectErrorAction {
+    Return,
+    Retry,
+    Timeout,
+}
+
 const FOCUS_GAINED: &[u8] = b"\x1b[I";
 const FOCUS_LOST: &[u8] = b"\x1b[O";
 
@@ -287,14 +294,12 @@ fn reconnect(
             profile,
         ) {
             Ok(attachment) => return Ok(attachment),
-            Err(error) if exact_reconnect_error_is_permanent(expected_run_id, &error) => {
-                return Err(error);
-            }
-            Err(error) if controller_busy(&error) => {}
             Err(error) => {
                 attempts += 1;
-                if attempts >= RECONNECT_ATTEMPTS {
-                    break error;
+                match reconnect_error_action(expected_run_id, &error, attempts) {
+                    ReconnectErrorAction::Return => return Err(error),
+                    ReconnectErrorAction::Retry => {}
+                    ReconnectErrorAction::Timeout => break error,
                 }
             }
         }
@@ -305,14 +310,18 @@ fn reconnect(
     ))
 }
 
-fn controller_busy(error: &client::ClientError) -> bool {
-    matches!(
-        error,
-        client::ClientError::Remote(client::RemoteError {
-            code: Some(crate::protocol::ErrorCode::Busy),
-            ..
-        })
-    )
+fn reconnect_error_action(
+    expected_run_id: Option<&str>,
+    error: &client::ClientError,
+    attempts: usize,
+) -> ReconnectErrorAction {
+    if exact_reconnect_error_is_permanent(expected_run_id, error) {
+        ReconnectErrorAction::Return
+    } else if attempts >= RECONNECT_ATTEMPTS {
+        ReconnectErrorAction::Timeout
+    } else {
+        ReconnectErrorAction::Retry
+    }
 }
 
 fn exact_reconnect_error_is_permanent(
@@ -589,6 +598,23 @@ mod tests {
         ));
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn controller_busy_retries_are_bounded() {
+        let busy = client::ClientError::Remote(client::RemoteError {
+            code: Some(crate::protocol::ErrorCode::Busy),
+            message: "controller is busy".into(),
+        });
+
+        assert_eq!(
+            reconnect_error_action(None, &busy, 1),
+            ReconnectErrorAction::Retry
+        );
+        assert_eq!(
+            reconnect_error_action(None, &busy, RECONNECT_ATTEMPTS),
+            ReconnectErrorAction::Timeout
+        );
     }
 
     #[test]

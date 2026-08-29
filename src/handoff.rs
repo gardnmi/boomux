@@ -149,26 +149,31 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     }
     let manifest: Manifest = protocol::read_message(&mut channel)?;
     validate_manifest(&manifest)?;
-    let event_stream = manifest.event_stream.clone();
-    let notifications = manifest.notifications.clone();
-    let claude_remote_control_bindings = manifest.claude_remote_control_bindings.clone();
-    let kiro_launch_holders = manifest.kiro_launch_holders.clone();
-    let focused_terminal = manifest.focused_terminal.clone().map(Box::new);
-    let presented_focused_terminal = manifest.presented_focused_terminal.clone().map(Box::new);
+    let Manifest {
+        runtimes: runtime_manifests,
+        exited: exited_manifests,
+        event_stream,
+        notifications,
+        focused_terminal,
+        presented_focused_terminal,
+        opencode_runtime,
+        claude_remote_control_bindings,
+        kiro_launch_holders,
+    } = manifest;
+    let focused_terminal = focused_terminal.map(Box::new);
+    let presented_focused_terminal = presented_focused_terminal.map(Box::new);
     let listener = receive_descriptor(&channel, LISTENER_MARKER)?;
     let runtime_lock = receive_descriptor(&channel, RUNTIME_LOCK_MARKER)?;
     let state_lock = receive_descriptor(&channel, STATE_LOCK_MARKER)?;
-    let opencode_runtime = manifest
-        .opencode_runtime
-        .clone()
+    let opencode_runtime = opencode_runtime
         .map(|manifest| {
             let pidfd = receive_descriptor(&channel, OPENCODE_PIDFD_MARKER)?;
             validate_pidfd(&pidfd, manifest.pid)?;
             Ok::<_, io::Error>(TransferredOpenCodeRuntime { manifest, pidfd })
         })
         .transpose()?;
-    let mut runtimes = Vec::with_capacity(manifest.runtimes.len());
-    for manifest in manifest.runtimes {
+    let mut runtimes = Vec::with_capacity(runtime_manifests.len());
+    for manifest in runtime_manifests {
         let pty = receive_descriptor(&channel, PTY_MARKER)?;
         validate_pty(&pty, manifest.pid)?;
         let pidfd = receive_descriptor(&channel, PIDFD_MARKER)?;
@@ -187,8 +192,8 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
             reconstruction,
         });
     }
-    let mut exited = Vec::with_capacity(manifest.exited.len());
-    for manifest in manifest.exited {
+    let mut exited = Vec::with_capacity(exited_manifests.len());
+    for manifest in exited_manifests {
         let reconstruction: Vec<u8> = protocol::read_message(&mut channel)?;
         if reconstruction.len() > protocol::MAX_ATTACH_FRAME {
             return Err(io::Error::new(

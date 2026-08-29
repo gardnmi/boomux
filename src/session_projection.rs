@@ -101,6 +101,17 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
         .iter()
         .map(|shell| (shell.id.as_str(), shell))
         .collect();
+    let current_runs: BTreeMap<_, _> = workspace
+        .shells
+        .iter()
+        .filter(|shell| matches!(shell.status, ShellStatus::Running))
+        .filter_map(|shell| {
+            shell
+                .run
+                .as_ref()
+                .map(|run| (shell.id.as_str(), run.id.as_str()))
+        })
+        .collect();
     let mut groups: BTreeMap<(String, String), Vec<&AgentInstanceSnapshot>> = BTreeMap::new();
     for agent in &workspace.agents {
         let identity = match &agent.external_session_id {
@@ -136,7 +147,7 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
             let active = agents
                 .iter()
                 .copied()
-                .filter(|agent| occurrence_is_current(workspace, agent));
+                .filter(|agent| occurrence_is_current(&workspace.id, &current_runs, agent));
             let (state_source, state_is_current) = active
                 .min_by(|left, right| {
                     state_priority(left.observation.state)
@@ -171,7 +182,7 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
                         started_at_ms: agent.started_at_ms,
                         ended_at_ms: agent.ended_at_ms,
                         observation: agent.observation.clone(),
-                        is_current: occurrence_is_current(workspace, agent),
+                        is_current: occurrence_is_current(&workspace.id, &current_runs, agent),
                         retained_shell_name: retained_shell.map(|shell| shell.name.clone()),
                         retained_shell_cwd: retained_shell.map(|shell| shell.cwd.clone()),
                         source_cwd: agent
@@ -213,36 +224,45 @@ fn merge_catalog(
     sessions: &mut Vec<SessionProjection>,
     catalog: &[HostSession],
 ) {
-    let workspace_directories = workspaces
-        .iter()
-        .map(|workspace| (workspace.id.as_str(), workspace_directories(workspace)))
-        .collect::<Vec<_>>();
+    let mut workspaces_by_directory: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+    for (index, workspace) in workspaces.iter().enumerate() {
+        for directory in workspace_directories(workspace) {
+            workspaces_by_directory
+                .entry(directory)
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut sessions_by_identity = BTreeMap::new();
+    for (index, session) in sessions.iter().enumerate() {
+        if let Some(external_id) = &session.external_session_id {
+            sessions_by_identity
+                .entry((
+                    session.workspace_id.clone(),
+                    session.integration.clone(),
+                    external_id.clone(),
+                ))
+                .or_insert(index);
+        }
+    }
 
     for record in catalog {
         let Some(record_directory) = normalize_absolute(&record.directory) else {
             continue;
         };
-        let matching_workspaces = workspace_directories
-            .iter()
-            .filter(|(_, directories)| directories.contains(&record_directory))
-            .map(|(workspace_id, _)| *workspace_id)
-            .collect::<Vec<_>>();
-        if matching_workspaces.is_empty() {
+        let Some(matching_workspaces) = workspaces_by_directory.get(&record_directory) else {
             continue;
-        }
-        for workspace_id in matching_workspaces {
-            let Some(workspace) = workspaces
-                .iter()
-                .find(|workspace| workspace.id == workspace_id)
-            else {
-                continue;
-            };
+        };
+        for &workspace_index in matching_workspaces {
+            let workspace = &workspaces[workspace_index];
             let identity = format!("external:{}", record.root_id);
-            if let Some(session) = sessions.iter_mut().find(|session| {
-                session.workspace_id == workspace.id
-                    && session.integration == record.integration
-                    && session.external_session_id.as_deref() == Some(record.root_id.as_str())
-            }) {
+            let key = (
+                workspace.id.clone(),
+                record.integration.clone(),
+                record.root_id.clone(),
+            );
+            if let Some(&session_index) = sessions_by_identity.get(&key) {
+                let session = &mut sessions[session_index];
                 session.description = record.title.clone();
                 if session.source_cwd.is_none() {
                     session.source_cwd = Some(record_directory.clone());
@@ -250,6 +270,7 @@ fn merge_catalog(
                 continue;
             }
 
+            let session_index = sessions.len();
             sessions.push(SessionProjection {
                 id: stable_session_id(&workspace.id, &record.integration, &identity),
                 workspace_id: workspace.id.clone(),
@@ -264,6 +285,7 @@ fn merge_catalog(
                 source_cwd: Some(record_directory.clone()),
                 occurrences: Vec::new(),
             });
+            sessions_by_identity.insert(key, session_index);
         }
     }
 }
@@ -307,15 +329,15 @@ pub(crate) fn agent_is_active_for_run(
         )
 }
 
-fn occurrence_is_current(workspace: &WorkspaceSnapshot, agent: &AgentInstanceSnapshot) -> bool {
-    agent.workspace_id == workspace.id
-        && workspace.shells.iter().any(|shell| {
-            matches!(shell.status, ShellStatus::Running)
-                && shell
-                    .run
-                    .as_ref()
-                    .is_some_and(|run| agent_is_active_for_run(agent, &shell.id, &run.id))
-        })
+fn occurrence_is_current(
+    workspace_id: &str,
+    current_runs: &BTreeMap<&str, &str>,
+    agent: &AgentInstanceSnapshot,
+) -> bool {
+    agent.workspace_id == workspace_id
+        && current_runs
+            .get(agent.shell_id.as_str())
+            .is_some_and(|run_id| agent_is_active_for_run(agent, &agent.shell_id, run_id))
 }
 
 fn stable_session_id(workspace_id: &str, integration: &str, identity: &str) -> String {
