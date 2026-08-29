@@ -1003,7 +1003,6 @@ fn is_session_effect(effect: &DashboardEffect) -> bool {
 
 struct App {
     nodes: Vec<NodeView>,
-    all_workspaces: Vec<WorkspaceView>,
     workspaces: Vec<WorkspaceView>,
     cached_projection_dismissal: bool,
     node_reauthentication: bool,
@@ -1840,7 +1839,6 @@ impl App {
         let has_nodes = !nodes.is_empty();
         Self {
             nodes,
-            all_workspaces: workspaces.clone(),
             workspaces,
             cached_projection_dismissal: false,
             node_reauthentication: false,
@@ -3043,8 +3041,6 @@ impl App {
         match result {
             Ok(state) => {
                 self.nodes = state.nodes;
-                self.all_workspaces = state.workspaces;
-                let workspaces = self.all_workspaces.clone();
                 self.node_state.select(
                     (!self.nodes.is_empty()).then_some(
                         self.node_state
@@ -3053,7 +3049,7 @@ impl App {
                             .min(self.nodes.len().saturating_sub(1)),
                     ),
                 );
-                self.replace_workspaces(workspaces);
+                self.replace_workspaces(state.workspaces);
                 self.node_reauthentication = state.node_reauthentication;
                 if state.reset_focus_revision {
                     self.observed_focus_revision = None;

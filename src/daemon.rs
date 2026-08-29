@@ -3671,10 +3671,10 @@ impl TransitionState {
     }
 
     fn queue_runtime_event(&mut self, event: DaemonEventKind) {
-        if let DaemonEventKind::OutputChanged {
-            shell_id, run_id, ..
-        } = &event
-            && let Some(index) = self.pending_runtime_events.iter().position(|pending| {
+        let duplicate = match &event {
+            DaemonEventKind::OutputChanged {
+                shell_id, run_id, ..
+            } => self.pending_runtime_events.iter().position(|pending| {
                 matches!(
                     pending,
                     DaemonEventKind::OutputChanged {
@@ -3683,8 +3683,26 @@ impl TransitionState {
                         ..
                     } if pending_shell_id == shell_id && pending_run_id == run_id
                 )
-            })
-        {
+            }),
+            DaemonEventKind::NodeProjectionChanged { node_id, .. } => {
+                self.pending_runtime_events.iter().position(|pending| {
+                    matches!(
+                        pending,
+                        DaemonEventKind::NodeProjectionChanged {
+                            node_id: pending_node_id,
+                            ..
+                        } if pending_node_id == node_id
+                    )
+                })
+            }
+            DaemonEventKind::FocusedTerminalPresentationChanged => {
+                self.pending_runtime_events.iter().position(|pending| {
+                    matches!(pending, DaemonEventKind::FocusedTerminalPresentationChanged)
+                })
+            }
+            _ => None,
+        };
+        if let Some(index) = duplicate {
             self.pending_runtime_events.remove(index);
         }
         self.pending_runtime_events.push_back(event);
@@ -4031,35 +4049,39 @@ impl EventStream {
         }
     }
 
-    fn append_batch_locked(
-        state: &mut EventStreamState,
-        kinds: Vec<DaemonEventKind>,
-    ) -> Vec<DaemonEvent> {
+    fn append_batch_locked(state: &mut EventStreamState, kinds: Vec<DaemonEventKind>) {
         debug_assert!(Self::ensure_capacity(state, kinds.len()).is_ok());
-        let mut appended = Vec::with_capacity(kinds.len());
         for kind in kinds {
-            state.latest_id += 1;
-            let event = DaemonEvent {
-                id: state.latest_id,
-                at_ms: unix_time_ms(),
-                kind,
-            };
-            state.events.push_back(event.clone());
-            appended.push(event);
+            Self::append_one_locked(state, kind);
         }
+        Self::retain_latest_locked(state);
+    }
+
+    fn append_one_locked(state: &mut EventStreamState, kind: DaemonEventKind) {
+        state.latest_id += 1;
+        state.events.push_back(DaemonEvent {
+            id: state.latest_id,
+            at_ms: unix_time_ms(),
+            kind,
+        });
+    }
+
+    fn retain_latest_locked(state: &mut EventStreamState) {
         if state.events.len() > MAX_RETAINED_EVENTS {
             let remove = state.events.len() - MAX_RETAINED_EVENTS;
             state.events.drain(..remove);
         }
-        appended
     }
 
     #[cfg(test)]
     fn publish(&self, kind: DaemonEventKind) -> io::Result<DaemonEvent> {
         let mut state = lock(&self.state)?;
         Self::ensure_capacity(&state, 1)?;
-        let event = Self::append_batch_locked(&mut state, vec![kind])
-            .pop()
+        Self::append_batch_locked(&mut state, vec![kind]);
+        let event = state
+            .events
+            .back()
+            .cloned()
             .expect("one event was appended");
         drop(state);
         self.changed.notify_all();
@@ -4097,10 +4119,12 @@ impl EventStream {
                     "event cursor is no longer available",
                 ));
             }
+            let offset = usize::try_from(after.event_id.saturating_sub(earliest))
+                .unwrap_or(state.events.len());
             let events = state
                 .events
                 .iter()
-                .filter(|event| event.id > after.event_id)
+                .skip(offset)
                 .take(limit)
                 .cloned()
                 .collect::<Vec<_>>();
@@ -4160,8 +4184,9 @@ impl EventStream {
             return;
         }
         while let Some(kind) = transition.pending_runtime_events.pop_front() {
-            Self::append_batch_locked(events, vec![kind]);
+            Self::append_one_locked(events, kind);
         }
+        Self::retain_latest_locked(events);
     }
 }
 
@@ -4183,16 +4208,17 @@ fn projection_transitions(
     {
         return (NodeProjectionSyncMode::Baseline, Vec::new());
     }
-    let events = state
-        .events
-        .iter()
-        .filter(|event| event.id > after.event_id && event.id <= through.event_id)
-        .collect::<Vec<_>>();
-    if events.len() > usize::from(protocol::MAX_NODE_PROJECTION_TRANSITIONS) {
+    let event_count = through.event_id.saturating_sub(after.event_id);
+    if event_count > u64::from(protocol::MAX_NODE_PROJECTION_TRANSITIONS) {
         return (NodeProjectionSyncMode::Baseline, Vec::new());
     }
-    let transitions = events
-        .into_iter()
+    let offset =
+        usize::try_from(after.event_id.saturating_sub(earliest)).unwrap_or(state.events.len());
+    let transitions = state
+        .events
+        .iter()
+        .skip(offset)
+        .take(event_count as usize)
         .filter_map(reduce_projection_transition)
         .collect();
     (NodeProjectionSyncMode::Resumed, transitions)
@@ -18151,6 +18177,50 @@ mod tests {
     }
 
     #[test]
+    fn blocked_publication_coalesces_snapshot_invalidations() {
+        let mut transition = TransitionState {
+            persistence_in_flight: true,
+            ..TransitionState::default()
+        };
+        for generation in 1..=10_000 {
+            transition.queue_runtime_event(DaemonEventKind::NodeProjectionChanged {
+                node_id: "node-1".into(),
+                cache_generation: generation,
+            });
+            transition.queue_runtime_event(DaemonEventKind::FocusedTerminalPresentationChanged);
+        }
+        transition.queue_runtime_event(DaemonEventKind::NodeProjectionChanged {
+            node_id: "node-2".into(),
+            cache_generation: 4,
+        });
+
+        assert_eq!(transition.pending_runtime_events.len(), 3);
+        assert!(
+            transition
+                .pending_runtime_events
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    DaemonEventKind::NodeProjectionChanged {
+                        node_id,
+                        cache_generation: 10_000,
+                    } if node_id == "node-1"
+                ))
+        );
+        assert_eq!(
+            transition
+                .pending_runtime_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    DaemonEventKind::FocusedTerminalPresentationChanged
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn process_name_is_trimmed_sanitized_and_bounded() {
         assert_eq!(parse_process_name(b"  sleep\n"), Some("sleep".into()));
         assert_eq!(parse_process_name(b" \n\t "), None);
@@ -18409,6 +18479,38 @@ mod tests {
             projection_transitions(&transaction.events, Some(&expired), &through);
         assert_eq!(mode, NodeProjectionSyncMode::Baseline);
         assert!(transitions.is_empty());
+    }
+
+    #[test]
+    fn projection_cut_reseeds_only_beyond_transition_limit() {
+        let events = EventStream::new();
+        let baseline = events.transaction().unwrap().cursor();
+        for index in 0..=protocol::MAX_NODE_PROJECTION_TRANSITIONS {
+            events
+                .publish(DaemonEventKind::WorkspaceClosed {
+                    workspace_id: format!("workspace-{index}"),
+                })
+                .unwrap();
+        }
+        let transaction = events.transaction().unwrap();
+        let through = transaction.cursor();
+
+        let (mode, transitions) =
+            projection_transitions(&transaction.events, Some(&baseline), &through);
+        assert_eq!(mode, NodeProjectionSyncMode::Baseline);
+        assert!(transitions.is_empty());
+
+        let after_first = EventCursor {
+            stream_id: baseline.stream_id,
+            event_id: baseline.event_id + 1,
+        };
+        let (mode, transitions) =
+            projection_transitions(&transaction.events, Some(&after_first), &through);
+        assert_eq!(mode, NodeProjectionSyncMode::Resumed);
+        assert_eq!(
+            transitions.len(),
+            usize::from(protocol::MAX_NODE_PROJECTION_TRANSITIONS)
+        );
     }
 
     fn remote_notification_test_settings() -> NotificationDeliverySettings {
