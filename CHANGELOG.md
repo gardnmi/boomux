@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.7.2](https://github.com/gardnmi/boomux/compare/v1.7.1...v1.7.2) (2026-08-29)
+
+
+### Performance Improvements
+
+* add regression benchmark harness ([#326](https://github.com/gardnmi/boomux/issues/326)) ([6c23d38](https://github.com/gardnmi/boomux/commit/6c23d382452793d37baf416f55085d419c75e816))
+* reduce event and session projection overhead ([#324](https://github.com/gardnmi/boomux/issues/324)) ([dd7acb7](https://github.com/gardnmi/boomux/commit/dd7acb700adc93e6f92924130c09f1817392a525))
+
 ## [1.7.1](https://github.com/gardnmi/boomux/compare/v1.7.0...v1.7.1) (2026-08-29)
 
 
