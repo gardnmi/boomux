@@ -145,7 +145,7 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = --gate ]; then shift; gate=$1; break; fi
   shift
 done
-python3 -c 'import json,os,sys; cp=os.environ["BOOMUX_HYPR_LAUNCH_COUNT"]; n=int(open(cp).read())+1 if os.path.exists(cp) else 1; open(cp,"w").write(str(n)); p=os.environ["BOOMUX_HYPR_CLIENTS"]; clients=json.load(open(p)); clients.append({"address":f"0x{n:08x}","workspace":{"id":-99,"name":"special:boomux-"+os.environ["BOOMUX_HYPR_WORKSPACE"]},"initialTitle":sys.argv[1]}); json.dump(clients,open(p,"w"))' "$title"
+python3 -c 'import json,os,sys; cp=os.environ["BOOMUX_HYPR_LAUNCH_COUNT"]; n=int(open(cp).read())+1 if os.path.exists(cp) else 1; open(cp,"w").write(str(n)); p=os.environ["BOOMUX_HYPR_CLIENTS"]; clients=json.load(open(p)); clients.append({"address":f"0x{n:08x}","workspace":{"id":-99,"name":"special:boomux-"+os.environ["BOOMUX_HYPR_WORKSPACE"]},"initialTitle":sys.argv[1]}); tmp=p+".tmp"; open(tmp,"w").write(json.dumps(clients)); os.replace(tmp,p)' "$title"
 printf '%s\0' python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); open(sys.argv[2], "wb").write(s.recv(1))' "$gate" "$BOOMUX_GATE_MARKER"
 "#;
     fs::write(&resolver, resolver_script).unwrap();
@@ -238,7 +238,7 @@ done
 n=$(cat "$BOOMUX_HYPR_LAUNCH_COUNT")
 n=$((n + 1))
 printf '%s' "$n" > "$BOOMUX_HYPR_LAUNCH_COUNT"
-printf '%s\0' python3 -c 'import json,sys,time; time.sleep(2.5); p=sys.argv[1]; clients=json.load(open(p)); clients.append({"address":"0xfeedbeef","workspace":{"id":-99,"name":"special:boomux-"+sys.argv[2]},"initialTitle":sys.argv[3]}); json.dump(clients,open(p,"w"))' "$BOOMUX_HYPR_CLIENTS" "$BOOMUX_HYPR_WORKSPACE" "$title"
+printf '%s\0' python3 -c 'import json,os,sys,time; time.sleep(2.5); p=sys.argv[1]; clients=json.load(open(p)); clients.append({"address":"0xfeedbeef","workspace":{"id":-99,"name":"special:boomux-"+sys.argv[2]},"initialTitle":sys.argv[3]}); tmp=p+".tmp"; open(tmp,"w").write(json.dumps(clients)); os.replace(tmp,p)' "$BOOMUX_HYPR_CLIENTS" "$BOOMUX_HYPR_WORKSPACE" "$title"
 "#,
     )
     .unwrap();
@@ -265,10 +265,11 @@ printf '%s\0' python3 -c 'import json,sys,time; time.sleep(2.5); p=sys.argv[1]; 
     assert_eq!(fs::read_to_string(&launch_count).unwrap(), "1");
     wait_until(
         || {
-            serde_json::from_slice::<serde_json::Value>(&fs::read(&clients).unwrap())
-                .unwrap()
-                .as_array()
-                .is_some_and(|clients| clients.len() == 2)
+            fs::read(&clients)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| value.as_array().map(Vec::len))
+                == Some(2)
         },
         "delayed terminal did not register its Hyprland window",
     );
