@@ -10228,6 +10228,9 @@ impl DaemonService {
                 {
                     continue;
                 }
+                if !lock(&self.durable.state)?.agents.contains_key(&agent_id) {
+                    continue;
+                }
                 let report = AgentReport {
                     state: AgentState::Inactive,
                     authority: AgentAuthority::LifecycleIntegration,
@@ -16952,6 +16955,26 @@ mod tests {
         );
         process_b.kill().unwrap();
         process_b.wait().unwrap();
+    }
+
+    #[test]
+    fn kiro_holder_release_survives_its_workspace_removing_the_agent_first() {
+        let registry = DaemonService::default();
+        let (workspace, shell, _) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let (holder_id, mut process) = test_kiro_holder(&registry, &shell.id, &run_id);
+        let agent = report_test_kiro(&registry, &holder_id, "removed-session");
+
+        registry.close_workspace(&workspace.id).unwrap();
+        assert!(registry.durable.agent(&agent.id).is_err());
+        assert!(matches!(
+            registry.release_kiro_launch_holder(&holder_id).unwrap(),
+            Response::KiroLaunchHolderReleased { released: true }
+        ));
+
+        assert!(!lock(&registry.kiro.state).unwrap().contains_key(&holder_id));
+        process.kill().unwrap();
+        process.wait().unwrap();
     }
 
     #[test]
