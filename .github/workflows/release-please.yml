@@ -225,3 +225,15 @@ jobs:
             printf 'release publication verification failed for %s\n' "$TAG" >&2
             exit 1
           fi
+
+  validate-omarchy-boomux:
+    name: Validate omarchy-boomux compatibility
+    needs:
+      - release-please
+      - publish-release
+    permissions:
+      contents: read
+    uses: gardnmi/omarchy-boomux/.github/workflows/boomux-compatibility.yml@6c26ce52c5dbfad6185037b374d98d0933f4b8fe
+    with:
+      boomux_tag: ${{ needs.release-please.outputs.tag-name }}
+      plugin_ref: 6c26ce52c5dbfad6185037b374d98d0933f4b8fe
