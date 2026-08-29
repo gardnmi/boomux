@@ -817,7 +817,7 @@ bounded to the attachment limit, browser backgrounding releases control, and all
 terminal API responses remain outside service-worker and HTTP caches. The
 external private access layer must restrict the dashboard to trusted users.
 
-Agent sessions are a client-side projection, not a sixth durable daemon
+Agent sessions are a client-side projection, not another durable daemon
 identity. The projection groups stored Agent instances by workspace,
 integration, and external session ID, while isolating instances without an
 external ID. It retains original shell/run identity and observations even when a
@@ -830,7 +830,49 @@ registration under the same stable ID. Catalog records associate to each
 workspace that references their exact normalized directory. The dashboard maps
 the active or latest exact match into a durable Agent's contextual preview and
 discovers catalogs asynchronously; session CLI listing performs the same bounded
-discovery synchronously. Sessions are not a dashboard kind.
+discovery synchronously. Pi, Claude, and Kiro have no complete catalog adapter,
+so their Sessions enter the projection only through durably observed Agent
+Instances.
+
+The dashboard primary kinds are Workspaces, Agents, Sessions, Shells, and Nodes.
+Sessions is this canonical projection, not a rename of ShellRun-bound Agent
+Instances or a new identity layer. Its bounded asynchronous loader combines the
+local projection with live protocol-36 Session catalogs from every online
+registered Node. Each row retains `(node_id, session_id)` identity; owner failures
+are reported independently so successful Nodes remain usable. Cached stale
+remote projections never supply Session catalog authority. Last-activity order
+uses deterministic Node, Workspace, and Session tie-breakers only for
+presentation and establishes no cross-Node causal order.
+
+Session rows always show textual harness identity. Rendering preserves age,
+harness, and title at narrow widths and progressively adds state, Node,
+Workspace, and occurrence columns. `i` opens the detail overlay; `Enter` opens
+the selected row, while a first mouse click selects it and a second click on the
+selected row opens it. A current Session opens its exact Node-qualified managed
+Shell. A historical resumable Session uses the existing exact owner-side harness
+resume service. Done, unavailable, missing-cwd, or otherwise invalid selections
+fail visibly and never substitute another Shell, Node, path, harness, or Session.
+This presentation reuses existing protocol-36 host services and existing durable
+Agent state; it changes neither protocol nor persistence versions.
+The public human-only `boomux session open SESSION_ID [--node NODE]
+[--workspace WORKSPACE]` command
+uses that same core activation path. Current Sessions revalidate one exact
+current owner ShellRun and launch a terminal with expected-run attachment and
+takeover; historical Sessions validate owner cwd and launch the existing exact
+owner-routed resume. Done, missing, ambiguous, unavailable, and concurrently
+changed targets fail closed. Command success reports terminal launch; a later
+owner-side rejection remains visible in that terminal without substitution. The
+optional Workspace validates a non-closing coordinated presentation target and
+uses the desktop presentation path; it does not change Shell membership or owner
+authority for a current Session. Historical opening with a Workspace creates a
+managed command-backed Shell on the Session owner Node in that coordinated
+Workspace and starts the exact harness resume argv through `agent supervise` and
+normal attachment. The process adapter creates an immediate unknown Agent for
+the exact canonical Session, then lifecycle integration supersedes it with
+authoritative state. `BOOMUX_*` run identity is available throughout. Historical
+opening without a Workspace retains the legacy unmanaged resume path. The
+static CLI capability is `exact_session_open`; no JSON command, wire request,
+protocol bump, or persistence change is added.
 The integration descriptor registry is the authority for integration keys,
 display names, and optional typed capabilities. A title capability selects its
 host adapter and independently declares catalog support. The shared title layer

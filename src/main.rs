@@ -148,6 +148,7 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "persistent_workspace_selection",
     "create_and_open_shell",
     "atomic_workspace_shell_creation",
+    "exact_session_open",
     "hyprland_special_workspaces",
     "contextual_desktop_terminal",
     "coordinated_shell_desktop_placement",
@@ -888,6 +889,16 @@ enum SessionCommands {
         #[arg(long)]
         node: Option<String>,
     },
+    /// Open one exact current or historical Session in a native terminal
+    Open {
+        session_id: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+        /// Coordinated Workspace to use for optional desktop placement
+        #[arg(long, value_name = "COORDINATED_WORKSPACE")]
+        workspace: Option<String>,
+    },
     /// Resume one exact projected session in a native terminal
     Resume {
         session_id: String,
@@ -1262,6 +1273,7 @@ command_keys! {
     IntegrationVerify => ("integration.verify", Json),
     SessionList => ("session.list", Json),
     SessionInspect => ("session.inspect", Json),
+    SessionOpen => ("session.open", HumanOnly),
     SessionResume => ("session.resume", HumanOnly),
     Skill => ("skill", HumanOnly),
     Opencode => ("opencode", HumanOnly),
@@ -1419,6 +1431,9 @@ impl Cli {
             Some(Commands::Session {
                 command: SessionCommands::Inspect { .. },
             }) => CommandKey::SessionInspect,
+            Some(Commands::Session {
+                command: SessionCommands::Open { .. },
+            }) => CommandKey::SessionOpen,
             Some(Commands::Session {
                 command: SessionCommands::Resume { .. },
             }) => CommandKey::SessionResume,
@@ -1896,7 +1911,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Notification {
             command: NotificationCommands::Test { reason },
         }) => test_notification(reason),
-        Some(Commands::Session { command }) => session_command(command, cli.json),
+        Some(Commands::Session { command }) => {
+            session_command(command, cli.json, cli.terminal.as_deref())
+        }
         Some(Commands::Integration { command }) => integration_command(command, cli.json),
         Some(Commands::Skill {
             command: SkillCommands::Install { force },
@@ -3403,6 +3420,8 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         .ok()
         .flatten()
         .map(|selection| selection.workspace_id().to_owned());
+    let session_local_node_id = local_node_id.clone();
+    let session_terminal = terminal.clone();
     tui::run(
         initial_state,
         selected_workspace_id,
@@ -3950,6 +3969,14 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 run_id,
                 output_revision,
             },
+            tui::DashboardEffect::LoadSessions { .. }
+            | tui::DashboardEffect::InspectSession(_)
+            | tui::DashboardEffect::ActivateSession(_) => {
+                unreachable!("Session effects use the dedicated dashboard worker")
+            }
+        },
+        move |effect| {
+            dashboard_session_effect(effect, &session_local_node_id, session_terminal.as_deref())
         },
     )?;
     Ok(())
@@ -4023,6 +4050,558 @@ fn dashboard_state(
         ),
         reset_focus_revision,
     }
+}
+
+fn dashboard_session_effect(
+    effect: tui::DashboardEffect,
+    local_node_id: &str,
+    terminal_entry: Option<&str>,
+) -> tui::DashboardEvent {
+    match effect {
+        tui::DashboardEffect::LoadSessions { nodes } => {
+            tui::DashboardEvent::SessionsLoaded(load_dashboard_sessions(&nodes))
+        }
+        tui::DashboardEffect::InspectSession(identity) => {
+            let result = inspect_session_on_node(&identity, local_node_id).map(|inspection| {
+                let action = session_open_action(&inspection).and_then(|action| {
+                    if inspection.summary.state_is_current {
+                        Ok(action)
+                    } else {
+                        validate_session_cwd(&identity, local_node_id, &inspection).map(|_| action)
+                    }
+                });
+                dashboard_session_details(&identity, inspection, action)
+            });
+            tui::DashboardEvent::SessionInspected { identity, result }
+        }
+        tui::DashboardEffect::ActivateSession(identity) => tui::DashboardEvent::OperationCompleted(
+            open_exact_session(&identity, local_node_id, terminal_entry, None),
+        ),
+        effect => panic!("unexpected effect on Session worker: {effect:?}"),
+    }
+}
+
+fn load_dashboard_sessions(
+    nodes: &[tui::SessionNodeView],
+) -> Result<tui::SessionLoadResult, String> {
+    let client = client::connect().map_err(|error| error.to_string())?;
+    let loads = nodes.iter().cloned().map(|node| {
+        let operation = protocol::HostServiceOperation::ListAgentSessions { workspace_id: None };
+        let result = if node.local {
+            client.host_service(operation)
+        } else {
+            client.route_node_host_service(&node.id, operation)
+        };
+        let result = match result {
+            Ok(protocol::HostServiceResult::AgentSessions {
+                sessions: node_sessions,
+            }) => Ok(node_sessions),
+            Ok(_) => Err("returned an unexpected Session-list response".into()),
+            Err(error) => Err(error.to_string()),
+        };
+        DashboardSessionNodeLoad { node, result }
+    });
+    aggregate_dashboard_session_loads(loads)
+}
+
+struct DashboardSessionNodeLoad {
+    node: tui::SessionNodeView,
+    result: Result<Vec<protocol::HostAgentSessionSummary>, String>,
+}
+
+fn aggregate_dashboard_session_loads(
+    loads: impl IntoIterator<Item = DashboardSessionNodeLoad>,
+) -> Result<tui::SessionLoadResult, String> {
+    let mut sessions = Vec::new();
+    let mut warnings = Vec::new();
+    let mut successful_nodes = 0usize;
+    for load in loads {
+        match load.result {
+            Ok(node_sessions) => {
+                successful_nodes += 1;
+                sessions.extend(node_sessions.into_iter().map(|session| {
+                    dashboard_session_summary(&load.node.id, &load.node.alias, session)
+                }));
+            }
+            Err(error) => warnings.push(format!("Node {}: {error}", load.node.alias)),
+        }
+    }
+    if successful_nodes == 0 && !warnings.is_empty() {
+        return Err(format!("Unable to load Sessions: {}", warnings.join("; ")));
+    }
+    sessions.sort_by(|left, right| {
+        right
+            .last_at_ms
+            .cmp(&left.last_at_ms)
+            .then_with(|| left.node_id.cmp(&right.node_id))
+            .then_with(|| left.workspace_id.cmp(&right.workspace_id))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    Ok(tui::SessionLoadResult { sessions, warnings })
+}
+
+fn dashboard_session_summary(
+    node_id: &str,
+    node_alias: &str,
+    session: protocol::HostAgentSessionSummary,
+) -> tui::DashboardSessionView {
+    tui::DashboardSessionView {
+        node_id: node_id.to_owned(),
+        node_alias: node_alias.to_owned(),
+        session_id: session.id,
+        workspace_id: session.workspace_id,
+        workspace_name: session.workspace_name,
+        title: session.description,
+        integration: session.integration,
+        state: session.state.into(),
+        state_is_current: session.state_is_current,
+        started_at_ms: session.started_at_ms,
+        last_at_ms: session.last_at_ms,
+        occurrence_count: session.occurrence_count,
+    }
+}
+
+fn inspect_session_on_node(
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+) -> Result<protocol::HostAgentSessionInspection, String> {
+    let client = client::connect().map_err(|error| error.to_string())?;
+    let operation = protocol::HostServiceOperation::InspectAgentSession {
+        session_id: identity.inner_id.clone(),
+    };
+    let result = if identity.node_id == local_node_id || identity.node_id.is_empty() {
+        client.host_service(operation)
+    } else {
+        client.route_node_host_service(&identity.node_id, operation)
+    }
+    .map_err(|error| error.to_string())?;
+    match result {
+        protocol::HostServiceResult::AgentSession { session } => Ok(session),
+        _ => Err("Node returned an unexpected Session inspection response".into()),
+    }
+}
+
+fn dashboard_session_details(
+    identity: &protocol::QualifiedIdentity,
+    inspection: protocol::HostAgentSessionInspection,
+    action: Result<String, String>,
+) -> tui::DashboardSessionDetails {
+    let node_alias = if identity.node_id.is_empty() {
+        "local".into()
+    } else {
+        identity.node_id.clone()
+    };
+    tui::DashboardSessionDetails {
+        session: dashboard_session_summary(&identity.node_id, &node_alias, inspection.summary),
+        source_cwd: inspection.source_cwd,
+        occurrences: inspection.occurrences,
+        action,
+    }
+}
+
+fn session_open_action(
+    inspection: &protocol::HostAgentSessionInspection,
+) -> Result<String, String> {
+    if inspection.summary.state == AgentState::Done {
+        return Err("Session is permanently done".into());
+    }
+    if inspection.summary.state_is_current {
+        return Ok("open exact current managed Shell".into());
+    }
+    if inspection.source_cwd.is_none() {
+        return Err("Session has no retained source cwd".into());
+    }
+    let integration = boomux::integrations::by_key(&inspection.summary.integration)
+        .ok_or_else(|| "Session uses an unknown integration".to_owned())?;
+    if integration.resume.is_none() || inspection.summary.external_session_id.is_none() {
+        return Err(format!(
+            "{} cannot resume this exact Session",
+            integration.display_name
+        ));
+    }
+    Ok("resume exact historical Session".into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionOpenPlan {
+    Current {
+        node_id: Option<String>,
+        shell_id: String,
+        run_id: String,
+        title: String,
+        description: String,
+    },
+    Historical {
+        node_id: Option<String>,
+        session_id: String,
+        title: String,
+        description: String,
+    },
+}
+
+fn session_open_plan(
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+    inspection: &protocol::HostAgentSessionInspection,
+    workspace: Option<&WorkspaceSnapshot>,
+) -> Result<SessionOpenPlan, String> {
+    session_open_action(inspection)?;
+    let summary = &inspection.summary;
+    let node_id = (identity.node_id != local_node_id && !identity.node_id.is_empty())
+        .then(|| identity.node_id.clone());
+    let title = format!(
+        "{} - {} Session",
+        summary.workspace_name, summary.integration
+    );
+    if !summary.state_is_current {
+        return Ok(SessionOpenPlan::Historical {
+            node_id,
+            session_id: identity.inner_id.clone(),
+            title,
+            description: summary.description.clone(),
+        });
+    }
+
+    let workspace =
+        workspace.ok_or_else(|| "Session owner Workspace is no longer available".to_owned())?;
+    if workspace.id != summary.workspace_id {
+        return Err("Session owner Workspace identity changed; refusing ambiguity".into());
+    }
+    let mut current = inspection.occurrences.iter().filter_map(|occurrence| {
+        if occurrence.ended_at_ms.is_some()
+            || matches!(
+                occurrence.observation.state,
+                AgentState::Inactive | AgentState::Done
+            )
+        {
+            return None;
+        }
+        workspace
+            .shells
+            .iter()
+            .find(|shell| {
+                shell.id == occurrence.shell_id
+                    && shell.status == ShellStatus::Running
+                    && shell
+                        .run
+                        .as_ref()
+                        .is_some_and(|run| run.id == occurrence.run_id)
+            })
+            .map(|shell| (shell.id.clone(), occurrence.run_id.clone()))
+    });
+    let (shell_id, run_id) = current
+        .next()
+        .ok_or_else(|| "Session no longer has an exact current managed Shell".to_owned())?;
+    if current.next().is_some() {
+        return Err("Session has multiple current managed Shells; refusing ambiguity".into());
+    }
+    Ok(SessionOpenPlan::Current {
+        node_id,
+        shell_id,
+        run_id,
+        title,
+        description: summary.description.clone(),
+    })
+}
+
+fn dispatch_session_open<L, R, H>(
+    plan: &SessionOpenPlan,
+    mut open_local: L,
+    mut open_remote: R,
+    mut resume: H,
+) -> Result<String, String>
+where
+    L: FnMut(&str, &str, &str) -> Result<(), String>,
+    R: FnMut(&str, &str, &str, &str) -> Result<(), String>,
+    H: FnMut(Option<&str>, &str, &str) -> Result<(), String>,
+{
+    match plan {
+        SessionOpenPlan::Current {
+            node_id,
+            shell_id,
+            run_id,
+            title,
+            description,
+        } => {
+            if let Some(node_id) = node_id {
+                open_remote(node_id, shell_id, run_id, title)?;
+            } else {
+                open_local(shell_id, run_id, title)?;
+            }
+            Ok(format!("Opened terminal for current Session {description}"))
+        }
+        SessionOpenPlan::Historical {
+            node_id,
+            session_id,
+            title,
+            description,
+        } => {
+            resume(node_id.as_deref(), session_id, title)?;
+            Ok(format!(
+                "Opened terminal for historical Session {description}"
+            ))
+        }
+    }
+}
+
+fn validate_session_cwd(
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+    inspection: &protocol::HostAgentSessionInspection,
+) -> Result<PathBuf, String> {
+    let cwd = inspection
+        .source_cwd
+        .clone()
+        .ok_or_else(|| "Session has no retained source cwd".to_owned())?;
+    let client = client::connect().map_err(|error| error.to_string())?;
+    let operation = protocol::HostServiceOperation::ResolveDirectory { path: cwd };
+    let result = if identity.node_id == local_node_id || identity.node_id.is_empty() {
+        client.host_service(operation)
+    } else {
+        client.route_node_host_service(&identity.node_id, operation)
+    }
+    .map_err(|error| format!("Session source cwd is unavailable: {error}"))?;
+    match result {
+        protocol::HostServiceResult::Directory { path } => Ok(path),
+        _ => Err("Node returned an unexpected source cwd response".into()),
+    }
+}
+
+fn open_exact_session(
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+    terminal_entry: Option<&str>,
+    coordinated_workspace: Option<&str>,
+) -> Result<String, String> {
+    let inspection = inspect_session_on_node(identity, local_node_id)?;
+    session_open_action(&inspection)?;
+    let summary = &inspection.summary;
+    let remote = identity.node_id != local_node_id && !identity.node_id.is_empty();
+    let (workspace, source_cwd) = if summary.state_is_current {
+        let client = client::connect().map_err(|error| error.to_string())?;
+        (
+            Some(if remote {
+                match client
+                    .route_node_operation(
+                        &identity.node_id,
+                        protocol::RoutedOperation::GetWorkspace {
+                            workspace_id: summary.workspace_id.clone(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?
+                {
+                    protocol::RoutedOperationResult::Workspace { workspace } => workspace,
+                    _ => return Err("Node returned an unexpected Workspace response".into()),
+                }
+            } else {
+                client
+                    .get_workspace(&summary.workspace_id)
+                    .map_err(|error| error.to_string())?
+            }),
+            None,
+        )
+    } else {
+        (
+            None,
+            Some(validate_session_cwd(identity, local_node_id, &inspection)?),
+        )
+    };
+    if !summary.state_is_current
+        && let Some(target) = coordinated_workspace
+    {
+        open_managed_historical_session(
+            identity,
+            &inspection,
+            source_cwd.as_deref().expect("historical Session cwd"),
+            target,
+            terminal_entry,
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(format!(
+            "Opened managed terminal for historical Session {}",
+            summary.description
+        ));
+    }
+    let placement = coordinated_workspace
+        .map(|target| {
+            let client = client::connect().map_err(|error| error.to_string())?;
+            prepare_session_desktop_placement(&client, target).map_err(|error| error.to_string())
+        })
+        .transpose()?
+        .flatten();
+    let plan = session_open_plan(identity, local_node_id, &inspection, workspace.as_ref())?;
+    dispatch_session_open(
+        &plan,
+        |shell_id, run_id, title| {
+            if let Some(workspace_id) = placement.as_deref() {
+                terminal::open_exact_run_placed(
+                    terminal_entry,
+                    shell_id,
+                    run_id,
+                    title,
+                    true,
+                    terminal::HyprlandPlacement {
+                        workspace_id,
+                        node_id: local_node_id,
+                        shell_id,
+                    },
+                )
+            } else {
+                terminal::open_exact_run(terminal_entry, shell_id, run_id, title, true)
+            }
+            .map_err(|error| error.to_string())
+        },
+        |node_id, shell_id, run_id, title| {
+            if let Some(workspace_id) = placement.as_deref() {
+                terminal::open_remote_exact_run_placed(
+                    terminal_entry,
+                    node_id,
+                    shell_id,
+                    run_id,
+                    title,
+                    true,
+                    workspace_id,
+                )
+            } else {
+                terminal::open_remote_exact_run(
+                    terminal_entry,
+                    node_id,
+                    shell_id,
+                    run_id,
+                    title,
+                    true,
+                )
+            }
+            .map_err(|error| error.to_string())
+        },
+        |node_id, session_id, title| {
+            terminal::open_agent_session(terminal_entry, node_id, session_id, title)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn open_managed_historical_session(
+    identity: &protocol::QualifiedIdentity,
+    inspection: &protocol::HostAgentSessionInspection,
+    cwd: &Path,
+    coordinated_workspace: &str,
+    terminal_entry: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let summary = &inspection.summary;
+    let external_session_id = summary.external_session_id.as_deref().ok_or_else(|| {
+        cli_output::failure("invalid_argument", "Session has no canonical external ID")
+    })?;
+    let integration = boomux::integrations::by_key(&summary.integration)
+        .ok_or_else(|| cli_output::failure("invalid_argument", "unknown Agent integration"))?;
+    let resume = integration.resume.ok_or_else(|| {
+        cli_output::failure(
+            "invalid_argument",
+            "integration does not support exact Session resume",
+        )
+    })?;
+    let resume_command = resume.command(&[], external_session_id).ok_or_else(|| {
+        cli_output::failure(
+            "invalid_argument",
+            "could not build exact Session resume argv",
+        )
+    })?;
+    let client = client::connect()?;
+    let context = WorkspaceCreationContext::load(&client)?;
+    let selection = context
+        .coordinated_owner(coordinated_workspace, Some(&identity.node_id))?
+        .ok_or_else(|| {
+            cli_output::failure(
+                "not_found",
+                format!("coordinated Workspace not found: {coordinated_workspace}"),
+            )
+        })?;
+    let boomux_executable = if selection.node.local {
+        env::current_exe()?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "Boomux executable path is not valid UTF-8")?
+    } else {
+        "boomux".into()
+    };
+    let command = supervised_session_resume_command(
+        &boomux_executable,
+        integration.display_name,
+        integration.key,
+        external_session_id,
+        &resume_command,
+    );
+    let shell_id = Uuid::new_v4().to_string();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let name = format!("{}-session-{}", summary.integration, &suffix[..8]);
+    let title = if selection.node.local {
+        format!("{} - {name}", selection.workspace.name)
+    } else {
+        format!(
+            "[{}] {} - {name}",
+            selection.node.alias, selection.workspace.name
+        )
+    };
+    let gate = if hyprland_special_workspaces_enabled()? {
+        terminal::open_waiting_placed(
+            terminal_entry,
+            (!selection.node.local).then_some(selection.node.node_id.as_str()),
+            &selection.node.node_id,
+            &selection.workspace.id,
+            &shell_id,
+            &title,
+        )?
+    } else {
+        terminal::open_waiting(
+            terminal_entry,
+            (!selection.node.local).then_some(selection.node.node_id.as_str()),
+            &shell_id,
+            &title,
+        )?
+    };
+    let owner_default_cwd = selection
+        .default_cwd
+        .clone()
+        .or_else(|| Some(cwd.to_path_buf()));
+    let (_, shell) = client.create_global_workspace_shell(
+        Uuid::new_v4().to_string(),
+        &selection.workspace.id,
+        selection.workspace.revision,
+        &selection.node.node_id,
+        selection.owner_workspace_id,
+        owner_default_cwd,
+        shell_id,
+        shell_spec(name, cwd, &command),
+    )?;
+    gate.release().map_err(|error| {
+        format!(
+            "Shell {} was created but its terminal could not attach: {error}",
+            shell.id
+        )
+    })?;
+    Ok(())
+}
+
+fn supervised_session_resume_command(
+    boomux_executable: &str,
+    agent_name: &str,
+    integration: &str,
+    external_session_id: &str,
+    resume_command: &[String],
+) -> Vec<String> {
+    let mut command = vec![
+        boomux_executable.to_owned(),
+        "agent".into(),
+        "supervise".into(),
+        agent_name.to_owned(),
+        "--integration".into(),
+        integration.to_owned(),
+        "--external-session-id".into(),
+        external_session_id.to_owned(),
+        "--".into(),
+    ];
+    command.extend_from_slice(resume_command);
+    command
 }
 
 fn assign_local_workspace_node(workspaces: &mut [tui::WorkspaceView], node: &tui::NodeView) {
@@ -8446,12 +9025,39 @@ fn attention_command(command: AttentionCommands, json: bool) -> Result<(), Box<d
     Ok(())
 }
 
-fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn Error>> {
+fn session_command(
+    command: SessionCommands,
+    json: bool,
+    terminal_override: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     validate_session_protocol(client.protocol_version()?)?;
+    if let SessionCommands::Open {
+        session_id,
+        node,
+        workspace,
+    } = &command
+    {
+        let local_node_id = client.node_identity()?;
+        let owner_node_id = match node {
+            Some(node) => client.node_registration(node)?.node_id,
+            None => local_node_id.clone(),
+        };
+        let terminal = effective_terminal(terminal_override)?;
+        let message = open_exact_session(
+            &protocol::QualifiedIdentity::new(owner_node_id, session_id),
+            &local_node_id,
+            terminal.as_deref(),
+            workspace.as_deref(),
+        )
+        .map_err(io::Error::other)?;
+        println!("{message}");
+        return Ok(());
+    }
     let selected_node = match &command {
         SessionCommands::List { node, .. }
         | SessionCommands::Inspect { node, .. }
+        | SessionCommands::Open { node, .. }
         | SessionCommands::Resume { node, .. } => node.as_deref(),
     };
     if let Some(node) = selected_node {
@@ -8465,24 +9071,15 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
                 .as_deref()
                 .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
                 .transpose()?;
-            let catalog = selected_workspace.map_or_else(
-                || discover_host_catalog(&snapshot.workspaces),
-                |workspace| discover_host_catalog(std::slice::from_ref(workspace)),
-            );
-            let sessions =
-                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
             let workspace_id = selected_workspace.map(|workspace| workspace.id.as_str());
-            let sessions = sessions
-                .iter()
-                .filter(|session| {
-                    workspace_id.is_none_or(|workspace_id| session.workspace_id == workspace_id)
-                })
-                .collect::<Vec<_>>();
+            let result =
+                client.host_service(protocol::HostServiceOperation::ListAgentSessions {
+                    workspace_id: workspace_id.map(str::to_owned),
+                })?;
+            let protocol::HostServiceResult::AgentSessions { sessions } = result else {
+                return Err("daemon returned an unexpected Session-list response".into());
+            };
             if json {
-                let sessions = sessions
-                    .iter()
-                    .map(|session| cli_output::session_summary(session))
-                    .collect::<Vec<_>>();
                 return print_json(
                     CommandKey::SessionList,
                     serde_json::json!({ "sessions": sessions }),
@@ -8505,7 +9102,7 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
                         "last-known"
                     },
                     session.last_at_ms,
-                    session.occurrences.len()
+                    session.occurrence_count
                 );
             }
         }
@@ -8536,6 +9133,7 @@ fn session_command(command: SessionCommands, json: bool) -> Result<(), Box<dyn E
             }
             print_session(session);
         }
+        SessionCommands::Open { .. } => unreachable!("Session open returns before projection"),
         SessionCommands::Resume { session_id, .. } => {
             let catalog = discover_host_catalog(&snapshot.workspaces);
             let sessions =
@@ -8639,6 +9237,7 @@ fn remote_session_command(
             println!("INTEGRATION\t{}", session.summary.integration);
             println!("OCCURRENCES\t{}", session.summary.occurrence_count);
         }
+        SessionCommands::Open { .. } => unreachable!("Session open uses shared exact-open logic"),
         SessionCommands::Resume { session_id, .. } => {
             let result = client.route_node_host_service(
                 &registration.node_id,
@@ -10104,6 +10703,34 @@ fn prepare_shell_desktop_placement(
         owner_workspace_id,
         &combined.workspaces,
     )
+}
+
+fn prepare_session_desktop_placement(
+    client: &client::Client,
+    target: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let combined = client.combined_node_snapshot(None)?;
+    let workspace =
+        resolve_global_workspace_target(&combined.workspaces, target).ok_or_else(|| {
+            cli_output::failure(
+                "not_found",
+                format!("coordinated Workspace not found: {target}"),
+            )
+        })?;
+    if workspace.closing {
+        return Err(cli_output::failure(
+            "invalid_argument",
+            "the selected coordinated Workspace is closing",
+        ));
+    }
+    if !hyprland_special_workspaces_enabled()? {
+        return Ok(None);
+    }
+    if hyprland::active_boomux_workspace()?.as_deref() != Some(workspace.id.as_str()) {
+        hyprland::toggle_special(&workspace.id)?;
+    }
+    select_desktop_workspace(workspace)?;
+    Ok(Some(workspace.id.clone()))
 }
 
 fn prepare_shell_desktop_placement_from_snapshot(
@@ -12774,7 +13401,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_session_discovery_commands_and_json_support() {
+    fn parses_session_discovery_and_human_only_open_commands() {
         let list = Cli::try_parse_from([
             "boomux",
             "session",
@@ -12801,7 +13428,52 @@ mod tests {
         assert_eq!(inspect.command_descriptor().key, "session.inspect");
         assert_eq!(inspect.command_descriptor().output, OutputMode::Json);
 
+        let open = Cli::try_parse_from([
+            "boomux",
+            "session",
+            "open",
+            "opaque",
+            "--node",
+            "workbox",
+            "--workspace",
+            "active",
+        ])
+        .unwrap();
+        assert_eq!(open.command_descriptor().key, "session.open");
+        assert_eq!(open.command_descriptor().output, OutputMode::HumanOnly);
+        assert!(matches!(
+            open.command,
+            Some(Commands::Session {
+                command: SessionCommands::Open { session_id, node, workspace }
+            }) if session_id == "opaque" && node.as_deref() == Some("workbox")
+                && workspace.as_deref() == Some("active")
+        ));
+
+        let json_open =
+            Cli::try_parse_from(["boomux", "--json", "session", "open", "opaque"]).unwrap();
+        assert!(
+            run(json_open)
+                .unwrap_err()
+                .to_string()
+                .contains("--json is not supported for session.open")
+        );
+
         assert!(Cli::try_parse_from(["boomux", "session", "read", "opaque"]).is_err());
+    }
+
+    #[test]
+    fn session_open_help_is_public_and_documents_exact_identity_and_node() {
+        let session_help = match Cli::try_parse_from(["boomux", "session", "--help"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("Session help must exit before command dispatch"),
+        };
+        assert!(session_help.contains("open"));
+        let open_help = match Cli::try_parse_from(["boomux", "session", "open", "--help"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("Session open help must exit before command dispatch"),
+        };
+        assert!(open_help.contains("SESSION_ID"));
+        assert!(open_help.contains("--node <NODE>"));
     }
 
     #[test]
@@ -14342,6 +15014,8 @@ mod tests {
         assert!(json_commands.contains(&"shell.suggest-name"));
         assert!(json_commands.contains(&"workspace.create"));
         assert!(NON_PROTOCOL_FEATURES.contains(&"atomic_workspace_shell_creation"));
+        assert!(NON_PROTOCOL_FEATURES.contains(&"exact_session_open"));
+        assert!(!json_commands.contains(&"session.open"));
         for command in [
             "agent.register",
             "agent.ensure",
@@ -14849,6 +15523,435 @@ mod tests {
         assert!(!skill_install_path(&home).exists());
         fs::remove_dir_all(home).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    fn inspected_session(
+        state: AgentState,
+        current: bool,
+        cwd: Option<&str>,
+    ) -> protocol::HostAgentSessionInspection {
+        protocol::HostAgentSessionInspection {
+            summary: protocol::HostAgentSessionSummary {
+                id: "session-id".into(),
+                workspace_id: "workspace-id".into(),
+                workspace_name: "workspace".into(),
+                description: "review".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("external-id".into()),
+                state,
+                state_is_current: current,
+                started_at_ms: 10,
+                last_at_ms: 20,
+                occurrence_count: 1,
+            },
+            source_cwd: cwd.map(PathBuf::from),
+            occurrences: Vec::new(),
+        }
+    }
+
+    fn host_session_summary(
+        id: &str,
+        workspace_id: &str,
+        last_at_ms: u64,
+    ) -> protocol::HostAgentSessionSummary {
+        protocol::HostAgentSessionSummary {
+            id: id.into(),
+            workspace_id: workspace_id.into(),
+            workspace_name: format!("workspace-{workspace_id}"),
+            description: format!("Session {id}"),
+            integration: "opencode".into(),
+            external_session_id: Some(format!("external-{id}")),
+            state: AgentState::Inactive,
+            state_is_current: false,
+            started_at_ms: last_at_ms.saturating_sub(10),
+            last_at_ms,
+            occurrence_count: 1,
+        }
+    }
+
+    fn current_inspected_session(
+        shell_id: &str,
+        run_id: &str,
+    ) -> protocol::HostAgentSessionInspection {
+        let mut inspection = inspected_session(AgentState::Working, true, Some("/tmp/project"));
+        let mut occurrence = agent("agent-id", "workspace-id", shell_id);
+        occurrence.run_id = run_id.into();
+        inspection.occurrences.push(occurrence);
+        inspection
+    }
+
+    #[test]
+    fn session_open_actions_distinguish_current_historical_and_invalid_sessions() {
+        assert_eq!(
+            session_open_action(&inspected_session(AgentState::Working, true, None)),
+            Ok("open exact current managed Shell".into())
+        );
+        assert_eq!(
+            session_open_action(&inspected_session(
+                AgentState::Inactive,
+                false,
+                Some("/tmp/project")
+            )),
+            Ok("resume exact historical Session".into())
+        );
+        assert!(
+            session_open_action(&inspected_session(AgentState::Done, false, Some("/tmp")))
+                .unwrap_err()
+                .contains("permanently done")
+        );
+        assert!(
+            session_open_action(&inspected_session(AgentState::Done, true, Some("/tmp")))
+                .unwrap_err()
+                .contains("permanently done")
+        );
+        assert!(
+            session_open_action(&inspected_session(AgentState::Inactive, false, None))
+                .unwrap_err()
+                .contains("source cwd")
+        );
+    }
+
+    #[test]
+    fn dashboard_session_aggregation_retains_partial_node_results_and_qualified_order() {
+        let loaded = aggregate_dashboard_session_loads([
+            DashboardSessionNodeLoad {
+                node: tui::SessionNodeView {
+                    id: "a-local".into(),
+                    alias: "local".into(),
+                    local: true,
+                },
+                result: Ok(vec![host_session_summary("same", "z-workspace", 100)]),
+            },
+            DashboardSessionNodeLoad {
+                node: tui::SessionNodeView {
+                    id: "b-remote".into(),
+                    alias: "work".into(),
+                    local: false,
+                },
+                result: Ok(vec![
+                    host_session_summary("newest", "remote-workspace", 200),
+                    host_session_summary("same", "a-workspace", 100),
+                ]),
+            },
+            DashboardSessionNodeLoad {
+                node: tui::SessionNodeView {
+                    id: "c-unavailable".into(),
+                    alias: "offline".into(),
+                    local: false,
+                },
+                result: Err("authentication required".into()),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(loaded.sessions.len(), 3);
+        assert_eq!(
+            loaded
+                .sessions
+                .iter()
+                .map(|session| (
+                    session.node_id.as_str(),
+                    session.workspace_id.as_str(),
+                    session.session_id.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("b-remote", "remote-workspace", "newest"),
+                ("a-local", "z-workspace", "same"),
+                ("b-remote", "a-workspace", "same"),
+            ]
+        );
+        assert_eq!(loaded.sessions[0].node_alias, "work");
+        assert_eq!(loaded.sessions[1].node_alias, "local");
+        assert_eq!(
+            loaded.warnings,
+            vec!["Node offline: authentication required"]
+        );
+    }
+
+    #[test]
+    fn dashboard_session_summary_preserves_node_qualified_identity_fields() {
+        let details = dashboard_session_details(
+            &protocol::QualifiedIdentity::new("owner-node", "session-id"),
+            inspected_session(AgentState::Inactive, false, Some("/owner/path")),
+            Ok("eligible".into()),
+        );
+
+        assert_eq!(details.session.node_id, "owner-node");
+        assert_eq!(details.session.session_id, "session-id");
+        assert_eq!(details.session.workspace_id, "workspace-id");
+        assert_eq!(details.source_cwd, Some(PathBuf::from("/owner/path")));
+    }
+
+    #[test]
+    fn session_open_plan_routes_exact_local_current_shell_and_run() {
+        let inspection = current_inspected_session("local-shell", "r1");
+        let workspace = workspace(
+            "workspace-id",
+            "workspace",
+            vec![shell("local-shell", "workspace-id", "agent")],
+        );
+        let plan = session_open_plan(
+            &protocol::QualifiedIdentity::new("local-node", "session-id"),
+            "local-node",
+            &inspection,
+            Some(&workspace),
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            SessionOpenPlan::Current {
+                node_id: None,
+                shell_id: "local-shell".into(),
+                run_id: "r1".into(),
+                title: "workspace - opencode Session".into(),
+                description: "review".into(),
+            }
+        );
+        let opened = std::cell::RefCell::new(Vec::new());
+        let message = dispatch_session_open(
+            &plan,
+            |shell, run, _| {
+                opened
+                    .borrow_mut()
+                    .push(("local", shell.to_owned(), run.to_owned()));
+                Ok(())
+            },
+            |_, _, _, _| panic!("must not route a local Session remotely"),
+            |_, _, _| panic!("must not resume a current Session"),
+        )
+        .unwrap();
+        assert_eq!(
+            opened.into_inner(),
+            vec![("local", "local-shell".into(), "r1".into())]
+        );
+        assert_eq!(message, "Opened terminal for current Session review");
+    }
+
+    #[test]
+    fn session_open_plan_routes_exact_remote_current_owner_and_ignores_local_collision() {
+        let inspection = current_inspected_session("same-shell", "r1");
+        let owner_workspace = workspace(
+            "workspace-id",
+            "owner",
+            vec![shell("same-shell", "workspace-id", "owner-agent")],
+        );
+        let remote = session_open_plan(
+            &protocol::QualifiedIdentity::new("remote-owner", "same-session"),
+            "local-node",
+            &inspection,
+            Some(&owner_workspace),
+        )
+        .unwrap();
+        let local = session_open_plan(
+            &protocol::QualifiedIdentity::new("local-node", "same-session"),
+            "local-node",
+            &inspection,
+            Some(&owner_workspace),
+        )
+        .unwrap();
+        assert!(matches!(
+            &remote,
+            SessionOpenPlan::Current { node_id: Some(node), shell_id, run_id, .. }
+                if node == "remote-owner" && shell_id == "same-shell" && run_id == "r1"
+        ));
+        assert!(matches!(
+            local,
+            SessionOpenPlan::Current { node_id: None, .. }
+        ));
+        let routed = std::cell::RefCell::new(Vec::new());
+        dispatch_session_open(
+            &remote,
+            |_, _, _| panic!("remote Session must not use local attachment"),
+            |node, shell, run, _| {
+                routed
+                    .borrow_mut()
+                    .push((node.to_owned(), shell.to_owned(), run.to_owned()));
+                Ok(())
+            },
+            |_, _, _| panic!("current Session must not resume historically"),
+        )
+        .unwrap();
+        assert_eq!(
+            routed.into_inner(),
+            vec![("remote-owner".into(), "same-shell".into(), "r1".into())]
+        );
+    }
+
+    #[test]
+    fn session_open_plan_resumes_exact_remote_historical_owner_identity() {
+        let inspection = inspected_session(AgentState::Inactive, false, Some("/owner/project"));
+        let plan = session_open_plan(
+            &protocol::QualifiedIdentity::new("remote-owner", "exact-session"),
+            "local-node",
+            &inspection,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            &plan,
+            SessionOpenPlan::Historical { node_id: Some(node), session_id, .. }
+                if node == "remote-owner" && session_id == "exact-session"
+        ));
+        let resumed = std::cell::RefCell::new(Vec::new());
+        dispatch_session_open(
+            &plan,
+            |_, _, _| panic!("historical Session must not attach locally"),
+            |_, _, _, _| panic!("historical Session must not attach remotely"),
+            |node, session, _| {
+                resumed
+                    .borrow_mut()
+                    .push((node.map(str::to_owned), session.to_owned()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.into_inner(),
+            vec![(Some("remote-owner".into()), "exact-session".into())]
+        );
+    }
+
+    #[test]
+    fn session_open_plan_resumes_exact_local_historical_identity() {
+        let inspection = inspected_session(AgentState::Inactive, false, Some("/local/project"));
+        let plan = session_open_plan(
+            &protocol::QualifiedIdentity::new("local-node", "exact-session"),
+            "local-node",
+            &inspection,
+            None,
+        )
+        .unwrap();
+        let resumed = std::cell::RefCell::new(Vec::new());
+        dispatch_session_open(
+            &plan,
+            |_, _, _| panic!("historical Session must not attach locally"),
+            |_, _, _, _| panic!("historical Session must not attach remotely"),
+            |node, session, _| {
+                resumed
+                    .borrow_mut()
+                    .push((node.map(str::to_owned), session.to_owned()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed.into_inner(), vec![(None, "exact-session".into())]);
+    }
+
+    #[test]
+    fn managed_historical_session_supervision_preserves_exact_identity_and_argv() {
+        let command = supervised_session_resume_command(
+            "/opt/boomux",
+            "OpenCode",
+            "opencode",
+            "ses_exact; literal",
+            &[
+                "opencode".into(),
+                "--session".into(),
+                "ses_exact; literal".into(),
+            ],
+        );
+        assert_eq!(
+            command,
+            [
+                "/opt/boomux",
+                "agent",
+                "supervise",
+                "OpenCode",
+                "--integration",
+                "opencode",
+                "--external-session-id",
+                "ses_exact; literal",
+                "--",
+                "opencode",
+                "--session",
+                "ses_exact; literal",
+            ]
+        );
+        let parsed = Cli::try_parse_from(command).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Agent {
+                command: AgentCommands::Supervise(AgentSuperviseArgs {
+                    name: Some(name),
+                    integration,
+                    external_session_id,
+                    command,
+                    ..
+                })
+            }) if name == "OpenCode"
+                && integration == "opencode"
+                && external_session_id == "ses_exact; literal"
+                && command == ["opencode", "--session", "ses_exact; literal"]
+        ));
+    }
+
+    #[test]
+    fn session_open_plan_rejects_done_missing_and_ambiguous_current_targets() {
+        let identity = protocol::QualifiedIdentity::new("local-node", "session-id");
+        assert!(
+            session_open_plan(
+                &identity,
+                "local-node",
+                &inspected_session(AgentState::Done, false, Some("/tmp")),
+                None,
+            )
+            .unwrap_err()
+            .contains("permanently done")
+        );
+        assert!(
+            session_open_plan(
+                &identity,
+                "local-node",
+                &current_inspected_session("missing", "r1"),
+                None,
+            )
+            .unwrap_err()
+            .contains("Workspace is no longer available")
+        );
+        let mut inspection = current_inspected_session("first", "r1");
+        inspection
+            .occurrences
+            .push(agent("second-agent", "workspace-id", "second"));
+        let workspace = workspace(
+            "workspace-id",
+            "workspace",
+            vec![
+                shell("first", "workspace-id", "first"),
+                shell("second", "workspace-id", "second"),
+            ],
+        );
+        assert!(
+            session_open_plan(&identity, "local-node", &inspection, Some(&workspace),)
+                .unwrap_err()
+                .contains("multiple current")
+        );
+    }
+
+    #[test]
+    fn session_open_plan_ignores_ended_and_inactive_occurrences() {
+        let identity = protocol::QualifiedIdentity::new("local-node", "session-id");
+        let mut inspection = current_inspected_session("current", "r1");
+        let mut inactive = agent("inactive-agent", "workspace-id", "inactive");
+        inactive.observation.state = AgentState::Inactive;
+        let mut ended = agent("ended-agent", "workspace-id", "ended");
+        ended.ended_at_ms = Some(12);
+        inspection.occurrences.extend([inactive, ended]);
+        let workspace = workspace(
+            "workspace-id",
+            "workspace",
+            vec![
+                shell("current", "workspace-id", "current"),
+                shell("inactive", "workspace-id", "inactive"),
+                shell("ended", "workspace-id", "ended"),
+            ],
+        );
+
+        assert!(matches!(
+            session_open_plan(&identity, "local-node", &inspection, Some(&workspace)),
+            Ok(SessionOpenPlan::Current { shell_id, run_id, .. })
+                if shell_id == "current" && run_id == "r1"
+        ));
     }
 
     fn test_skill_home(label: &str) -> PathBuf {

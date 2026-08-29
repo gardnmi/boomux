@@ -315,9 +315,11 @@ Discover projected session metadata with:
 boomux session list --json
 boomux session list --workspace "<workspace-name-or-id>" --json
 boomux session inspect "<exact-session-id>" --json
+boomux session open "<exact-session-id>"
 boomux session resume "<exact-session-id>"
 boomux session list --node "<node>" --json
 boomux session inspect "<exact-session-id>" --node "<same-node>" --json
+boomux session open "<exact-session-id>" --node "<same-node>"
 boomux session resume "<exact-session-id>" --node "<same-node>"
 ```
 
@@ -328,9 +330,12 @@ run of a running retained shell; otherwise it is last-known. Catalog-only
 OpenCode or Codex history has state `unknown`, no fabricated occurrence, and a
 sanitized host title. Registered-session descriptions remain durable Agent names.
 Protocol-13 sessions retain a `source_cwd` after shell removal so an exact
-canonical session can be resumed in its original context. Resume launches a
-native host process and requires authorization. A remote Session ID is exact
-only within its owning Node; keep the same `--node` used for discovery.
+canonical session can be resumed in its original context. Open attaches the exact
+current ShellRun with takeover or resumes an exact historical Session, and fails
+closed if that target is done, missing, ambiguous, unavailable, or changed.
+Resume always launches a native host process and requires authorization. A
+remote Session ID is exact only within its owning Node; keep the same `--node`
+used for discovery.
 
 Exact shell IDs are global only within one Node. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.

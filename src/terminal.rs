@@ -257,6 +257,25 @@ pub(crate) fn open_exact_run(
     )
 }
 
+pub(crate) fn open_exact_run_placed(
+    desktop_entry: Option<&str>,
+    shell_id: &str,
+    expected_run_id: &str,
+    title: &str,
+    takeover: bool,
+    placement: HyprlandPlacement<'_>,
+) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run_and_placement(
+        desktop_entry,
+        shell_id,
+        None,
+        title,
+        takeover,
+        Some(expected_run_id),
+        Some(placement),
+    )
+}
+
 pub(crate) fn open_remote_exact_run(
     desktop_entry: Option<&str>,
     node_id: &str,
@@ -272,6 +291,30 @@ pub(crate) fn open_remote_exact_run(
         title,
         takeover,
         Some(expected_run_id),
+    )
+}
+
+pub(crate) fn open_remote_exact_run_placed(
+    desktop_entry: Option<&str>,
+    node_id: &str,
+    shell_id: &str,
+    expected_run_id: &str,
+    title: &str,
+    takeover: bool,
+    workspace_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    open_with_expected_run_and_placement(
+        desktop_entry,
+        shell_id,
+        Some(node_id),
+        title,
+        takeover,
+        Some(expected_run_id),
+        Some(HyprlandPlacement {
+            workspace_id,
+            node_id,
+            shell_id,
+        }),
     )
 }
 

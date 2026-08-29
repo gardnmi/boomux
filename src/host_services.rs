@@ -551,13 +551,25 @@ pub(crate) fn verify_integration(
 }
 
 pub(crate) fn sessions(snapshot: &Snapshot) -> Vec<SessionProjection> {
-    let directories = workspace_directories(&snapshot.workspaces)
+    let directories = session_catalog_directories(snapshot);
+    let catalog = session_catalog(&directories);
+    sessions_with_catalog(snapshot, &catalog)
+}
+
+pub(crate) fn session_catalog_directories(snapshot: &Snapshot) -> Vec<PathBuf> {
+    workspace_directories(&snapshot.workspaces)
         .into_iter()
         .take(MAX_CATALOG_DIRECTORIES)
-        .collect::<Vec<_>>();
-    let catalog = thread::scope(|scope| {
+        .collect()
+}
+
+pub(crate) fn session_catalog(
+    directories: &[PathBuf],
+) -> Vec<crate::host_session_titles::HostSession> {
+    thread::scope(|scope| {
         directories
-            .into_iter()
+            .iter()
+            .cloned()
             .flat_map(|directory| {
                 crate::host_session_titles::catalog_integrations()
                     .map(move |integration| (integration, directory.clone()))
@@ -570,8 +582,14 @@ pub(crate) fn sessions(snapshot: &Snapshot) -> Vec<SessionProjection> {
             .filter_map(|handle| handle.join().ok().flatten())
             .flatten()
             .collect::<Vec<_>>()
-    });
-    let mut sessions = session_projection::project_snapshot_with_catalog(snapshot, Some(&catalog));
+    })
+}
+
+pub(crate) fn sessions_with_catalog(
+    snapshot: &Snapshot,
+    catalog: &[crate::host_session_titles::HostSession],
+) -> Vec<SessionProjection> {
+    let mut sessions = session_projection::project_snapshot_with_catalog(snapshot, Some(catalog));
     sessions.truncate(MAX_HOST_SERVICE_SESSIONS);
     sessions
 }
@@ -617,12 +635,12 @@ pub(crate) fn session_summary(session: &SessionProjection) -> HostAgentSessionSu
     }
 }
 
-pub(crate) fn inspect_session(
+pub(crate) fn inspect_projected_session(
     snapshot: &Snapshot,
+    sessions: &[SessionProjection],
     session_id: &str,
 ) -> io::Result<HostAgentSessionInspection> {
-    let sessions = sessions(snapshot);
-    let session = session_projection::resolve_exact(&sessions, session_id).map_err(|error| {
+    let session = session_projection::resolve_exact(sessions, session_id).map_err(|error| {
         io::Error::new(
             match error {
                 session_projection::ResolveError::NotFound => io::ErrorKind::NotFound,
