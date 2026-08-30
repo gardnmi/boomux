@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/gardnmi/boomux/compare/v1.7.2...v1.8.0) (2026-08-30)
+
+
+### Features
+
+* add explicit daemon startup ([#333](https://github.com/gardnmi/boomux/issues/333)) ([c7fcb93](https://github.com/gardnmi/boomux/commit/c7fcb9310973a81275b96c7462a9ea255d2dc11e))
+
 ## [1.7.2](https://github.com/gardnmi/boomux/compare/v1.7.1...v1.7.2) (2026-08-29)
 
 
