@@ -158,6 +158,7 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "guided_local_update",
     "guided_local_uninstall",
     "guided_setup",
+    "explicit_daemon_start",
 ];
 const LEGACY_BOOMUX_SHELLS_SKILL: &str = r#"---
 name: boomux-shells
@@ -1168,6 +1169,8 @@ enum DaemonCommands {
         #[arg(long)]
         channel: i32,
     },
+    /// Start the daemon in the background
+    Start,
     /// Report whether the daemon is accepting requests
     Status,
     /// Replace the daemon without changing pending workspace state
@@ -1489,6 +1492,7 @@ impl Cli {
                 command:
                     DaemonCommands::Run
                     | DaemonCommands::ReceiveHandoff { .. }
+                    | DaemonCommands::Start
                     | DaemonCommands::Restart
                     | DaemonCommands::Stop,
             }) => CommandKey::Daemon,
@@ -3141,10 +3145,34 @@ fn print_web_start(
 }
 
 fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Error>> {
-    let client = client::connect()?;
+    let running_client = client::connect_if_running()?;
     match command {
+        DaemonCommands::Start => {
+            if running_client.is_some() {
+                println!("Boomux daemon is already running");
+            } else {
+                client::connect_or_start()?;
+                println!("Started Boomux daemon");
+            }
+        }
+        DaemonCommands::Status if running_client.is_none() && json => print_json(
+            CommandKey::DaemonStatus,
+            serde_json::json!({
+                "status": "stopped",
+                "protocol_version": null,
+                "socket_path": client::socket_path()?.display().to_string(),
+                "pid": null,
+                "executable": null,
+                "socket_device": null,
+                "socket_inode": null,
+            }),
+        )?,
+        DaemonCommands::Status if running_client.is_none() => {
+            println!("stopped ({})", client::socket_path()?.display());
+        }
         DaemonCommands::Status if json => {
-            let identity = daemon_process_identity(&client);
+            let client = running_client.as_ref().expect("running client checked");
+            let identity = daemon_process_identity(client);
             let protocol_version = identity.as_ref().map_or_else(
                 || client.protocol_version(),
                 |identity| Ok(identity.protocol_version),
@@ -3163,6 +3191,7 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
             )?
         }
         DaemonCommands::Status => {
+            let client = running_client.as_ref().expect("running client checked");
             println!(
                 "running (protocol {}, {})",
                 client.protocol_version()?,
@@ -3170,11 +3199,17 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
             );
         }
         DaemonCommands::Restart => {
+            let client = running_client.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "Boomux daemon is stopped")
+            })?;
             client
                 .restart_with_notification_config(config::load_notification_settings()?.into())?;
             println!("Restarted Boomux daemon");
         }
         DaemonCommands::Stop => {
+            let client = running_client.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "Boomux daemon is stopped")
+            })?;
             client.shutdown()?;
             println!("Stopped Boomux daemon");
         }
