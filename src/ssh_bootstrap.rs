@@ -2734,6 +2734,13 @@ fn parse_remote_daemon_status(stdout: &[u8]) -> io::Result<RemoteDaemonStatus> {
             "remote daemon status returned an invalid envelope",
         ));
     }
+    if value
+        .pointer("/data/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("stopped")
+    {
+        return Ok(RemoteDaemonStatus::Absent);
+    }
     let version = value
         .pointer("/data/protocol_version")
         .and_then(serde_json::Value::as_u64)
@@ -5454,6 +5461,13 @@ mod tests {
     fn daemon_status_distinguishes_absent_compatible_and_incompatible() {
         assert_eq!(
             parse_remote_daemon_status(b"boomux-daemon-status-v1\0absent\0").unwrap(),
+            RemoteDaemonStatus::Absent
+        );
+        assert_eq!(
+            parse_remote_daemon_status(
+                br#"{"schema":"boomux.cli/v1","command":"daemon.status","data":{"status":"stopped","protocol_version":null}}"#,
+            )
+            .unwrap(),
             RemoteDaemonStatus::Absent
         );
         for (version, expected) in [
