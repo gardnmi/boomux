@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.0](https://github.com/gardnmi/boomux/compare/v1.8.0...v1.9.0) (2026-08-31)
+
+
+### Features
+
+* **session:** add workspace session history management ([#335](https://github.com/gardnmi/boomux/issues/335)) ([fda74ea](https://github.com/gardnmi/boomux/commit/fda74ea9b21764f02dca50690a61c30c28926d49))
+
 ## [1.8.0](https://github.com/gardnmi/boomux/compare/v1.7.2...v1.8.0) (2026-08-30)
 
 
