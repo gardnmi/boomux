@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -25,22 +25,38 @@ impl TitleAdapter for CodexAdapter {
 }
 
 fn inspect_catalog(directory: &Path) -> Option<Inspection> {
-    let directory = normalize_absolute(directory)?;
-    let stdout = run(&directory)?;
-    parse_catalog(&stdout, &directory)
+    inspect_catalogs(&[directory.to_owned()]).pop().flatten()
 }
 
-fn run(directory: &Path) -> Option<Vec<u8>> {
+pub(super) fn inspect_catalogs(directories: &[PathBuf]) -> Vec<Option<Inspection>> {
+    let normalized = directories
+        .iter()
+        .map(|directory| normalize_absolute(directory))
+        .collect::<Vec<_>>();
+    let Some(current_directory) = normalized.iter().flatten().next() else {
+        return vec![None; directories.len()];
+    };
     let mut child = Command::new("codex")
         .args(["app-server", "--stdio"])
-        .current_dir(directory)
+        .current_dir(current_directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    let stdout = child.stdout.take()?;
+        .ok();
+    let Some(mut child) = child.take() else {
+        return vec![None; directories.len()];
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return vec![None; directories.len()];
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return vec![None; directories.len()];
+    };
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || stream_stdout(stdout, sender));
     let deadline = Instant::now() + COMMAND_TIMEOUT;
@@ -64,26 +80,38 @@ fn run(directory: &Path) -> Option<Vec<u8>> {
             &mut stdin,
             &serde_json::json!({ "method": "initialized", "params": {} }),
         )?;
-        write_request(
-            &mut stdin,
-            &serde_json::json!({
-            "method": "thread/list",
-            "id": 2,
-            "params": {
-                "limit": MAX_SESSIONS,
-                "cwd": directory,
-                "useStateDbOnly": true,
-                "modelProviders": [],
-                "sourceKinds": ["cli", "vscode", "exec", "appServer", "unknown"],
-            }
-            }),
-        )?;
-        wait_for_response(&receiver, 2, deadline)
+        let mut results = Vec::with_capacity(normalized.len());
+        for (index, directory) in normalized.iter().enumerate() {
+            let Some(directory) = directory else {
+                results.push(None);
+                continue;
+            };
+            let id = index as u64 + 2;
+            write_request(
+                &mut stdin,
+                &serde_json::json!({
+                "method": "thread/list",
+                "id": id,
+                "params": {
+                    "limit": MAX_SESSIONS,
+                    "cwd": directory,
+                    "useStateDbOnly": true,
+                    "modelProviders": [],
+                    "sourceKinds": ["cli", "vscode", "exec", "appServer", "unknown"],
+                }
+                }),
+            )?;
+            results.push(
+                wait_for_response(&receiver, id, deadline)
+                    .and_then(|output| parse_catalog_response(&output, directory, id)),
+            );
+        }
+        Some(results)
     })();
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
-    result
+    result.unwrap_or_else(|| vec![None; directories.len()])
 }
 
 fn stream_stdout(stdout: impl Read, sender: mpsc::Sender<io::Result<Vec<u8>>>) {
@@ -163,13 +191,17 @@ struct CodexThread {
 }
 
 fn parse_catalog(output: &[u8], directory: &Path) -> Option<Inspection> {
+    parse_catalog_response(output, directory, 2)
+}
+
+fn parse_catalog_response(output: &[u8], directory: &Path, expected_id: u64) -> Option<Inspection> {
     if output.len() as u64 > MAX_STDOUT_BYTES {
         return None;
     }
     let directory = normalize_absolute(directory)?;
     let response = output.split(|byte| *byte == b'\n').find_map(|line| {
         let response = serde_json::from_slice::<ListResponse>(line).ok()?;
-        (response.id == 2).then_some(response)
+        (response.id == expected_id).then_some(response)
     })?;
     let mut catalog = Vec::new();
     for thread in response.result?.data.into_iter().take(MAX_SESSIONS) {

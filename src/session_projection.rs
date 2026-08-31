@@ -407,6 +407,10 @@ fn workspace_directories(workspace: &WorkspaceSnapshot) -> BTreeSet<PathBuf> {
         .collect()
 }
 
+pub(crate) fn catalog_directories(workspaces: &[WorkspaceSnapshot]) -> BTreeSet<PathBuf> {
+    workspaces.iter().flat_map(workspace_directories).collect()
+}
+
 fn normalized_directory(directory: &Path) -> Option<PathBuf> {
     normalize_absolute(directory)
 }

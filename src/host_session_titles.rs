@@ -59,6 +59,12 @@ struct CacheKey {
     directory: PathBuf,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ProjectionRequest {
+    pub(crate) integration: String,
+    pub(crate) directory: PathBuf,
+}
+
 struct CachedInspection {
     value: Option<Inspection>,
     inspected_at: Instant,
@@ -216,6 +222,75 @@ pub(crate) fn projection_records(integration: &str, directory: &Path) -> Option<
     adapter
         .inspect(directory)
         .map(|inspection| inspection.catalog)
+}
+
+pub(crate) fn projection_records_batch(
+    requests: &[ProjectionRequest],
+) -> Vec<Option<Vec<HostSession>>> {
+    enum Work {
+        Codex(Vec<(usize, PathBuf)>),
+        One(usize, String, PathBuf),
+    }
+
+    let codex = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.integration == "codex")
+        .map(|(index, request)| (index, request.directory.clone()))
+        .collect::<Vec<_>>();
+    let mut work = Vec::new();
+    if !codex.is_empty() {
+        work.push(Work::Codex(codex));
+    }
+    work.extend(
+        requests
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| request.integration != "codex")
+            .map(|(index, request)| {
+                Work::One(
+                    index,
+                    request.integration.clone(),
+                    request.directory.clone(),
+                )
+            }),
+    );
+
+    let mut results = vec![None; requests.len()];
+    for batch in work.chunks(4) {
+        let completed = thread::scope(|scope| {
+            batch
+                .iter()
+                .map(|request| {
+                    scope.spawn(move || match request {
+                        Work::Codex(requests) => codex::inspect_catalogs(
+                            &requests
+                                .iter()
+                                .map(|(_, directory)| directory.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                        .into_iter()
+                        .zip(requests)
+                        .map(|(inspection, (index, _))| {
+                            (*index, inspection.map(|inspection| inspection.catalog))
+                        })
+                        .collect(),
+                        Work::One(index, integration, directory) => {
+                            vec![(*index, projection_records(integration, directory))]
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .flatten()
+                .collect::<Vec<_>>()
+        });
+        for (index, result) in completed {
+            results[index] = result;
+        }
+    }
+    results
 }
 
 fn adapter(integration: &str) -> Option<&'static dyn TitleAdapter> {

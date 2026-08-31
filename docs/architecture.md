@@ -281,8 +281,10 @@ changed metadata replaces and promotes it. Session projection resolves the
 registration-time source cwd with the same bounded Git inspection, excludes that
 canonical launch root from observed-work presentation, deduplicates the remaining
 roots across exact Agent occurrences, reports their total distinct count, and
-returns at most the four newest repository/branch/timestamp summaries. The Agent
-retains its launch-root observation. The independent nullable `git_branch`
+returns at most the four newest repository/branch/timestamp summaries in lists.
+Exact inspection returns up to 64 deduplicated contexts while limiting response-
+time Git push and worktree inspection to the first four. The Agent retains its
+launch-root observation. The independent nullable `git_branch`
 remains owner inspection of the registration-time Session source cwd, so older
 clients and launch-context presentation retain their prior meaning. Catalog-only
 Sessions receive no fabricated Agent contexts. Exact
@@ -317,6 +319,7 @@ false` without advancing the Workspace revision or publishing an event. The
 first change persists before `agent_session_hidden` publication. Protocol-50
 callers retain prior visibility and resume behavior, and filtered event readers
 still advance their cursor.
+
 Protocol-49 responses omit working contexts, filter their events and reduced
 `session_context` transitions while preserving cursors, and clear the other
 protocol-50 presentation additions. Successful Session activation acknowledges
@@ -926,6 +929,16 @@ unrelated hosts; a catalog-only ID performs discovery only when no cached catalo
 can resolve it. Pi, Claude, and Kiro have no complete catalog projection: their
 Sessions enter the projection only through durably observed Agent Instances, and
 host records can change only their title.
+
+Synchronous discovery plans normalized `(integration, directory)` requests before
+inspection. OpenCode and Codex inspect every bounded projection directory because
+they can contribute history; Pi, Claude, and Kiro inspect only directories with a
+matching durable external Session. The owner keeps at most 256 ephemeral per-key
+results, with 30-second success and five-second failure freshness, and coalesces
+concurrent misses into one demand-driven refresh. Discovery runs outside the cache
+lock with at most four concurrent tasks. One short-lived Codex app-server serves
+all missing Codex directories in a refresh batch. The cache is neither persisted
+nor transferred, and no startup, timer, or background process warms it.
 
 Session summaries can project outstanding Agent attention and Git branch context
 without changing ownership. Attention remains durable Agent state and carries

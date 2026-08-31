@@ -443,14 +443,15 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
 }
 
 #[test]
-fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
+fn one_codex_app_server_catalogs_multiple_workspace_directories() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("codex-catalog-bin");
         fs::create_dir(&bin).unwrap();
+        fs::create_dir(runtime_dir.join("other")).unwrap();
         let codex = bin.join("codex");
         fs::write(
             &codex,
-            "#!/bin/sh\nprintf x >> \"$CODEX_CATALOG_COUNT\"\n/bin/sleep 1\n[ \"$1\" = app-server ] || exit 64\nIFS= read -r line || exit 65\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nIFS= read -r line || exit 66\nIFS= read -r line || exit 67\nprintf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"id\":\"codex-history\",\"name\":\"Historical Codex thread\",\"preview\":\"fallback\",\"ephemeral\":false,\"createdAt\":10,\"updatedAt\":20}],\"nextCursor\":null}}'\n",
+            "#!/bin/sh\nprintf x >> \"$CODEX_CATALOG_COUNT\"\n/bin/sleep 1\n[ \"$1\" = app-server ] || exit 64\nIFS= read -r line || exit 65\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nIFS= read -r line || exit 66\nfor id in 2 3; do\n  IFS= read -r line || exit 67\n  printf '{\"id\":%s,\"result\":{\"data\":[{\"id\":\"codex-history-%s\",\"name\":\"Historical Codex thread %s\",\"preview\":\"fallback\",\"ephemeral\":false,\"createdAt\":10,\"updatedAt\":20}],\"nextCursor\":null}}\\n' \"$id\" \"$id\" \"$id\"\ndone\n",
         )
         .unwrap();
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
@@ -462,7 +463,10 @@ fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
         .client
         .create_workspace(
             "codex-catalog",
-            vec![ShellSpec::login("shell", &daemon.runtime_dir)],
+            vec![
+                ShellSpec::login("shell", &daemon.runtime_dir),
+                ShellSpec::login("other", daemon.runtime_dir.join("other")),
+            ],
         )
         .unwrap();
 
@@ -480,12 +484,12 @@ fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
     );
     let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let sessions = output["data"]["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0]["integration"], "codex");
-    assert_eq!(sessions[0]["external_session_id"], "codex-history");
-    assert_eq!(sessions[0]["description"], "Historical Codex thread");
-    assert_eq!(sessions[0]["state"], "unknown");
-    assert_eq!(sessions[0]["occurrence_count"], 0);
+    assert_eq!(sessions.len(), 2, "{sessions:#?}");
+    assert!(sessions.iter().all(|session| {
+        session["integration"] == "codex"
+            && session["state"] == "unknown"
+            && session["occurrence_count"] == 0
+    }));
     let session_id = sessions[0]["id"].as_str().unwrap();
     let inspect_started = Instant::now();
     assert!(matches!(

@@ -26,10 +26,12 @@ Agent Sessions continue to be projections. The owner deduplicates roots across
 the exact Agent occurrences, excludes the canonical launch root already
 represented by launch context, exposes at most four newest remaining
 repository/branch/time items and their total distinct count, and omits root paths
-from Session JSON. The Agent retains launch-root evidence. Catalog-only Sessions
-receive no contexts. The presentation is bounded evidence, not a completeness
-claim, current lifecycle signal, credential, or instruction to resume from a
-different directory.
+from Session list JSON. Explicit exact Session inspection may expose up to 64
+deduplicated items so clients can present the detail hidden by the list summary;
+only its first four receive response-time Git push and worktree inspection. The
+Agent retains launch-root evidence. Catalog-only Sessions receive no contexts.
+The presentation is bounded evidence, not a completeness claim, current lifecycle
+signal, credential, or instruction to resume from a different directory.
 
 The rejected alternatives are replacing `source_cwd`, inspecting only the launch
 directory at read time, parsing transcripts or shell commands, storing

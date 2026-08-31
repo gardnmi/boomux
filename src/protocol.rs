@@ -213,6 +213,7 @@ pub const MAX_KIRO_HOLDER_SESSIONS: usize = 16;
 pub const MAX_KIRO_SESSION_ID_BYTES: usize = 256;
 pub const MAX_AGENT_WORKING_CONTEXTS: usize = 8;
 pub const MAX_SESSION_WORKING_CONTEXTS: usize = 4;
+pub const MAX_SESSION_INSPECTION_WORKING_CONTEXTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

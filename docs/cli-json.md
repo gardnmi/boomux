@@ -859,14 +859,16 @@ represented by `git_branch`, deduplicates the remaining exact canonical worktree
 roots across the Session's Agent occurrences, sorts newest-first with
 deterministic label tie-breaks, and returns at most four items.
 `working_context_count` is the total remaining distinct root count before
-truncation. The root path and any launch-root observation remain in the owning
-Agent's durable snapshot and are deliberately omitted from Session JSON.
+truncation. Explicit inspection returns up to 64 of those ordered contexts; to
+keep owner response work bounded, contexts after the first four omit response-
+time push and worktree status. The root path and any launch-root observation
+remain in the owning Agent's durable snapshot and are deliberately omitted from Session JSON.
 Catalog-only Sessions have no observed contexts. These fields record bounded
 evidence supplied by structured integration events; they do not claim to list
 every repository touched and do not replace `source_cwd`.
 
-Inspect includes all summary fields, session-level `source_cwd`, and ordered
-`occurrences`. Each occurrence
+Inspect includes the expanded bounded working-context set, all other summary
+fields, session-level `source_cwd`, and ordered `occurrences`. Each occurrence
 contains `agent_id`, the original `shell_id` even if that shell was removed,
 `retained_shell_name`, `retained_shell_cwd`, `source_cwd`, `run_id`,
 `started_at_ms`, `ended_at_ms`, `is_current`, and the full stable Agent

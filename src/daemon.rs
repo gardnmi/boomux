@@ -93,6 +93,8 @@ const MAX_AGENT_EVIDENCE_BYTES: usize = 4 * 1024;
 const MAX_HOST_SERVICE_PREVIEWS: usize = 64;
 const HOST_SERVICE_PREVIEW_TTL: Duration = Duration::from_secs(300);
 const HOST_SESSION_CATALOG_TTL: Duration = Duration::from_secs(30);
+const HOST_SESSION_CATALOG_FAILURE_TTL: Duration = Duration::from_secs(5);
+const MAX_HOST_SESSION_CATALOG_ENTRIES: usize = 256;
 const REGISTERED_NODE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const REGISTERED_NODE_SESSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SESSION_DISPLAY_NAME_CHARS: usize = 160;
@@ -3138,7 +3140,7 @@ struct DaemonService {
     claude_remote_control: ClaudeRemoteControlBindings,
     remote_attachments: RemoteAttachmentManager,
     host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
-    host_session_catalog: Mutex<Option<HostSessionCatalog>>,
+    host_session_catalog: HostSessionCatalogCache,
     workspace_operation_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     mutation_lock: Mutex<()>,
     notification_settings: NotificationDeliverySettings,
@@ -3154,10 +3156,131 @@ struct HostServicePreview {
     prepared: PreparedIntegrationMutation,
 }
 
-struct HostSessionCatalog {
-    directories: Vec<PathBuf>,
-    sessions: Vec<crate::host_session_titles::HostSession>,
+#[derive(Default)]
+struct HostSessionCatalogCache {
+    state: Mutex<HostSessionCatalogState>,
+    refreshed: Condvar,
+}
+
+#[derive(Default)]
+struct HostSessionCatalogState {
+    entries: HashMap<crate::host_session_titles::ProjectionRequest, CachedHostSessionCatalog>,
+    refreshing: bool,
+    use_counter: u64,
+}
+
+struct CachedHostSessionCatalog {
+    sessions: Option<Vec<crate::host_session_titles::HostSession>>,
     inspected_at: Instant,
+    last_used: u64,
+}
+
+impl HostSessionCatalogCache {
+    fn records(
+        &self,
+        requests: &[crate::host_session_titles::ProjectionRequest],
+    ) -> io::Result<Vec<crate::host_session_titles::HostSession>> {
+        self.records_with(
+            requests,
+            &crate::host_session_titles::projection_records_batch,
+        )
+    }
+
+    fn records_with(
+        &self,
+        requests: &[crate::host_session_titles::ProjectionRequest],
+        discover: &impl Fn(
+            &[crate::host_session_titles::ProjectionRequest],
+        ) -> Vec<Option<Vec<crate::host_session_titles::HostSession>>>,
+    ) -> io::Result<Vec<crate::host_session_titles::HostSession>> {
+        loop {
+            let mut state = lock(&self.state)?;
+            let now = Instant::now();
+            let stale = requests
+                .iter()
+                .filter(|request| {
+                    state.entries.get(*request).is_none_or(|entry| {
+                        let ttl = if entry.sessions.is_some() {
+                            HOST_SESSION_CATALOG_TTL
+                        } else {
+                            HOST_SESSION_CATALOG_FAILURE_TTL
+                        };
+                        now.duration_since(entry.inspected_at) >= ttl
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if stale.is_empty() {
+                state.use_counter = state.use_counter.saturating_add(1);
+                let used = state.use_counter;
+                let mut sessions = Vec::new();
+                for request in requests {
+                    if let Some(entry) = state.entries.get_mut(request) {
+                        entry.last_used = used;
+                        if let Some(records) = &entry.sessions {
+                            sessions.extend(records.clone());
+                        }
+                    }
+                }
+                return Ok(sessions);
+            }
+            if state.refreshing {
+                state = self
+                    .refreshed
+                    .wait(state)
+                    .map_err(|_| io::Error::other("Session catalog cache lock poisoned"))?;
+                drop(state);
+                continue;
+            }
+            state.refreshing = true;
+            drop(state);
+
+            let discovered = discover(&stale);
+            let mut state = lock(&self.state)?;
+            state.use_counter = state.use_counter.saturating_add(1);
+            let used = state.use_counter;
+            let inspected_at = Instant::now();
+            for (request, sessions) in stale.into_iter().zip(discovered) {
+                state.entries.insert(
+                    request,
+                    CachedHostSessionCatalog {
+                        sessions,
+                        inspected_at,
+                        last_used: used,
+                    },
+                );
+            }
+            while state.entries.len() > MAX_HOST_SESSION_CATALOG_ENTRIES {
+                let Some(oldest) = state
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(request, _)| request.clone())
+                else {
+                    break;
+                };
+                state.entries.remove(&oldest);
+            }
+            state.refreshing = false;
+            self.refreshed.notify_all();
+        }
+    }
+
+    fn cached_records(&self) -> io::Result<Option<Vec<crate::host_session_titles::HostSession>>> {
+        let state = lock(&self.state)?;
+        if state.entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            state
+                .entries
+                .values()
+                .filter_map(|entry| entry.sessions.as_ref())
+                .flatten()
+                .cloned()
+                .collect(),
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -7029,7 +7152,7 @@ impl Default for DaemonService {
             claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
-            host_session_catalog: Mutex::new(None),
+            host_session_catalog: HostSessionCatalogCache::default(),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
@@ -9077,26 +9200,9 @@ impl DaemonService {
         } else {
             snapshot
         };
-        let directories = host_services::session_catalog_directories(snapshot);
-        let mut cached = lock(&self.host_session_catalog)?;
-        if cached.as_ref().is_none_or(|catalog| {
-            catalog.directories != directories
-                || catalog.inspected_at.elapsed() >= HOST_SESSION_CATALOG_TTL
-        }) {
-            *cached = Some(HostSessionCatalog {
-                sessions: host_services::session_catalog(&directories),
-                directories,
-                inspected_at: Instant::now(),
-            });
-        }
-        let mut sessions = host_services::sessions_with_catalog(
-            snapshot,
-            &cached
-                .as_ref()
-                .expect("Session catalog was inserted")
-                .sessions,
-        );
-        drop(cached);
+        let requests = host_services::session_catalog_requests(snapshot);
+        let catalog = self.host_session_catalog.records(&requests)?;
+        let mut sessions = host_services::sessions_with_catalog(snapshot, &catalog);
         crate::session_projection::apply_display_names(
             &mut sessions,
             &self.session_display_name_metadata()?,
@@ -9127,17 +9233,14 @@ impl DaemonService {
             Err(crate::session_projection::ResolveError::NotFound)
         );
 
-        let cached = lock(&self.host_session_catalog)?;
-        let Some(catalog) = cached.as_ref() else {
-            drop(cached);
+        let Some(catalog) = self.host_session_catalog.cached_records()? else {
             return if durable_contains_session {
                 Ok(durable)
             } else {
                 self.host_sessions(snapshot, None)
             };
         };
-        let mut sessions = host_services::sessions_with_catalog(snapshot, &catalog.sessions);
-        drop(cached);
+        let mut sessions = host_services::sessions_with_catalog(snapshot, &catalog);
         crate::session_projection::apply_display_names(
             &mut sessions,
             &self.session_display_name_metadata()?,
@@ -13427,7 +13530,7 @@ impl DaemonService {
             claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
-            host_session_catalog: Mutex::new(None),
+            host_session_catalog: HostSessionCatalogCache::default(),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
             notification_settings: NotificationDeliverySettings::default(),
@@ -18654,13 +18757,70 @@ mod tests {
             .host_sessions(&registry.snapshot().unwrap(), Some(&selected.id))
             .unwrap();
 
-        let catalog = lock(&registry.host_session_catalog).unwrap();
-        let queried = &catalog.as_ref().unwrap().directories;
-        assert!(queried.contains(&selected_cwd));
-        assert!(!queried.contains(&unrelated_cwd));
+        let catalog = lock(&registry.host_session_catalog.state).unwrap();
+        assert!(
+            catalog
+                .entries
+                .keys()
+                .any(|request| request.directory == selected_cwd)
+        );
+        assert!(
+            !catalog
+                .entries
+                .keys()
+                .any(|request| request.directory == unrelated_cwd)
+        );
         drop(catalog);
         fs::remove_dir_all(selected_cwd).unwrap();
         fs::remove_dir_all(unrelated_cwd).unwrap();
+    }
+
+    #[test]
+    fn session_catalog_cache_is_single_flight_without_holding_its_state_lock() {
+        use std::sync::Barrier;
+
+        let cache = Arc::new(HostSessionCatalogCache::default());
+        let requests = vec![crate::host_session_titles::ProjectionRequest {
+            integration: "opencode".into(),
+            directory: "/repo".into(),
+        }];
+        let calls = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let first_cache = Arc::clone(&cache);
+        let first_requests = requests.clone();
+        let first_calls = Arc::clone(&calls);
+        let first_barrier = Arc::clone(&barrier);
+        let first = thread::spawn(move || {
+            first_cache
+                .records_with(&first_requests, &|requests| {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    first_barrier.wait();
+                    vec![None; requests.len()]
+                })
+                .unwrap()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let second_cache = Arc::clone(&cache);
+        let second_requests = requests.clone();
+        let second_calls = Arc::clone(&calls);
+        let second = thread::spawn(move || {
+            second_cache
+                .records_with(&second_requests, &|requests| {
+                    second_calls.fetch_add(1, Ordering::SeqCst);
+                    vec![None; requests.len()]
+                })
+                .unwrap()
+        });
+
+        assert!(cache.state.try_lock().is_ok());
+        barrier.wait();
+        assert!(first.join().unwrap().is_empty());
+        assert!(second.join().unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -20,7 +20,8 @@ use crate::protocol::{
     HostGitWorktreeStatus, HostIntegrationMutationResult, HostIntegrationPlan,
     HostIntegrationStatus, HostProjectDiscovery, HostProjectSnapshot, HostServiceIntegrationAction,
     MAX_HOST_SERVICE_PROJECTS, MAX_HOST_SERVICE_SESSIONS, MAX_HOST_SERVICE_WARNINGS,
-    MAX_SESSION_WORKING_CONTEXTS, Snapshot, WorkspaceLauncherSnapshot, WorkspaceSnapshot,
+    MAX_SESSION_INSPECTION_WORKING_CONTEXTS, MAX_SESSION_WORKING_CONTEXTS, Snapshot,
+    WorkspaceLauncherSnapshot, WorkspaceSnapshot,
 };
 use crate::session_projection::{self, SessionProjection};
 
@@ -855,34 +856,54 @@ pub(crate) fn durable_sessions(snapshot: &Snapshot) -> Vec<SessionProjection> {
 }
 
 pub(crate) fn session_catalog_directories(snapshot: &Snapshot) -> Vec<PathBuf> {
-    workspace_directories(&snapshot.workspaces)
+    session_projection::catalog_directories(&snapshot.workspaces)
         .into_iter()
         .take(MAX_CATALOG_DIRECTORIES)
         .collect()
 }
 
-pub(crate) fn session_catalog(
-    directories: &[PathBuf],
-) -> Vec<crate::host_session_titles::HostSession> {
-    thread::scope(|scope| {
-        directories
+pub(crate) fn session_catalog_requests(
+    snapshot: &Snapshot,
+) -> Vec<crate::host_session_titles::ProjectionRequest> {
+    let directories = session_catalog_directories(snapshot);
+    let allowed = directories.iter().cloned().collect::<HashSet<_>>();
+    let mut requests = BTreeSet::new();
+    for directory in &directories {
+        for integration in crate::host_session_titles::catalog_integrations() {
+            requests.insert(crate::host_session_titles::ProjectionRequest {
+                integration: integration.to_owned(),
+                directory: directory.clone(),
+            });
+        }
+    }
+    for workspace in &snapshot.workspaces {
+        let shells = workspace
+            .shells
             .iter()
-            .cloned()
-            .flat_map(|directory| {
-                crate::host_session_titles::projection_integrations()
-                    .map(move |integration| (integration, directory.clone()))
-            })
-            .map(|(integration, directory)| {
-                scope.spawn(move || {
-                    crate::host_session_titles::projection_records(integration, &directory)
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .filter_map(|handle| handle.join().ok().flatten())
-            .flatten()
-            .collect::<Vec<_>>()
-    })
+            .map(|shell| (shell.id.as_str(), shell.cwd.as_path()))
+            .collect::<HashMap<_, _>>();
+        for agent in &workspace.agents {
+            if agent.external_session_id.is_none()
+                || crate::integrations::by_key(&agent.integration)
+                    .and_then(|descriptor| descriptor.titles)
+                    .is_none_or(|titles| titles.provides_catalog)
+            {
+                continue;
+            }
+            let directory = agent
+                .cwd
+                .as_deref()
+                .or_else(|| shells.get(agent.shell_id.as_str()).copied())
+                .and_then(crate::host_session_source::normalize_absolute);
+            if let Some(directory) = directory.filter(|directory| allowed.contains(directory)) {
+                requests.insert(crate::host_session_titles::ProjectionRequest {
+                    integration: agent.integration.clone(),
+                    directory,
+                });
+            }
+        }
+    }
+    requests.into_iter().collect()
 }
 
 pub(crate) fn sessions_with_catalog(
@@ -892,34 +913,17 @@ pub(crate) fn sessions_with_catalog(
     session_projection::project_snapshot_with_catalog(snapshot, Some(catalog))
 }
 
-fn workspace_directories(workspaces: &[WorkspaceSnapshot]) -> BTreeSet<PathBuf> {
-    workspaces
-        .iter()
-        .flat_map(|workspace| {
-            workspace
-                .default_cwd
-                .iter()
-                .cloned()
-                .chain(workspace.shells.iter().map(|shell| shell.cwd.clone()))
-                .chain(
-                    workspace
-                        .launchers
-                        .iter()
-                        .map(|launcher| launcher.cwd.clone()),
-                )
-                .chain(
-                    workspace
-                        .agents
-                        .iter()
-                        .filter_map(|agent| agent.cwd.clone()),
-                )
-        })
-        .collect()
-}
-
 pub(crate) fn session_summaries(
     snapshot: &Snapshot,
     sessions: &[SessionProjection],
+) -> Vec<HostAgentSessionSummary> {
+    session_summaries_with_context_limit(snapshot, sessions, MAX_SESSION_WORKING_CONTEXTS)
+}
+
+fn session_summaries_with_context_limit(
+    snapshot: &Snapshot,
+    sessions: &[SessionProjection],
+    context_limit: usize,
 ) -> Vec<HostAgentSessionSummary> {
     let agents = snapshot
         .workspaces
@@ -1006,11 +1010,16 @@ pub(crate) fn session_summaries(
                     .then_with(|| left.repository.cmp(&right.repository))
                     .then_with(|| left.branch.cmp(&right.branch))
             });
-            working_contexts.truncate(MAX_SESSION_WORKING_CONTEXTS);
+            working_contexts.truncate(context_limit);
             let working_contexts = working_contexts
                 .into_iter()
-                .map(|context| {
-                    let status = inspect_presentation_status(context);
+                .enumerate()
+                .map(|(index, context)| {
+                    let status = if index < MAX_SESSION_WORKING_CONTEXTS {
+                        inspect_presentation_status(context)
+                    } else {
+                        WorkingContextPresentationStatus::default()
+                    };
                     HostAgentSessionWorkingContext {
                         repository: context.repository.clone(),
                         branch: context.branch.clone(),
@@ -1039,6 +1048,19 @@ pub(crate) fn session_summary_with_snapshot(
     session_summaries(snapshot, std::slice::from_ref(session))
         .pop()
         .expect("one Session produces one summary")
+}
+
+fn session_inspection_summary_with_snapshot(
+    snapshot: &Snapshot,
+    session: &SessionProjection,
+) -> HostAgentSessionSummary {
+    session_summaries_with_context_limit(
+        snapshot,
+        std::slice::from_ref(session),
+        MAX_SESSION_INSPECTION_WORKING_CONTEXTS,
+    )
+    .pop()
+    .expect("one Session produces one inspection summary")
 }
 
 fn session_summary(
@@ -1106,7 +1128,7 @@ pub(crate) fn inspect_projected_session(
         .cloned()
         .collect();
     Ok(HostAgentSessionInspection {
-        summary: session_summary_with_snapshot(snapshot, session),
+        summary: session_inspection_summary_with_snapshot(snapshot, session),
         source_cwd: session.source_cwd.clone(),
         occurrences,
         projected_occurrences: session
@@ -1192,6 +1214,66 @@ mod tests {
         AgentAttentionSnapshot, AgentAuthority, AgentObservationSnapshot, AgentState,
     };
     use crate::session_projection::SessionOccurrence;
+
+    fn catalog_agent(id: &str, integration: &str, cwd: &str) -> AgentInstanceSnapshot {
+        AgentInstanceSnapshot {
+            id: id.into(),
+            workspace_id: "workspace".into(),
+            shell_id: format!("shell-{id}"),
+            run_id: format!("run-{id}"),
+            name: integration.into(),
+            integration: integration.into(),
+            external_session_id: Some(format!("session-{id}")),
+            cwd: Some(cwd.into()),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            observation: AgentObservationSnapshot {
+                state: AgentState::Inactive,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "test".into(),
+                confidence: 100,
+                observed_at_ms: 1,
+                revision: 1,
+            },
+            attention: None,
+            working_contexts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_catalog_plan_limits_title_only_providers_to_matching_agents() {
+        let snapshot = Snapshot {
+            workspaces: vec![WorkspaceSnapshot {
+                id: "workspace".into(),
+                revision: 1,
+                name: "workspace".into(),
+                default_cwd: Some("/unused-default".into()),
+                shells: Vec::new(),
+                launchers: Vec::new(),
+                agents: vec![
+                    catalog_agent("open", "opencode", "/repo/open/./"),
+                    catalog_agent("pi", "pi", "/repo/pi"),
+                ],
+            }],
+            focused_terminal: None,
+        };
+
+        let requests = session_catalog_requests(&snapshot)
+            .into_iter()
+            .map(|request| (request.integration, request.directory))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            requests,
+            BTreeSet::from([
+                ("codex".into(), PathBuf::from("/repo/open")),
+                ("codex".into(), PathBuf::from("/repo/pi")),
+                ("opencode".into(), PathBuf::from("/repo/open")),
+                ("opencode".into(), PathBuf::from("/repo/pi")),
+                ("pi".into(), PathBuf::from("/repo/pi")),
+            ])
+        );
+    }
 
     #[test]
     fn working_context_inspection_resolves_owner_git_metadata() {
@@ -1678,6 +1760,12 @@ mod tests {
                 ("completed", AgentAttentionReason::Completed, 3),
             ]
         );
+        let inspection =
+            inspect_projected_session(&snapshot, std::slice::from_ref(&session), "session")
+                .unwrap();
+        assert_eq!(inspection.summary.working_context_count, 5);
+        assert_eq!(inspection.summary.working_contexts.len(), 5);
+        assert_eq!(inspection.summary.working_contexts[4].repository, "client");
         std::fs::remove_dir_all(repository).unwrap();
     }
 }
