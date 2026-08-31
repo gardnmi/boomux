@@ -7,8 +7,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::agent_attention_projection::AgentStateCounts;
 use crate::protocol::{
-    AgentInstanceSnapshot, NodeProjectionHealthCode, QualifiedIdentity, TerminalColor,
-    TerminalPreview, TerminalPreviewLine, TerminalStyle,
+    AgentInstanceSnapshot, AgentSessionDisplayNameResult, NodeProjectionHealthCode,
+    QualifiedIdentity, TerminalColor, TerminalPreview, TerminalPreviewLine, TerminalStyle,
 };
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -225,6 +225,7 @@ pub(crate) struct SessionNodeView {
     pub(crate) id: String,
     pub(crate) alias: String,
     pub(crate) local: bool,
+    pub(crate) session_display_names: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,6 +236,9 @@ pub(crate) struct DashboardSessionView {
     pub(crate) workspace_id: String,
     pub(crate) workspace_name: String,
     pub(crate) title: String,
+    pub(crate) user_display_name: Option<String>,
+    pub(crate) workspace_revision: u64,
+    pub(crate) session_display_names: bool,
     pub(crate) integration: String,
     pub(crate) state: AgentDisplayState,
     pub(crate) state_is_current: bool,
@@ -752,6 +756,11 @@ pub(crate) enum DashboardEffect {
     },
     InspectSession(QualifiedIdentity),
     ActivateSession(QualifiedIdentity),
+    SetSessionDisplayName {
+        identity: QualifiedIdentity,
+        expected_workspace_revision: u64,
+        display_name: Option<String>,
+    },
     ReadTerminalPreview {
         shell_id: QualifiedIdentity,
         run_id: Option<String>,
@@ -797,8 +806,9 @@ pub(crate) enum DashboardEvent {
     SessionsLoaded(Result<SessionLoadResult, String>),
     SessionInspected {
         identity: QualifiedIdentity,
-        result: Result<DashboardSessionDetails, String>,
+        result: Result<Box<DashboardSessionDetails>, String>,
     },
+    SessionDisplayNameMutationCompleted(Result<AgentSessionDisplayNameResult, String>),
     TextPasted(String),
     TerminalPreviewCompleted {
         shell_id: String,
@@ -998,6 +1008,7 @@ fn is_session_effect(effect: &DashboardEffect) -> bool {
         DashboardEffect::LoadSessions { .. }
             | DashboardEffect::InspectSession(_)
             | DashboardEffect::ActivateSession(_)
+            | DashboardEffect::SetSessionDisplayName { .. }
     )
 }
 
@@ -1169,6 +1180,11 @@ enum Mode {
     InspectNode(NodeView),
     InspectSessionLoading(QualifiedIdentity),
     InspectSession(DashboardSessionDetails),
+    RenameSession {
+        identity: QualifiedIdentity,
+        expected_workspace_revision: u64,
+        input: String,
+    },
     RetargetNode {
         node_id: String,
         expected_revision: u64,
@@ -2583,6 +2599,10 @@ impl App {
                 id: node.id.clone(),
                 alias: node.alias.clone(),
                 local: node.local,
+                session_display_names: node
+                    .observed_capabilities
+                    .iter()
+                    .any(|capability| capability == "session_display_names"),
             })
             .collect()
     }
@@ -2604,6 +2624,26 @@ impl App {
         Some(DashboardEffect::ActivateSession(
             self.selected_session()?.identity(),
         ))
+    }
+
+    fn rename_selected_session(&mut self) {
+        let Some(session) = self
+            .selected_session()
+            .filter(|session| session.session_display_names)
+            .cloned()
+        else {
+            return;
+        };
+        self.mode = Mode::RenameSession {
+            identity: session.identity(),
+            expected_workspace_revision: session.workspace_revision,
+            input: session.user_display_name.unwrap_or_default(),
+        };
+    }
+
+    fn reset_selected_session_name(&self) -> Option<DashboardEffect> {
+        let session = self.selected_session()?.clone();
+        session_display_name_effect(&session, None)
     }
 
     fn activate_selected_item(&mut self) -> Option<DashboardEffect> {
@@ -2799,8 +2839,10 @@ impl App {
                                     && session.session_id == identity.inner_id
                             }) {
                                 details.session.node_alias = session.node_alias.clone();
+                                details.session.session_display_names =
+                                    session.session_display_names;
                             }
-                            self.mode = Mode::InspectSession(details);
+                            self.mode = Mode::InspectSession(*details);
                         }
                         Err(text) => {
                             self.mode = Mode::Normal;
@@ -2808,6 +2850,19 @@ impl App {
                         }
                     }
                 }
+            }
+            DashboardEvent::SessionDisplayNameMutationCompleted(result) => {
+                self.message = Some(match result {
+                    Ok(result) => Message {
+                        text: result.user_display_name.map_or_else(
+                            || "Reset Session name".into(),
+                            |name| format!("Renamed Session to {name}"),
+                        ),
+                        error: false,
+                    },
+                    Err(text) => Message { text, error: true },
+                });
+                return vec![self.load_sessions()];
             }
             DashboardEvent::TextPasted(_) => {}
             DashboardEvent::TerminalPreviewCompleted {
@@ -2932,6 +2987,12 @@ impl App {
             }
             KeyCode::Char('L') if self.primary_tab == PrimaryTab::Workspaces => {
                 self.link_selected_external();
+            }
+            KeyCode::Char('e') if self.primary_tab == PrimaryTab::Sessions => {
+                self.rename_selected_session();
+            }
+            KeyCode::Char('E') if self.primary_tab == PrimaryTab::Sessions => {
+                return self.reset_selected_session_name();
             }
             KeyCode::Char('e') => return self.request_rename(),
             KeyCode::Char('i') if self.primary_tab == PrimaryTab::Sessions => {
@@ -3647,7 +3708,7 @@ fn handle_help_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
 fn normal_mode_modifiers_supported(code: KeyCode, modifiers: KeyModifiers) -> bool {
     modifiers.is_empty()
         || (modifiers == KeyModifiers::SHIFT
-            && matches!(code, KeyCode::BackTab | KeyCode::Char('?' | ':')))
+            && matches!(code, KeyCode::BackTab | KeyCode::Char('?' | ':' | 'E')))
 }
 
 fn handle_palette_key(
@@ -3698,6 +3759,22 @@ fn handle_palette_key(
             None
         }
     }
+}
+
+fn session_display_name_effect(
+    session: &DashboardSessionView,
+    display_name: Option<String>,
+) -> Option<DashboardEffect> {
+    if !session.session_display_names
+        || (display_name.is_none() && session.user_display_name.is_none())
+    {
+        return None;
+    }
+    Some(DashboardEffect::SetSessionDisplayName {
+        identity: session.identity(),
+        expected_workspace_revision: session.workspace_revision,
+        display_name,
+    })
 }
 
 fn handle_mode_key(
@@ -3841,8 +3918,62 @@ fn handle_mode_key(
         },
         Mode::InspectSession(details) => match key {
             KeyCode::Esc => None,
+            KeyCode::Char('e') if details.session.session_display_names => {
+                app.mode = Mode::RenameSession {
+                    identity: details.session.identity(),
+                    expected_workspace_revision: details.session.workspace_revision,
+                    input: details.session.user_display_name.unwrap_or_default(),
+                };
+                None
+            }
+            KeyCode::Char('E')
+                if details.session.session_display_names
+                    && details.session.user_display_name.is_some() =>
+            {
+                session_display_name_effect(&details.session, None)
+            }
             _ => {
                 app.mode = Mode::InspectSession(details);
+                None
+            }
+        },
+        Mode::RenameSession {
+            identity,
+            expected_workspace_revision,
+            mut input,
+        } => match key {
+            KeyCode::Enter if !input.trim().is_empty() => {
+                Some(DashboardEffect::SetSessionDisplayName {
+                    identity,
+                    expected_workspace_revision,
+                    display_name: Some(input),
+                })
+            }
+            KeyCode::Esc => None,
+            KeyCode::Backspace => {
+                input.pop();
+                app.mode = Mode::RenameSession {
+                    identity,
+                    expected_workspace_revision,
+                    input,
+                };
+                None
+            }
+            KeyCode::Char(character) => {
+                input.push(character);
+                app.mode = Mode::RenameSession {
+                    identity,
+                    expected_workspace_revision,
+                    input,
+                };
+                None
+            }
+            _ => {
+                app.mode = Mode::RenameSession {
+                    identity,
+                    expected_workspace_revision,
+                    input,
+                };
                 None
             }
         },
@@ -3958,7 +4089,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         Mode::InspectSession(details) => render_session_inspection(frame, area, details),
         Mode::RetargetNode { input, .. } => render_node_retarget(frame, area, input),
         Mode::ConfirmForgetNode(node) => render_node_forget_confirmation(frame, area, node),
-        Mode::Normal | Mode::Rename { .. } => {}
+        Mode::Normal | Mode::Rename { .. } | Mode::RenameSession { .. } => {}
     }
 }
 
@@ -4013,6 +4144,14 @@ fn render_session_inspection(frame: &mut Frame, area: Rect, details: &DashboardS
     let lines = vec![
         preview_field("TITLE", session.title.clone()),
         preview_field(
+            "OVERRIDE",
+            session
+                .user_display_name
+                .as_deref()
+                .unwrap_or("-")
+                .to_owned(),
+        ),
+        preview_field(
             "NODE",
             format!("{} ({})", session.node_alias, session.node_id),
         ),
@@ -4045,7 +4184,16 @@ fn render_session_inspection(frame: &mut Frame, area: Rect, details: &DashboardS
         preview_field("OCCURRENCES", details.occurrences.len().to_string()),
         Line::from(vec![preview_label("ACTION"), action]),
         Line::from(""),
-        Line::styled("esc close", Style::new().fg(SUBTEXT)),
+        Line::styled(
+            if session.session_display_names && session.user_display_name.is_some() {
+                "e rename  E reset  esc close"
+            } else if session.session_display_names {
+                "e rename  esc close"
+            } else {
+                "esc close"
+            },
+            Style::new().fg(SUBTEXT),
+        ),
     ];
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -5125,7 +5273,11 @@ fn render_sessions(frame: &mut Frame, area: Rect, app: &mut App) {
         let mut cells = vec![
             Cell::from(compact_recency(session.last_at_ms)),
             Cell::from(integration_display_name(&session.integration)),
-            Cell::from(session.title.clone()),
+            Cell::from(if session.user_display_name.is_some() {
+                format!("* {}", session.title)
+            } else {
+                session.title.clone()
+            }),
         ];
         if wide_state {
             cells.insert(
@@ -6388,6 +6540,15 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled("n/esc", Style::new().fg(GREEN)),
             Span::styled(" cancel", Style::new().fg(SUBTEXT)),
         ])
+    } else if let Mode::RenameSession { input, .. } = &app.mode {
+        Line::from(vec![
+            Span::styled(" Session name: ", Style::new().fg(YELLOW)),
+            Span::styled(format!("{input}_"), Style::new().fg(TEXT)),
+            Span::styled("  enter", Style::new().fg(GREEN)),
+            Span::raw(" rename  "),
+            Span::styled("esc", Style::new().fg(RED)),
+            Span::raw(" cancel"),
+        ])
     } else if let Mode::Rename { target, input } = &app.mode {
         Line::from(vec![
             Span::styled(
@@ -6411,16 +6572,34 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Style::new().fg(if message.error { RED } else { GREEN }),
         ))
     } else if app.primary_tab == PrimaryTab::Sessions {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled("enter", Style::new().fg(GREEN)),
             Span::styled(" open exact  ", Style::new().fg(SUBTEXT)),
             Span::styled("i", Style::new().fg(TEAL)),
             Span::styled(" details  ", Style::new().fg(SUBTEXT)),
+        ];
+        if let Some(session) = app
+            .selected_session()
+            .filter(|session| session.session_display_names)
+        {
+            spans.extend([
+                Span::styled("e", Style::new().fg(YELLOW)),
+                Span::styled(" rename  ", Style::new().fg(SUBTEXT)),
+            ]);
+            if session.user_display_name.is_some() {
+                spans.extend([
+                    Span::styled("E", Style::new().fg(YELLOW)),
+                    Span::styled(" reset  ", Style::new().fg(SUBTEXT)),
+                ]);
+            }
+        }
+        spans.extend([
             Span::styled("r", Style::new().fg(BLUE)),
             Span::styled(" refresh  ", Style::new().fg(SUBTEXT)),
             Span::styled("q", Style::new().fg(RED)),
             Span::styled(" quit", Style::new().fg(SUBTEXT)),
-        ])
+        ]);
+        Line::from(spans)
     } else {
         let launcher_selected = matches!(app.selected_item(), Some(WorkspaceItemView::Launcher(_)));
         let offline_shell_selected =
@@ -10475,6 +10654,9 @@ mod tests {
             workspace_id: format!("workspace-{session_id}"),
             workspace_name: format!("work-{session_id}"),
             title: format!("Session {session_id}"),
+            user_display_name: None,
+            workspace_revision: 1,
+            session_display_names: false,
             integration: "opencode".into(),
             state: AgentDisplayState::Idle,
             state_is_current: false,
@@ -10499,6 +10681,7 @@ mod tests {
                     id: "local-node".into(),
                     alias: "local".into(),
                     local: true,
+                    session_display_names: false,
                 }]
         ));
         assert_eq!(app.update_key(KeyCode::Char('3'), KeyModifiers::NONE), None);
@@ -10609,12 +10792,12 @@ mod tests {
         let identity = QualifiedIdentity::new("owner", "exact");
         app.update(DashboardEvent::SessionInspected {
             identity,
-            result: Ok(DashboardSessionDetails {
+            result: Ok(Box::new(DashboardSessionDetails {
                 session: dashboard_session("owner", "exact", 20),
                 source_cwd: Some("/tmp/exact".into()),
                 occurrences: Vec::new(),
                 action: Ok("resume exact historical Session".into()),
-            }),
+            })),
         });
         let rendered = rendered_text(&mut app, 140, 30);
         for expected in [
@@ -10634,6 +10817,88 @@ mod tests {
         }
         app.update_key(KeyCode::Esc, KeyModifiers::NONE);
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn session_display_name_actions_are_capability_gated_and_revision_guarded() {
+        let mut app = app();
+        app.select_tab(PrimaryTab::Sessions);
+        let mut session = dashboard_session("owner", "exact", 20);
+        session.session_display_names = true;
+        session.workspace_revision = 7;
+        app.apply_sessions(Ok(SessionLoadResult {
+            sessions: vec![session],
+            warnings: Vec::new(),
+        }));
+        let rendered = rendered_text(&mut app, 120, 20);
+        assert!(rendered.contains("e rename"), "{rendered}");
+        assert!(!rendered.contains("E reset"), "{rendered}");
+
+        assert_eq!(app.update_key(KeyCode::Char('e'), KeyModifiers::NONE), None);
+        assert!(matches!(app.mode, Mode::RenameSession { .. }));
+        for character in "Checkout retry".chars() {
+            assert_eq!(
+                app.update_key(KeyCode::Char(character), KeyModifiers::NONE),
+                None
+            );
+        }
+        assert_eq!(
+            app.update_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(DashboardEffect::SetSessionDisplayName {
+                identity: QualifiedIdentity::new("owner", "exact"),
+                expected_workspace_revision: 7,
+                display_name: Some("Checkout retry".into()),
+            })
+        );
+
+        app.mode = Mode::Normal;
+        app.sessions[0].user_display_name = Some("Checkout retry".into());
+        app.sessions[0].title = "Checkout retry".into();
+        let rendered = rendered_text(&mut app, 120, 20);
+        assert!(rendered.contains("* Checkout retry"), "{rendered}");
+        assert!(rendered.contains("e rename"), "{rendered}");
+        assert!(rendered.contains("E reset"), "{rendered}");
+        assert_eq!(
+            app.update_key(KeyCode::Char('E'), KeyModifiers::SHIFT),
+            Some(DashboardEffect::SetSessionDisplayName {
+                identity: QualifiedIdentity::new("owner", "exact"),
+                expected_workspace_revision: 7,
+                display_name: None,
+            })
+        );
+
+        app.sessions[0].session_display_names = false;
+        app.sessions[0].user_display_name = None;
+        assert_eq!(app.update_key(KeyCode::Char('e'), KeyModifiers::NONE), None);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.update_key(KeyCode::Char('E'), KeyModifiers::SHIFT),
+            None
+        );
+    }
+
+    #[test]
+    fn session_display_name_completion_refreshes_the_session_projection() {
+        let mut app = app();
+        app.select_tab(PrimaryTab::Sessions);
+
+        assert!(matches!(
+            app.update(DashboardEvent::SessionDisplayNameMutationCompleted(Ok(
+                AgentSessionDisplayNameResult {
+                    session_id: "session".into(),
+                    workspace_id: "workspace".into(),
+                    user_display_name: Some("Review queue".into()),
+                    workspace_revision: 2,
+                    changed: true,
+                }
+            )))
+            .as_slice(),
+            [DashboardEffect::LoadSessions { .. }]
+        ));
+        assert_eq!(
+            app.message.as_ref().unwrap().text,
+            "Renamed Session to Review queue"
+        );
     }
 
     #[test]

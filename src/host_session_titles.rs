@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use boomux::integrations::{self, TitleProvider};
 
+mod claude;
 mod codex;
+mod kiro;
 mod opencode;
 mod pi;
 
@@ -124,6 +126,14 @@ impl Cache {
         {
             return None;
         }
+        self.projection_records(integration, directory)
+    }
+
+    pub(crate) fn projection_records(
+        &mut self,
+        integration: &str,
+        directory: &Path,
+    ) -> Option<Vec<HostSession>> {
         self.refresh(integration, directory);
         let key = CacheKey {
             integration: integration.to_owned(),
@@ -184,6 +194,13 @@ pub(crate) fn catalog_integrations() -> impl Iterator<Item = &'static str> {
         .map(|descriptor| descriptor.key)
 }
 
+pub(crate) fn projection_integrations() -> impl Iterator<Item = &'static str> {
+    integrations::ALL
+        .iter()
+        .filter(|descriptor| descriptor.titles.is_some())
+        .map(|descriptor| descriptor.key)
+}
+
 pub(crate) fn catalog(integration: &str, directory: &Path) -> Option<Vec<HostSession>> {
     if !integrations::by_key(integration)?.titles?.provides_catalog {
         return None;
@@ -194,11 +211,20 @@ pub(crate) fn catalog(integration: &str, directory: &Path) -> Option<Vec<HostSes
         .map(|inspection| inspection.catalog)
 }
 
+pub(crate) fn projection_records(integration: &str, directory: &Path) -> Option<Vec<HostSession>> {
+    let adapter = adapter(integration)?;
+    adapter
+        .inspect(directory)
+        .map(|inspection| inspection.catalog)
+}
+
 fn adapter(integration: &str) -> Option<&'static dyn TitleAdapter> {
     match integrations::by_key(integration)?.titles?.provider {
         TitleProvider::OpenCode => Some(opencode::ADAPTER),
         TitleProvider::Pi => Some(pi::ADAPTER),
+        TitleProvider::Claude => Some(claude::ADAPTER),
         TitleProvider::Codex => Some(codex::ADAPTER),
+        TitleProvider::Kiro => Some(kiro::ADAPTER),
     }
 }
 
@@ -405,7 +431,11 @@ mod tests {
         );
 
         let inspection = inspect_pi(Path::new("/repo"), &test.environment()).expect("catalog");
-        assert!(inspection.catalog.is_empty());
+        assert_eq!(inspection.catalog.len(), 1);
+        assert_eq!(inspection.catalog[0].integration, "pi");
+        assert_eq!(inspection.catalog[0].root_id, "matching");
+        assert_eq!(inspection.catalog[0].directory, Path::new("/repo"));
+        assert_eq!(inspection.catalog[0].created_at_ms, 0);
         let titles = inspection.titles;
 
         assert_eq!(
@@ -582,7 +612,13 @@ mod tests {
             catalog_integrations().collect::<Vec<_>>(),
             ["opencode", "codex"]
         );
+        assert_eq!(
+            projection_integrations().collect::<Vec<_>>(),
+            ["opencode", "pi", "claude", "codex", "kiro"]
+        );
         assert!(catalog("pi", Path::new("/repo")).is_none());
+        assert!(catalog("claude", Path::new("/repo")).is_none());
+        assert!(catalog("kiro", Path::new("/repo")).is_none());
         assert!(adapter("missing").is_none());
     }
 

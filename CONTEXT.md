@@ -119,6 +119,57 @@ The canonical external conversation projected into one workspace from Agent Inst
 history. It can span multiple shell runs and Agent Instances that share an integration and exact
 external session identity, but it owns no process, PTY, or lifecycle observation.
 
+An Agent Session remains a projection rather than a durable lifecycle entity. An owning Node may
+persist only explicit user presentation metadata inside the owning Workspace, keyed by Workspace,
+integration, and external Session identity, or by Agent Instance identity when no external identity
+exists. Display-name metadata overrides the projected description. A hidden-Session tombstone
+suppresses the semantic Session from protocol-51 list, inspect, resolve, open, and resume without
+deleting host history, Agent Instances, Shells, processes, display names, or lifecycle state.
+Metadata survives temporary host-catalog absence, new Agent occurrences, Workspace rename, and
+daemon restart, but is removed with the Workspace. Different Workspaces may name or hide the same
+external conversation independently. Remote mutation is accepted only by a live authoritative
+owner. Bounded idempotency receipts may retain the semantic key, request, and minimal accepted
+mutation result; they never retain the projected Session summary, harness title, catalog data,
+lifecycle state, or occurrences.
+
+The projected display name is the user override, then the current harness title, then the latest
+Agent Instance name or generated fallback. Presentation may separately expose that latest Agent
+name as attribution; it does not replace the effective description.
+
+A projected Session may include bounded references to outstanding Agent-owned
+attention and bounded Agent Working Contexts. Those fields are presentation
+context, not Session lifecycle. Attention remains guarded by the exact Agent
+observation revision. Working Contexts remain owned by the Agent's Node and are
+never resolved from a path on another Node. The owner may enrich a projected
+Working Context with bounded, no-fetch response-time inspection for its exact
+current branch. Existing local tracking refs produce the separate push status;
+porcelain worktree inspection produces only staged and unstaged-or-untracked
+booleans, never file names, file counts, or file contents. Neither reports behind
+count, persists derived status, publishes an event, or turns Git state into
+lifecycle authority. A catalog-only Session has neither kind of Agent-owned
+context.
+
+## Agent Working Context
+
+A bounded durable observation that one exact active Agent Instance worked in a
+Git worktree. An integration supplies only a structured absolute cwd or
+allowlisted structured tool path while the Agent's exact ShellRun is current.
+The owning Node canonicalizes the existing path and records the Git worktree
+root, repository label, branch, and observation time. It retains at most eight
+roots per Agent, replacing an existing root and ordering observations newest
+first.
+
+Working Context describes observed work, not launch or lifecycle authority. It
+does not replace the Agent's registration-time `cwd`, a Shell's cwd, or a
+Workspace's default cwd, and it never proves that the retained set is complete.
+Boomux does not derive it from transcripts, terminal output, command strings,
+process trees, arbitrary tool payloads, or paths resolved by another Node. A
+Session projection excludes the canonical launch root already represented by
+its launch context, deduplicates the remaining contexts from its Agent
+occurrences, exposes at most four newest roots plus the total distinct count, and
+may retain them after the originating Shell is removed. The Agent retains the
+launch-root observation in its own bounded evidence.
+
 ## Shared Harness Runtime
 
 One ephemeral Node-local, daemon-supervised generation of an external harness

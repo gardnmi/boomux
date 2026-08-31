@@ -54,7 +54,12 @@ opens an exact current ShellRun with expected-run attachment and takeover, or
 uses exact owner-routed resume for a historical Session; done, missing,
 ambiguous, unavailable, and changed targets fail closed. A successful command
 exit confirms terminal launch, while owner-side attachment or resume errors
-remain visible in that terminal and never fall back to another target.
+remain visible in that terminal and never fall back to another target. After
+launch, Boomux acknowledges each outstanding Agent attention reference projected
+onto that exact Session using its original observation revision. A newer
+attention revision remains outstanding, and an acknowledgment failure is
+reported as a post-launch warning rather than misreporting the terminal launch
+as failed.
 When `--workspace` names a non-closing coordinated Workspace, Boomux presents that
 desktop Workspace and places an exact current ShellRun terminal there without
 changing durable Shell membership. For a historical Session, it creates a
@@ -293,6 +298,9 @@ The following commands support `--json`:
 - `boomux attention acknowledge`
 - `boomux session list`
 - `boomux session inspect`
+- `boomux session rename SESSION_ID NAME --revision N [--node NODE]`
+- `boomux session reset-name SESSION_ID --revision N [--node NODE]`
+- `boomux session hide SESSION_ID --workspace WORKSPACE_ID [--node NODE]`
 - `boomux integration list`
 - `boomux integration status [opencode|pi|claude|codex]`
 - `boomux integration install <opencode|pi|claude|codex>`
@@ -306,9 +314,9 @@ The following commands support `--json`:
 - `boomux daemon status`
 
 JSON mutations are deliberately narrow. Node registration add, rename, retarget,
-and forget; Agent register, ensure, and report; attention acknowledgment; and
-integration install and uninstall support the contract. Other mutation commands
-retain human output. Passing `--json` to an unsupported command fails with
+and forget; Agent register, ensure, and report; attention acknowledgment; Session
+display-name and hide mutations; and integration install and uninstall support
+the contract. Other mutation commands retain human output. Passing `--json` to an unsupported command fails with
 `invalid_argument` before performing the operation.
 
 `boomux integration setup <opencode|pi|claude|codex>` is intentionally
@@ -407,6 +415,19 @@ Command payloads are:
   by exact workspace name or ID.
 - `session.inspect`: one projected `session` object selected only by exact
   opaque session ID.
+- `session.rename` and `session.reset-name`: one owner-authoritative `result`
+  containing `session_id`, `workspace_id`, nullable `user_display_name`,
+  `workspace_revision`, and `changed`. It deliberately contains no projected
+  description, harness title, lifecycle state, or occurrences. A Node-qualified
+  result also includes exact `node_id`.
+  Both require the exact projected Session ID and current owning
+  `workspace_revision`; external harness IDs are rejected.
+- `session.hide`: one owner-authoritative `result` containing `session_id`,
+  `workspace_id`, `workspace_revision`, and `changed`. A Node-qualified result
+  also includes exact `node_id`. The CLI freshly reads the exact supplied owning
+  Workspace revision before submitting the guarded mutation. A hidden Session is
+  removed only from that Workspace's Boomux projection; provider history, Agents,
+  Shells, processes, display-name metadata, and lifecycle state are unchanged.
 - `integration.list`: an `integrations` array containing bundled integration
   names, display names, packages, and validated host versions.
 - `integration.status`: an `integrations` array containing independent `host`,
@@ -520,6 +541,28 @@ Protocol 49 adds `protocol_49` and `workspace_placement_default_cwd` plus the
 coordinated Workspace, exact existing Node placement, fresh global and owner
 Workspace revisions, and an owner-resolved existing directory. Repeating the
 same path returns `unchanged` without incrementing either revision.
+Protocol 50 adds `protocol_50`, `session_display_names`,
+`session_presentation_context`, and `observed_agent_working_contexts` plus the stable
+`session.rename` and `session.reset-name` JSON commands. Mutation is optional for
+consumers of Session browsing and is never inferred from the package version.
+Protocol-50 inspection also carries owner-projected occurrence details so local
+and remote `session.inspect` serialize the same authoritative response without
+client-side catalog rediscovery. Session presentation context consists only of
+bounded exact Agent attention references, nullable owner-inspected launch Git
+branch context, and bounded observed repository/branch contexts. It adds no
+durable Session lifecycle or transcript state. The integration-only
+`agent observe-working-context` command is private JSON plumbing, not a stable
+automation command.
+Protocol 51 adds `protocol_51`, `session_latest_agent_attribution`,
+`session_working_context_push_status`,
+`session_working_context_worktree_status`, and `workspace_session_hiding` plus
+the stable `session.hide` JSON command. Latest Agent attribution and the two Git
+status objects are optional additive presentation fields. Hide is an
+owner-authoritative, Workspace-scoped tombstone mutation and is never inferred
+from package version. Protocol-50 list, inspect, resolve, and resume callers
+retain their previous visibility; protocol-50 responses omit
+`latest_agent_name`, `push_status`, `worktree_status`, and the hide event while
+event cursors still advance.
 
 Protocol-38 `workspace create NAME` without placement flags creates empty
 coordinator metadata without a default Node or cwd and remains human-only.
@@ -761,11 +804,66 @@ the revision or satisfy a wait.
 ## Session Data
 
 Session summaries contain `id`, `workspace_id`, `workspace_name`, `description`,
+nullable `user_display_name`, owning `workspace_revision`,
 `integration`, `external_session_id`, `state`, `state_is_current`,
-`started_at_ms`, `last_at_ms`, and `occurrence_count`. Registered-session
+`started_at_ms`, `last_at_ms`, `occurrence_count`, `attentions`, and nullable
+`git_branch`. Protocol 51 may add nullable `latest_agent_name`; it attributes the
+newest Agent occurrence without replacing the effective description. When
+`observed_agent_working_contexts` is advertised summaries also
+contain `working_contexts` and `working_context_count`. Registered-session
 `description` is the latest stored Boomux Agent registration name. Catalog-only
 OpenCode or Codex sessions use the sanitized host title, state `unknown`, and
-zero occurrences. Missing optional values are JSON `null`.
+zero occurrences. An exact-ID Pi, Claude, or Kiro host title may enrich an
+already-observed Session for that integration but never creates a catalog-only
+row. `description` remains the effective display value and follows user override,
+current harness title, then latest Agent name or fallback.
+Protocol-49 peers retain effective `description` but receive a null
+`user_display_name`, a safe zero default for `workspace_revision`, an empty
+`attentions` array, null `git_branch`, and no working-context fields. Missing
+optional values are JSON `null`.
+
+Each Session attention reference contains exact `agent_id`, `reason`,
+`observation_revision`, and `observed_at_ms`. Blocked references sort before
+completed references, then newest-first. They point to Agent-owned durable
+attention and do not make attention Session-owned. `git_branch` is recomputed by
+the owning Node from the registration-time Session source cwd, is `detached` for
+a detached Git worktree, and is null when the launch context is unavailable or
+not a repository.
+
+Each working-context item contains `repository`, `branch`, and
+`observed_at_ms`. Protocol 51 may add optional `push_status`: `up_to_date`,
+`ahead` with positive `commit_count`, or `unpublished`, while preserving that
+existing enum exactly. It may separately add optional `worktree_status` with the
+exact shape
+
+```json
+{
+  "staged": true,
+  "unstaged_or_untracked": false
+}
+```
+
+The owner derives both only when the recorded branch is still the canonical
+current worktree branch. It performs bounded no-fetch response-time inspection:
+existing local tracking refs produce push status, and porcelain v1 with branch
+output and normal untracked files produces the two worktree booleans. Clean is
+both false; conflicts may set both true. The owner exposes no file names, file
+counts, or file contents and no behind count. A failed, timed-out, or oversized
+probe omits only its status where practical; no remotes can therefore omit
+`push_status` while retaining `worktree_status`, while a configured remote with
+no upstream remains `unpublished`. Neither status is persisted or published as
+an event. Protocol-50 responses omit both objects rather than serializing false
+or null values.
+The owner excludes the canonical launch root already
+represented by `git_branch`, deduplicates the remaining exact canonical worktree
+roots across the Session's Agent occurrences, sorts newest-first with
+deterministic label tie-breaks, and returns at most four items.
+`working_context_count` is the total remaining distinct root count before
+truncation. The root path and any launch-root observation remain in the owning
+Agent's durable snapshot and are deliberately omitted from Session JSON.
+Catalog-only Sessions have no observed contexts. These fields record bounded
+evidence supplied by structured integration events; they do not claim to list
+every repository touched and do not replace `source_cwd`.
 
 Inspect includes all summary fields, session-level `source_cwd`, and ordered
 `occurrences`. Each occurrence
@@ -776,13 +874,24 @@ contains `agent_id`, the original `shell_id` even if that shell was removed,
 `source_cwd` is the registration-time Agent working directory under protocol 13
 and can remain available for exact interactive session resume. Protocol-12
 snapshots fall back to a currently retained shell directory. State and authority
-use the same spellings documented for Agent observations.
+use the same spellings documented for Agent observations. When a protocol-50
+client inspects through a protocol-49 daemon, the new projected-occurrence field
+is absent; the client preserves the legacy `occurrences` by normalizing their
+Agent IDs, Shell IDs, run IDs, source cwd, timestamps, and observations rather
+than serializing an empty list. Fields unavailable from the legacy response stay
+null or conservatively false.
 
 Projection groups Agent instances only when workspace, integration, and external
 session ID match. An Agent without an external session ID forms its own session.
 Bounded OpenCode and Codex catalogs add root sessions to workspaces that
 reference the same normalized directory. A matching durable Agent merges into the same stable
-ID and supplies authoritative lifecycle state and occurrences.
+ID and supplies authoritative lifecycle state and occurrences. Bounded Pi,
+Claude, and Kiro title sources require the exact external ID and normalized
+Workspace directory; they may change only the description of an already-observed
+Session and cannot add history.
+Exact inspection and resume do not synchronously refresh host catalogs when the
+ID resolves from durable state or the existing catalog cache. A catalog-only ID
+falls back to bounded discovery when the daemon has no cache that can resolve it.
 Current state is selected from occurrences that are incomplete, non-inactive,
 and bound to the current run of a running retained shell; otherwise state is the
 latest stored observation and `state_is_current` is false. List order is newest
@@ -802,6 +911,71 @@ resume` accept `--node SELECTOR` under protocol 36. Remote JSON responses add th
 `node_id`. Resume opens a local native terminal but resolves the opaque ID and
 executes the integration argv only on the owner; it creates no ordinary
 Workspace or Shell.
+Rename and reset additionally require protocol 50. The CLI creates a mutation
+operation UUID, and the owner retains the newest 256 replays per Workspace so an
+exact retry after an ambiguous transport result is safe. A replay returns the
+immutable originally accepted minimal result without requiring the current
+Session projection, including after later mutations, owner restart, or
+host-catalog disappearance. Receipts persist the semantic key and explicit user
+metadata but never a harness title, lifecycle state, catalog record, projected
+description, or occurrence. Reusing the UUID for different arguments fails
+closed. Names are trimmed,
+internal Unicode whitespace is collapsed to one ASCII space, controls are
+rejected, and the result is limited to 160 characters. Each Workspace retains at
+most 1,024 display-name records. Remote mutation is live-only and never queued or
+satisfied by cached projection state.
+Automation that must retry across CLI process boundaries may supply the same
+canonical UUID with `--operation-id`; omission generates a fresh UUID.
+
+Hide requires protocol 51. The CLI resolves the exact supplied Workspace to its
+current revision, then submits a fresh canonical operation UUID with the exact
+projected Session ID. The owner retains at most 1,024 semantic tombstones and 256
+replay receipts per Workspace. Exact replay returns its original minimal result.
+A fresh request for an already-hidden semantic Session persists a receipt and
+returns `changed: false` at the unchanged Workspace revision. Hiding filters the
+complete owner projection before the 1,000-row list bound and makes exact
+protocol-51 inspect, resolve, open, and resume return `not_found`. There is no
+unhide command.
+
+Rename JSON has this shape; reset uses the same fields with
+`user_display_name: null`:
+
+```json
+{
+  "schema": "boomux.cli/v1",
+  "command": "session.rename",
+  "data": {
+    "result": {
+      "session_id": "opaque-session-uuid",
+      "workspace_id": "workspace-uuid",
+      "user_display_name": "Checkout retry investigation",
+      "workspace_revision": 8,
+      "changed": true
+    }
+  }
+}
+```
+
+Hide JSON has the same minimal identity discipline:
+
+```json
+{
+  "schema": "boomux.cli/v1",
+  "command": "session.hide",
+  "data": {
+    "result": {
+      "session_id": "opaque-session-uuid",
+      "workspace_id": "workspace-uuid",
+      "workspace_revision": 9,
+      "changed": true
+    }
+  }
+}
+```
+
+Workspace-filtered list and inspect resolve only the authoritative owner response;
+the owner scopes its snapshot before enumerating host catalog directories, so an
+unrelated Workspace cannot cause catalog access or appear in the result.
 
 `read` returns `shell_id`, `run_id`, `output_revision`, `changed`, `status`, and
 `output`. Output is a JSON string containing the same bounded plain rendered text

@@ -12,13 +12,17 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::protocol::{
-    AgentAttentionSnapshot, AgentObservationSnapshot, ShellRunExitReason, TerminalProfile,
+    AgentAttentionSnapshot, AgentObservationSnapshot, AgentSessionDisplayNameResult,
+    AgentSessionHideResult, AgentWorkingContextSnapshot, ShellRunExitReason, TerminalProfile,
 };
 
-const STATE_VERSION: u32 = 14;
+const STATE_VERSION: u32 = 17;
+const PREVIOUS_STATE_VERSION: u32 = 16;
+const VERSION_FIFTEEN_STATE_VERSION: u32 = 15;
+const VERSION_FOURTEEN_STATE_VERSION: u32 = 14;
 const VERSION_EIGHT_STATE_VERSION: u32 = 8;
 const VERSION_SEVEN_STATE_VERSION: u32 = 7;
-const PREVIOUS_STATE_VERSION: u32 = 6;
+const VERSION_SIX_STATE_VERSION: u32 = 6;
 const VERSION_FIVE_STATE_VERSION: u32 = 5;
 const VERSION_FOUR_STATE_VERSION: u32 = 4;
 const VERSION_THREE_STATE_VERSION: u32 = 3;
@@ -57,6 +61,97 @@ pub(crate) struct PersistedWorkspace {
     pub(crate) shells: Vec<PersistedShell>,
     pub(crate) launchers: Vec<PersistedWorkspaceLauncher>,
     pub(crate) agents: Vec<PersistedAgentInstance>,
+    pub(crate) session_display_names: Vec<PersistedSessionDisplayName>,
+    pub(crate) session_display_name_operations: Vec<PersistedSessionDisplayNameOperation>,
+    pub(crate) hidden_sessions: Vec<PersistedHiddenSession>,
+    pub(crate) session_hide_operations: Vec<PersistedSessionHideOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "identity", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PersistedSessionIdentity {
+    External { external_session_id: String },
+    Instance { agent_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedSessionDisplayName {
+    pub(crate) integration: String,
+    pub(crate) session: PersistedSessionIdentity,
+    pub(crate) display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedSessionDisplayNameOperation {
+    pub(crate) operation_id: String,
+    pub(crate) session_id: String,
+    pub(crate) expected_revision: u64,
+    pub(crate) display_name: Option<String>,
+    pub(crate) integration: String,
+    pub(crate) session: PersistedSessionIdentity,
+    pub(crate) result: AgentSessionDisplayNameResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedHiddenSession {
+    pub(crate) session_id: String,
+    pub(crate) integration: String,
+    pub(crate) session: PersistedSessionIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedSessionHideOperation {
+    pub(crate) operation_id: String,
+    pub(crate) session_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) expected_revision: u64,
+    pub(crate) integration: String,
+    pub(crate) session: PersistedSessionIdentity,
+    pub(crate) result: AgentSessionHideResult,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionSixteenPersistedState {
+    version: u32,
+    workspaces: Vec<VersionSixteenPersistedWorkspace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionSixteenPersistedWorkspace {
+    id: String,
+    revision: u64,
+    name: String,
+    default_cwd: Option<PathBuf>,
+    shells: Vec<PersistedShell>,
+    launchers: Vec<PersistedWorkspaceLauncher>,
+    agents: Vec<PersistedAgentInstance>,
+    session_display_names: Vec<PersistedSessionDisplayName>,
+    session_display_name_operations: Vec<PersistedSessionDisplayNameOperation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionFourteenPersistedState {
+    version: u32,
+    workspaces: Vec<VersionFourteenPersistedWorkspace>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionFourteenPersistedWorkspace {
+    id: String,
+    revision: u64,
+    name: String,
+    default_cwd: Option<PathBuf>,
+    shells: Vec<PersistedShell>,
+    launchers: Vec<PersistedWorkspaceLauncher>,
+    agents: Vec<PersistedAgentInstance>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,6 +168,8 @@ pub(crate) struct PersistedAgentInstance {
     pub(crate) ended_at_ms: Option<u64>,
     pub(crate) observation: AgentObservationSnapshot,
     pub(crate) attention: Option<AgentAttentionSnapshot>,
+    #[serde(default)]
+    pub(crate) working_contexts: Vec<AgentWorkingContextSnapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -448,6 +545,18 @@ impl StateStore {
         })?;
         let (state, migrated) = match version.version {
             STATE_VERSION => (parse_current_state(&bytes, &self.path)?, false),
+            PREVIOUS_STATE_VERSION => {
+                let previous: VersionSixteenPersistedState = parse_state(&bytes, &self.path)?;
+                (migrate_version_sixteen_state(previous), true)
+            }
+            VERSION_FIFTEEN_STATE_VERSION => {
+                let previous: VersionSixteenPersistedState = parse_state(&bytes, &self.path)?;
+                (migrate_version_fifteen_state(previous), true)
+            }
+            VERSION_FOURTEEN_STATE_VERSION => {
+                let previous: VersionFourteenPersistedState = parse_state(&bytes, &self.path)?;
+                (migrate_version_fourteen_state(previous), true)
+            }
             VERSION_EIGHT_STATE_VERSION => {
                 let previous: VersionEightPersistedState = parse_state(&bytes, &self.path)?;
                 (migrate_version_eight_state(previous), true)
@@ -456,7 +565,7 @@ impl StateStore {
                 let previous: VersionSevenPersistedState = parse_state(&bytes, &self.path)?;
                 (migrate_version_seven_state(previous), true)
             }
-            PREVIOUS_STATE_VERSION => {
+            VERSION_SIX_STATE_VERSION => {
                 let previous: PreviousPersistedState = parse_state(&bytes, &self.path)?;
                 (migrate_previous_state(previous), true)
             }
@@ -566,6 +675,22 @@ fn parse_current_state(bytes: &[u8], path: &Path) -> io::Result<PersistedState> 
         {
             require_positive_revision(launcher, "workspace launcher")?;
         }
+        for agent in workspace
+            .get("agents")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if !agent
+                .get("working_contexts")
+                .is_some_and(serde_json::Value::is_array)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Boomux state contains an Agent without a working-context array",
+                ));
+            }
+        }
     }
     serde_json::from_value(value).map_err(|error| {
         io::Error::new(
@@ -573,6 +698,40 @@ fn parse_current_state(bytes: &[u8], path: &Path) -> io::Result<PersistedState> 
             format!("could not parse {}: {error}", path.display()),
         )
     })
+}
+
+fn migrate_version_sixteen_state(previous: VersionSixteenPersistedState) -> PersistedState {
+    debug_assert_eq!(previous.version, PREVIOUS_STATE_VERSION);
+    migrate_version_sixteen_workspaces(previous.workspaces)
+}
+
+fn migrate_version_fifteen_state(previous: VersionSixteenPersistedState) -> PersistedState {
+    debug_assert_eq!(previous.version, VERSION_FIFTEEN_STATE_VERSION);
+    migrate_version_sixteen_workspaces(previous.workspaces)
+}
+
+fn migrate_version_sixteen_workspaces(
+    workspaces: Vec<VersionSixteenPersistedWorkspace>,
+) -> PersistedState {
+    PersistedState {
+        version: STATE_VERSION,
+        workspaces: workspaces
+            .into_iter()
+            .map(|workspace| PersistedWorkspace {
+                id: workspace.id,
+                revision: workspace.revision,
+                name: workspace.name,
+                default_cwd: workspace.default_cwd,
+                shells: workspace.shells,
+                launchers: workspace.launchers,
+                agents: workspace.agents,
+                session_display_names: workspace.session_display_names,
+                session_display_name_operations: workspace.session_display_name_operations,
+                hidden_sessions: Vec::new(),
+                session_hide_operations: Vec::new(),
+            })
+            .collect(),
+    }
 }
 
 fn require_positive_revision(value: &serde_json::Value, resource: &str) -> io::Result<()> {
@@ -627,6 +786,34 @@ fn migrate_legacy_state(legacy: LegacyPersistedState) -> PersistedState {
                     .collect(),
                 launchers: Vec::new(),
                 agents: Vec::new(),
+                session_display_names: Vec::new(),
+                session_display_name_operations: Vec::new(),
+                hidden_sessions: Vec::new(),
+                session_hide_operations: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+fn migrate_version_fourteen_state(previous: VersionFourteenPersistedState) -> PersistedState {
+    debug_assert_eq!(previous.version, VERSION_FOURTEEN_STATE_VERSION);
+    PersistedState {
+        version: STATE_VERSION,
+        workspaces: previous
+            .workspaces
+            .into_iter()
+            .map(|workspace| PersistedWorkspace {
+                id: workspace.id,
+                revision: workspace.revision,
+                name: workspace.name,
+                default_cwd: workspace.default_cwd,
+                shells: workspace.shells,
+                launchers: workspace.launchers,
+                agents: workspace.agents,
+                session_display_names: Vec::new(),
+                session_display_name_operations: Vec::new(),
+                hidden_sessions: Vec::new(),
+                session_hide_operations: Vec::new(),
             })
             .collect(),
     }
@@ -662,6 +849,10 @@ fn migrate_version_eight_state(previous: VersionEightPersistedState) -> Persiste
                     .collect(),
                 launchers: workspace.launchers,
                 agents: workspace.agents,
+                session_display_names: Vec::new(),
+                session_display_name_operations: Vec::new(),
+                hidden_sessions: Vec::new(),
+                session_hide_operations: Vec::new(),
             })
             .collect(),
     }
@@ -703,13 +894,17 @@ fn migrate_version_seven_state(previous: VersionSevenPersistedState) -> Persiste
                     .collect(),
                 launchers: workspace.launchers,
                 agents: workspace.agents,
+                session_display_names: Vec::new(),
+                session_display_name_operations: Vec::new(),
+                hidden_sessions: Vec::new(),
+                session_hide_operations: Vec::new(),
             })
             .collect(),
     }
 }
 
 fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
-    debug_assert_eq!(previous.version, PREVIOUS_STATE_VERSION);
+    debug_assert_eq!(previous.version, VERSION_SIX_STATE_VERSION);
     PersistedState {
         version: STATE_VERSION,
         workspaces: previous
@@ -727,6 +922,10 @@ fn migrate_previous_state(previous: PreviousPersistedState) -> PersistedState {
                     .collect(),
                 launchers: workspace.launchers,
                 agents: workspace.agents,
+                session_display_names: Vec::new(),
+                session_display_name_operations: Vec::new(),
+                hidden_sessions: Vec::new(),
+                session_hide_operations: Vec::new(),
             })
             .collect(),
     }
@@ -749,6 +948,10 @@ fn migrate_version_five_state(previous: VersionFivePersistedState) -> PersistedS
                     .into_iter()
                     .map(migrate_pre_ownership_shell)
                     .collect(),
+                session_display_names: Vec::new(),
+                session_display_name_operations: Vec::new(),
+                hidden_sessions: Vec::new(),
+                session_hide_operations: Vec::new(),
                 launchers: workspace.launchers,
                 agents: workspace
                     .agents
@@ -765,6 +968,7 @@ fn migrate_version_five_state(previous: VersionFivePersistedState) -> PersistedS
                         ended_at_ms: agent.ended_at_ms,
                         observation: agent.observation,
                         attention: None,
+                        working_contexts: Vec::new(),
                     })
                     .collect(),
             })
@@ -811,8 +1015,13 @@ fn migrate_version_four_state(previous: VersionFourPersistedState) -> PersistedS
                             ended_at_ms: agent.ended_at_ms,
                             observation: agent.observation,
                             attention: None,
+                            working_contexts: Vec::new(),
                         })
                         .collect(),
+                    session_display_names: Vec::new(),
+                    session_display_name_operations: Vec::new(),
+                    hidden_sessions: Vec::new(),
+                    session_hide_operations: Vec::new(),
                 }
             })
             .collect(),
@@ -838,6 +1047,10 @@ fn migrate_version_three_state(previous: VersionThreePersistedState) -> Persiste
                     .collect(),
                 launchers: workspace.launchers,
                 agents: Vec::new(),
+                session_display_names: Vec::new(),
+                session_display_name_operations: Vec::new(),
+                hidden_sessions: Vec::new(),
+                session_hide_operations: Vec::new(),
             })
             .collect(),
     }
@@ -862,6 +1075,10 @@ fn migrate_version_two_state(previous: VersionTwoPersistedState) -> PersistedSta
                     .collect(),
                 launchers: Vec::new(),
                 agents: Vec::new(),
+                session_display_names: Vec::new(),
+                session_display_name_operations: Vec::new(),
+                hidden_sessions: Vec::new(),
+                session_hide_operations: Vec::new(),
             })
             .collect(),
     }
@@ -929,6 +1146,108 @@ mod tests {
             let error = StateStore::at(path.clone()).load().unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_sixteen_with_empty_session_hiding_metadata() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 16,
+  "workspaces": [{
+    "id": "w1", "revision": 7, "name": "version-sixteen",
+    "default_cwd": null, "shells": [], "launchers": [], "agents": [],
+    "session_display_names": [], "session_display_name_operations": []
+  }]
+}"#,
+        )
+        .unwrap();
+
+        let migrated = StateStore::at(path.clone()).load().unwrap().unwrap();
+
+        assert_eq!(migrated.workspaces[0].revision, 7);
+        assert!(migrated.workspaces[0].hidden_sessions.is_empty());
+        assert!(migrated.workspaces[0].session_hide_operations.is_empty());
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"version\": 17")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_fifteen_agents_with_empty_working_contexts() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 15,
+  "workspaces": [{
+    "id": "w1", "revision": 7, "name": "version-fifteen",
+    "default_cwd": null, "shells": [], "launchers": [],
+    "agents": [{
+      "id": "a1", "shell_id": "s1", "run_id": "r1", "name": "agent",
+      "integration": "opencode", "external_session_id": "external",
+      "cwd": "/tmp/project", "started_at_ms": 1, "ended_at_ms": null,
+      "observation": {
+        "revision": 1, "state": "working", "authority": "lifecycle_integration",
+        "evidence": "working", "confidence": 100, "observed_at_ms": 1
+      },
+      "attention": null
+    }],
+    "session_display_names": [], "session_display_name_operations": []
+  }]
+}"#,
+        )
+        .unwrap();
+
+        let migrated = StateStore::at(path.clone()).load().unwrap().unwrap();
+
+        assert!(migrated.workspaces[0].agents[0].working_contexts.is_empty());
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"version\": 17"));
+        assert!(saved.contains("\"working_contexts\": []"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migrates_version_fourteen_with_empty_session_display_name_metadata() {
+        let directory = env::temp_dir().join(format!("boomux-state-{}", Uuid::new_v4()));
+        let path = directory.join("boomux/state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{
+  "version": 14,
+  "workspaces": [{
+    "id": "w1", "revision": 7, "name": "version-fourteen",
+    "default_cwd": null, "shells": [], "launchers": [], "agents": []
+  }]
+}"#,
+        )
+        .unwrap();
+
+        let migrated = StateStore::at(path.clone()).load().unwrap().unwrap();
+
+        assert_eq!(migrated.workspaces[0].revision, 7);
+        assert!(migrated.workspaces[0].session_display_names.is_empty());
+        assert!(
+            migrated.workspaces[0]
+                .session_display_name_operations
+                .is_empty()
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"version\": 17")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1005,7 +1324,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 14")
+                .contains("\"version\": 17")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1054,7 +1373,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 14")
+                .contains("\"version\": 17")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1110,7 +1429,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 14")
+                .contains("\"version\": 17")
         );
         assert!(migrated.workspaces[0].launchers.is_empty());
         assert!(migrated.workspaces[0].agents.is_empty());
@@ -1160,7 +1479,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 14")
+                .contains("\"version\": 17")
         );
         assert!(migrated.workspaces[0].agents.is_empty());
         fs::remove_dir_all(directory).unwrap();
@@ -1198,7 +1517,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 14")
+                .contains("\"version\": 17")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1274,7 +1593,7 @@ mod tests {
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
-                .contains("\"version\": 14")
+                .contains("\"version\": 17")
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1309,7 +1628,7 @@ mod tests {
 
         assert!(migrated.workspaces[0].agents[0].attention.is_none());
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 14"));
+        assert!(saved.contains("\"version\": 17"));
         assert!(saved.contains("\"attention\": null"));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1341,7 +1660,7 @@ mod tests {
         assert!(!original.contains("default_cwd"));
         store.save(&migrated).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"version\": 14"));
+        assert!(saved.contains("\"version\": 17"));
         assert!(saved.contains("\"default_cwd\": null"));
         fs::remove_dir_all(directory).unwrap();
     }

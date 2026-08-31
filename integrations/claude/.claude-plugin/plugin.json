@@ -39,6 +39,12 @@
     ],
     "SessionEnd": [
       { "hooks": [{ "type": "command", "command": "boomux", "args": ["claude", "hook"], "timeout": 5 }] }
+    ],
+    "CwdChanged": [
+      { "hooks": [{ "type": "command", "command": "boomux", "args": ["claude", "hook"], "timeout": 5 }] }
+    ],
+    "DirectoryAdded": [
+      { "hooks": [{ "type": "command", "command": "boomux", "args": ["claude", "hook"], "timeout": 5 }] }
     ]
   }
 }

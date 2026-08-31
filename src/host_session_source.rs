@@ -1,5 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) mod claude;
 pub(crate) mod pi;
 
 pub(crate) fn normalize_absolute(path: &Path) -> Option<PathBuf> {

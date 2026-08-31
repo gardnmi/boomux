@@ -9,6 +9,41 @@ function text(value) {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function absolutePath(value) {
+  const path = text(value);
+  return path?.startsWith("/") ? path : undefined;
+}
+
+function workingContextPaths(event, initial = []) {
+  const paths = new Set(initial.map(absolutePath).filter(Boolean));
+  const properties = event?.properties ?? {};
+  for (const candidate of [properties.directory, properties.worktree]) {
+    const path = absolutePath(candidate);
+    if (path) paths.add(path);
+  }
+  if (!["tool.execute.before", "tool.execute.after"].includes(event?.type)) {
+    return [...paths];
+  }
+  const tool = text(properties.tool)?.toLowerCase();
+  const args = properties.args ?? properties.input;
+  if (!tool || !args || typeof args !== "object" || Array.isArray(args)) {
+    return [...paths];
+  }
+  let fields = [];
+  if (["read", "write", "edit", "multiedit"].includes(tool)) {
+    fields = ["filePath", "file_path"];
+  } else if (["glob", "grep", "list"].includes(tool)) {
+    fields = ["path"];
+  } else if (["bash", "shell"].includes(tool)) {
+    fields = ["workdir", "cwd"];
+  }
+  for (const field of fields) {
+    const path = absolutePath(args[field]);
+    if (path) paths.add(path);
+  }
+  return [...paths].slice(0, 8);
+}
+
 function boundedEvidence(value) {
   const clean = String(value ?? "OpenCode lifecycle event")
     .replace(/\s+/g, " ")
@@ -413,6 +448,21 @@ function reportArgv(agentID, shellID, runID, state, evidence) {
   ];
 }
 
+function observeWorkingContextArgv(agentID, shellID, runID, path) {
+  return [
+    "boomux",
+    "agent",
+    "observe-working-context",
+    agentID,
+    path,
+    "--shell-id",
+    shellID,
+    "--run-id",
+    runID,
+    "--json",
+  ];
+}
+
 function sharedReportArgv(generation, rootID, state, evidence) {
   return [
     "boomux",
@@ -477,7 +527,14 @@ function rateLimitedLogger(log, now = Date.now) {
   };
 }
 
-function createLifecycle({ client, env, run, log = console.error, now }) {
+function createLifecycle({
+  client,
+  env,
+  run,
+  initialWorkingContexts = [],
+  log = console.error,
+  now,
+}) {
   const environmentShellID = text(env?.BOOMUX_SHELL_ID);
   const environmentRunID = text(env?.BOOMUX_RUN_ID);
   const generation = text(env?.BOOMUX_OPENCODE_SHARED_GENERATION);
@@ -495,7 +552,11 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
         reducer: createReducerState(),
         disabled: false,
       };
-      if (standalone) value.agentID = undefined;
+      if (standalone) {
+        value.agentID = undefined;
+        value.shellID = environmentShellID;
+        value.runID = environmentRunID;
+      }
       roots.set(rootID, value);
     }
     return value;
@@ -506,7 +567,7 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
     if (item.disabled) return;
     try {
       if (!standalone) {
-        await run(
+        const result = await run(
           sharedReportArgv(
             generation,
             rootID,
@@ -514,6 +575,10 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
             derived.evidence,
           ),
         );
+        const agent = agentFromJSON(result);
+        item.agentID = text(agent?.id);
+        item.shellID = text(agent?.shell_id);
+        item.runID = text(agent?.run_id);
         return;
       }
       if (!item.agentID) {
@@ -528,6 +593,8 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
         );
         const agent = agentFromJSON(result);
         item.agentID = text(agent?.id);
+        item.shellID = text(agent?.shell_id) ?? environmentShellID;
+        item.runID = text(agent?.run_id) ?? environmentRunID;
         if (!item.agentID)
           throw new Error("boomux ensure response has no agent id");
         if (
@@ -563,6 +630,24 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
     }
   }
 
+  async function observe(item, paths) {
+    if (!item.agentID || !item.shellID || !item.runID) return;
+    for (const path of paths) {
+      try {
+        await run(
+          observeWorkingContextArgv(
+            item.agentID,
+            item.shellID,
+            item.runID,
+            path,
+          ),
+        );
+      } catch (error) {
+        reportError(error);
+      }
+    }
+  }
+
   async function handle(event) {
     const info = event?.properties?.info;
     if (info) resolver.remember(info);
@@ -571,6 +656,7 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
     const rootID = await resolver.root(action.sessionID);
     const item = tracked(rootID);
     if (item.disabled) return;
+    const contexts = workingContextPaths(event, initialWorkingContexts);
     const previous = {
       blockers: new Map(
         [...item.reducer.blockers].map(([id, blockers]) => [
@@ -584,7 +670,10 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
       terminal: item.reducer.terminal,
     };
     const derived = reduce(item.reducer, action, action.sessionID === rootID);
-    if (!derived) return;
+    if (!derived) {
+      await observe(item, contexts);
+      return;
+    }
     try {
       await send(rootID, derived);
     } catch (error) {
@@ -597,6 +686,7 @@ function createLifecycle({ client, env, run, log = console.error, now }) {
       }
       throw error;
     }
+    await observe(item, contexts);
   }
 
   function enqueue(event) {
@@ -612,7 +702,7 @@ function hookEvent(type, input) {
   return { type, properties: { ...input, sessionID: input?.sessionID } };
 }
 
-export async function BoomuxOpenCodePlugin({ client }) {
+export async function BoomuxOpenCodePlugin({ client, directory, worktree }) {
   const env = globalThis.process?.env ?? {};
   const standalone = text(env.BOOMUX_SHELL_ID) && text(env.BOOMUX_RUN_ID);
   const shared = text(env.BOOMUX_OPENCODE_SHARED_GENERATION);
@@ -621,6 +711,7 @@ export async function BoomuxOpenCodePlugin({ client }) {
     client,
     env,
     run: createProcessRunner(),
+    initialWorkingContexts: [directory, worktree],
   });
   return {
     event: ({ event }) => lifecycle.enqueue(event),
@@ -644,5 +735,7 @@ BoomuxOpenCodePlugin.__internal = Object.freeze({
   createProcessRunner,
   createReducerState,
   reduce,
+  observeWorkingContextArgv,
   sharedReportArgv,
+  workingContextPaths,
 });

@@ -978,12 +978,48 @@ impl Client {
         }
     }
 
+    pub fn set_agent_session_display_name(
+        &self,
+        operation_id: impl Into<String>,
+        session_id: impl Into<String>,
+        expected_workspace_revision: u64,
+        display_name: Option<String>,
+    ) -> Result<crate::protocol::AgentSessionDisplayNameResult> {
+        match self.request(Request::SetAgentSessionDisplayName {
+            operation_id: operation_id.into(),
+            session_id: session_id.into(),
+            expected_workspace_revision,
+            display_name,
+        })? {
+            Response::AgentSessionDisplayName { outcome } => Ok(outcome),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn hide_agent_session(
+        &self,
+        operation_id: impl Into<String>,
+        session_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        expected_workspace_revision: u64,
+    ) -> Result<crate::protocol::AgentSessionHideResult> {
+        match self.request(Request::HideAgentSession {
+            operation_id: operation_id.into(),
+            session_id: session_id.into(),
+            workspace_id: workspace_id.into(),
+            expected_workspace_revision,
+        })? {
+            Response::AgentSessionHidden { outcome } => Ok(outcome),
+            response => unexpected(response),
+        }
+    }
+
     pub fn host_service(
         &self,
         operation: crate::protocol::HostServiceOperation,
     ) -> Result<crate::protocol::HostServiceResult> {
         match self.request(Request::HostService { operation })? {
-            Response::HostService { result } => Ok(result),
+            Response::HostService { result } => Ok(normalize_host_service_result(result)),
             response => unexpected(response),
         }
     }
@@ -997,7 +1033,7 @@ impl Client {
             node_id: node_id.into(),
             operation,
         })? {
-            Response::HostService { result } => Ok(result),
+            Response::HostService { result } => Ok(normalize_host_service_result(result)),
             response => unexpected(response),
         }
     }
@@ -1533,6 +1569,24 @@ impl Client {
         }
     }
 
+    pub fn observe_agent_working_context(
+        &self,
+        agent_id: impl Into<String>,
+        shell_id: impl Into<String>,
+        run_id: impl Into<String>,
+        path: impl Into<PathBuf>,
+    ) -> Result<(AgentInstanceSnapshot, bool)> {
+        match self.request(Request::ObserveAgentWorkingContext {
+            agent_id: agent_id.into(),
+            shell_id: shell_id.into(),
+            run_id: run_id.into(),
+            path: path.into(),
+        })? {
+            Response::AgentWorkingContext { agent, changed } => Ok((agent, changed)),
+            other => unexpected(other),
+        }
+    }
+
     pub fn wait_agent(
         &self,
         agent_id: impl Into<String>,
@@ -1950,6 +2004,32 @@ impl Client {
         })?;
         attachment_from_response(stream, protocol_version, response)
     }
+}
+
+fn normalize_host_service_result(
+    mut result: crate::protocol::HostServiceResult,
+) -> crate::protocol::HostServiceResult {
+    if let crate::protocol::HostServiceResult::AgentSession { session } = &mut result
+        && session.projected_occurrences.is_empty()
+    {
+        session.projected_occurrences = session
+            .occurrences
+            .iter()
+            .map(|agent| crate::protocol::HostAgentSessionOccurrence {
+                agent_id: agent.id.clone(),
+                shell_id: agent.shell_id.clone(),
+                retained_shell_name: None,
+                retained_shell_cwd: None,
+                source_cwd: agent.cwd.clone(),
+                run_id: agent.run_id.clone(),
+                started_at_ms: agent.started_at_ms,
+                ended_at_ms: agent.ended_at_ms,
+                is_current: false,
+                observation: agent.observation.clone(),
+            })
+            .collect();
+    }
+    result
 }
 
 fn attachment_from_response(
@@ -2395,7 +2475,7 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            for expected in [49, 48, 47] {
+            for expected in [51, 50, 49, 48, 47] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
                 assert_eq!(request.version, expected);
@@ -2680,5 +2760,65 @@ mod tests {
         ));
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn protocol_fifty_client_normalizes_protocol_forty_nine_session_occurrences() {
+        let legacy: protocol::HostServiceResult = serde_json::from_value(serde_json::json!({
+            "result": "agent_session",
+            "session": {
+                "summary": {
+                    "id": "session-id",
+                    "workspace_id": "workspace-id",
+                    "workspace_name": "workspace",
+                    "description": "legacy",
+                    "integration": "opencode",
+                    "external_session_id": "external-id",
+                    "state": "inactive",
+                    "state_is_current": false,
+                    "started_at_ms": 10,
+                    "last_at_ms": 20,
+                    "occurrence_count": 1
+                },
+                "source_cwd": "/tmp/project",
+                "occurrences": [{
+                    "id": "agent-id",
+                    "workspace_id": "workspace-id",
+                    "shell_id": "shell-id",
+                    "run_id": "run-id",
+                    "name": "legacy",
+                    "integration": "opencode",
+                    "external_session_id": "external-id",
+                    "cwd": "/tmp/project",
+                    "started_at_ms": 10,
+                    "ended_at_ms": 20,
+                    "observation": {
+                        "revision": 1,
+                        "state": "inactive",
+                        "authority": "lifecycle_integration",
+                        "evidence": "legacy peer",
+                        "confidence": 100,
+                        "observed_at_ms": 20
+                    }
+                }]
+            }
+        }))
+        .unwrap();
+
+        let protocol::HostServiceResult::AgentSession { session } =
+            normalize_host_service_result(legacy)
+        else {
+            panic!("expected Session inspection");
+        };
+        assert_eq!(session.projected_occurrences.len(), 1);
+        let occurrence = &session.projected_occurrences[0];
+        assert_eq!(occurrence.agent_id, "agent-id");
+        assert_eq!(occurrence.shell_id, "shell-id");
+        assert_eq!(occurrence.run_id, "run-id");
+        assert_eq!(
+            occurrence.source_cwd.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
+        assert!(!occurrence.is_current);
     }
 }

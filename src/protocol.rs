@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 49;
+pub const PROTOCOL_VERSION: u32 = 51;
 pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -183,6 +183,23 @@ define_protocol_features! {
         "protocol_49",
         "workspace_placement_default_cwd",
     ]),
+    SessionDisplayNames => (50, "Agent Session display-name mutation", [
+        "protocol_50",
+        "session_display_names",
+    ]),
+    SessionPresentationContext => (50, "Agent Session presentation context", [
+        "session_presentation_context",
+        "observed_agent_working_contexts",
+    ]),
+    SessionExtendedPresentation => (51, "extended Agent Session presentation", [
+        "protocol_51",
+        "session_working_context_push_status",
+        "session_working_context_worktree_status",
+        "session_latest_agent_attribution",
+    ]),
+    WorkspaceSessionHiding => (51, "Workspace Agent Session hiding", [
+        "workspace_session_hiding",
+    ]),
 }
 
 pub const MAX_NODE_PROJECTION_TRANSITIONS: u16 = 256;
@@ -194,6 +211,8 @@ pub const MAX_CLAUDE_BRIDGE_SESSION_ID_BYTES: usize = 256;
 pub const MAX_KIRO_LAUNCH_HOLDERS: usize = 256;
 pub const MAX_KIRO_HOLDER_SESSIONS: usize = 16;
 pub const MAX_KIRO_SESSION_ID_BYTES: usize = 256;
+pub const MAX_AGENT_WORKING_CONTEXTS: usize = 8;
+pub const MAX_SESSION_WORKING_CONTEXTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -313,6 +332,12 @@ pub struct HostAgentSessionSummary {
     pub workspace_id: String,
     pub workspace_name: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_agent_name: Option<String>,
+    #[serde(default)]
+    pub user_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub workspace_revision: u64,
     pub integration: String,
     pub external_session_id: Option<String>,
     pub state: AgentState,
@@ -320,6 +345,69 @@ pub struct HostAgentSessionSummary {
     pub started_at_ms: u64,
     pub last_at_ms: u64,
     pub occurrence_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attentions: Vec<HostAgentSessionAttention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_contexts: Vec<HostAgentSessionWorkingContext>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub working_context_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostAgentSessionWorkingContext {
+    pub repository: String,
+    pub branch: String,
+    pub observed_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_status: Option<HostGitPushStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_status: Option<HostGitWorktreeStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostGitPushStatus {
+    UpToDate,
+    Ahead { commit_count: u64 },
+    Unpublished,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostGitWorktreeStatus {
+    pub staged: bool,
+    pub unstaged_or_untracked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostAgentSessionAttention {
+    pub agent_id: String,
+    pub reason: AgentAttentionReason,
+    pub observation_revision: u64,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionDisplayNameResult {
+    pub session_id: String,
+    pub workspace_id: String,
+    pub user_display_name: Option<String>,
+    pub workspace_revision: u64,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionHideResult {
+    pub session_id: String,
+    pub workspace_id: String,
+    pub workspace_revision: u64,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +415,22 @@ pub struct HostAgentSessionInspection {
     pub summary: HostAgentSessionSummary,
     pub source_cwd: Option<PathBuf>,
     pub occurrences: Vec<AgentInstanceSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projected_occurrences: Vec<HostAgentSessionOccurrence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostAgentSessionOccurrence {
+    pub agent_id: String,
+    pub shell_id: String,
+    pub retained_shell_name: Option<String>,
+    pub retained_shell_cwd: Option<PathBuf>,
+    pub source_cwd: Option<PathBuf>,
+    pub run_id: String,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub is_current: bool,
+    pub observation: AgentObservationSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -651,6 +755,10 @@ pub enum NodeProjectionTransitionKind {
         agent_id: String,
         revision: u64,
     },
+    SessionContext {
+        workspace_id: String,
+        agent_id: String,
+    },
     HandoffCompleted,
 }
 
@@ -868,6 +976,15 @@ pub struct AgentAttentionSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWorkingContextSnapshot {
+    pub worktree_root: PathBuf,
+    pub repository: String,
+    pub branch: String,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInstanceSnapshot {
     pub id: String,
     pub workspace_id: String,
@@ -883,6 +1000,8 @@ pub struct AgentInstanceSnapshot {
     pub observation: AgentObservationSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<AgentAttentionSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_contexts: Vec<AgentWorkingContextSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1080,6 +1199,19 @@ pub enum RoutedOperation {
         agent_id: String,
         observation_revision: u64,
     },
+    SetAgentSessionDisplayName {
+        operation_id: String,
+        session_id: String,
+        expected_workspace_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    HideAgentSession {
+        operation_id: String,
+        session_id: String,
+        workspace_id: String,
+        expected_workspace_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1089,6 +1221,7 @@ pub enum RoutedGuard {
     ResourceRevision,
     ResourceRevisionAndRun,
     AttentionObservationRevision,
+    WorkspaceRevisionAndOperationId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1108,6 +1241,7 @@ impl RoutedOperation {
         use RoutedAmbiguity::{ReadAndProve, RetrySameRequest};
         use RoutedGuard::{
             AttentionObservationRevision, ExactId, ResourceRevision, ResourceRevisionAndRun,
+            WorkspaceRevisionAndOperationId,
         };
         match self {
             Self::CreateWorkspaceShell { .. } | Self::CreateWorkspaceLauncher { .. } => {
@@ -1141,6 +1275,12 @@ impl RoutedOperation {
                 guard: AttentionObservationRevision,
                 ambiguity: RetrySameRequest,
             },
+            Self::SetAgentSessionDisplayName { .. } | Self::HideAgentSession { .. } => {
+                RoutedOperationClass {
+                    guard: WorkspaceRevisionAndOperationId,
+                    ambiguity: RetrySameRequest,
+                }
+            }
         }
     }
 
@@ -1278,6 +1418,28 @@ impl RoutedOperation {
                 agent_id,
                 observation_revision,
             },
+            Self::SetAgentSessionDisplayName {
+                operation_id,
+                session_id,
+                expected_workspace_revision,
+                display_name,
+            } => Request::SetAgentSessionDisplayName {
+                operation_id,
+                session_id,
+                expected_workspace_revision,
+                display_name,
+            },
+            Self::HideAgentSession {
+                operation_id,
+                session_id,
+                workspace_id,
+                expected_workspace_revision,
+            } => Request::HideAgentSession {
+                operation_id,
+                session_id,
+                workspace_id,
+                expected_workspace_revision,
+            },
         }
     }
 }
@@ -1377,6 +1539,23 @@ pub enum DaemonEventKind {
         workspace_id: String,
         shell_id: String,
         agent: AgentInstanceSnapshot,
+    },
+    AgentWorkingContextObserved {
+        workspace_id: String,
+        shell_id: String,
+        agent: AgentInstanceSnapshot,
+    },
+    AgentSessionDisplayNameChanged {
+        workspace_id: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_display_name: Option<String>,
+        workspace_revision: u64,
+    },
+    AgentSessionHidden {
+        workspace_id: String,
+        session_id: String,
+        workspace_revision: u64,
     },
     NodeProjectionChanged {
         node_id: String,
@@ -1759,9 +1938,28 @@ pub enum Request {
         run_id: String,
         report: AgentReport,
     },
+    ObserveAgentWorkingContext {
+        agent_id: String,
+        shell_id: String,
+        run_id: String,
+        path: PathBuf,
+    },
     AcknowledgeAgentAttention {
         agent_id: String,
         observation_revision: u64,
+    },
+    SetAgentSessionDisplayName {
+        operation_id: String,
+        session_id: String,
+        expected_workspace_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    HideAgentSession {
+        operation_id: String,
+        session_id: String,
+        workspace_id: String,
+        expected_workspace_revision: u64,
     },
     ReadShell {
         shell_id: String,
@@ -1942,6 +2140,16 @@ impl Request {
                 operation: RoutedOperation::SetWorkspaceDefaultCwd { .. },
                 ..
             } => Some(ProtocolFeature::WorkspacePlacementDefaultCwd),
+            Self::SetAgentSessionDisplayName { .. }
+            | Self::RouteNodeOperation {
+                operation: RoutedOperation::SetAgentSessionDisplayName { .. },
+                ..
+            } => Some(ProtocolFeature::SessionDisplayNames),
+            Self::HideAgentSession { .. }
+            | Self::RouteNodeOperation {
+                operation: RoutedOperation::HideAgentSession { .. },
+                ..
+            } => Some(ProtocolFeature::WorkspaceSessionHiding),
             Self::CreateWorkspaceShell { .. }
             | Self::CreateWorkspaceLauncher { .. }
             | Self::RouteNodeOperation {
@@ -1992,6 +2200,9 @@ impl Request {
             } => Some(ProtocolFeature::ClientEnvironment),
             Self::AcknowledgeAgentAttention { .. } => {
                 Some(ProtocolFeature::PersistentAgentAttention)
+            }
+            Self::ObserveAgentWorkingContext { .. } => {
+                Some(ProtocolFeature::SessionPresentationContext)
             }
             Self::WaitAgent { .. } => Some(ProtocolFeature::RevisionAwareAgentWait),
             Self::RegisterAgent { spec, .. } | Self::EnsureAgent { spec, .. }
@@ -2147,6 +2358,16 @@ pub enum Response {
         agent: AgentInstanceSnapshot,
         changed: bool,
     },
+    AgentWorkingContext {
+        agent: AgentInstanceSnapshot,
+        changed: bool,
+    },
+    AgentSessionDisplayName {
+        outcome: AgentSessionDisplayNameResult,
+    },
+    AgentSessionHidden {
+        outcome: AgentSessionHideResult,
+    },
     Output {
         bytes: Vec<u8>,
     },
@@ -2200,11 +2421,25 @@ pub enum RoutedOperationResult {
         agent: AgentInstanceSnapshot,
         changed: bool,
     },
+    AgentSessionDisplayName {
+        outcome: AgentSessionDisplayNameResult,
+    },
+    AgentSessionHidden {
+        outcome: AgentSessionHideResult,
+    },
     Ok,
 }
 
 fn default_event_limit() -> u16 {
     256
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2558,6 +2793,7 @@ mod tests {
                 observed_at_ms: 11,
             },
             attention: None,
+            working_contexts: Vec::new(),
         };
         let event = DaemonEventKind::AgentStateChanged {
             workspace_id: "w1".into(),
@@ -2573,8 +2809,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_forty_nine_with_forty_seven_floor() {
-        assert_eq!(PROTOCOL_VERSION, 49);
+    fn protocol_version_is_fifty_one_with_forty_seven_floor() {
+        assert_eq!(PROTOCOL_VERSION, 51);
         assert_eq!(MIN_PROTOCOL_VERSION, 47);
     }
 
@@ -2866,6 +3102,7 @@ mod tests {
                 observed_at_ms: 101,
             },
             attention: None,
+            working_contexts: Vec::new(),
         };
         for response in [
             Response::OpenCodeSharedRuntime {
@@ -3351,6 +3588,223 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Request>(serde_json::to_value(&routed).unwrap()).unwrap(),
             routed
+        );
+    }
+
+    #[test]
+    fn protocol_fifty_routes_idempotent_session_display_name_mutations() {
+        let operation = RoutedOperation::SetAgentSessionDisplayName {
+            operation_id: uuid::Uuid::from_u128(1).to_string(),
+            session_id: uuid::Uuid::from_u128(2).to_string(),
+            expected_workspace_revision: 7,
+            display_name: Some("Checkout retry investigation".into()),
+        };
+        assert_eq!(
+            operation.classification().guard,
+            RoutedGuard::WorkspaceRevisionAndOperationId
+        );
+        assert!(operation.is_retryable());
+        assert_eq!(
+            operation.owner_request(),
+            Request::SetAgentSessionDisplayName {
+                operation_id: uuid::Uuid::from_u128(1).to_string(),
+                session_id: uuid::Uuid::from_u128(2).to_string(),
+                expected_workspace_revision: 7,
+                display_name: Some("Checkout retry investigation".into()),
+            }
+        );
+        let request = Request::RouteNodeOperation {
+            node_id: uuid::Uuid::from_u128(3).to_string(),
+            operation,
+        };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::SessionDisplayNames)
+        );
+        assert_eq!(request.minimum_protocol_version(), 50);
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+
+        let response = Response::AgentSessionDisplayName {
+            outcome: AgentSessionDisplayNameResult {
+                session_id: uuid::Uuid::from_u128(2).to_string(),
+                workspace_id: uuid::Uuid::from_u128(4).to_string(),
+                user_display_name: Some("Checkout retry investigation".into()),
+                workspace_revision: 8,
+                changed: true,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            serde_json::json!({
+                "response": "agent_session_display_name",
+                "outcome": {
+                    "session_id": uuid::Uuid::from_u128(2).to_string(),
+                    "workspace_id": uuid::Uuid::from_u128(4).to_string(),
+                    "user_display_name": "Checkout retry investigation",
+                    "workspace_revision": 8,
+                    "changed": true
+                }
+            })
+        );
+
+        let old: HostAgentSessionSummary = serde_json::from_value(serde_json::json!({
+            "id": "s", "workspace_id": "w", "workspace_name": "work",
+            "description": "derived", "integration": "opencode",
+            "external_session_id": "external", "state": "inactive",
+            "state_is_current": false, "started_at_ms": 1, "last_at_ms": 2,
+            "occurrence_count": 1
+        }))
+        .unwrap();
+        assert_eq!(old.user_display_name, None);
+        assert_eq!(old.latest_agent_name, None);
+        assert_eq!(old.workspace_revision, 0);
+        assert!(old.attentions.is_empty());
+        assert_eq!(old.git_branch, None);
+        assert!(old.working_contexts.is_empty());
+        assert_eq!(old.working_context_count, 0);
+
+        let observe = Request::ObserveAgentWorkingContext {
+            agent_id: "agent".into(),
+            shell_id: "shell".into(),
+            run_id: "run".into(),
+            path: "/tmp/project".into(),
+        };
+        assert_eq!(
+            observe.required_feature(),
+            Some(ProtocolFeature::SessionPresentationContext)
+        );
+        assert_eq!(observe.minimum_protocol_version(), 50);
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&observe).unwrap()).unwrap(),
+            observe
+        );
+
+        let working_context = AgentWorkingContextSnapshot {
+            worktree_root: "/worktrees/boomux".into(),
+            repository: "boomux".into(),
+            branch: "feat/working-contexts".into(),
+            observed_at_ms: 43,
+        };
+        let encoded = serde_json::json!({
+            "worktree_root": "/worktrees/boomux",
+            "repository": "boomux",
+            "branch": "feat/working-contexts",
+            "observed_at_ms": 43
+        });
+        assert_eq!(serde_json::to_value(&working_context).unwrap(), encoded);
+        assert_eq!(
+            serde_json::from_value::<AgentWorkingContextSnapshot>(encoded).unwrap(),
+            working_context
+        );
+
+        let context = HostAgentSessionAttention {
+            agent_id: "agent".into(),
+            reason: AgentAttentionReason::Blocked,
+            observation_revision: 7,
+            observed_at_ms: 42,
+        };
+        assert_eq!(
+            serde_json::to_value(&context).unwrap(),
+            serde_json::json!({
+                "agent_id": "agent",
+                "reason": "blocked",
+                "observation_revision": 7,
+                "observed_at_ms": 42
+            })
+        );
+
+        let context = HostAgentSessionWorkingContext {
+            repository: "boomux".into(),
+            branch: "feat/push-status".into(),
+            observed_at_ms: 44,
+            push_status: Some(HostGitPushStatus::Ahead { commit_count: 2 }),
+            worktree_status: Some(HostGitWorktreeStatus {
+                staged: true,
+                unstaged_or_untracked: false,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&context).unwrap(),
+            serde_json::json!({
+                "repository": "boomux",
+                "branch": "feat/push-status",
+                "observed_at_ms": 44,
+                "push_status": { "status": "ahead", "commit_count": 2 },
+                "worktree_status": {
+                    "staged": true,
+                    "unstaged_or_untracked": false
+                }
+            })
+        );
+        let defaulted =
+            serde_json::from_value::<HostAgentSessionWorkingContext>(serde_json::json!({
+                "repository": "boomux",
+                "branch": "main",
+                "observed_at_ms": 45
+            }))
+            .unwrap();
+        assert_eq!(defaulted.push_status, None);
+        assert_eq!(defaulted.worktree_status, None);
+        assert_eq!(
+            serde_json::to_value(defaulted).unwrap(),
+            serde_json::json!({
+                "repository": "boomux",
+                "branch": "main",
+                "observed_at_ms": 45
+            })
+        );
+    }
+
+    #[test]
+    fn protocol_fifty_one_routes_idempotent_workspace_session_hiding() {
+        let operation = RoutedOperation::HideAgentSession {
+            operation_id: uuid::Uuid::from_u128(1).to_string(),
+            session_id: uuid::Uuid::from_u128(2).to_string(),
+            workspace_id: uuid::Uuid::from_u128(3).to_string(),
+            expected_workspace_revision: 7,
+        };
+        assert_eq!(
+            operation.classification().guard,
+            RoutedGuard::WorkspaceRevisionAndOperationId
+        );
+        assert!(operation.is_retryable());
+        assert_eq!(
+            operation.owner_request(),
+            Request::HideAgentSession {
+                operation_id: uuid::Uuid::from_u128(1).to_string(),
+                session_id: uuid::Uuid::from_u128(2).to_string(),
+                workspace_id: uuid::Uuid::from_u128(3).to_string(),
+                expected_workspace_revision: 7,
+            }
+        );
+        let request = Request::RouteNodeOperation {
+            node_id: uuid::Uuid::from_u128(4).to_string(),
+            operation,
+        };
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::WorkspaceSessionHiding)
+        );
+        assert_eq!(request.minimum_protocol_version(), 51);
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+
+        let response = Response::AgentSessionHidden {
+            outcome: AgentSessionHideResult {
+                session_id: uuid::Uuid::from_u128(2).to_string(),
+                workspace_id: uuid::Uuid::from_u128(3).to_string(),
+                workspace_revision: 8,
+                changed: true,
+            },
+        };
+        assert_eq!(
+            serde_json::from_value::<Response>(serde_json::to_value(&response).unwrap()).unwrap(),
+            response
         );
     }
 
@@ -3936,6 +4390,24 @@ mod tests {
             (47, &["protocol_47"][..]),
             (48, &["protocol_48", "node_uninstall_coordination"][..]),
             (49, &["protocol_49", "workspace_placement_default_cwd"][..]),
+            (50, &["protocol_50", "session_display_names"][..]),
+            (
+                50,
+                &[
+                    "session_presentation_context",
+                    "observed_agent_working_contexts",
+                ][..],
+            ),
+            (
+                51,
+                &[
+                    "protocol_51",
+                    "session_working_context_push_status",
+                    "session_working_context_worktree_status",
+                    "session_latest_agent_attribution",
+                ][..],
+            ),
+            (51, &["workspace_session_hiding"][..]),
         ];
 
         let actual = ProtocolFeature::ALL
@@ -4010,6 +4482,7 @@ mod tests {
                     observed_at_ms: 2,
                 },
                 attention: None,
+                working_contexts: Vec::new(),
             },
             changed: true,
         };
@@ -4022,7 +4495,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_snapshot_defaults_cwd_omitted_by_old_daemons() {
+    fn agent_snapshot_defaults_fields_omitted_by_old_daemons() {
         let agent: AgentInstanceSnapshot = serde_json::from_value(serde_json::json!({
             "id": "a1",
             "workspace_id": "w1",
@@ -4046,6 +4519,7 @@ mod tests {
 
         assert!(agent.cwd.is_none());
         assert!(agent.attention.is_none());
+        assert!(agent.working_contexts.is_empty());
         assert!(serde_json::to_value(agent).unwrap().get("cwd").is_none());
     }
 

@@ -83,6 +83,7 @@ fn native_daemon_lifecycle() {
         "integration.status",
         "integration.install",
         "integration.verify",
+        "session.hide",
     ] {
         assert!(json_commands.iter().any(|current| current == command));
     }
@@ -122,6 +123,8 @@ fn native_daemon_lifecycle() {
         "protocol_40",
         "protocol_42",
         "protocol_47",
+        "protocol_51",
+        "workspace_session_hiding",
         "opencode_shared_runtime_claims",
         "node_registration_management",
         "node_projection_sync",

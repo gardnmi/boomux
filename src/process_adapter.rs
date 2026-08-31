@@ -359,6 +359,7 @@ mod tests {
                 confidence: 100,
                 observed_at_ms: 1,
             },
+            working_contexts: Vec::new(),
         }
     }
 

@@ -155,6 +155,7 @@ mod tests {
                 },
             }),
             observation,
+            working_contexts: Vec::new(),
         }
     }
 

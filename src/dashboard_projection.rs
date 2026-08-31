@@ -610,6 +610,7 @@ mod tests {
                 observed_at_ms: 2,
             },
             attention: None,
+            working_contexts: Vec::new(),
         });
         let views = project(std::slice::from_ref(&workspace), &mut git::Cache::default());
         let WorkspaceItemView::AgentShell(agent) = &views[0].items[0] else {
@@ -650,6 +651,7 @@ mod tests {
                 observed_at_ms: 2,
             },
             attention: None,
+            working_contexts: Vec::new(),
         });
         let mut distractor = workspace.agents[0].clone();
         distractor.id = "agent-2".into();
@@ -771,6 +773,7 @@ mod tests {
                 observed_at_ms: 2,
             },
             attention: None,
+            working_contexts: Vec::new(),
         });
 
         let views = project(std::slice::from_ref(&workspace), &mut git::Cache::default());

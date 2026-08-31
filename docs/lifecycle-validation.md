@@ -7,6 +7,47 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-08-31
+
+Pi Coding Agent `0.84.4` documentation and the installed session store were
+inspected for title compatibility. Pi JSONL files identify a Session in their
+`session` header with exact `id` and `cwd`; later `session_info` entries carry the
+user-defined `name`. Repository tests validate direct-file and symlink-safe
+bounded discovery, exact ID and normalized-directory matching, newest valid name
+selection, the existing bounded first-user-message fallback, and title-only
+projection. Native and remote-owner tests prove that a matching record enriches
+an observed Pi Session while unmatched records create no historical Session.
+This establishes local title compatibility only and adds no Pi catalog,
+lifecycle authority, or completion claim.
+
+Claude Code `2.1.251` was inspected for title compatibility. Claude documents
+Session naming and exact resume but no title-list API; this adapter therefore
+uses version-validated, fail-open compatibility with direct project JSONL
+transcripts. Observed `ai-title` records include `aiTitle` and `sessionId`, while
+transcripts carry the exact cwd and use the Session ID as their filename stem.
+Repository tests validate Claude's encoded project-directory mapping, direct
+regular-file and symlink-safe bounded discovery, exact filename/session/cwd
+agreement, latest valid title selection, sanitization, and title-only projection.
+Transcript messages are never used to invent a title, and unmatched records
+create no historical Session. This establishes local title compatibility only;
+it is not a documented Claude catalog contract and adds no lifecycle, completion,
+or Remote Control authority.
+
+Kiro CLI `2.19.1` was inspected with its documented
+`kiro-cli chat --list-sessions --format json` interface in an existing Workspace
+directory. The JSON response initially associated the exact canonical Session ID
+`sess_8e787d45-9429-4822-b6fe-2621bcfac4f1` with `Triage Slack issue thread`.
+After later Kiro activity, the same interface and a rebuilt live Boomux daemon
+both returned the updated title `Ticket 300765 complete`, while preserving that
+same external ID and Boomux lifecycle occurrence. Repository tests validate the
+exact command vector, normalized-directory matching, bounded parsing, title
+sanitization, malformed and oversized fail-open behavior, and exact-ID merge.
+They also prove that an unmatched Kiro listing record creates no historical
+Session and that exact durable inspection does not wait for host title discovery.
+This establishes local title compatibility only; it adds no cloud or historical
+catalog projection, lifecycle authority, completion claim, or native web
+handoff.
+
 ## 2026-08-25
 
 Kiro CLI `2.18.0` was live-validated in a Boomux-managed ShellRun with the

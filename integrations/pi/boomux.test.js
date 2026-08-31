@@ -54,6 +54,7 @@ describe("Pi lifecycle", () => {
       "agent_start",
       "agent_end",
       "agent_settled",
+      "tool_call",
       "session_shutdown",
     ]);
   });
@@ -129,6 +130,7 @@ describe("Pi lifecycle", () => {
     const calls = [];
     const lifecycle = {
       enqueue: async (...values) => calls.push(values),
+      enqueueContexts: async () => {},
     };
     __internal.registerLifecycleHandlers(
       { on: (event, handler) => handlers.set(event, handler) },
@@ -178,15 +180,52 @@ describe("Pi lifecycle", () => {
     );
 
     expect(calls).toEqual([
-      ["session-1", "idle", "Pi session idle"],
-      ["session-1", "working", "Pi agent working"],
-      ["session-1", "blocked", "Pi error: provider unavailable"],
-      ["session-1", "inactive", "Pi session inactive", 2],
-      ["session-1", "idle", "Pi session idle"],
-      ["session-1", "inactive", "Pi session inactive", 2],
-      ["session-2", "idle", "Pi session idle"],
-      ["session-2", "inactive", "Pi session inactive", 2],
+      ["session-1", "idle", "Pi session idle", 1, []],
+      ["session-1", "working", "Pi agent working", 1, []],
+      ["session-1", "blocked", "Pi error: provider unavailable", 1, []],
+      ["session-1", "inactive", "Pi session inactive", 2, []],
+      ["session-1", "idle", "Pi session idle", 1, []],
+      ["session-1", "inactive", "Pi session inactive", 2, []],
+      ["session-2", "idle", "Pi session idle", 1, []],
+      ["session-2", "inactive", "Pi session inactive", 2, []],
     ]);
+  });
+
+  test("observes cwd and typed tool paths after lifecycle identity exists", async () => {
+    const calls = [];
+    const lifecycle = __internal.createLifecycle({
+      env: { BOOMUX_SHELL_ID: "shell-1", BOOMUX_RUN_ID: "run-1" },
+      run: async (argv) => {
+        calls.push(argv);
+        return argv[2] === "ensure"
+          ? agent("agent-1", "working", "Pi agent working")
+          : { data: { ok: true } };
+      },
+      log: () => {},
+    });
+    await lifecycle.enqueue(
+      "session-1",
+      "working",
+      "Pi agent working",
+      1,
+      ["/worktrees/boomux"],
+    );
+    await lifecycle.enqueueContexts("session-1", ["/worktrees/omarchy"]);
+
+    expect(calls.map((argv) => argv[2])).toEqual([
+      "ensure",
+      "observe-working-context",
+      "observe-working-context",
+    ]);
+    expect(
+      __internal.workingContextPaths(
+        { cwd: "/worktrees/boomux" },
+        {
+          toolName: "read",
+          input: { path: "/worktrees/omarchy/Panel.qml", command: "ignored" },
+        },
+      ),
+    ).toEqual(["/worktrees/boomux", "/worktrees/omarchy/Panel.qml"]);
   });
 
   test("ensures a new identity when Pi switches sessions", async () => {

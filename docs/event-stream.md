@@ -49,6 +49,20 @@ part of the protocol-47 wire contract.
 Protocol 49 adds `workspace_default_cwd_changed` after the owner Workspace and
 its revision are durably persisted. Protocol-48 clients do not receive the new
 event, but their returned cursor still advances across it.
+Protocol 50 adds `agent_session_display_name_changed` only after the owning
+Workspace metadata and incremented revision are durable. It also adds
+`agent_working_context_observed` after an exact Agent working-context observation
+is durable. Protocol-49 clients receive neither event, but their cursor still
+advances. Reduced remote projection cuts similarly filter the corresponding
+`session_context` transition without rewinding their cursor.
+Protocol 51 adds `agent_session_hidden` only after the owning Workspace
+tombstone and incremented revision are durable. Protocol-50 clients do not
+receive the event, but their returned cursor still advances across it. Latest
+Agent attribution and the separate Working Context push and worktree status
+objects are bounded no-fetch response-time Session presentation and add no event
+kind. Worktree status carries only staged and unstaged-or-untracked booleans, no
+file names, file counts, or file contents. Neither status is persisted;
+protocol-50 responses omit both.
 
 `boomux agent wait <id> --after-revision <revision>` is the preferred way to
 await one Agent. It returns on a newer accepted durable observation, returns
@@ -116,7 +130,8 @@ The event vocabulary is:
 - `launcher_created`, `launcher_renamed`, `launcher_removed`
 - `run_started`, `output_changed`, `run_exited`
 - `agent_registered`, `agent_state_changed`, `agent_completed`,
-  `agent_attention_acknowledged`
+  `agent_attention_acknowledged`, `agent_working_context_observed`,
+  `agent_session_display_name_changed`, `agent_session_hidden`
 - `node_projection_changed`
 - `focused_terminal_presentation_changed`
 - `handoff_completed`
@@ -130,8 +145,9 @@ publication frontier.
 
 Agent events carry the complete durable agent snapshot, including exact shell
 and run IDs and the latest state, authority, evidence, confidence, observation
-revision, and timestamps. Registration emits `agent_registered`; registration
-as `done` also emits `agent_completed`. Later reports emit
+revision, timestamps, and any bounded working contexts supported by the peer.
+Registration emits `agent_registered`; registration as `done` also emits
+`agent_completed`. Later reports emit
 `agent_state_changed`, except the terminal `done` report emits
 `agent_completed`.
 
@@ -144,6 +160,24 @@ other reports against a completed instance are rejected.
 
 `workspace_default_cwd_changed` carries the owner Workspace ID and resolved
 absolute default cwd. It does not rewrite existing Shell or launcher cwd values.
+
+`agent_session_display_name_changed` carries the owning Workspace ID, exact
+projected Session ID, nullable user override, and resulting Workspace revision.
+It carries no harness transcript or history mutation. Reset publishes a null
+override after the effective description has fallen back to current projected
+metadata.
+
+`agent_session_hidden` carries the owning Workspace ID, exact projected Session
+ID, and resulting Workspace revision. It carries no provider history, projected
+summary, lifecycle state, occurrences, or deletion semantics. A fresh hide of an
+already-hidden semantic Session is an event-free no-op.
+
+`agent_working_context_observed` carries the owning Workspace and Shell IDs and
+the complete resulting Agent snapshot. It is emitted only when the exact active
+Agent/Shell/ShellRun accepts a new root or changed repository/branch metadata.
+Reobserving the current tuple is a successful no-op with no timestamp refresh or
+event. The observation does not increment the Agent lifecycle revision or wake
+an `agent wait` caller waiting on that revision.
 
 Accepted blocked and completed observations also carry an outstanding attention
 item in their Agent snapshot. `agent_attention_acknowledged` contains the full

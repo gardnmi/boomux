@@ -304,10 +304,10 @@ the invoking client's resolved notification settings, even when the old daemon
 inherited a different config environment.
 
 Session discovery is not limited to daemon metadata. It may execute the
-PATH-resolved OpenCode or Codex CLI and inspect host catalogs in
-workspace-derived directories, exposing sanitized but potentially private session titles.
-Require authorization appropriate to the host-history metadata before listing
-or inspecting sessions.
+PATH-resolved OpenCode, Codex, or Kiro CLI and inspect bounded Pi or Claude host
+files in workspace-derived directories, exposing sanitized but potentially
+private Session titles. Require authorization appropriate to the host-history
+metadata before listing or inspecting Sessions.
 
 Discover projected session metadata with:
 
@@ -328,7 +328,9 @@ resolve it from an external session ID, description, shell ID, or Agent ID.
 Session state is marked current only when an occurrence is active on the current
 run of a running retained shell; otherwise it is last-known. Catalog-only
 OpenCode or Codex history has state `unknown`, no fabricated occurrence, and a
-sanitized host title. Registered-session descriptions remain durable Agent names.
+sanitized host title. Exact Pi, Claude, or Kiro host records may title only an
+already-observed Session and never create history. A user override still takes
+precedence over every host title.
 Protocol-13 sessions retain a `source_cwd` after shell removal so an exact
 canonical session can be resumed in its original context. Open attaches the exact
 current ShellRun with takeover or resumes an exact historical Session, and fails

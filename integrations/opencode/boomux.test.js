@@ -7,8 +7,10 @@ const {
   createLifecycle,
   createProcessRunner,
   createReducerState,
+  observeWorkingContextArgv,
   reduce,
   sharedReportArgv,
+  workingContextPaths,
 } = BoomuxOpenCodePlugin.__internal;
 
 const env = {
@@ -42,6 +44,35 @@ function successfulEnsure(
 }
 
 describe("event mapping and reducer", () => {
+  test("extracts only structured allowlisted working-context paths", () => {
+    expect(
+      workingContextPaths(
+        event("tool.execute.before", {
+          tool: "read",
+          args: {
+            filePath: "/worktrees/omarchy/Panel.qml",
+            command: "cd /private",
+          },
+        }),
+        ["/worktrees/boomux", "relative"],
+      ),
+    ).toEqual(["/worktrees/boomux", "/worktrees/omarchy/Panel.qml"]);
+    expect(
+      observeWorkingContextArgv("agent", "shell", "run", "/worktree"),
+    ).toEqual([
+      "boomux",
+      "agent",
+      "observe-working-context",
+      "agent",
+      "/worktree",
+      "--shell-id",
+      "shell",
+      "--run-id",
+      "run",
+      "--json",
+    ]);
+  });
+
   test("maps structural status, chat, tool, compaction, waits, and errors", () => {
     expect(
       classifyEvent(event("session.created", { info: { id: "root" } })),
@@ -168,6 +199,35 @@ describe("event mapping and reducer", () => {
     expect(reduce(state, chat, true).evidence).toBe("OpenCode chat.message");
     expect(reduce(state, tool, true)).toBeUndefined();
     expect(reduce(state, tool, true)).toBeUndefined();
+  });
+});
+
+describe("working-context observation", () => {
+  test("records initializer context after ensure without coupling lifecycle success", async () => {
+    const calls = [];
+    const lifecycle = createLifecycle({
+      client: { session: { get: async () => {} } },
+      env,
+      initialWorkingContexts: ["/worktrees/boomux"],
+      run: async (argv) => {
+        calls.push(argv);
+        if (argv[2] === "ensure") return successfulEnsure();
+        if (argv[2] === "observe-working-context") {
+          throw new Error("not a Git worktree");
+        }
+        return { data: {} };
+      },
+      log: () => {},
+    });
+
+    await lifecycle.enqueue(event("session.created", { info: { id: "root" } }));
+
+    expect(calls.map((argv) => argv[2])).toEqual([
+      "ensure",
+      "report",
+      "observe-working-context",
+    ]);
+    expect(lifecycle.roots.get("root").reducer.lastState).toBe("idle");
   });
 });
 
@@ -792,7 +852,7 @@ describe("Boomux commands", () => {
         "OpenCode root session idle",
       ),
     ]);
-    expect(lifecycle.roots.get("root").agentID).toBeUndefined();
+    expect(lifecycle.roots.get("root").agentID).toBe("daemon-resolved");
   });
 });
 

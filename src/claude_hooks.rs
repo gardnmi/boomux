@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 use boomux::protocol::AgentState;
 use serde::Deserialize;
@@ -22,6 +23,8 @@ enum HookEvent {
     Stop,
     StopFailure,
     SessionEnd,
+    CwdChanged,
+    DirectoryAdded,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +39,12 @@ struct HookInput {
     background_tasks: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     session_crons: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default, alias = "toolName")]
+    tool_name: Option<String>,
+    #[serde(default, alias = "toolInput")]
+    tool_input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -49,6 +58,7 @@ pub(crate) struct HookUpdate {
     pub(crate) session_id: String,
     pub(crate) observation: Option<LifecycleObservation>,
     pub(crate) session_ended: bool,
+    pub(crate) working_contexts: Vec<PathBuf>,
 }
 
 pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::error::Error>> {
@@ -67,10 +77,16 @@ pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::
     })?;
     let session_ended = input.hook_event_name == HookEvent::SessionEnd && input.agent_id.is_none();
     let session_id = input.session_id.clone();
+    let working_contexts = crate::hook_input::structured_working_contexts(
+        input.cwd.clone(),
+        input.tool_name.as_deref(),
+        input.tool_input.as_ref(),
+    );
     Ok(HookUpdate {
         session_id,
         observation: reduce(input),
         session_ended,
+        working_contexts,
     })
 }
 
@@ -116,6 +132,7 @@ fn reduce(input: HookInput) -> Option<LifecycleObservation> {
             (AgentState::Working, "Claude subagent session ended")
         }
         HookEvent::SessionEnd => (AgentState::Inactive, "Claude session inactive"),
+        HookEvent::CwdChanged | HookEvent::DirectoryAdded => return None,
     };
     Some(LifecycleObservation { state, evidence })
 }
@@ -198,6 +215,29 @@ mod tests {
             assert_eq!(actual.state, AgentState::Working);
             assert!(!update.session_ended);
         }
+    }
+
+    #[test]
+    fn cwd_and_allowlisted_tool_paths_are_projected_without_lifecycle_inference() {
+        let changed = update(
+            r#"{"session_id":"root","hook_event_name":"CwdChanged","cwd":"/worktrees/boomux"}"#,
+        );
+        assert!(changed.observation.is_none());
+        assert_eq!(
+            changed.working_contexts,
+            [PathBuf::from("/worktrees/boomux")]
+        );
+
+        let tool = update(
+            r#"{"session_id":"root","hook_event_name":"PreToolUse","cwd":"/worktrees/boomux","tool_name":"Read","tool_input":{"file_path":"/worktrees/omarchy/Panel.qml","command":"ignored"}}"#,
+        );
+        assert_eq!(
+            tool.working_contexts,
+            [
+                PathBuf::from("/worktrees/boomux"),
+                PathBuf::from("/worktrees/omarchy/Panel.qml"),
+            ]
+        );
     }
 
     #[test]

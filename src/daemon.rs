@@ -49,9 +49,10 @@ use crate::node_registration::NodeRegistrationManager;
 use crate::protocol::ClaudeRemoteControlBindingSnapshot;
 use crate::protocol::{
     self, AgentAttentionReason, AgentAttentionSnapshot, AgentAuthority, AgentInstanceSnapshot,
-    AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame,
-    DaemonEvent, DaemonEventKind, Envelope, ErrorCode, EventCursor, FocusedTerminalSnapshot,
-    HostIntegrationMutationPreview, HostServiceOperation, HostServiceResult, NodeProjectionAgent,
+    AgentObservationSnapshot, AgentRegistrationSpec, AgentReport, AgentState,
+    AgentWorkingContextSnapshot, AttachFrame, DaemonEvent, DaemonEventKind, Envelope, ErrorCode,
+    EventCursor, FocusedTerminalSnapshot, HostIntegrationMutationPreview, HostServiceOperation,
+    HostServiceResult, MAX_AGENT_WORKING_CONTEXTS, MAX_HOST_SERVICE_SESSIONS, NodeProjectionAgent,
     NodeProjectionAttention, NodeProjectionLauncher, NodeProjectionShell, NodeProjectionSnapshot,
     NodeProjectionSync, NodeProjectionSyncMode, NodeProjectionTransition,
     NodeProjectionTransitionKind, NodeProjectionWorkspace, NotificationDeliveryConfig,
@@ -65,7 +66,9 @@ use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, Ssh
 #[cfg(debug_assertions)]
 use crate::state_store::state_directory_from_environment;
 use crate::state_store::{
-    PersistedAgentInstance, PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
+    PersistedAgentInstance, PersistedHiddenSession, PersistedSessionDisplayName,
+    PersistedSessionDisplayNameOperation, PersistedSessionHideOperation, PersistedSessionIdentity,
+    PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
     PersistedWorkspaceLauncher, StateStore,
 };
 use crate::terminal_state::TerminalState;
@@ -90,6 +93,13 @@ const MAX_AGENT_EVIDENCE_BYTES: usize = 4 * 1024;
 const MAX_HOST_SERVICE_PREVIEWS: usize = 64;
 const HOST_SERVICE_PREVIEW_TTL: Duration = Duration::from_secs(300);
 const HOST_SESSION_CATALOG_TTL: Duration = Duration::from_secs(30);
+const REGISTERED_NODE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const REGISTERED_NODE_SESSION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_SESSION_DISPLAY_NAME_CHARS: usize = 160;
+const MAX_SESSION_DISPLAY_NAMES_PER_WORKSPACE: usize = 1_024;
+const MAX_SESSION_DISPLAY_NAME_OPERATIONS_PER_WORKSPACE: usize = 256;
+const MAX_HIDDEN_SESSIONS_PER_WORKSPACE: usize = 1_024;
+const MAX_SESSION_HIDE_OPERATIONS_PER_WORKSPACE: usize = 256;
 const MAX_TERMINAL_ROWS: u16 = 1_000;
 const MAX_TERMINAL_COLS: u16 = 1_000;
 const MAX_TERMINAL_PREVIEW_LINES: usize = 500;
@@ -2314,6 +2324,121 @@ fn global_workspace_error(error: io::Error) -> DaemonError {
 
 fn response_for_version(response: Response, version: u32) -> Response {
     let mut response = response;
+    if !protocol::ProtocolFeature::WorkspaceSessionHiding.is_supported_by(version)
+        && let Response::Events { events, .. } = &mut response
+    {
+        events.retain(|event| !matches!(event.kind, DaemonEventKind::AgentSessionHidden { .. }));
+    }
+    if !protocol::ProtocolFeature::SessionExtendedPresentation.is_supported_by(version) {
+        match &mut response {
+            Response::HostService {
+                result: HostServiceResult::AgentSessions { sessions },
+            } => {
+                for session in sessions {
+                    session.latest_agent_name = None;
+                    for context in &mut session.working_contexts {
+                        context.push_status = None;
+                        context.worktree_status = None;
+                    }
+                }
+            }
+            Response::HostService {
+                result: HostServiceResult::AgentSession { session },
+            } => {
+                session.summary.latest_agent_name = None;
+                for context in &mut session.summary.working_contexts {
+                    context.push_status = None;
+                    context.worktree_status = None;
+                }
+            }
+            Response::HostService {
+                result: HostServiceResult::ResolvedAgentSession { session },
+            } => {
+                session.latest_agent_name = None;
+                for context in &mut session.working_contexts {
+                    context.push_status = None;
+                    context.worktree_status = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !protocol::ProtocolFeature::SessionDisplayNames.is_supported_by(version) {
+        match &mut response {
+            Response::HostService {
+                result: HostServiceResult::AgentSessions { sessions },
+            } => {
+                for session in sessions {
+                    session.user_display_name = None;
+                    session.workspace_revision = 0;
+                }
+            }
+            Response::HostService {
+                result: HostServiceResult::AgentSession { session },
+            } => {
+                session.summary.user_display_name = None;
+                session.summary.workspace_revision = 0;
+                session.projected_occurrences.clear();
+            }
+            Response::HostService {
+                result: HostServiceResult::ResolvedAgentSession { session },
+            } => {
+                session.user_display_name = None;
+                session.workspace_revision = 0;
+            }
+            Response::Events { events, .. } => events.retain(|event| {
+                !matches!(
+                    event.kind,
+                    DaemonEventKind::AgentSessionDisplayNameChanged { .. }
+                )
+            }),
+            _ => {}
+        }
+    }
+    if !protocol::ProtocolFeature::SessionPresentationContext.is_supported_by(version) {
+        match &mut response {
+            Response::HostService {
+                result: HostServiceResult::AgentSessions { sessions },
+            } => {
+                for session in sessions {
+                    session.attentions.clear();
+                    session.git_branch = None;
+                    session.working_contexts.clear();
+                    session.working_context_count = 0;
+                }
+            }
+            Response::HostService {
+                result: HostServiceResult::AgentSession { session },
+            } => {
+                session.summary.attentions.clear();
+                session.summary.git_branch = None;
+                session.summary.working_contexts.clear();
+                session.summary.working_context_count = 0;
+            }
+            Response::HostService {
+                result: HostServiceResult::ResolvedAgentSession { session },
+            } => {
+                session.attentions.clear();
+                session.git_branch = None;
+                session.working_contexts.clear();
+                session.working_context_count = 0;
+            }
+            Response::NodeProjectionSync { sync } => sync.transitions.retain(|transition| {
+                !matches!(
+                    transition.kind,
+                    NodeProjectionTransitionKind::SessionContext { .. }
+                )
+            }),
+            Response::Events { events, .. } => events.retain(|event| {
+                !matches!(
+                    event.kind,
+                    DaemonEventKind::AgentWorkingContextObserved { .. }
+                )
+            }),
+            _ => {}
+        }
+        visit_response_agents(&mut response, &mut |agent| agent.working_contexts.clear());
+    }
     if !protocol::ProtocolFeature::QualifiedFocusedTerminal.is_supported_by(version) {
         match &mut response {
             Response::CombinedNodeSnapshot { snapshot } => snapshot.focused_terminal = None,
@@ -2423,6 +2548,7 @@ fn response_for_version(response: Response, version: u32) -> Response {
                     DaemonEventKind::AgentRegistered { .. }
                         | DaemonEventKind::AgentStateChanged { .. }
                         | DaemonEventKind::AgentCompleted { .. }
+                        | DaemonEventKind::AgentWorkingContextObserved { .. }
                 )
             });
             if !protocol::ProtocolFeature::WorkspaceLaunchers.is_supported_by(version) {
@@ -2520,7 +2646,8 @@ fn event_shell_id(event: &DaemonEventKind) -> Option<&str> {
         | DaemonEventKind::AgentRegistered { shell_id, .. }
         | DaemonEventKind::AgentStateChanged { shell_id, .. }
         | DaemonEventKind::AgentCompleted { shell_id, .. }
-        | DaemonEventKind::AgentAttentionAcknowledged { shell_id, .. } => Some(shell_id),
+        | DaemonEventKind::AgentAttentionAcknowledged { shell_id, .. }
+        | DaemonEventKind::AgentWorkingContextObserved { shell_id, .. } => Some(shell_id),
         _ => None,
     }
 }
@@ -2554,6 +2681,17 @@ fn remove_focused_terminal(response: &mut Response) {
         } => snapshot.focused_terminal = None,
         _ => {}
     }
+}
+
+fn apply_session_visibility_limit(
+    sessions: &mut Vec<crate::session_projection::SessionProjection>,
+    hidden: &[crate::session_projection::HiddenSessionMetadata],
+    requester_version: u32,
+) {
+    if protocol::ProtocolFeature::WorkspaceSessionHiding.is_supported_by(requester_version) {
+        crate::session_projection::filter_hidden(sessions, hidden);
+    }
+    sessions.truncate(MAX_HOST_SERVICE_SESSIONS);
 }
 
 fn remove_agent_cwds(response: &mut Response) {
@@ -2591,7 +2729,8 @@ fn visit_response_agents(
         }
         Response::Agent { agent }
         | Response::AgentWait { agent, .. }
-        | Response::AgentAttentionAcknowledged { agent, .. } => visitor(agent),
+        | Response::AgentAttentionAcknowledged { agent, .. }
+        | Response::AgentWorkingContext { agent, .. } => visitor(agent),
         Response::Events {
             snapshot, events, ..
         } => {
@@ -2607,7 +2746,8 @@ fn visit_response_agents(
                     DaemonEventKind::AgentRegistered { agent, .. }
                     | DaemonEventKind::AgentStateChanged { agent, .. }
                     | DaemonEventKind::AgentCompleted { agent, .. }
-                    | DaemonEventKind::AgentAttentionAcknowledged { agent, .. } => visitor(agent),
+                    | DaemonEventKind::AgentAttentionAcknowledged { agent, .. }
+                    | DaemonEventKind::AgentWorkingContextObserved { agent, .. } => visitor(agent),
                     _ => {}
                 }
             }
@@ -2656,6 +2796,12 @@ fn routed_result(response: Response) -> Result<RoutedOperationResult, Box<Respon
         Response::Agent { agent } => Ok(RoutedOperationResult::Agent { agent }),
         Response::AgentAttentionAcknowledged { agent, changed } => {
             Ok(RoutedOperationResult::AgentAttentionAcknowledged { agent, changed })
+        }
+        Response::AgentSessionDisplayName { outcome } => {
+            Ok(RoutedOperationResult::AgentSessionDisplayName { outcome })
+        }
+        Response::AgentSessionHidden { outcome } => {
+            Ok(RoutedOperationResult::AgentSessionHidden { outcome })
         }
         Response::Ok => Ok(RoutedOperationResult::Ok),
         Response::Error { .. } => Err(Box::new(response)),
@@ -2753,7 +2899,21 @@ fn send_registered_node_request(
     registration: &crate::protocol::NodeRegistrationSnapshot,
     request: Request,
 ) -> io::Result<Response> {
-    send_registered_node_request_with_timeout(registration, request, Duration::from_secs(2), None)
+    send_registered_node_request_for_version(registration, request, protocol::PROTOCOL_VERSION)
+}
+
+fn send_registered_node_request_for_version(
+    registration: &crate::protocol::NodeRegistrationSnapshot,
+    request: Request,
+    requester_version: u32,
+) -> io::Result<Response> {
+    send_registered_node_request_with_timeout_for_version(
+        registration,
+        request,
+        REGISTERED_NODE_RESPONSE_TIMEOUT,
+        None,
+        requester_version,
+    )
 }
 
 fn send_registered_node_request_with_timeout(
@@ -2762,20 +2922,38 @@ fn send_registered_node_request_with_timeout(
     response_timeout: Duration,
     route_feature: Option<protocol::ProtocolFeature>,
 ) -> io::Result<Response> {
-    send_registered_node_request_with_timeout_after_handshake(
+    send_registered_node_request_with_timeout_for_version(
         registration,
         request,
         response_timeout,
         route_feature,
-        &mut || Ok(()),
+        protocol::PROTOCOL_VERSION,
     )
 }
 
-fn send_registered_node_request_with_timeout_after_handshake(
+fn send_registered_node_request_with_timeout_for_version(
     registration: &crate::protocol::NodeRegistrationSnapshot,
     request: Request,
     response_timeout: Duration,
     route_feature: Option<protocol::ProtocolFeature>,
+    requester_version: u32,
+) -> io::Result<Response> {
+    send_registered_node_request_with_timeout_for_version_after_handshake(
+        registration,
+        request,
+        response_timeout,
+        route_feature,
+        requester_version,
+        &mut || Ok(()),
+    )
+}
+
+fn send_registered_node_request_with_timeout_for_version_after_handshake(
+    registration: &crate::protocol::NodeRegistrationSnapshot,
+    request: Request,
+    response_timeout: Duration,
+    route_feature: Option<protocol::ProtocolFeature>,
+    requester_version: u32,
     before_request: &mut dyn FnMut() -> io::Result<()>,
 ) -> io::Result<Response> {
     let target = SshTarget::parse(registration.target.clone())?;
@@ -2799,13 +2977,14 @@ fn send_registered_node_request_with_timeout_after_handshake(
             "remote Node identity changed",
         ));
     }
+    let forwarded_version = requester_version.min(helper.handshake.core_protocol_version);
     prepare_supported_owner_request(
-        helper.handshake.core_protocol_version,
+        forwarded_version,
         route_feature.or_else(|| request.required_feature()),
         before_request,
     )?;
     let mut remote = bootstrap.connect(helper, Duration::from_secs(2))?;
-    remote.request(request, response_timeout)
+    remote.request_at_version(request, response_timeout, forwarded_version)
 }
 
 fn prepare_supported_owner_request(
@@ -2830,6 +3009,15 @@ fn routed_response_timeout(operation: &RoutedOperation) -> Duration {
 }
 
 fn routed_owner_feature(operation: &RoutedOperation) -> Option<protocol::ProtocolFeature> {
+    if matches!(
+        operation,
+        RoutedOperation::SetAgentSessionDisplayName { .. }
+    ) {
+        return Some(protocol::ProtocolFeature::SessionDisplayNames);
+    }
+    if matches!(operation, RoutedOperation::HideAgentSession { .. }) {
+        return Some(protocol::ProtocolFeature::WorkspaceSessionHiding);
+    }
     if matches!(operation, RoutedOperation::SetWorkspaceDefaultCwd { .. }) {
         return Some(protocol::ProtocolFeature::WorkspacePlacementDefaultCwd);
     }
@@ -3635,6 +3823,18 @@ enum DurableUndo {
     AgentState {
         agent: Arc<AgentInstance>,
         previous: AgentInstanceState,
+    },
+    SessionDisplayNames {
+        workspace: Arc<Workspace>,
+        previous_names: Vec<PersistedSessionDisplayName>,
+        previous_operations: Vec<PersistedSessionDisplayNameOperation>,
+        previous_revision: u64,
+    },
+    HiddenSessions {
+        workspace: Arc<Workspace>,
+        previous_hidden_sessions: Vec<PersistedHiddenSession>,
+        previous_operations: Vec<PersistedSessionHideOperation>,
+        previous_revision: u64,
     },
     RemovedLauncher {
         workspace: Arc<Workspace>,
@@ -4633,9 +4833,19 @@ fn reduce_projection_transition(event: &DaemonEvent) -> Option<NodeProjectionTra
             agent_id: agent.id.clone(),
             revision: agent.observation.revision,
         },
+        DaemonEventKind::AgentWorkingContextObserved {
+            workspace_id,
+            agent,
+            ..
+        } => NodeProjectionTransitionKind::SessionContext {
+            workspace_id: workspace_id.clone(),
+            agent_id: agent.id.clone(),
+        },
         DaemonEventKind::HandoffCompleted => NodeProjectionTransitionKind::HandoffCompleted,
         DaemonEventKind::NodeProjectionChanged { .. }
-        | DaemonEventKind::FocusedTerminalPresentationChanged => return None,
+        | DaemonEventKind::FocusedTerminalPresentationChanged
+        | DaemonEventKind::AgentSessionDisplayNameChanged { .. }
+        | DaemonEventKind::AgentSessionHidden { .. } => return None,
     };
     Some(NodeProjectionTransition {
         event_id: event.id,
@@ -4793,6 +5003,10 @@ impl DurableRegistry {
             shell_ids: Mutex::new(shells.iter().map(|shell| shell.id.clone()).collect()),
             launcher_ids: Mutex::new(Vec::new()),
             agent_ids: Mutex::new(Vec::new()),
+            session_display_names: Mutex::new(Vec::new()),
+            session_display_name_operations: Mutex::new(Vec::new()),
+            hidden_sessions: Mutex::new(Vec::new()),
+            session_hide_operations: Mutex::new(Vec::new()),
         });
         let snapshot = WorkspaceSnapshot {
             id: workspace_id.clone(),
@@ -4858,6 +5072,10 @@ impl DurableRegistry {
             shell_ids: Mutex::new(Vec::new()),
             launcher_ids: Mutex::new(Vec::new()),
             agent_ids: Mutex::new(Vec::new()),
+            session_display_names: Mutex::new(Vec::new()),
+            session_display_name_operations: Mutex::new(Vec::new()),
+            hidden_sessions: Mutex::new(Vec::new()),
+            session_hide_operations: Mutex::new(Vec::new()),
         });
         let snapshot = WorkspaceSnapshot {
             id: workspace_id.to_owned(),
@@ -5373,6 +5591,7 @@ impl DurableRegistry {
                     observed_at_ms: started_at_ms,
                 },
                 attention: None,
+                working_contexts: Vec::new(),
             }),
         });
         {
@@ -5541,6 +5760,69 @@ impl DurableRegistry {
         ))
     }
 
+    fn observe_agent_working_context(
+        &self,
+        agent_id: &str,
+        shell_id: &str,
+        run_id: &str,
+        mut context: AgentWorkingContextSnapshot,
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool, Option<DurableUndo>)> {
+        validate_working_context(&context)?;
+        let agent = self.agent(agent_id)?;
+        if agent.shell_id != shell_id {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::RunChanged,
+                "agent instance is bound to a different shell",
+            ));
+        }
+        if agent.run_id != run_id {
+            return Err(DaemonError::lifecycle(
+                ErrorCode::RunChanged,
+                "agent instance is bound to a different shell run",
+            ));
+        }
+        let shell = self.shell(shell_id)?;
+        match &*lock(&shell.lifecycle)? {
+            ShellLifecycle::Running { run, .. } if run.id == run_id => {}
+            _ => {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::RunChanged,
+                    "shell does not have the requested active run",
+                ));
+            }
+        }
+        let mut state = lock(&agent.state)?;
+        if state.working_contexts.first().is_some_and(|current| {
+            current.worktree_root == context.worktree_root
+                && current.repository == context.repository
+                && current.branch == context.branch
+        }) {
+            return Ok((agent.snapshot_from(&state), false, None));
+        }
+        let previous = state.clone();
+        context.observed_at_ms = unix_time_ms()
+            .max(agent.started_at_ms)
+            .max(state.observation.observed_at_ms)
+            .max(
+                state
+                    .working_contexts
+                    .first()
+                    .map_or(0, |current| current.observed_at_ms),
+            );
+        state
+            .working_contexts
+            .retain(|current| current.worktree_root != context.worktree_root);
+        state.working_contexts.insert(0, context);
+        state.working_contexts.truncate(MAX_AGENT_WORKING_CONTEXTS);
+        let snapshot = agent.snapshot_from(&state);
+        drop(state);
+        Ok((
+            snapshot,
+            true,
+            Some(DurableUndo::AgentState { agent, previous }),
+        ))
+    }
+
     fn acknowledge_agent_attention(
         &self,
         agent_id: &str,
@@ -5679,6 +5961,26 @@ impl DurableRegistry {
             }
             DurableUndo::AgentState { agent, previous } => {
                 *lock(&agent.state)? = previous;
+            }
+            DurableUndo::SessionDisplayNames {
+                workspace,
+                previous_names,
+                previous_operations,
+                previous_revision,
+            } => {
+                *lock(&workspace.session_display_names)? = previous_names;
+                *lock(&workspace.session_display_name_operations)? = previous_operations;
+                *lock(&workspace.revision)? = previous_revision;
+            }
+            DurableUndo::HiddenSessions {
+                workspace,
+                previous_hidden_sessions,
+                previous_operations,
+                previous_revision,
+            } => {
+                *lock(&workspace.hidden_sessions)? = previous_hidden_sessions;
+                *lock(&workspace.session_hide_operations)? = previous_operations;
+                *lock(&workspace.revision)? = previous_revision;
             }
             DurableUndo::RemovedLauncher {
                 workspace,
@@ -5865,6 +6167,11 @@ impl DurableRegistry {
                 shells,
                 launchers,
                 agents,
+                session_display_names: lock(&workspace.session_display_names)?.clone(),
+                session_display_name_operations: lock(&workspace.session_display_name_operations)?
+                    .clone(),
+                hidden_sessions: lock(&workspace.hidden_sessions)?.clone(),
+                session_hide_operations: lock(&workspace.session_hide_operations)?.clone(),
             });
         }
         Ok(PersistenceGeneration {
@@ -6743,6 +7050,10 @@ struct Workspace {
     shell_ids: Mutex<Vec<String>>,
     launcher_ids: Mutex<Vec<String>>,
     agent_ids: Mutex<Vec<String>>,
+    session_display_names: Mutex<Vec<PersistedSessionDisplayName>>,
+    session_display_name_operations: Mutex<Vec<PersistedSessionDisplayNameOperation>>,
+    hidden_sessions: Mutex<Vec<PersistedHiddenSession>>,
+    session_hide_operations: Mutex<Vec<PersistedSessionHideOperation>>,
 }
 
 struct AgentInstance {
@@ -6763,6 +7074,7 @@ struct AgentInstanceState {
     ended_at_ms: Option<u64>,
     observation: AgentObservationSnapshot,
     attention: Option<AgentAttentionSnapshot>,
+    working_contexts: Vec<AgentWorkingContextSnapshot>,
 }
 
 struct WorkspaceLauncher {
@@ -8056,7 +8368,21 @@ impl DaemonService {
                 );
             }
         };
-        let plan = match host_services::prepare_session_resume(&snapshot, session_id) {
+        let mut sessions = match self.exact_host_sessions(&snapshot, session_id) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                return send_response(&mut stream, response_version, error.into_response());
+            }
+        };
+        if protocol::ProtocolFeature::WorkspaceSessionHiding.is_supported_by(response_version) {
+            match self.hidden_session_metadata() {
+                Ok(metadata) => crate::session_projection::filter_hidden(&mut sessions, &metadata),
+                Err(error) => {
+                    return send_response(&mut stream, response_version, error.into_response());
+                }
+            }
+        }
+        let plan = match host_services::prepare_session_resume(&sessions, session_id) {
             Ok(plan) => plan,
             Err(error) => {
                 return send_response(
@@ -8279,9 +8605,8 @@ impl DaemonService {
                 ),
             );
         }
-        if !protocol::ProtocolFeature::NodeHostServices
-            .is_supported_by(helper.handshake.core_protocol_version)
-        {
+        let forwarded_version = response_version.min(helper.handshake.core_protocol_version);
+        if !protocol::ProtocolFeature::NodeHostServices.is_supported_by(forwarded_version) {
             return send_response(
                 stream,
                 response_version,
@@ -8292,12 +8617,13 @@ impl DaemonService {
             );
         }
         let remote = bootstrap.connect(helper, HANDSHAKE_TIMEOUT)?;
-        let (response, mut remote_reader, mut remote_writer) = remote.open_attachment(
+        let (response, mut remote_reader, mut remote_writer) = remote.open_attachment_at_version(
             Request::ResumeAgentSession {
                 session_id: session_id.to_owned(),
                 profile,
             },
             HANDSHAKE_TIMEOUT,
+            forwarded_version,
         )?;
         if !matches!(response, Response::Attached { .. }) {
             return send_response(stream, response_version, response);
@@ -8588,7 +8914,21 @@ impl DaemonService {
     }
 
     fn route_node_operation(&self, node_id: &str, operation: RoutedOperation) -> Response {
-        self.route_node_operation_after_handshake(node_id, operation, &mut || Ok(()))
+        self.route_node_operation_for_version(node_id, operation, protocol::PROTOCOL_VERSION)
+    }
+
+    fn route_node_operation_for_version(
+        &self,
+        node_id: &str,
+        operation: RoutedOperation,
+        requester_version: u32,
+    ) -> Response {
+        self.route_node_operation_for_version_after_handshake(
+            node_id,
+            operation,
+            requester_version,
+            &mut || Ok(()),
+        )
     }
 
     fn route_node_operation_after_handshake(
@@ -8597,6 +8937,31 @@ impl DaemonService {
         operation: RoutedOperation,
         before_request: &mut dyn FnMut() -> io::Result<()>,
     ) -> Response {
+        self.route_node_operation_for_version_after_handshake(
+            node_id,
+            operation,
+            protocol::PROTOCOL_VERSION,
+            before_request,
+        )
+    }
+
+    fn route_node_operation_for_version_after_handshake(
+        &self,
+        node_id: &str,
+        operation: RoutedOperation,
+        requester_version: u32,
+        before_request: &mut dyn FnMut() -> io::Result<()>,
+    ) -> Response {
+        if let RoutedOperation::SetAgentSessionDisplayName { operation_id, .. } = &operation
+            && let Err(error) = validate_uuid(operation_id, "Session display-name operation ID")
+        {
+            return DaemonError::from(error).into_response();
+        }
+        if let RoutedOperation::HideAgentSession { operation_id, .. } = &operation
+            && let Err(error) = validate_uuid(operation_id, "Session hide operation ID")
+        {
+            return DaemonError::from(error).into_response();
+        }
         let registrations = match self.node_registrations() {
             Ok(registrations) => registrations,
             Err(error) => return error.into_response(),
@@ -8620,19 +8985,21 @@ impl DaemonService {
         }
         let response_timeout = routed_response_timeout(&operation);
         let owner_feature = routed_owner_feature(&operation);
-        let mut result = send_registered_node_request_with_timeout_after_handshake(
+        let mut result = send_registered_node_request_with_timeout_for_version_after_handshake(
             &registration,
             operation.owner_request(),
             response_timeout,
             owner_feature,
+            requester_version,
             before_request,
         );
         if result.is_err() && operation.is_retryable() {
-            result = send_registered_node_request_with_timeout_after_handshake(
+            result = send_registered_node_request_with_timeout_for_version_after_handshake(
                 &registration,
                 operation.owner_request(),
                 response_timeout,
                 owner_feature,
+                requester_version,
                 before_request,
             );
         }
@@ -8693,7 +9060,23 @@ impl DaemonService {
     fn host_sessions(
         &self,
         snapshot: &Snapshot,
+        workspace_id: Option<&str>,
     ) -> DaemonResult<Vec<crate::session_projection::SessionProjection>> {
+        let scoped;
+        let snapshot = if let Some(workspace_id) = workspace_id {
+            let workspace = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .ok_or_else(|| not_found("workspace", workspace_id))?;
+            scoped = Snapshot {
+                workspaces: vec![workspace.clone()],
+                focused_terminal: None,
+            };
+            &scoped
+        } else {
+            snapshot
+        };
         let directories = host_services::session_catalog_directories(snapshot);
         let mut cached = lock(&self.host_session_catalog)?;
         if cached.as_ref().is_none_or(|catalog| {
@@ -8706,16 +9089,137 @@ impl DaemonService {
                 inspected_at: Instant::now(),
             });
         }
-        Ok(host_services::sessions_with_catalog(
+        let mut sessions = host_services::sessions_with_catalog(
             snapshot,
             &cached
                 .as_ref()
                 .expect("Session catalog was inserted")
                 .sessions,
-        ))
+        );
+        drop(cached);
+        crate::session_projection::apply_display_names(
+            &mut sessions,
+            &self.session_display_name_metadata()?,
+        );
+        Ok(sessions)
     }
 
-    fn host_service(&self, operation: HostServiceOperation) -> DaemonResult<HostServiceResult> {
+    fn durable_host_sessions(
+        &self,
+        snapshot: &Snapshot,
+    ) -> DaemonResult<Vec<crate::session_projection::SessionProjection>> {
+        let mut sessions = host_services::durable_sessions(snapshot);
+        crate::session_projection::apply_display_names(
+            &mut sessions,
+            &self.session_display_name_metadata()?,
+        );
+        Ok(sessions)
+    }
+
+    fn exact_host_sessions(
+        &self,
+        snapshot: &Snapshot,
+        session_id: &str,
+    ) -> DaemonResult<Vec<crate::session_projection::SessionProjection>> {
+        let durable = self.durable_host_sessions(snapshot)?;
+        let durable_contains_session = !matches!(
+            crate::session_projection::resolve_exact(&durable, session_id),
+            Err(crate::session_projection::ResolveError::NotFound)
+        );
+
+        let cached = lock(&self.host_session_catalog)?;
+        let Some(catalog) = cached.as_ref() else {
+            drop(cached);
+            return if durable_contains_session {
+                Ok(durable)
+            } else {
+                self.host_sessions(snapshot, None)
+            };
+        };
+        let mut sessions = host_services::sessions_with_catalog(snapshot, &catalog.sessions);
+        drop(cached);
+        crate::session_projection::apply_display_names(
+            &mut sessions,
+            &self.session_display_name_metadata()?,
+        );
+        if durable_contains_session
+            || !matches!(
+                crate::session_projection::resolve_exact(&sessions, session_id),
+                Err(crate::session_projection::ResolveError::NotFound)
+            )
+        {
+            Ok(sessions)
+        } else {
+            self.host_sessions(snapshot, None)
+        }
+    }
+
+    fn session_display_name_metadata(
+        &self,
+    ) -> DaemonResult<Vec<crate::session_projection::SessionDisplayNameMetadata>> {
+        let workspaces = lock(&self.durable.state)?
+            .workspaces
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut metadata = Vec::new();
+        for workspace in workspaces {
+            for record in lock(&workspace.session_display_names)?.iter() {
+                let (external_session_id, agent_id) = match &record.session {
+                    PersistedSessionIdentity::External {
+                        external_session_id,
+                    } => (Some(external_session_id.clone()), None),
+                    PersistedSessionIdentity::Instance { agent_id } => {
+                        (None, Some(agent_id.clone()))
+                    }
+                };
+                metadata.push(crate::session_projection::SessionDisplayNameMetadata {
+                    workspace_id: workspace.id.clone(),
+                    integration: record.integration.clone(),
+                    external_session_id,
+                    agent_id,
+                    display_name: record.display_name.clone(),
+                });
+            }
+        }
+        Ok(metadata)
+    }
+
+    fn hidden_session_metadata(
+        &self,
+    ) -> DaemonResult<Vec<crate::session_projection::HiddenSessionMetadata>> {
+        let workspaces = lock(&self.durable.state)?
+            .workspaces
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut metadata = Vec::new();
+        for workspace in workspaces {
+            for record in lock(&workspace.hidden_sessions)?.iter() {
+                let (external_session_id, agent_id) = match &record.session {
+                    PersistedSessionIdentity::External {
+                        external_session_id,
+                    } => (Some(external_session_id.clone()), None),
+                    PersistedSessionIdentity::Instance { agent_id } => {
+                        (None, Some(agent_id.clone()))
+                    }
+                };
+                metadata.push(crate::session_projection::HiddenSessionMetadata {
+                    workspace_id: workspace.id.clone(),
+                    integration: record.integration.clone(),
+                    external_session_id,
+                    agent_id,
+                });
+            }
+        }
+        Ok(metadata)
+    }
+
+    fn host_service_for_version(
+        &self,
+        operation: HostServiceOperation,
+        requester_version: u32,
+    ) -> DaemonResult<HostServiceResult> {
         match operation {
             HostServiceOperation::DiscoverProjects => Ok(HostServiceResult::Projects {
                 discovery: host_services::discover_projects().map_err(DaemonError::from)?,
@@ -8821,21 +9325,29 @@ impl DaemonService {
             }),
             HostServiceOperation::ListAgentSessions { workspace_id } => {
                 let snapshot = self.snapshot()?;
-                let sessions = self
-                    .host_sessions(&snapshot)?
-                    .into_iter()
-                    .filter(|session| {
-                        workspace_id
-                            .as_deref()
-                            .is_none_or(|workspace_id| session.workspace_id == workspace_id)
-                    })
-                    .map(|session| host_services::session_summary(&session))
-                    .collect();
+                let mut projected = self.host_sessions(&snapshot, workspace_id.as_deref())?;
+                let hidden = if protocol::ProtocolFeature::WorkspaceSessionHiding
+                    .is_supported_by(requester_version)
+                {
+                    self.hidden_session_metadata()?
+                } else {
+                    Vec::new()
+                };
+                apply_session_visibility_limit(&mut projected, &hidden, requester_version);
+                let sessions = host_services::session_summaries(&snapshot, &projected);
                 Ok(HostServiceResult::AgentSessions { sessions })
             }
             HostServiceOperation::InspectAgentSession { session_id } => {
                 let snapshot = self.snapshot()?;
-                let sessions = self.host_sessions(&snapshot)?;
+                let mut sessions = self.exact_host_sessions(&snapshot, &session_id)?;
+                if protocol::ProtocolFeature::WorkspaceSessionHiding
+                    .is_supported_by(requester_version)
+                {
+                    crate::session_projection::filter_hidden(
+                        &mut sessions,
+                        &self.hidden_session_metadata()?,
+                    );
+                }
                 Ok(HostServiceResult::AgentSession {
                     session: host_services::inspect_projected_session(
                         &snapshot,
@@ -8849,7 +9361,17 @@ impl DaemonService {
                 workspace_id,
                 agent_id,
             } => {
-                let matches = host_services::sessions(&self.snapshot()?)
+                let snapshot = self.snapshot()?;
+                let mut sessions = self.durable_host_sessions(&snapshot)?;
+                if protocol::ProtocolFeature::WorkspaceSessionHiding
+                    .is_supported_by(requester_version)
+                {
+                    crate::session_projection::filter_hidden(
+                        &mut sessions,
+                        &self.hidden_session_metadata()?,
+                    );
+                }
+                let matches = sessions
                     .into_iter()
                     .filter(|session| {
                         session.workspace_id == workspace_id
@@ -8870,13 +9392,342 @@ impl DaemonService {
                     ));
                 };
                 Ok(HostServiceResult::ResolvedAgentSession {
-                    session: host_services::session_summary(session),
+                    session: host_services::session_summary_with_snapshot(&snapshot, session),
                 })
             }
         }
     }
 
+    fn set_agent_session_display_name(
+        &self,
+        operation_id: String,
+        session_id: String,
+        expected_workspace_revision: u64,
+        display_name: Option<String>,
+    ) -> DaemonResult<Response> {
+        validate_uuid(&operation_id, "Session display-name operation ID")?;
+        let display_name = display_name
+            .map(|name| normalize_session_display_name(&name))
+            .transpose()?;
+        self.durable_mutation_outcome(|undo| {
+            let workspaces = lock(&self.durable.state)?
+                .workspaces
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for workspace in workspaces {
+                if let Some(replayed) = lock(&workspace.session_display_name_operations)?
+                    .iter()
+                    .find(|operation| operation.operation_id == operation_id)
+                    .cloned()
+                {
+                    if replayed.session_id != session_id
+                        || replayed.expected_revision != expected_workspace_revision
+                        || replayed.display_name != display_name
+                    {
+                        return Err(DaemonError::lifecycle(
+                            ErrorCode::IdempotencyExpired,
+                            "Session display-name operation ID was reused for another request",
+                        ));
+                    }
+                    return Ok(DurableMutation::Unchanged(
+                        Response::AgentSessionDisplayName {
+                            outcome: replayed.result,
+                        },
+                    ));
+                }
+            }
+            let snapshot = self.snapshot()?;
+            let sessions = self.host_sessions(&snapshot, None)?;
+            let session = crate::session_projection::resolve_exact(&sessions, &session_id)
+                .map_err(|error| {
+                    DaemonError::lifecycle(
+                        match error {
+                            crate::session_projection::ResolveError::NotFound => {
+                                ErrorCode::NotFound
+                            }
+                            crate::session_projection::ResolveError::DuplicateId => {
+                                ErrorCode::AmbiguousTarget
+                            }
+                        },
+                        "exact Agent Session was not found",
+                    )
+                })?;
+            let workspace = self.workspace(&session.workspace_id)?;
+            let integration = session.integration.clone();
+            require_guard(
+                session.workspace_revision,
+                expected_workspace_revision,
+                "workspace",
+            )?;
+            let identity = match &session.external_session_id {
+                Some(external_session_id) => PersistedSessionIdentity::External {
+                    external_session_id: external_session_id.clone(),
+                },
+                None => PersistedSessionIdentity::Instance {
+                    agent_id: session
+                        .occurrences
+                        .first()
+                        .ok_or_else(|| {
+                            DaemonError::lifecycle(
+                                ErrorCode::NotFound,
+                                "Agent Session has no semantic fallback identity",
+                            )
+                        })?
+                        .agent_id
+                        .clone(),
+                },
+            };
+            let mut names = lock(&workspace.session_display_names)?;
+            let operations = lock(&workspace.session_display_name_operations)?;
+            let mut revision = lock(&workspace.revision)?;
+            let previous_names = names.clone();
+            let previous_operations = operations.clone();
+            let previous_revision = *revision;
+            let record_index = names
+                .iter()
+                .position(|record| record.integration == integration && record.session == identity);
+            match (record_index, &display_name) {
+                (Some(index), Some(name)) => names[index].display_name = name.clone(),
+                (Some(index), None) => {
+                    names.remove(index);
+                }
+                (None, Some(name)) => {
+                    if names.len() >= MAX_SESSION_DISPLAY_NAMES_PER_WORKSPACE {
+                        return Err(DaemonError::lifecycle(
+                            ErrorCode::Busy,
+                            "Workspace Session display-name limit reached",
+                        ));
+                    }
+                    names.push(PersistedSessionDisplayName {
+                        integration: integration.clone(),
+                        session: identity.clone(),
+                        display_name: name.clone(),
+                    });
+                }
+                (None, None) => {}
+            }
+            *revision = revision
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("workspace revision exhausted"))?;
+            let resulting_revision = *revision;
+            undo.record(DurableUndo::SessionDisplayNames {
+                workspace: Arc::clone(&workspace),
+                previous_names,
+                previous_operations,
+                previous_revision,
+            });
+            drop(revision);
+            drop(operations);
+            drop(names);
+
+            let result = protocol::AgentSessionDisplayNameResult {
+                session_id: session_id.clone(),
+                workspace_id: workspace.id.clone(),
+                user_display_name: display_name.clone(),
+                workspace_revision: resulting_revision,
+                changed: true,
+            };
+            let mut operations = lock(&workspace.session_display_name_operations)?;
+            if operations.len() >= MAX_SESSION_DISPLAY_NAME_OPERATIONS_PER_WORKSPACE {
+                operations.remove(0);
+            }
+            operations.push(PersistedSessionDisplayNameOperation {
+                operation_id,
+                session_id: session_id.clone(),
+                expected_revision: expected_workspace_revision,
+                display_name,
+                integration,
+                session: identity,
+                result: result.clone(),
+            });
+            drop(operations);
+            Ok(DurableMutation::Changed(
+                Response::AgentSessionDisplayName {
+                    outcome: result.clone(),
+                },
+                vec![DaemonEventKind::AgentSessionDisplayNameChanged {
+                    workspace_id: result.workspace_id.clone(),
+                    session_id,
+                    user_display_name: result.user_display_name.clone(),
+                    workspace_revision: result.workspace_revision,
+                }],
+            ))
+        })
+    }
+
+    fn hide_agent_session(
+        &self,
+        operation_id: String,
+        session_id: String,
+        workspace_id: String,
+        expected_workspace_revision: u64,
+    ) -> DaemonResult<Response> {
+        validate_uuid(&operation_id, "Session hide operation ID")?;
+        validate_uuid(&session_id, "Agent Session ID")?;
+        validate_uuid(&workspace_id, "workspace ID")?;
+        self.durable_mutation_outcome(|undo| {
+            let workspaces = lock(&self.durable.state)?
+                .workspaces
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for workspace in workspaces {
+                if let Some(replayed) = lock(&workspace.session_hide_operations)?
+                    .iter()
+                    .find(|operation| operation.operation_id == operation_id)
+                    .cloned()
+                {
+                    if replayed.session_id != session_id
+                        || replayed.workspace_id != workspace_id
+                        || replayed.expected_revision != expected_workspace_revision
+                    {
+                        return Err(DaemonError::lifecycle(
+                            ErrorCode::IdempotencyExpired,
+                            "Session hide operation ID was reused for another request",
+                        ));
+                    }
+                    return Ok(DurableMutation::Unchanged(Response::AgentSessionHidden {
+                        outcome: replayed.result,
+                    }));
+                }
+            }
+
+            let workspace = self.workspace(&workspace_id)?;
+            require_guard(
+                *lock(&workspace.revision)?,
+                expected_workspace_revision,
+                "workspace",
+            )?;
+            let existing = lock(&workspace.hidden_sessions)?
+                .iter()
+                .find(|hidden| hidden.session_id == session_id)
+                .map(|hidden| (hidden.integration.clone(), hidden.session.clone()));
+            let (integration, identity) = match existing {
+                Some(identity) => identity,
+                None => {
+                    let snapshot = self.snapshot()?;
+                    let sessions = self.host_sessions(&snapshot, Some(&workspace_id))?;
+                    let session = crate::session_projection::resolve_exact(&sessions, &session_id)
+                        .map_err(|error| {
+                            DaemonError::lifecycle(
+                                match error {
+                                    crate::session_projection::ResolveError::NotFound => {
+                                        ErrorCode::NotFound
+                                    }
+                                    crate::session_projection::ResolveError::DuplicateId => {
+                                        ErrorCode::AmbiguousTarget
+                                    }
+                                },
+                                "exact Agent Session was not found in the requested Workspace",
+                            )
+                        })?;
+                    let identity = match &session.external_session_id {
+                        Some(external_session_id) => PersistedSessionIdentity::External {
+                            external_session_id: external_session_id.clone(),
+                        },
+                        None => PersistedSessionIdentity::Instance {
+                            agent_id: session
+                                .occurrences
+                                .first()
+                                .ok_or_else(|| {
+                                    DaemonError::lifecycle(
+                                        ErrorCode::NotFound,
+                                        "Agent Session has no semantic fallback identity",
+                                    )
+                                })?
+                                .agent_id
+                                .clone(),
+                        },
+                    };
+                    (session.integration.clone(), identity)
+                }
+            };
+
+            let mut hidden_sessions = lock(&workspace.hidden_sessions)?;
+            let mut operations = lock(&workspace.session_hide_operations)?;
+            let mut revision = lock(&workspace.revision)?;
+            require_guard(*revision, expected_workspace_revision, "workspace")?;
+            let changed = !hidden_sessions
+                .iter()
+                .any(|hidden| hidden.integration == integration && hidden.session == identity);
+            if changed && hidden_sessions.len() >= MAX_HIDDEN_SESSIONS_PER_WORKSPACE {
+                return Err(DaemonError::lifecycle(
+                    ErrorCode::Busy,
+                    "Workspace hidden Session limit reached",
+                ));
+            }
+            let resulting_revision = if changed {
+                revision
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("workspace revision exhausted"))?
+            } else {
+                *revision
+            };
+            let previous_hidden_sessions = hidden_sessions.clone();
+            let previous_operations = operations.clone();
+            let previous_revision = *revision;
+            undo.record(DurableUndo::HiddenSessions {
+                workspace: Arc::clone(&workspace),
+                previous_hidden_sessions,
+                previous_operations,
+                previous_revision,
+            });
+            if changed {
+                hidden_sessions.push(PersistedHiddenSession {
+                    session_id: session_id.clone(),
+                    integration: integration.clone(),
+                    session: identity.clone(),
+                });
+                *revision = resulting_revision;
+            }
+            let result = protocol::AgentSessionHideResult {
+                session_id: session_id.clone(),
+                workspace_id: workspace_id.clone(),
+                workspace_revision: resulting_revision,
+                changed,
+            };
+            if operations.len() >= MAX_SESSION_HIDE_OPERATIONS_PER_WORKSPACE {
+                operations.remove(0);
+            }
+            operations.push(PersistedSessionHideOperation {
+                operation_id,
+                session_id: session_id.clone(),
+                workspace_id: workspace_id.clone(),
+                expected_revision: expected_workspace_revision,
+                integration,
+                session: identity,
+                result: result.clone(),
+            });
+            drop(revision);
+            drop(operations);
+            drop(hidden_sessions);
+
+            let events = changed
+                .then_some(DaemonEventKind::AgentSessionHidden {
+                    workspace_id,
+                    session_id,
+                    workspace_revision: resulting_revision,
+                })
+                .into_iter()
+                .collect();
+            Ok(DurableMutation::Changed(
+                Response::AgentSessionHidden { outcome: result },
+                events,
+            ))
+        })
+    }
+
     fn route_node_host_service(&self, node_id: &str, operation: HostServiceOperation) -> Response {
+        self.route_node_host_service_for_version(node_id, operation, protocol::PROTOCOL_VERSION)
+    }
+
+    fn route_node_host_service_for_version(
+        &self,
+        node_id: &str,
+        operation: HostServiceOperation,
+        requester_version: u32,
+    ) -> Response {
         let registrations = match self.node_registrations() {
             Ok(registrations) => registrations,
             Err(error) => return error.into_response(),
@@ -8903,11 +9754,21 @@ impl DaemonService {
             HostServiceOperation::InvokeLauncher { .. }
                 | HostServiceOperation::CommitIntegrationMutation { .. }
         );
-        let response = send_registered_node_request(
+        let response_timeout = match &operation {
+            HostServiceOperation::ListAgentSessions { .. }
+            | HostServiceOperation::InspectAgentSession { .. } => {
+                REGISTERED_NODE_SESSION_RESPONSE_TIMEOUT
+            }
+            _ => REGISTERED_NODE_RESPONSE_TIMEOUT,
+        };
+        let response = send_registered_node_request_with_timeout_for_version(
             &registration,
             Request::HostService {
                 operation: operation.clone(),
             },
+            response_timeout,
+            None,
+            requester_version,
         );
         registrations.release(&registration);
         let response = match response {
@@ -10377,16 +11238,16 @@ impl DaemonService {
     fn dispatch_arc(
         self: &Arc<Self>,
         request: Request,
-        _response_version: u32,
+        response_version: u32,
     ) -> DaemonResult<Response> {
         if matches!(request, Request::AddNodeRegistration { .. }) {
-            let response = self.dispatch(request)?;
+            let response = self.dispatch_for_version(request, response_version)?;
             if let Response::NodeRegistration { registration } = &response {
                 self.start_node_projection_worker(registration.node_id.clone())?;
             }
             return Ok(response);
         }
-        self.dispatch(request)
+        self.dispatch_for_version(request, response_version)
     }
 
     fn clear_terminal_histories(&self) -> io::Result<()> {
@@ -11271,6 +12132,14 @@ impl DaemonService {
     }
 
     fn dispatch(&self, request: Request) -> DaemonResult<Response> {
+        self.dispatch_for_version(request, protocol::PROTOCOL_VERSION)
+    }
+
+    fn dispatch_for_version(
+        &self,
+        request: Request,
+        requester_version: u32,
+    ) -> DaemonResult<Response> {
         let reconcile_combined_snapshot =
             if matches!(&request, Request::GetCombinedNodeSnapshot { .. }) {
                 self.global_workspaces
@@ -11770,14 +12639,14 @@ impl DaemonService {
                 )?,
             }),
             Request::RouteNodeOperation { node_id, operation } => {
-                Ok(self.route_node_operation(&node_id, operation))
+                Ok(self.route_node_operation_for_version(&node_id, operation, requester_version))
             }
             Request::HostService { operation } => Ok(Response::HostService {
-                result: self.host_service(operation)?,
+                result: self.host_service_for_version(operation, requester_version)?,
             }),
-            Request::RouteNodeHostService { node_id, operation } => {
-                Ok(self.route_node_host_service(&node_id, operation))
-            }
+            Request::RouteNodeHostService { node_id, operation } => Ok(
+                self.route_node_host_service_for_version(&node_id, operation, requester_version)
+            ),
             Request::Restart | Request::RestartWithNotificationConfig { .. } => {
                 unreachable!("restart is handled before dispatch")
             }
@@ -11837,6 +12706,28 @@ impl DaemonService {
                     vec![event],
                 ))
             }),
+            Request::SetAgentSessionDisplayName {
+                operation_id,
+                session_id,
+                expected_workspace_revision,
+                display_name,
+            } => self.set_agent_session_display_name(
+                operation_id,
+                session_id,
+                expected_workspace_revision,
+                display_name,
+            ),
+            Request::HideAgentSession {
+                operation_id,
+                session_id,
+                workspace_id,
+                expected_workspace_revision,
+            } => self.hide_agent_session(
+                operation_id,
+                session_id,
+                workspace_id,
+                expected_workspace_revision,
+            ),
             Request::CreateWorkspace {
                 name,
                 default_cwd,
@@ -12111,6 +13002,37 @@ impl DaemonService {
                     vec![event],
                 ))
             }),
+            Request::ObserveAgentWorkingContext {
+                agent_id,
+                shell_id,
+                run_id,
+                path,
+            } => {
+                let context = host_services::inspect_working_context(&path)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "Agent working-context path is not inside a Git worktree",
+                    )
+                })?;
+                self.durable_mutation_outcome(|undo| {
+                    let (agent, changed) = self.observe_agent_working_context_mutation(
+                        undo, &agent_id, &shell_id, &run_id, context,
+                    )?;
+                    let response = Response::AgentWorkingContext {
+                        agent: agent.clone(),
+                        changed,
+                    };
+                    if !changed {
+                        return Ok(DurableMutation::Unchanged(response));
+                    }
+                    let event = DaemonEventKind::AgentWorkingContextObserved {
+                        workspace_id: agent.workspace_id.clone(),
+                        shell_id: agent.shell_id.clone(),
+                        agent,
+                    };
+                    Ok(DurableMutation::Changed(response, vec![event]))
+                })
+            }
             Request::ReadShell {
                 shell_id,
                 max_bytes,
@@ -12354,6 +13276,7 @@ impl DaemonService {
             if let Some(default_cwd) = &saved_workspace.default_cwd {
                 validate_persisted_cwd(default_cwd)?;
             }
+            validate_persisted_session_display_names(&saved_workspace)?;
             if !workspace_names.insert(saved_workspace.name.clone())
                 || state.workspaces.contains_key(&saved_workspace.id)
             {
@@ -12469,6 +13392,12 @@ impl DaemonService {
                 shell_ids: Mutex::new(shell_ids),
                 launcher_ids: Mutex::new(launcher_ids),
                 agent_ids: Mutex::new(workspace_agent_ids),
+                session_display_names: Mutex::new(saved_workspace.session_display_names),
+                session_display_name_operations: Mutex::new(
+                    saved_workspace.session_display_name_operations,
+                ),
+                hidden_sessions: Mutex::new(saved_workspace.hidden_sessions),
+                session_hide_operations: Mutex::new(saved_workspace.session_hide_operations),
             });
             state.workspaces.insert(saved_workspace.id, workspace);
         }
@@ -13759,6 +14688,23 @@ impl DaemonService {
         Ok((snapshot, changed, completed))
     }
 
+    fn observe_agent_working_context_mutation(
+        &self,
+        undo: &mut DurableUndoLog,
+        agent_id: &str,
+        shell_id: &str,
+        run_id: &str,
+        context: AgentWorkingContextSnapshot,
+    ) -> DaemonResult<(AgentInstanceSnapshot, bool)> {
+        let (snapshot, changed, record) = self
+            .durable
+            .observe_agent_working_context(agent_id, shell_id, run_id, context)?;
+        if let Some(record) = record {
+            undo.record(record);
+        }
+        Ok((snapshot, changed))
+    }
+
     #[cfg(test)]
     fn acknowledge_agent_attention(
         &self,
@@ -14252,6 +15198,7 @@ impl AgentInstance {
                 ended_at_ms: saved.ended_at_ms,
                 observation: saved.observation,
                 attention: saved.attention,
+                working_contexts: saved.working_contexts,
             }),
         }
     }
@@ -14275,6 +15222,7 @@ impl AgentInstance {
             ended_at_ms: state.ended_at_ms,
             observation: state.observation.clone(),
             attention: state.attention.clone(),
+            working_contexts: state.working_contexts.clone(),
         }
     }
 
@@ -14292,6 +15240,7 @@ impl AgentInstance {
             ended_at_ms: snapshot.ended_at_ms,
             observation: snapshot.observation,
             attention: snapshot.attention,
+            working_contexts: snapshot.working_contexts,
         })
     }
 }
@@ -15783,6 +16732,199 @@ fn validate_name(name: &str) -> io::Result<()> {
     }
 }
 
+fn normalize_session_display_name(name: &str) -> io::Result<String> {
+    if name.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Session display name cannot contain control characters",
+        ));
+    }
+    let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() || normalized.chars().count() > MAX_SESSION_DISPLAY_NAME_CHARS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Session display name must contain 1 through {MAX_SESSION_DISPLAY_NAME_CHARS} normalized characters"
+            ),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn validate_persisted_session_display_names(workspace: &PersistedWorkspace) -> io::Result<()> {
+    if workspace.session_display_names.len() > MAX_SESSION_DISPLAY_NAMES_PER_WORKSPACE
+        || workspace.session_display_name_operations.len()
+            > MAX_SESSION_DISPLAY_NAME_OPERATIONS_PER_WORKSPACE
+        || workspace.hidden_sessions.len() > MAX_HIDDEN_SESSIONS_PER_WORKSPACE
+        || workspace.session_hide_operations.len() > MAX_SESSION_HIDE_OPERATIONS_PER_WORKSPACE
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Boomux state exceeds a Workspace Session display-name bound",
+        ));
+    }
+    let mut identities = HashSet::new();
+    for record in &workspace.session_display_names {
+        if validate_required_agent_string("integration", &record.integration, MAX_NAME_BYTES)
+            .is_err()
+            || normalize_session_display_name(&record.display_name)
+                .map(|name| name != record.display_name)
+                .unwrap_or(true)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains invalid Session display-name metadata",
+            ));
+        }
+        let identity = match &record.session {
+            PersistedSessionIdentity::External {
+                external_session_id,
+            } => {
+                if validate_required_agent_string(
+                    "external_session_id",
+                    external_session_id,
+                    MAX_NAME_BYTES,
+                )
+                .is_err()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Boomux state contains an invalid Session external identity",
+                    ));
+                }
+                format!("external:{external_session_id}")
+            }
+            PersistedSessionIdentity::Instance { agent_id } => {
+                if validate_uuid(agent_id, "Agent ID").is_err() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Boomux state contains an invalid Session Agent identity",
+                    ));
+                }
+                format!("instance:{agent_id}")
+            }
+        };
+        if !identities.insert((record.integration.as_str(), identity)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains duplicate Session display-name metadata",
+            ));
+        }
+    }
+    let mut operation_ids = HashSet::new();
+    let mut previous_resulting_revision = 0;
+    for operation in &workspace.session_display_name_operations {
+        if validate_uuid(&operation.operation_id, "Session display-name operation ID").is_err()
+            || validate_uuid(&operation.session_id, "Agent Session ID").is_err()
+            || operation.expected_revision == 0
+            || operation.result.workspace_revision <= operation.expected_revision
+            || operation.result.workspace_revision <= previous_resulting_revision
+            || operation.result.workspace_revision > workspace.revision
+            || operation.result.session_id != operation.session_id
+            || operation.result.workspace_id != workspace.id
+            || operation.result.user_display_name != operation.display_name
+            || !operation.result.changed
+            || validate_required_agent_string("integration", &operation.integration, MAX_NAME_BYTES)
+                .is_err()
+            || match &operation.session {
+                PersistedSessionIdentity::External {
+                    external_session_id,
+                } => validate_required_agent_string(
+                    "external Session ID",
+                    external_session_id,
+                    MAX_NAME_BYTES,
+                )
+                .is_err(),
+                PersistedSessionIdentity::Instance { agent_id } => {
+                    validate_uuid(agent_id, "Agent ID").is_err()
+                }
+            }
+            || operation.display_name.as_deref().is_some_and(|name| {
+                normalize_session_display_name(name)
+                    .map(|normalized| normalized != name)
+                    .unwrap_or(true)
+            })
+            || !operation_ids.insert(operation.operation_id.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains an invalid Session display-name operation",
+            ));
+        }
+        previous_resulting_revision = operation.result.workspace_revision;
+    }
+
+    let mut hidden_identities = HashSet::new();
+    let mut hidden_session_ids = HashSet::new();
+    for hidden in &workspace.hidden_sessions {
+        let identity = persisted_session_identity_key(&hidden.session).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains invalid hidden Session metadata",
+            )
+        })?;
+        if validate_uuid(&hidden.session_id, "Agent Session ID").is_err()
+            || validate_required_agent_string("integration", &hidden.integration, MAX_NAME_BYTES)
+                .is_err()
+            || !hidden_identities.insert((hidden.integration.as_str(), identity))
+            || !hidden_session_ids.insert(hidden.session_id.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains invalid hidden Session metadata",
+            ));
+        }
+    }
+    let mut operation_ids = HashSet::new();
+    let mut previous_resulting_revision = 0;
+    for operation in &workspace.session_hide_operations {
+        let expected_result_revision = operation
+            .expected_revision
+            .checked_add(u64::from(operation.result.changed));
+        if validate_uuid(&operation.operation_id, "Session hide operation ID").is_err()
+            || validate_uuid(&operation.session_id, "Agent Session ID").is_err()
+            || validate_uuid(&operation.workspace_id, "workspace ID").is_err()
+            || operation.workspace_id != workspace.id
+            || operation.expected_revision == 0
+            || expected_result_revision != Some(operation.result.workspace_revision)
+            || operation.result.workspace_revision < previous_resulting_revision
+            || operation.result.workspace_revision > workspace.revision
+            || operation.result.session_id != operation.session_id
+            || operation.result.workspace_id != workspace.id
+            || validate_required_agent_string("integration", &operation.integration, MAX_NAME_BYTES)
+                .is_err()
+            || persisted_session_identity_key(&operation.session).is_err()
+            || !operation_ids.insert(operation.operation_id.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains an invalid Session hide operation",
+            ));
+        }
+        previous_resulting_revision = operation.result.workspace_revision;
+    }
+    Ok(())
+}
+
+fn persisted_session_identity_key(identity: &PersistedSessionIdentity) -> io::Result<String> {
+    match identity {
+        PersistedSessionIdentity::External {
+            external_session_id,
+        } => {
+            validate_required_agent_string(
+                "external Session ID",
+                external_session_id,
+                MAX_NAME_BYTES,
+            )?;
+            Ok(format!("external:{external_session_id}"))
+        }
+        PersistedSessionIdentity::Instance { agent_id } => {
+            validate_uuid(agent_id, "Agent ID")?;
+            Ok(format!("instance:{agent_id}"))
+        }
+    }
+}
+
 fn validate_uuid(value: &str, label: &str) -> io::Result<()> {
     let parsed = Uuid::parse_str(value)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid {label}")))?;
@@ -16060,6 +17202,19 @@ fn validate_agent_report(report: &AgentReport) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_working_context(context: &AgentWorkingContextSnapshot) -> io::Result<()> {
+    if !context.worktree_root.is_absolute()
+        || context.worktree_root.as_os_str().as_bytes().len() > 4 * 1024
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Agent working-context root must be a bounded absolute path",
+        ));
+    }
+    validate_required_agent_string("repository", &context.repository, MAX_NAME_BYTES)?;
+    validate_required_agent_string("branch", &context.branch, MAX_NAME_BYTES)
+}
+
 fn validate_external_agent_authority(authority: AgentAuthority) -> io::Result<()> {
     if authority == AgentAuthority::DaemonLifecycle {
         return Err(io::Error::new(
@@ -16247,6 +17402,28 @@ fn validate_persisted_agent(agent: &PersistedAgentInstance) -> io::Result<()> {
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     if let Some(cwd) = &agent.cwd {
         validate_persisted_cwd(cwd)?;
+    }
+    if agent.working_contexts.len() > MAX_AGENT_WORKING_CONTEXTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Boomux state contains too many Agent working contexts",
+        ));
+    }
+    let mut roots = HashSet::new();
+    let mut previous_observed_at_ms = u64::MAX;
+    for context in &agent.working_contexts {
+        validate_working_context(context)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        if context.observed_at_ms < agent.started_at_ms
+            || context.observed_at_ms > previous_observed_at_ms
+            || !roots.insert(&context.worktree_root)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Boomux state contains invalid Agent working contexts",
+            ));
+        }
+        previous_observed_at_ms = context.observed_at_ms;
     }
     if agent.observation.revision == 0
         || agent.observation.observed_at_ms < agent.started_at_ms
@@ -16933,6 +18110,7 @@ mod tests {
                     observed_at_ms: 1,
                 },
                 attention: None,
+                working_contexts: Vec::new(),
             }),
         });
         let agent_id = agent.id.clone();
@@ -17025,6 +18203,464 @@ mod tests {
                 .is_none()
         );
         assert!(registry.recovery_presentation(&shell.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn session_display_name_mutation_replays_and_reset_restores_derived_name() {
+        let registry = DaemonService::default();
+        let (shell, run) = recovery_shell(&registry, vec!["agent".into()]);
+        let agent_id = add_recovery_agent(
+            &registry,
+            &shell,
+            &run.id,
+            "native-test",
+            "external-session",
+        );
+        let workspace = registry.workspace(&shell.workspace_id).unwrap();
+        lock(&workspace.agent_ids).unwrap().push(agent_id);
+        let snapshot = registry.snapshot().unwrap();
+        let projected = host_services::sessions_with_catalog(&snapshot, &[]);
+        let session_id = projected[0].id.clone();
+        let revision = projected[0].workspace_revision;
+        let operation_id = Uuid::new_v4().to_string();
+        assert!(
+            registry
+                .set_agent_session_display_name(
+                    "not-a-uuid".into(),
+                    session_id.clone(),
+                    revision,
+                    Some("invalid operation".into()),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("invalid Session display-name operation ID")
+        );
+        let response = registry.route_node_operation(
+            "unregistered-node",
+            RoutedOperation::SetAgentSessionDisplayName {
+                operation_id: "not-a-uuid".into(),
+                session_id: session_id.clone(),
+                expected_workspace_revision: revision,
+                display_name: Some("invalid routed operation".into()),
+            },
+        );
+        assert!(matches!(
+            response,
+            Response::Error {
+                code: Some(ErrorCode::InvalidArgument),
+                ref message,
+            } if message.contains("invalid Session display-name operation ID")
+        ));
+
+        let response = registry
+            .set_agent_session_display_name(
+                operation_id.clone(),
+                session_id.clone(),
+                revision,
+                Some("  Checkout   retry investigation  ".into()),
+            )
+            .unwrap();
+        let Response::AgentSessionDisplayName { outcome: result } = response else {
+            panic!("unexpected Session display-name response");
+        };
+        assert_eq!(
+            result.user_display_name.as_deref(),
+            Some("Checkout retry investigation")
+        );
+        assert_eq!(result.session_id, session_id);
+        assert_eq!(result.workspace_id, workspace.id);
+        assert_eq!(result.workspace_revision, revision + 1);
+        assert!(result.changed);
+        let accepted = result.clone();
+
+        let replay = registry
+            .set_agent_session_display_name(
+                operation_id.clone(),
+                session_id.clone(),
+                revision,
+                Some("Checkout retry investigation".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            replay,
+            Response::AgentSessionDisplayName { outcome: result }
+        );
+        assert_eq!(
+            registry
+                .set_agent_session_display_name(
+                    operation_id.clone(),
+                    session_id.clone(),
+                    revision,
+                    Some("different request".into()),
+                )
+                .unwrap_err()
+                .wire_code(),
+            ErrorCode::IdempotencyExpired
+        );
+
+        let response = registry
+            .set_agent_session_display_name(
+                Uuid::new_v4().to_string(),
+                session_id.clone(),
+                revision + 1,
+                None,
+            )
+            .unwrap();
+        let Response::AgentSessionDisplayName { outcome: result } = response else {
+            panic!("unexpected Session reset response");
+        };
+        assert!(result.user_display_name.is_none());
+        assert_eq!(result.workspace_revision, revision + 2);
+        assert!(result.changed);
+        let snapshot = registry.snapshot().unwrap();
+        let sessions = registry
+            .host_sessions(&snapshot, Some(&workspace.id))
+            .unwrap();
+        assert_eq!(sessions[0].description, "native-test");
+
+        let replay = registry
+            .set_agent_session_display_name(
+                operation_id.clone(),
+                session_id.clone(),
+                revision,
+                Some("Checkout retry investigation".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            replay,
+            Response::AgentSessionDisplayName { outcome: accepted }
+        );
+
+        lock(&workspace.agent_ids).unwrap().clear();
+        let replay_without_projection = registry
+            .set_agent_session_display_name(
+                operation_id,
+                session_id,
+                revision,
+                Some("Checkout retry investigation".into()),
+            )
+            .unwrap();
+        assert_eq!(replay_without_projection, replay);
+
+        registry.close_workspace(&workspace.id).unwrap();
+        assert!(
+            registry
+                .capture_persisted_state()
+                .unwrap()
+                .state
+                .workspaces
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn session_hide_is_workspace_scoped_revision_safe_and_semantically_idempotent() {
+        let registry = DaemonService::default();
+        let (shell, run) = recovery_shell(&registry, vec!["agent".into()]);
+        let agent_id = add_recovery_agent(
+            &registry,
+            &shell,
+            &run.id,
+            "native-test",
+            "external-session",
+        );
+        let workspace = registry.workspace(&shell.workspace_id).unwrap();
+        lock(&workspace.agent_ids).unwrap().push(agent_id.clone());
+        let projected = registry
+            .host_sessions(&registry.snapshot().unwrap(), Some(&workspace.id))
+            .unwrap();
+        let session_id = projected[0].id.clone();
+        let revision = projected[0].workspace_revision;
+        let operation_id = Uuid::new_v4().to_string();
+
+        let response = registry
+            .hide_agent_session(
+                operation_id.clone(),
+                session_id.clone(),
+                workspace.id.clone(),
+                revision,
+            )
+            .unwrap();
+        let Response::AgentSessionHidden { outcome: hidden } = response else {
+            panic!("unexpected Session hide response");
+        };
+        assert!(hidden.changed);
+        assert_eq!(hidden.workspace_revision, revision + 1);
+        assert_eq!(
+            registry.agent(&agent_id).unwrap().snapshot().unwrap().id,
+            agent_id
+        );
+
+        let HostServiceResult::AgentSessions { sessions } = registry
+            .host_service_for_version(
+                HostServiceOperation::ListAgentSessions {
+                    workspace_id: Some(workspace.id.clone()),
+                },
+                51,
+            )
+            .unwrap()
+        else {
+            panic!("unexpected current Session list response");
+        };
+        assert!(sessions.is_empty());
+        let HostServiceResult::AgentSessions { sessions } = registry
+            .host_service_for_version(
+                HostServiceOperation::ListAgentSessions {
+                    workspace_id: Some(workspace.id.clone()),
+                },
+                50,
+            )
+            .unwrap()
+        else {
+            panic!("unexpected old Session list response");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            registry
+                .host_service_for_version(
+                    HostServiceOperation::InspectAgentSession {
+                        session_id: session_id.clone(),
+                    },
+                    51,
+                )
+                .unwrap_err()
+                .wire_code(),
+            ErrorCode::NotFound
+        );
+        assert!(matches!(
+            registry
+                .host_service_for_version(
+                    HostServiceOperation::InspectAgentSession {
+                        session_id: session_id.clone(),
+                    },
+                    50,
+                )
+                .unwrap(),
+            HostServiceResult::AgentSession { .. }
+        ));
+
+        let replay = registry
+            .hide_agent_session(
+                operation_id,
+                session_id.clone(),
+                workspace.id.clone(),
+                revision,
+            )
+            .unwrap();
+        assert_eq!(replay, Response::AgentSessionHidden { outcome: hidden });
+
+        assert_eq!(
+            registry
+                .hide_agent_session(
+                    Uuid::new_v4().to_string(),
+                    session_id.clone(),
+                    workspace.id.clone(),
+                    revision,
+                )
+                .unwrap_err()
+                .wire_code(),
+            ErrorCode::RevisionAhead
+        );
+
+        let fresh = registry
+            .hide_agent_session(
+                Uuid::new_v4().to_string(),
+                session_id.clone(),
+                workspace.id.clone(),
+                revision + 1,
+            )
+            .unwrap();
+        let Response::AgentSessionHidden { outcome: fresh } = fresh else {
+            panic!("unexpected repeated Session hide response");
+        };
+        assert!(!fresh.changed);
+        assert_eq!(fresh.workspace_revision, revision + 1);
+        assert_eq!(lock(&workspace.hidden_sessions).unwrap().len(), 1);
+        assert_eq!(lock(&workspace.session_hide_operations).unwrap().len(), 2);
+        assert!(matches!(
+            &lock(&workspace.hidden_sessions).unwrap()[0].session,
+            PersistedSessionIdentity::External { external_session_id }
+                if external_session_id == "external-session"
+        ));
+    }
+
+    #[test]
+    fn session_display_name_persistence_failure_rolls_back_without_event() {
+        let directory = env::temp_dir().join(format!("boomux-session-name-{}", Uuid::new_v4()));
+        let registry =
+            DaemonService::restore(StateStore::at(directory.join("state.json")), false, None)
+                .unwrap();
+        let (shell, run) = recovery_shell(&registry, vec!["agent".into()]);
+        let agent_id = add_recovery_agent(
+            &registry,
+            &shell,
+            &run.id,
+            "native-test",
+            "external-session",
+        );
+        let workspace = registry.workspace(&shell.workspace_id).unwrap();
+        lock(&workspace.agent_ids).unwrap().push(agent_id);
+        let projected = registry
+            .host_sessions(&registry.snapshot().unwrap(), Some(&workspace.id))
+            .unwrap();
+        let session_id = projected[0].id.clone();
+        let revision = projected[0].workspace_revision;
+        let events_before = registry.events.manifest().unwrap().events.len();
+
+        registry.fail_next_persistence();
+        assert_eq!(
+            registry
+                .set_agent_session_display_name(
+                    Uuid::new_v4().to_string(),
+                    session_id.clone(),
+                    revision,
+                    Some("not committed".into()),
+                )
+                .unwrap_err()
+                .wire_code(),
+            ErrorCode::PersistenceFailed
+        );
+
+        assert_eq!(*lock(&workspace.revision).unwrap(), revision);
+        assert!(lock(&workspace.session_display_names).unwrap().is_empty());
+        assert!(
+            lock(&workspace.session_display_name_operations)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            registry.events.manifest().unwrap().events.len(),
+            events_before
+        );
+
+        registry
+            .set_agent_session_display_name(
+                Uuid::new_v4().to_string(),
+                session_id,
+                revision,
+                Some("committed".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.events.manifest().unwrap().events.len(),
+            events_before + 1
+        );
+        let persisted = registry.capture_persisted_state().unwrap();
+        let receipt =
+            serde_json::to_value(&persisted.state.workspaces[0].session_display_name_operations[0])
+                .unwrap();
+        assert_eq!(
+            receipt["result"],
+            serde_json::json!({
+                "session_id": projected[0].id,
+                "workspace_id": workspace.id,
+                "user_display_name": "committed",
+                "workspace_revision": revision + 1,
+                "changed": true
+            })
+        );
+        assert!(receipt.to_string().find("description").is_none());
+        drop(registry);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_hide_persistence_failure_rolls_back_without_event() {
+        let directory = env::temp_dir().join(format!("boomux-session-hide-{}", Uuid::new_v4()));
+        let registry =
+            DaemonService::restore(StateStore::at(directory.join("state.json")), false, None)
+                .unwrap();
+        let (shell, run) = recovery_shell(&registry, vec!["agent".into()]);
+        let agent_id = add_recovery_agent(
+            &registry,
+            &shell,
+            &run.id,
+            "native-test",
+            "external-session",
+        );
+        let workspace = registry.workspace(&shell.workspace_id).unwrap();
+        lock(&workspace.agent_ids).unwrap().push(agent_id);
+        let projected = registry
+            .host_sessions(&registry.snapshot().unwrap(), Some(&workspace.id))
+            .unwrap();
+        let session_id = projected[0].id.clone();
+        let revision = projected[0].workspace_revision;
+        let events_before = registry.events.manifest().unwrap().events.len();
+
+        registry.fail_next_persistence();
+        assert_eq!(
+            registry
+                .hide_agent_session(
+                    Uuid::new_v4().to_string(),
+                    session_id.clone(),
+                    workspace.id.clone(),
+                    revision,
+                )
+                .unwrap_err()
+                .wire_code(),
+            ErrorCode::PersistenceFailed
+        );
+        assert_eq!(*lock(&workspace.revision).unwrap(), revision);
+        assert!(lock(&workspace.hidden_sessions).unwrap().is_empty());
+        assert!(lock(&workspace.session_hide_operations).unwrap().is_empty());
+        assert_eq!(
+            registry.events.manifest().unwrap().events.len(),
+            events_before
+        );
+
+        registry
+            .hide_agent_session(
+                Uuid::new_v4().to_string(),
+                session_id,
+                workspace.id.clone(),
+                revision,
+            )
+            .unwrap();
+        assert_eq!(
+            registry.events.manifest().unwrap().events.len(),
+            events_before + 1
+        );
+        assert_eq!(
+            registry.capture_persisted_state().unwrap().state.workspaces[0]
+                .hidden_sessions
+                .len(),
+            1
+        );
+        drop(registry);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn workspace_scoped_session_catalog_excludes_unrelated_directories() {
+        let registry = DaemonService::default();
+        let selected_cwd = env::temp_dir().join(format!("selected-{}", Uuid::new_v4()));
+        let unrelated_cwd = env::temp_dir().join(format!("unrelated-{}", Uuid::new_v4()));
+        fs::create_dir(&selected_cwd).unwrap();
+        fs::create_dir(&unrelated_cwd).unwrap();
+        let selected = registry
+            .create_workspace(
+                "selected".into(),
+                vec![ShellSpec::login("selected", selected_cwd.clone())],
+            )
+            .unwrap();
+        registry
+            .create_workspace(
+                "unrelated".into(),
+                vec![ShellSpec::login("unrelated", unrelated_cwd.clone())],
+            )
+            .unwrap();
+
+        registry
+            .host_sessions(&registry.snapshot().unwrap(), Some(&selected.id))
+            .unwrap();
+
+        let catalog = lock(&registry.host_session_catalog).unwrap();
+        let queried = &catalog.as_ref().unwrap().directories;
+        assert!(queried.contains(&selected_cwd));
+        assert!(!queried.contains(&unrelated_cwd));
+        drop(catalog);
+        fs::remove_dir_all(selected_cwd).unwrap();
+        fs::remove_dir_all(unrelated_cwd).unwrap();
     }
 
     #[test]
@@ -18690,6 +20326,110 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_and_bounds_session_display_name_metadata() {
+        assert_eq!(
+            normalize_session_display_name("  Checkout   retry  ").unwrap(),
+            "Checkout retry"
+        );
+        assert!(
+            normalize_session_display_name(&"x".repeat(MAX_SESSION_DISPLAY_NAME_CHARS + 1))
+                .is_err()
+        );
+        assert!(normalize_session_display_name("forged\nrow").is_err());
+
+        let record = PersistedSessionDisplayName {
+            integration: "opencode".into(),
+            session: PersistedSessionIdentity::External {
+                external_session_id: "external".into(),
+            },
+            display_name: "Valid name".into(),
+        };
+        let mut workspace = PersistedWorkspace {
+            id: Uuid::new_v4().to_string(),
+            revision: 1,
+            name: "work".into(),
+            default_cwd: None,
+            shells: Vec::new(),
+            launchers: Vec::new(),
+            agents: Vec::new(),
+            session_display_names: vec![record.clone()],
+            session_display_name_operations: Vec::new(),
+            hidden_sessions: Vec::new(),
+            session_hide_operations: Vec::new(),
+        };
+        assert!(validate_persisted_session_display_names(&workspace).is_ok());
+        workspace.session_display_names[0].display_name = "not  normalized".into();
+        assert_eq!(
+            validate_persisted_session_display_names(&workspace)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        workspace.session_display_names = vec![record; MAX_SESSION_DISPLAY_NAMES_PER_WORKSPACE + 1];
+        assert_eq!(
+            validate_persisted_session_display_names(&workspace)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        workspace.session_display_names.clear();
+        let hidden = PersistedHiddenSession {
+            session_id: Uuid::new_v4().to_string(),
+            integration: "opencode".into(),
+            session: PersistedSessionIdentity::External {
+                external_session_id: "external".into(),
+            },
+        };
+        workspace.hidden_sessions = vec![hidden; MAX_HIDDEN_SESSIONS_PER_WORKSPACE + 1];
+        assert_eq!(
+            validate_persisted_session_display_names(&workspace)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn hidden_sessions_are_filtered_before_the_list_limit() {
+        let sessions = (0..=MAX_HOST_SERVICE_SESSIONS)
+            .map(|index| crate::session_projection::SessionProjection {
+                id: format!("session-{index}"),
+                workspace_id: "workspace".into(),
+                workspace_name: "work".into(),
+                integration: "opencode".into(),
+                external_session_id: Some(format!("external-{index}")),
+                description: format!("Session {index}"),
+                user_display_name: None,
+                workspace_revision: 1,
+                state: AgentState::Inactive,
+                state_is_current: false,
+                started_at_ms: 1,
+                last_at_ms: 1,
+                source_cwd: None,
+                occurrences: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let hidden = [crate::session_projection::HiddenSessionMetadata {
+            workspace_id: "workspace".into(),
+            integration: "opencode".into(),
+            external_session_id: Some("external-0".into()),
+            agent_id: None,
+        }];
+
+        let mut current = sessions.clone();
+        apply_session_visibility_limit(&mut current, &hidden, 51);
+        assert_eq!(current.len(), MAX_HOST_SERVICE_SESSIONS);
+        assert_eq!(current[0].id, "session-1");
+        assert_eq!(current.last().unwrap().id, "session-1000");
+
+        let mut old = sessions;
+        apply_session_visibility_limit(&mut old, &hidden, 50);
+        assert_eq!(old.len(), MAX_HOST_SERVICE_SESSIONS);
+        assert_eq!(old[0].id, "session-0");
+        assert_eq!(old.last().unwrap().id, "session-999");
+    }
+
+    #[test]
     fn protocol_thirty_one_filters_projection_invalidation_without_rewinding_cursor() {
         let cursor = EventCursor {
             stream_id: Uuid::new_v4().to_string(),
@@ -18721,6 +20461,236 @@ mod tests {
         };
         assert_eq!(filtered_cursor, cursor);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn protocol_forty_nine_filters_session_display_name_fields_and_events() {
+        let summary: crate::protocol::HostAgentSessionSummary =
+            serde_json::from_value(serde_json::json!({
+                "id": "session", "workspace_id": "workspace",
+                "workspace_name": "work", "description": "User name",
+                "user_display_name": "User name", "workspace_revision": 3,
+                "integration": "opencode", "external_session_id": "external",
+                "state": "inactive", "state_is_current": false,
+                "started_at_ms": 1, "last_at_ms": 2, "occurrence_count": 1,
+                "attentions": [{
+                    "agent_id": "agent", "reason": "completed",
+                    "observation_revision": 3, "observed_at_ms": 2
+                }],
+                "git_branch": "feat/session-radar",
+                "working_contexts": [{
+                    "repository": "boomux", "branch": "feat/session-radar",
+                    "observed_at_ms": 3
+                }],
+                "working_context_count": 1
+            }))
+            .unwrap();
+        let cursor = EventCursor {
+            stream_id: Uuid::new_v4().to_string(),
+            event_id: 9,
+        };
+        let response = response_for_version(
+            Response::Events {
+                stream_id: cursor.stream_id.clone(),
+                cursor: cursor.clone(),
+                snapshot: None,
+                events: vec![DaemonEvent {
+                    id: 9,
+                    at_ms: 1,
+                    kind: DaemonEventKind::AgentSessionDisplayNameChanged {
+                        workspace_id: "workspace".into(),
+                        session_id: "session".into(),
+                        user_display_name: Some("User name".into()),
+                        workspace_revision: 3,
+                    },
+                }],
+            },
+            49,
+        );
+        let Response::Events {
+            cursor: filtered,
+            events,
+            ..
+        } = response
+        else {
+            panic!("expected events response");
+        };
+        assert_eq!(filtered, cursor);
+        assert!(events.is_empty());
+
+        let response = response_for_version(
+            Response::HostService {
+                result: HostServiceResult::AgentSessions {
+                    sessions: vec![summary.clone()],
+                },
+            },
+            49,
+        );
+        let Response::HostService {
+            result: HostServiceResult::AgentSessions { sessions },
+        } = response
+        else {
+            panic!("expected Session list response");
+        };
+        assert!(sessions[0].user_display_name.is_none());
+        assert_eq!(sessions[0].workspace_revision, 0);
+        assert_eq!(sessions[0].description, "User name");
+        assert!(sessions[0].attentions.is_empty());
+        assert!(sessions[0].git_branch.is_none());
+        assert!(sessions[0].working_contexts.is_empty());
+        assert_eq!(sessions[0].working_context_count, 0);
+
+        let response = response_for_version(
+            Response::HostService {
+                result: HostServiceResult::AgentSession {
+                    session: crate::protocol::HostAgentSessionInspection {
+                        summary,
+                        source_cwd: None,
+                        occurrences: Vec::new(),
+                        projected_occurrences: vec![crate::protocol::HostAgentSessionOccurrence {
+                            agent_id: Uuid::new_v4().to_string(),
+                            shell_id: Uuid::new_v4().to_string(),
+                            retained_shell_name: None,
+                            retained_shell_cwd: None,
+                            source_cwd: Some("/tmp/project".into()),
+                            run_id: Uuid::new_v4().to_string(),
+                            started_at_ms: 1,
+                            ended_at_ms: None,
+                            is_current: false,
+                            observation: AgentObservationSnapshot {
+                                revision: 1,
+                                state: AgentState::Inactive,
+                                authority: AgentAuthority::LifecycleIntegration,
+                                evidence: "inactive".into(),
+                                confidence: 100,
+                                observed_at_ms: 2,
+                            },
+                        }],
+                    },
+                },
+            },
+            49,
+        );
+        let Response::HostService {
+            result: HostServiceResult::AgentSession { session },
+        } = response
+        else {
+            panic!("expected Session inspection response");
+        };
+        assert!(session.projected_occurrences.is_empty());
+        assert!(session.summary.user_display_name.is_none());
+        assert_eq!(session.summary.workspace_revision, 0);
+        assert!(session.summary.attentions.is_empty());
+        assert!(session.summary.git_branch.is_none());
+        assert!(session.summary.working_contexts.is_empty());
+        assert_eq!(session.summary.working_context_count, 0);
+    }
+
+    #[test]
+    fn protocol_fifty_strips_session_response_time_git_status_from_all_host_shapes() {
+        let summary: crate::protocol::HostAgentSessionSummary =
+            serde_json::from_value(serde_json::json!({
+                "id": "session", "workspace_id": "workspace",
+                "workspace_name": "work", "description": "Session",
+                "integration": "opencode", "external_session_id": "external",
+                "state": "inactive", "state_is_current": false,
+                "started_at_ms": 1, "last_at_ms": 2, "occurrence_count": 1,
+                "working_contexts": [{
+                    "repository": "boomux", "branch": "feat/session-radar",
+                    "observed_at_ms": 3,
+                    "push_status": { "status": "ahead", "commit_count": 2 },
+                    "worktree_status": {
+                        "staged": true,
+                        "unstaged_or_untracked": true
+                    }
+                }],
+                "working_context_count": 1
+            }))
+            .unwrap();
+        let responses = [
+            Response::HostService {
+                result: HostServiceResult::AgentSessions {
+                    sessions: vec![summary.clone()],
+                },
+            },
+            Response::HostService {
+                result: HostServiceResult::AgentSession {
+                    session: crate::protocol::HostAgentSessionInspection {
+                        summary: summary.clone(),
+                        source_cwd: None,
+                        occurrences: Vec::new(),
+                        projected_occurrences: Vec::new(),
+                    },
+                },
+            },
+            Response::HostService {
+                result: HostServiceResult::ResolvedAgentSession { session: summary },
+            },
+        ];
+
+        for response in responses {
+            for (version, retained) in [(51, true), (50, false)] {
+                let response = response_for_version(response.clone(), version);
+                let context = match &response {
+                    Response::HostService {
+                        result: HostServiceResult::AgentSessions { sessions },
+                    } => &sessions[0].working_contexts[0],
+                    Response::HostService {
+                        result: HostServiceResult::AgentSession { session },
+                    } => &session.summary.working_contexts[0],
+                    Response::HostService {
+                        result: HostServiceResult::ResolvedAgentSession { session },
+                    } => &session.working_contexts[0],
+                    _ => panic!("expected Agent Session host-service response"),
+                };
+                assert_eq!(context.push_status.is_some(), retained);
+                assert_eq!(context.worktree_status.is_some(), retained);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_fifty_filters_session_hide_events_without_rewinding_cursor() {
+        let cursor = EventCursor {
+            stream_id: Uuid::new_v4().to_string(),
+            event_id: 9,
+        };
+        let response = Response::Events {
+            stream_id: cursor.stream_id.clone(),
+            cursor: cursor.clone(),
+            snapshot: None,
+            events: vec![DaemonEvent {
+                id: 9,
+                at_ms: 1,
+                kind: DaemonEventKind::AgentSessionHidden {
+                    workspace_id: Uuid::from_u128(1).to_string(),
+                    session_id: Uuid::from_u128(2).to_string(),
+                    workspace_revision: 3,
+                },
+            }],
+        };
+
+        let Response::Events {
+            cursor: current_cursor,
+            events: current_events,
+            ..
+        } = response_for_version(response.clone(), 51)
+        else {
+            panic!("expected current events response");
+        };
+        assert_eq!(current_cursor, cursor);
+        assert_eq!(current_events.len(), 1);
+
+        let Response::Events {
+            cursor: old_cursor,
+            events: old_events,
+            ..
+        } = response_for_version(response, 50)
+        else {
+            panic!("expected old events response");
+        };
+        assert_eq!(old_cursor, cursor);
+        assert!(old_events.is_empty());
     }
 
     #[test]
@@ -20072,6 +22042,197 @@ mod tests {
     }
 
     #[test]
+    fn agent_working_contexts_are_exact_deduplicated_and_bounded() {
+        let directory = env::temp_dir().join(format!("boomux-agent-context-{}", Uuid::new_v4()));
+        let repository = directory.join("boomux");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "feat/working-contexts"])
+                .arg(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let registry = DaemonService::default();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected registered Agent");
+        };
+
+        assert_eq!(
+            registry
+                .dispatch(Request::ObserveAgentWorkingContext {
+                    agent_id: agent.id.clone(),
+                    shell_id: shell.id.clone(),
+                    run_id: Uuid::new_v4().to_string(),
+                    path: repository.clone(),
+                })
+                .unwrap_err()
+                .wire_code(),
+            ErrorCode::RunChanged
+        );
+        let event_id = lock(&registry.events.state).unwrap().latest_id;
+        let Response::AgentWorkingContext {
+            agent: observed,
+            changed,
+        } = registry
+            .dispatch(Request::ObserveAgentWorkingContext {
+                agent_id: agent.id.clone(),
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                path: repository.clone(),
+            })
+            .unwrap()
+        else {
+            panic!("expected working context");
+        };
+        assert!(changed);
+        assert_eq!(observed.working_contexts.len(), 1);
+        assert_eq!(observed.working_contexts[0].repository, "boomux");
+        assert_eq!(observed.working_contexts[0].branch, "feat/working-contexts");
+        assert!(matches!(
+            lock(&registry.events.state)
+                .unwrap()
+                .events
+                .back()
+                .unwrap()
+                .kind,
+            DaemonEventKind::AgentWorkingContextObserved { .. }
+        ));
+
+        let Response::AgentWorkingContext { changed, .. } = registry
+            .dispatch(Request::ObserveAgentWorkingContext {
+                agent_id: agent.id.clone(),
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                path: repository,
+            })
+            .unwrap()
+        else {
+            panic!("expected duplicate working context");
+        };
+        assert!(!changed);
+        assert_eq!(
+            lock(&registry.events.state).unwrap().latest_id,
+            event_id + 1
+        );
+
+        for index in 0..=MAX_AGENT_WORKING_CONTEXTS {
+            registry
+                .durable
+                .observe_agent_working_context(
+                    &agent.id,
+                    &shell.id,
+                    &run_id,
+                    AgentWorkingContextSnapshot {
+                        worktree_root: format!("/worktrees/repository-{index}").into(),
+                        repository: format!("repository-{index}"),
+                        branch: "main".into(),
+                        observed_at_ms: 0,
+                    },
+                )
+                .unwrap();
+        }
+        let bounded = registry.agent(&agent.id).unwrap().snapshot().unwrap();
+        assert_eq!(bounded.working_contexts.len(), MAX_AGENT_WORKING_CONTEXTS);
+        assert_eq!(bounded.working_contexts[0].repository, "repository-8");
+        assert!(
+            bounded
+                .working_contexts
+                .iter()
+                .all(|context| context.repository != "repository-0")
+        );
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_working_context_persistence_rolls_back_without_event() {
+        let directory =
+            env::temp_dir().join(format!("boomux-agent-context-undo-{}", Uuid::new_v4()));
+        let repository = directory.join("boomux");
+        fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "feat/working-contexts"])
+                .arg(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let registry = DaemonService::restore(
+            StateStore::at(directory.join("state/state.json")),
+            false,
+            None,
+        )
+        .unwrap();
+        let (workspace, shell, _runtime) = running_shell(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let Response::Agent { agent } = registry
+            .dispatch(Request::RegisterAgent {
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: agent_spec(AgentState::Working),
+            })
+            .unwrap()
+        else {
+            panic!("expected registered Agent");
+        };
+        let event_id = lock(&registry.events.state).unwrap().latest_id;
+        registry.fail_next_persistence();
+
+        let error = registry
+            .dispatch(Request::ObserveAgentWorkingContext {
+                agent_id: agent.id.clone(),
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                path: repository.clone(),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.wire_code(), ErrorCode::PersistenceFailed);
+        assert!(
+            registry
+                .agent(&agent.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .working_contexts
+                .is_empty()
+        );
+        assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
+        let Response::AgentWorkingContext { agent, changed } = registry
+            .dispatch(Request::ObserveAgentWorkingContext {
+                agent_id: agent.id,
+                shell_id: shell.id.clone(),
+                run_id,
+                path: repository,
+            })
+            .unwrap()
+        else {
+            panic!("expected working context");
+        };
+        assert!(changed);
+        assert_eq!(agent.working_contexts.len(), 1);
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+        drop(registry);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn ensure_agent_reuses_identity_without_events_or_revision_changes() {
         let registry = DaemonService::default();
         let (workspace, shell, _runtime) = running_shell(&registry);
@@ -21047,6 +23208,7 @@ mod tests {
                 observed_at_ms: 1,
             },
             attention: None,
+            working_contexts: Vec::new(),
         };
         let workspace = WorkspaceSnapshot {
             id: "w1".into(),
@@ -21460,6 +23622,7 @@ mod tests {
                 observed_at_ms: 2,
             },
             attention: None,
+            working_contexts: Vec::new(),
         };
 
         let Response::Agent { agent: downgraded } = response_for_version(
@@ -21585,6 +23748,7 @@ mod tests {
                 reason: AgentAttentionReason::Blocked,
                 observation,
             }),
+            working_contexts: Vec::new(),
         };
         let cursor = EventCursor {
             stream_id: "stream".into(),
@@ -21662,6 +23826,119 @@ mod tests {
     }
 
     #[test]
+    fn protocol_forty_nine_filters_working_contexts_without_rewinding_cursors() {
+        let context = AgentWorkingContextSnapshot {
+            worktree_root: "/worktrees/boomux".into(),
+            repository: "boomux".into(),
+            branch: "feat/working-contexts".into(),
+            observed_at_ms: 5,
+        };
+        let agent = AgentInstanceSnapshot {
+            id: "a1".into(),
+            workspace_id: "w1".into(),
+            shell_id: "s1".into(),
+            run_id: "r1".into(),
+            name: "agent".into(),
+            integration: "test".into(),
+            external_session_id: Some("external".into()),
+            cwd: Some("/worktrees/boomux".into()),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            observation: AgentObservationSnapshot {
+                revision: 1,
+                state: AgentState::Working,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "working".into(),
+                confidence: 100,
+                observed_at_ms: 1,
+            },
+            attention: None,
+            working_contexts: vec![context],
+        };
+        let cursor = EventCursor {
+            stream_id: "stream".into(),
+            event_id: 5,
+        };
+        let response = Response::Events {
+            stream_id: "stream".into(),
+            cursor: cursor.clone(),
+            snapshot: Some(Snapshot {
+                workspaces: vec![WorkspaceSnapshot {
+                    id: "w1".into(),
+                    revision: 1,
+                    name: "workspace".into(),
+                    default_cwd: None,
+                    shells: Vec::new(),
+                    launchers: Vec::new(),
+                    agents: vec![agent.clone()],
+                }],
+                focused_terminal: None,
+            }),
+            events: vec![DaemonEvent {
+                id: 5,
+                at_ms: 5,
+                kind: DaemonEventKind::AgentWorkingContextObserved {
+                    workspace_id: "w1".into(),
+                    shell_id: "s1".into(),
+                    agent,
+                },
+            }],
+        };
+
+        let Response::Events {
+            cursor: filtered_cursor,
+            snapshot: Some(snapshot),
+            events,
+            ..
+        } = response_for_version(response, 49)
+        else {
+            panic!("expected events response");
+        };
+        assert_eq!(filtered_cursor, cursor);
+        assert!(events.is_empty());
+        assert!(snapshot.workspaces[0].agents[0].working_contexts.is_empty());
+
+        let sync = Response::NodeProjectionSync {
+            sync: NodeProjectionSync {
+                mode: NodeProjectionSyncMode::Resumed,
+                cursor: cursor.clone(),
+                projection: remote_notification_projection("node-1"),
+                transitions: vec![
+                    NodeProjectionTransition {
+                        event_id: 4,
+                        at_ms: 4,
+                        kind: NodeProjectionTransitionKind::HandoffCompleted,
+                    },
+                    NodeProjectionTransition {
+                        event_id: 5,
+                        at_ms: 5,
+                        kind: NodeProjectionTransitionKind::SessionContext {
+                            workspace_id: "w1".into(),
+                            agent_id: "a1".into(),
+                        },
+                    },
+                ],
+                capabilities: vec!["session_presentation_context".into()],
+            },
+        };
+        let Response::NodeProjectionSync { sync: filtered } =
+            response_for_version(sync.clone(), 49)
+        else {
+            panic!("expected projection sync");
+        };
+        assert_eq!(filtered.cursor, cursor);
+        assert_eq!(filtered.transitions.len(), 1);
+        assert!(matches!(
+            filtered.transitions[0].kind,
+            NodeProjectionTransitionKind::HandoffCompleted
+        ));
+        let Response::NodeProjectionSync { sync } = response_for_version(sync, 50) else {
+            panic!("expected projection sync");
+        };
+        assert_eq!(sync.transitions.len(), 2);
+    }
+
+    #[test]
     fn protocol_forty_eight_owner_fails_default_cwd_feature_preflight() {
         let protocol_forty_eight = protocol::ProtocolFeature::ALL
             .iter()
@@ -21717,6 +23994,32 @@ mod tests {
         )
         .unwrap();
         assert!(attempted);
+    }
+
+    #[test]
+    fn session_display_name_remote_request_requires_protocol_fifty_before_dispatch() {
+        let mut dispatched = false;
+        let unsupported = prepare_supported_owner_request(
+            49,
+            Some(protocol::ProtocolFeature::SessionDisplayNames),
+            &mut || {
+                dispatched = true;
+                Ok(())
+            },
+        );
+        assert_eq!(unsupported.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert!(!dispatched);
+
+        prepare_supported_owner_request(
+            50,
+            Some(protocol::ProtocolFeature::SessionDisplayNames),
+            &mut || {
+                dispatched = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(dispatched);
     }
 
     #[test]
@@ -22359,6 +24662,7 @@ mod tests {
                 observed_at_ms: 20,
             },
             attention: Some(attention),
+            working_contexts: Vec::new(),
         };
         let completed = AgentAttentionSnapshot {
             reason: AgentAttentionReason::Completed,
