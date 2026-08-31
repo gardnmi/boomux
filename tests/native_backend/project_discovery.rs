@@ -4,6 +4,71 @@ use std::process::Command;
 use uuid::Uuid;
 
 #[test]
+fn daemon_status_and_start_are_explicit_and_idempotent() {
+    let root = std::env::temp_dir().join(format!(
+        "boomux-explicit-start-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let runtime = root.join("runtime");
+    fs::create_dir_all(&runtime).unwrap();
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_boomux"));
+        command
+            .env("HOME", &root)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("state"));
+        command
+    };
+
+    let stopped = command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&stopped.stdout).unwrap();
+    assert_eq!(status["command"], "daemon.status");
+    assert_eq!(status["data"]["status"], "stopped");
+    assert!(status["data"]["protocol_version"].is_null());
+    assert!(!runtime.join("boomux/daemon.sock").exists());
+
+    let started = command().args(["daemon", "start"]).output().unwrap();
+    assert!(
+        started.status.success(),
+        "daemon start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(started.stdout).unwrap().trim(),
+        "Started Boomux daemon"
+    );
+
+    let repeated = command().args(["daemon", "start"]).output().unwrap();
+    assert!(repeated.status.success());
+    assert_eq!(
+        String::from_utf8(repeated.stdout).unwrap().trim(),
+        "Boomux daemon is already running"
+    );
+
+    let running = command()
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(running.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&running.stdout).unwrap();
+    assert_eq!(status["data"]["status"], "running");
+    assert_eq!(
+        status["data"]["protocol_version"],
+        boomux::protocol::PROTOCOL_VERSION
+    );
+
+    let stopped = command().args(["daemon", "stop"]).output().unwrap();
+    assert!(stopped.status.success());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn workspace_create_starts_the_daemon_when_absent() {
     let root = std::env::temp_dir().join(format!(
         "bmux-create-start-{}-{}",

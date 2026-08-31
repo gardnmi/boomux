@@ -124,6 +124,10 @@ Prefer `daemon restart` over `daemon stop`: stopping the daemon terminates every
 managed process. Upgrade registered remote Nodes separately with
 `boomux node upgrade NODE`.
 
+Use `boomux daemon status` to inspect the daemon without starting it and
+`boomux daemon start` to start it explicitly in the background. Starting an
+already-running daemon succeeds without replacing it.
+
 To remove an official release installation, use `boomux uninstall`. Add
 `--purge` only when you also intend to remove user data. Use
 `boomux node uninstall NODE` for an identity-verified remote uninstall. See

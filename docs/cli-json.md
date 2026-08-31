@@ -465,7 +465,9 @@ Command payloads are:
   bounded absolute `/proc/<pid>/exe` validation. This remains current after the
   listener is transferred between daemon processes; retained `SO_PEERCRED` alone
   is not process identity. The executable has a kernel ` (deleted)` suffix
-  removed. Other platforms or failed proof return null.
+  removed. Other platforms or failed proof return null. A stopped daemon is a
+  successful status result with `status: "stopped"`; all identity fields and
+  `protocol_version` are null. Status inspection never starts the daemon.
 
 ## Project Data
 

@@ -392,6 +392,15 @@ pub fn connect_or_start() -> Result<Client> {
     )))
 }
 
+pub fn connect_if_running() -> Result<Option<Client>> {
+    let client = connect_client()?;
+    match client.ping() {
+        Ok(()) => Ok(Some(client)),
+        Err(error) if daemon_unreachable(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn daemon_unreachable(error: &ClientError) -> bool {
     matches!(
         error,

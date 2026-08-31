@@ -772,6 +772,7 @@ it does not invoke launchers or open sibling Shells.
 
 ```console
 boomux daemon status
+boomux daemon start
 boomux daemon restart
 boomux daemon stop
 ```
