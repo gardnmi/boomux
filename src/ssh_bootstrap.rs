@@ -833,11 +833,21 @@ pub(crate) struct RemoteAttachmentWriter(Option<ChildStdin>);
 
 impl RemoteConnection {
     pub(crate) fn open_attachment(
-        mut self,
+        self,
         request: Request,
         timeout: Duration,
     ) -> io::Result<(Response, RemoteAttachmentReader, RemoteAttachmentWriter)> {
-        let response = self.request(request, timeout)?;
+        let version = self.handshake.core_protocol_version;
+        self.open_attachment_at_version(request, timeout, version)
+    }
+
+    pub(crate) fn open_attachment_at_version(
+        mut self,
+        request: Request,
+        timeout: Duration,
+        version: u32,
+    ) -> io::Result<(Response, RemoteAttachmentReader, RemoteAttachmentWriter)> {
+        let response = self.request_at_version(request, timeout, version)?;
         let mut this = std::mem::ManuallyDrop::new(self);
         // Ownership moves to the attachment while suppressing RemoteConnection's
         // process-group cleanup for the still-live channel.
@@ -857,6 +867,20 @@ impl RemoteConnection {
     }
     pub(crate) fn request(&mut self, request: Request, timeout: Duration) -> io::Result<Response> {
         let version = self.handshake.core_protocol_version;
+        self.request_at_version(request, timeout, version)
+    }
+
+    pub(crate) fn request_at_version(
+        &mut self,
+        request: Request,
+        timeout: Duration,
+        version: u32,
+    ) -> io::Result<Response> {
+        if version > self.handshake.core_protocol_version {
+            return Err(invalid_probe(
+                "remote request version exceeds owner protocol",
+            ));
+        }
         protocol::write_message(
             self.stdin.as_mut().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "remote channel closed")

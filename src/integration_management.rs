@@ -1657,7 +1657,13 @@ mod tests {
             IntegrationId::Kiro.installation().validated_version,
             "2.18.0"
         );
-        assert!(IntegrationId::Claude.spec().titles.is_none());
+        assert_eq!(
+            IntegrationId::Claude.spec().titles,
+            Some(boomux::integrations::TitleCapability {
+                provider: boomux::integrations::TitleProvider::Claude,
+                provides_catalog: false,
+            })
+        );
         assert_eq!(
             IntegrationId::Claude
                 .spec()
@@ -1751,6 +1757,8 @@ mod tests {
         assert_eq!(
             hooks.keys().map(String::as_str).collect::<Vec<_>>(),
             [
+                "CwdChanged",
+                "DirectoryAdded",
                 "Notification",
                 "PermissionDenied",
                 "PermissionRequest",
@@ -2176,6 +2184,7 @@ mod tests {
                 confidence: 100,
                 observed_at_ms: 1,
             },
+            working_contexts: Vec::new(),
         });
         let snapshot = Snapshot {
             workspaces: vec![workspace.clone()],

@@ -38,7 +38,9 @@ pub struct InstallationCapability {
 pub enum TitleProvider {
     OpenCode,
     Pi,
+    Claude,
     Codex,
+    Kiro,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,7 +168,10 @@ pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
         reload_message: "Restart any running Claude Code process to activate the plugin",
         target: InstallTargetKind::Claude,
     }),
-    titles: None,
+    titles: Some(TitleCapability {
+        provider: TitleProvider::Claude,
+        provides_catalog: false,
+    }),
     resume: Some(ResumeCapability {
         executable: "claude",
         arguments_before_session: &["--resume"],
@@ -215,7 +220,10 @@ pub const KIRO: IntegrationDescriptor = IntegrationDescriptor {
         reload_message: "Reopen its managed ShellRun, then start Kiro CLI in v3 mode to activate the hooks",
         target: InstallTargetKind::Kiro,
     }),
-    titles: None,
+    titles: Some(TitleCapability {
+        provider: TitleProvider::Kiro,
+        provides_catalog: false,
+    }),
     resume: Some(ResumeCapability {
         executable: "kiro-cli",
         arguments_before_session: &["--v3", "chat", "--resume-id"],

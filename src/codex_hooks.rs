@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 use boomux::protocol::AgentState;
 use serde::Deserialize;
@@ -28,6 +29,12 @@ struct HookInput {
     hook_event_name: HookEvent,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default, alias = "toolName")]
+    tool_name: Option<String>,
+    #[serde(default, alias = "toolInput")]
+    tool_input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,6 +47,7 @@ pub(crate) struct LifecycleObservation {
 pub(crate) struct HookUpdate {
     pub(crate) session_id: String,
     pub(crate) observation: LifecycleObservation,
+    pub(crate) working_contexts: Vec<PathBuf>,
 }
 
 pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::error::Error>> {
@@ -57,9 +65,15 @@ pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::
         )
     })?;
     let observation = reduce(&input);
+    let working_contexts = crate::hook_input::structured_working_contexts(
+        input.cwd.clone(),
+        input.tool_name.as_deref(),
+        input.tool_input.as_ref(),
+    );
     Ok(HookUpdate {
         session_id: input.session_id,
         observation,
+        working_contexts,
     })
 }
 
@@ -127,6 +141,21 @@ mod tests {
                 .observation
                 .state,
             AgentState::Working
+        );
+    }
+
+    #[test]
+    fn structured_cwd_and_tool_paths_are_projected() {
+        let update = update(
+            "PreToolUse",
+            r#", "cwd":"/worktrees/boomux", "tool_name":"Bash", "tool_input":{"workdir":"/worktrees/omarchy","command":"ignored"}"#,
+        );
+        assert_eq!(
+            update.working_contexts,
+            [
+                PathBuf::from("/worktrees/boomux"),
+                PathBuf::from("/worktrees/omarchy"),
+            ]
         );
     }
 

@@ -274,12 +274,23 @@ projections authority. Rows are ordered by last activity for presentation only;
 timestamps do not establish causal order across Nodes. Every row names its
 harness, and columns adapt from the compact age, harness, and title view to add
 state, Node, Workspace, and occurrence information as space permits.
+Session details distinguish the registration-time source directory and launch
+branch from bounded repository/branch contexts observed by the Session's exact
+Agent occurrences. Observed contexts are owner-authoritative hints, may be
+incomplete, and are never fabricated for catalog-only history. Protocol-51
+owners may also report the latest Agent name plus separate push and worktree
+status for the context's exact current branch. The owner uses bounded no-fetch
+response-time inspection of local tracking refs and porcelain state; worktree
+status exposes only `staged` and `unstaged_or_untracked` booleans, never file
+names, file counts, or file contents. These derived fields are not persisted or
+published as events, and protocol-50 responses omit them.
 
 `Enter` opens the selected Session. A current Session opens its exact managed
 Shell; historical resume runs the exact owner-side harness. An unavailable,
 missing-cwd, done, or otherwise invalid Session reports an error and never opens
 a substitute. OpenCode and Codex may contribute catalog-only history; Pi,
-Claude, and Kiro appear only after Boomux has durably observed an Agent Instance.
+Claude, and Kiro appear only after Boomux has durably observed an Agent Instance,
+but exact bounded host records may supply their displayed titles.
 Press `i` for Session details and `Esc` to return. With the mouse, the first click
 selects a Session row and a second click on that selected row opens it.
 
@@ -386,6 +397,16 @@ boomux session open <session-id> --node <node>
 Current Sessions open their exact current ShellRun with takeover. Historical
 Sessions resume on their exact owning Node. Invalid or changed targets fail
 closed rather than substituting another Shell, run, Session, path, or Node.
+
+Hide a projected Session from one owning Workspace without deleting provider
+history, Agents, Shells, or processes:
+
+```console
+boomux session hide <session-id> --workspace <workspace-id>
+boomux session hide <session-id> --workspace <workspace-id> --node <node>
+```
+
+Hiding is persistent and Workspace-scoped. There is no unhide command.
 
 See [Remote Nodes](docs/remote-nodes.md) for routing, bootstrap, upgrade, and
 failure semantics.

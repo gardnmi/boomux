@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::{Inspection, MAX_SESSIONS, TitleAdapter, sanitize_title};
+use super::{HostSession, Inspection, MAX_SESSIONS, TitleAdapter, sanitize_title};
 use crate::host_session_source::{
     normalize_absolute,
     pi::{Environment, session_catalog},
@@ -20,16 +20,27 @@ impl TitleAdapter for PiAdapter {
 pub(super) fn inspect(directory: &Path, environment: &Environment) -> Option<Inspection> {
     let (normalized_directory, prefixes) = session_catalog(directory, environment, MAX_SESSIONS)?;
     let mut titles = HashMap::new();
+    let mut catalog = Vec::new();
 
     for prefix in prefixes {
         if let Some((id, title)) = parse_session(&prefix, &normalized_directory) {
-            titles.entry(id).or_insert(title);
+            if titles.contains_key(&id)
+                || boomux::integrations::validate_external_session_id(&id).is_err()
+            {
+                continue;
+            }
+            titles.insert(id.clone(), title.clone());
+            catalog.push(HostSession {
+                integration: boomux::integrations::PI.key.into(),
+                root_id: id,
+                title,
+                directory: normalized_directory.clone(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
         }
     }
-    Some(Inspection {
-        titles,
-        catalog: Vec::new(),
-    })
+    Some(Inspection { titles, catalog })
 }
 
 pub(super) fn parse_session(output: &[u8], requested_directory: &Path) -> Option<(String, String)> {

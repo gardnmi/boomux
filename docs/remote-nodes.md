@@ -677,6 +677,10 @@ request and cannot run a caller-supplied command. Launchers are selected by exac
 Workspace and launcher IDs, then their stored cwd and argv execute directly on
 the owner. Integration commits consume an owner-held expiring preview token and
 fail if action, force policy, target path, or observed file state changed.
+Ordinary host-service responses retain the two-second verified-channel budget.
+Session list and inspect allow twenty seconds so the owner's independently
+bounded fifteen-second title/catalog adapters can fail open before the channel
+deadline; this changes no request shape or execution authority.
 
 Exact remote Agent Session resume is a distinct streaming request. The owner
 freshly resolves the opaque projected Session ID, validates owner cwd, builds the
@@ -685,6 +689,51 @@ presenting Node launches only its native terminal and relays bounded attachment
 frames. No ordinary Workspace/Shell row, transcript, prompt, environment,
 credential, stderr capture, cache update, or event is created.
 
+Protocol 50 routes Session display-name mutation through the closed operation
+union. The dashboard exposes rename and reset only for Nodes advertising
+`session_display_names`, sends the exact Node-qualified Session ID and listed
+Workspace revision, and refreshes after completion. The owner keeps the immutable
+minimal mutation result in a bounded durable receipt, so exact replay does not
+rediscover the Session or consult a host catalog. Receipts contain no projected
+summary, harness title, catalog data, lifecycle state, or occurrences.
+Workspace-filtered reads scope the owner
+snapshot before catalog-directory discovery and never enumerate unrelated
+Workspace paths.
+The same protocol advertises `session_presentation_context`. Session list and
+inspect responses may include exact references to owner-authoritative Agent
+attention, a launch Git branch inspected from the owner-resolved source cwd, and
+bounded repository/branch contexts previously observed and persisted by exact
+Agent occurrences. The owner alone canonicalizes structured paths and runs
+bounded Git inspection while the reporting Agent's exact ShellRun is active. The
+coordinator never runs Git against a remote path, receives a working-context root
+path, or turns those references into coordinator-owned lifecycle state. Reduced
+`session_context` transitions carry only Workspace and Agent identity so a
+presenting Node can invalidate its live Session query. A successful remote
+Session open routes each acknowledgment back to that same live owner with the
+exact listed observation revision.
+
+Protocol 51 advertises `session_latest_agent_attribution`,
+`session_working_context_push_status`, and
+`session_working_context_worktree_status`. The owner may include the latest
+occurrence's Agent name and separate push and worktree status for a Working
+Context whose branch still matches that owner's canonical current worktree
+branch. It performs bounded no-fetch response-time inspection of local tracking
+refs plus porcelain-v1 staged and unstaged-or-untracked state. The presenting
+Node receives only the two worktree booleans, never file names, file counts, file
+contents, or behind count; it never runs Git against a remote path, persists
+these derived fields, or publishes events for them. Protocol-50 routed list,
+inspect, and resolve responses omit both status objects.
+
+The same protocol routes `workspace_session_hiding` through the closed operation
+union. The owner resolves the unfiltered exact Session, validates its Workspace
+and current revision, and persists a semantic tombstone before publishing the
+event. Protocol-51 list filtering happens before response truncation, and exact
+inspect, resolve, open, and resume treat the hidden Session as not found.
+Protocol-50 callers retain prior visibility and resume behavior. Remote host
+service and resume forwarding therefore negotiate the minimum of the requesting
+client and owner versions rather than silently applying protocol-51 visibility to
+an older caller.
+
 | Operation | Owner guard | Automatic retry | Ambiguity read and exact postcondition |
 | --- | --- | --- | --- |
 | Workspace/Shell/launcher/Agent inspect | Exact ID on a fresh verified channel | Yes; read-only | Not applicable |
@@ -692,13 +741,17 @@ credential, stderr capture, cache update, or event is created.
 | Close Workspace/Shell; remove launcher | Durable resource revision | No | Exact inspect returns typed `not_found` |
 | Restart exited Shell | Durable Shell revision and exact run ID | No | Exact inspect proves pending state, unchanged definition revision, and the confirmed retained run |
 | Acknowledge attention | Exact raising observation revision; empty is idempotent | Yes, with the same revision | Returned Agent retains lifecycle revision and has no matching outstanding item |
+| Rename/reset Agent Session display name | Exact projected Session ID, Workspace revision, canonical operation UUID | Yes, only with the same UUID and arguments | Bounded immutable owner receipt returns only Session ID, Workspace ID, explicit user name, resulting revision, and `changed` |
+| Hide Agent Session from one Workspace | Exact projected Session ID, owning Workspace revision, canonical operation UUID | Yes, only with the same UUID and arguments | Bounded immutable owner receipt returns only Session ID, Workspace ID, resulting revision, and `changed`; inspect then returns typed `not_found` for protocol 51 |
 
 Any unproved ambiguous write returns `outcome_unknown`; conditional revisions
 alone never authorize blind replay. Workspace revisions also act as membership
 generations and advance when owned Shell, launcher, or Agent membership changes.
-Current state schema 14 persists positive Workspace, Shell, and launcher
-revisions. Historical state schema 13 is rejected at the protocol-47 alpha break
-rather than migrated.
+Current state schema 17 persists positive Workspace, Shell, and launcher
+revisions, bounded Agent working contexts, and bounded Workspace-owned hidden
+Session tombstones and replay receipts. Schema 16 migrates explicitly with empty
+hide metadata; schema 15 migrates with empty context lists. Historical state schema 13 is rejected at the
+protocol-47 alpha break rather than migrated.
 
 New explicitly Node-aware read-only views can use persisted remote projections
 and must expose their observation time and stale state. Existing commands and

@@ -831,6 +831,16 @@ enum AgentCommands {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
         confidence: u8,
     },
+    /// Record one host-observed Git working context for an exact Agent occurrence
+    #[command(name = "observe-working-context", hide = true)]
+    ObserveWorkingContext {
+        agent_id: String,
+        path: PathBuf,
+        #[arg(long)]
+        shell_id: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -903,6 +913,38 @@ enum SessionCommands {
     /// Resume one exact projected session in a native terminal
     Resume {
         session_id: String,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+    },
+    /// Set a Boomux display name on one exact projected Session
+    Rename {
+        session_id: String,
+        name: String,
+        #[arg(long)]
+        revision: u64,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
+    /// Reset the Boomux display name on one exact projected Session
+    ResetName {
+        session_id: String,
+        #[arg(long)]
+        revision: u64,
+        /// Exact registered Node alias or Node ID
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
+    /// Hide one exact Session from this Workspace without deleting host history
+    Hide {
+        session_id: String,
+        #[arg(long)]
+        workspace: String,
         /// Exact registered Node alias or Node ID
         #[arg(long)]
         node: Option<String>,
@@ -1264,6 +1306,7 @@ command_keys! {
     AgentEnsure => ("agent.ensure", Json),
     AgentSupervise => ("agent.supervise", HumanOnly),
     AgentReport => ("agent.report", Json),
+    AgentObserveWorkingContext => ("agent.observe-working-context", PrivateJson),
     AgentWait => ("agent.wait", Json),
     AttentionList => ("attention.list", Json),
     AttentionAcknowledge => ("attention.acknowledge", Json),
@@ -1276,6 +1319,9 @@ command_keys! {
     IntegrationVerify => ("integration.verify", Json),
     SessionList => ("session.list", Json),
     SessionInspect => ("session.inspect", Json),
+    SessionRename => ("session.rename", Json),
+    SessionResetName => ("session.reset-name", Json),
+    SessionHide => ("session.hide", Json),
     SessionOpen => ("session.open", HumanOnly),
     SessionResume => ("session.resume", HumanOnly),
     Skill => ("skill", HumanOnly),
@@ -1419,6 +1465,9 @@ impl Cli {
             Some(Commands::Agent {
                 command: AgentCommands::Report { .. },
             }) => CommandKey::AgentReport,
+            Some(Commands::Agent {
+                command: AgentCommands::ObserveWorkingContext { .. },
+            }) => CommandKey::AgentObserveWorkingContext,
             Some(Commands::Attention {
                 command: AttentionCommands::List { .. },
             }) => CommandKey::AttentionList,
@@ -1434,6 +1483,15 @@ impl Cli {
             Some(Commands::Session {
                 command: SessionCommands::Inspect { .. },
             }) => CommandKey::SessionInspect,
+            Some(Commands::Session {
+                command: SessionCommands::Rename { .. },
+            }) => CommandKey::SessionRename,
+            Some(Commands::Session {
+                command: SessionCommands::ResetName { .. },
+            }) => CommandKey::SessionResetName,
+            Some(Commands::Session {
+                command: SessionCommands::Hide { .. },
+            }) => CommandKey::SessionHide,
             Some(Commands::Session {
                 command: SessionCommands::Open { .. },
             }) => CommandKey::SessionOpen,
@@ -4006,7 +4064,8 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             },
             tui::DashboardEffect::LoadSessions { .. }
             | tui::DashboardEffect::InspectSession(_)
-            | tui::DashboardEffect::ActivateSession(_) => {
+            | tui::DashboardEffect::ActivateSession(_)
+            | tui::DashboardEffect::SetSessionDisplayName { .. } => {
                 unreachable!("Session effects use the dedicated dashboard worker")
             }
         },
@@ -4105,13 +4164,55 @@ fn dashboard_session_effect(
                         validate_session_cwd(&identity, local_node_id, &inspection).map(|_| action)
                     }
                 });
-                dashboard_session_details(&identity, inspection, action)
+                Box::new(dashboard_session_details(&identity, inspection, action))
             });
             tui::DashboardEvent::SessionInspected { identity, result }
         }
         tui::DashboardEffect::ActivateSession(identity) => tui::DashboardEvent::OperationCompleted(
             open_exact_session(&identity, local_node_id, terminal_entry, None),
         ),
+        tui::DashboardEffect::SetSessionDisplayName {
+            identity,
+            expected_workspace_revision,
+            display_name,
+        } => {
+            let result = (|| {
+                let client = client::connect().map_err(|error| error.to_string())?;
+                let operation_id = Uuid::new_v4().to_string();
+                let result = if identity.node_id == local_node_id || identity.node_id.is_empty() {
+                    client.set_agent_session_display_name(
+                        operation_id,
+                        identity.inner_id,
+                        expected_workspace_revision,
+                        display_name.clone(),
+                    )
+                } else {
+                    let result = client
+                        .route_node_operation(
+                            identity.node_id,
+                            protocol::RoutedOperation::SetAgentSessionDisplayName {
+                                operation_id,
+                                session_id: identity.inner_id,
+                                expected_workspace_revision,
+                                display_name: display_name.clone(),
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let protocol::RoutedOperationResult::AgentSessionDisplayName {
+                        outcome: result,
+                    } = result
+                    else {
+                        return Err(
+                            "Node returned an unexpected Session display-name response".into()
+                        );
+                    };
+                    Ok(result)
+                }
+                .map_err(|error| error.to_string())?;
+                Ok(result)
+            })();
+            tui::DashboardEvent::SessionDisplayNameMutationCompleted(result)
+        }
         effect => panic!("unexpected effect on Session worker: {effect:?}"),
     }
 }
@@ -4155,7 +4256,12 @@ fn aggregate_dashboard_session_loads(
             Ok(node_sessions) => {
                 successful_nodes += 1;
                 sessions.extend(node_sessions.into_iter().map(|session| {
-                    dashboard_session_summary(&load.node.id, &load.node.alias, session)
+                    dashboard_session_summary(
+                        &load.node.id,
+                        &load.node.alias,
+                        load.node.session_display_names,
+                        session,
+                    )
                 }));
             }
             Err(error) => warnings.push(format!("Node {}: {error}", load.node.alias)),
@@ -4178,6 +4284,7 @@ fn aggregate_dashboard_session_loads(
 fn dashboard_session_summary(
     node_id: &str,
     node_alias: &str,
+    session_display_names: bool,
     session: protocol::HostAgentSessionSummary,
 ) -> tui::DashboardSessionView {
     tui::DashboardSessionView {
@@ -4187,6 +4294,9 @@ fn dashboard_session_summary(
         workspace_id: session.workspace_id,
         workspace_name: session.workspace_name,
         title: session.description,
+        user_display_name: session.user_display_name,
+        workspace_revision: session.workspace_revision,
+        session_display_names,
         integration: session.integration,
         state: session.state.into(),
         state_is_current: session.state_is_current,
@@ -4227,7 +4337,12 @@ fn dashboard_session_details(
         identity.node_id.clone()
     };
     tui::DashboardSessionDetails {
-        session: dashboard_session_summary(&identity.node_id, &node_alias, inspection.summary),
+        session: dashboard_session_summary(
+            &identity.node_id,
+            &node_alias,
+            false,
+            inspection.summary,
+        ),
         source_cwd: inspection.source_cwd,
         occurrences: inspection.occurrences,
         action,
@@ -4452,9 +4567,13 @@ fn open_exact_session(
             terminal_entry,
         )
         .map_err(|error| error.to_string())?;
-        return Ok(format!(
+        let opened = format!(
             "Opened managed terminal for historical Session {}",
             summary.description
+        );
+        return Ok(with_session_attention_warnings(
+            opened,
+            acknowledge_session_attentions(identity, local_node_id, &summary.attentions),
         ));
     }
     let placement = coordinated_workspace
@@ -4465,7 +4584,7 @@ fn open_exact_session(
         .transpose()?
         .flatten();
     let plan = session_open_plan(identity, local_node_id, &inspection, workspace.as_ref())?;
-    dispatch_session_open(
+    let opened = dispatch_session_open(
         &plan,
         |shell_id, run_id, title| {
             if let Some(workspace_id) = placement.as_deref() {
@@ -4513,7 +4632,63 @@ fn open_exact_session(
             terminal::open_agent_session(terminal_entry, node_id, session_id, title)
                 .map_err(|error| error.to_string())
         },
-    )
+    )?;
+    Ok(with_session_attention_warnings(
+        opened,
+        acknowledge_session_attentions(identity, local_node_id, &summary.attentions),
+    ))
+}
+
+fn acknowledge_session_attentions(
+    identity: &protocol::QualifiedIdentity,
+    local_node_id: &str,
+    attentions: &[protocol::HostAgentSessionAttention],
+) -> Vec<String> {
+    if attentions.is_empty() {
+        return Vec::new();
+    }
+    let client = match client::connect() {
+        Ok(client) => client,
+        Err(error) => return vec![error.to_string()],
+    };
+    let remote = identity.node_id != local_node_id && !identity.node_id.is_empty();
+    attentions
+        .iter()
+        .filter_map(|attention| {
+            let result = if remote {
+                client
+                    .route_node_operation(
+                        &identity.node_id,
+                        protocol::RoutedOperation::AcknowledgeAgentAttention {
+                            agent_id: attention.agent_id.clone(),
+                            observation_revision: attention.observation_revision,
+                        },
+                    )
+                    .map(|_| ())
+            } else {
+                client
+                    .acknowledge_agent_attention(
+                        &attention.agent_id,
+                        attention.observation_revision,
+                    )
+                    .map(|_| ())
+            };
+            result
+                .err()
+                .map(|error| format!("{}: {error}", attention.agent_id))
+        })
+        .collect()
+}
+
+fn with_session_attention_warnings(opened: String, warnings: Vec<String>) -> String {
+    if warnings.is_empty() {
+        opened
+    } else {
+        format!(
+            "{opened}; Session opened but attention remains: {}",
+            warnings.join("; ")
+        )
+    }
 }
 
 fn open_managed_historical_session(
@@ -5069,8 +5244,8 @@ fn cached_host_catalog(
         .into_iter()
         .take(MAX_HOST_CATALOG_DIRECTORIES)
     {
-        for integration in host_session_titles::catalog_integrations() {
-            if let Some(sessions) = cache.catalog(integration, &directory) {
+        for integration in host_session_titles::projection_integrations() {
+            if let Some(sessions) = cache.projection_records(integration, &directory) {
                 catalog.extend(sessions);
             }
         }
@@ -5086,13 +5261,14 @@ fn discover_host_catalog(
         .take(MAX_HOST_CATALOG_DIRECTORIES)
         .collect::<Vec<_>>();
     let requests = directories.into_iter().flat_map(|directory| {
-        host_session_titles::catalog_integrations()
+        host_session_titles::projection_integrations()
             .map(move |integration| (integration, directory.clone()))
     });
     thread::scope(|scope| {
         requests
             .map(|(integration, directory)| {
-                scope.spawn(move || host_session_titles::catalog(integration, &directory))
+                scope
+                    .spawn(move || host_session_titles::projection_records(integration, &directory))
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -8968,6 +9144,31 @@ fn agent_command(command: AgentCommands, json: bool) -> Result<(), Box<dyn Error
                 agent.observation.revision
             );
         }
+        AgentCommands::ObserveWorkingContext {
+            agent_id,
+            path,
+            shell_id,
+            run_id,
+        } => {
+            let (shell_id, run_id) = resolve_agent_context(
+                shell_id,
+                run_id,
+                env::var("BOOMUX_SHELL_ID").ok(),
+                env::var("BOOMUX_RUN_ID").ok(),
+            )?;
+            let (agent, changed) =
+                client.observe_agent_working_context(agent_id, shell_id, run_id, path)?;
+            if json {
+                return print_json(
+                    CommandKey::AgentObserveWorkingContext,
+                    serde_json::json!({
+                        "changed": changed,
+                        "working_contexts": agent.working_contexts,
+                    }),
+                );
+            }
+            println!("CHANGED\t{changed}");
+        }
     }
     Ok(())
 }
@@ -9093,24 +9294,30 @@ fn session_command(
         SessionCommands::List { node, .. }
         | SessionCommands::Inspect { node, .. }
         | SessionCommands::Open { node, .. }
-        | SessionCommands::Resume { node, .. } => node.as_deref(),
+        | SessionCommands::Resume { node, .. }
+        | SessionCommands::Rename { node, .. }
+        | SessionCommands::ResetName { node, .. }
+        | SessionCommands::Hide { node, .. } => node.as_deref(),
     };
     if let Some(node) = selected_node {
         let registration = client.node_registration(node)?;
         return remote_session_command(&client, &registration, command, json);
     }
-    let snapshot = client.snapshot()?;
     match command {
         SessionCommands::List { workspace, .. } => {
-            let selected_workspace = workspace
+            let workspace_id = workspace
                 .as_deref()
-                .map(|target| resolve_workspace_target(&snapshot.workspaces, target))
+                .map(|target| {
+                    let snapshot = client.snapshot()?;
+                    Ok::<_, Box<dyn Error>>(
+                        resolve_workspace_target(&snapshot.workspaces, target)?
+                            .id
+                            .clone(),
+                    )
+                })
                 .transpose()?;
-            let workspace_id = selected_workspace.map(|workspace| workspace.id.as_str());
-            let result =
-                client.host_service(protocol::HostServiceOperation::ListAgentSessions {
-                    workspace_id: workspace_id.map(str::to_owned),
-                })?;
+            let result = client
+                .host_service(protocol::HostServiceOperation::ListAgentSessions { workspace_id })?;
             let protocol::HostServiceResult::AgentSessions { sessions } = result else {
                 return Err("daemon returned an unexpected Session-list response".into());
             };
@@ -9142,54 +9349,76 @@ fn session_command(
             }
         }
         SessionCommands::Inspect { session_id, .. } => {
-            let catalog = discover_host_catalog(&snapshot.workspaces);
-            let sessions =
-                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
-            let session = match session_projection::resolve_exact(&sessions, &session_id) {
-                Ok(session) => session,
-                Err(session_projection::ResolveError::NotFound) => {
-                    return Err(cli_output::failure(
-                        "not_found",
-                        format!("session not found: {session_id}"),
-                    ));
-                }
-                Err(session_projection::ResolveError::DuplicateId) => {
-                    return Err(cli_output::failure(
-                        "internal",
-                        format!("duplicate projected session ID: {session_id}"),
-                    ));
-                }
+            let result = client
+                .host_service(protocol::HostServiceOperation::InspectAgentSession { session_id })?;
+            let protocol::HostServiceResult::AgentSession { session } = result else {
+                return Err("daemon returned an unexpected Session response".into());
             };
-            if json {
-                return print_json(
-                    CommandKey::SessionInspect,
-                    serde_json::json!({ "session": cli_output::session(session) }),
-                );
-            }
-            print_session(session);
+            print_host_session_inspection(&session, None, json)?;
         }
         SessionCommands::Open { .. } => unreachable!("Session open returns before projection"),
         SessionCommands::Resume { session_id, .. } => {
-            let catalog = discover_host_catalog(&snapshot.workspaces);
-            let sessions =
-                session_projection::project_snapshot_with_catalog(&snapshot, Some(&catalog));
-            let session =
-                session_projection::resolve_exact(&sessions, &session_id).map_err(|_| {
-                    cli_output::failure("not_found", format!("session not found: {session_id}"))
+            let result =
+                client.host_service(protocol::HostServiceOperation::InspectAgentSession {
+                    session_id: session_id.clone(),
                 })?;
-            let (cwd, command) = dashboard_session_resume_plan(session)
-                .map_err(|message| cli_output::failure("invalid_argument", message))?;
+            let protocol::HostServiceResult::AgentSession { session } = result else {
+                return Err("daemon returned an unexpected Session response".into());
+            };
             let terminal = effective_terminal(None)?;
-            terminal::open_command(
+            terminal::open_agent_session(
                 terminal.as_deref(),
-                &cwd,
+                None,
+                &session_id,
                 &format!(
                     "{} - {} session",
-                    session.workspace_name, session.integration
+                    session.summary.workspace_name, session.summary.integration
                 ),
-                &command,
             )?;
-            println!("Opened exact {} Agent Session", session.integration);
+            println!("Opened exact {} Agent Session", session.summary.integration);
+        }
+        SessionCommands::Rename {
+            session_id,
+            name,
+            revision,
+            operation_id,
+            ..
+        } => {
+            let result = client.set_agent_session_display_name(
+                operation_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                session_id,
+                revision,
+                Some(name),
+            )?;
+            print_session_display_name_result(CommandKey::SessionRename, &result, None, json)?;
+        }
+        SessionCommands::ResetName {
+            session_id,
+            revision,
+            operation_id,
+            ..
+        } => {
+            let result = client.set_agent_session_display_name(
+                operation_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                session_id,
+                revision,
+                None,
+            )?;
+            print_session_display_name_result(CommandKey::SessionResetName, &result, None, json)?;
+        }
+        SessionCommands::Hide {
+            session_id,
+            workspace,
+            ..
+        } => {
+            let revision = client.get_workspace(&workspace)?.revision;
+            let result = client.hide_agent_session(
+                Uuid::new_v4().to_string(),
+                session_id,
+                workspace,
+                revision,
+            )?;
+            print_session_hide_result(CommandKey::SessionHide, &result, None, json)?;
         }
     }
     Ok(())
@@ -9247,30 +9476,11 @@ fn remote_session_command(
             let protocol::HostServiceResult::AgentSession { session } = result else {
                 return Err("remote Node returned an unexpected session response".into());
             };
-            if json {
-                let mut value = serde_json::to_value(&session.summary)?;
-                let object = value
-                    .as_object_mut()
-                    .expect("session summary serializes as object");
-                object.insert(
-                    "source_cwd".into(),
-                    serde_json::to_value(&session.source_cwd)?,
-                );
-                object.insert(
-                    "occurrences".into(),
-                    serde_json::to_value(&session.occurrences)?,
-                );
-                return print_json(
-                    CommandKey::SessionInspect,
-                    serde_json::json!({ "node_id": registration.node_id, "session": value }),
-                );
-            }
-            println!("NODE\t{}", registration.alias);
-            println!("ID\t{}", session.summary.id);
-            println!("WORKSPACE\t{}", session.summary.workspace_name);
-            println!("DESCRIPTION\t{}", session.summary.description);
-            println!("INTEGRATION\t{}", session.summary.integration);
-            println!("OCCURRENCES\t{}", session.summary.occurrence_count);
+            print_host_session_inspection(
+                &session,
+                Some((&registration.node_id, &registration.alias)),
+                json,
+            )?;
         }
         SessionCommands::Open { .. } => unreachable!("Session open uses shared exact-open logic"),
         SessionCommands::Resume { session_id, .. } => {
@@ -9298,7 +9508,184 @@ fn remote_session_command(
                 session.summary.integration, registration.alias
             );
         }
+        SessionCommands::Rename {
+            session_id,
+            name,
+            revision,
+            operation_id,
+            ..
+        } => {
+            let result = client.route_node_operation(
+                &registration.node_id,
+                protocol::RoutedOperation::SetAgentSessionDisplayName {
+                    operation_id: operation_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    session_id,
+                    expected_workspace_revision: revision,
+                    display_name: Some(name),
+                },
+            )?;
+            let protocol::RoutedOperationResult::AgentSessionDisplayName { outcome: result } =
+                result
+            else {
+                return Err("remote Node returned an unexpected Session rename response".into());
+            };
+            print_session_display_name_result(
+                CommandKey::SessionRename,
+                &result,
+                Some(&registration.node_id),
+                json,
+            )?;
+        }
+        SessionCommands::ResetName {
+            session_id,
+            revision,
+            operation_id,
+            ..
+        } => {
+            let result = client.route_node_operation(
+                &registration.node_id,
+                protocol::RoutedOperation::SetAgentSessionDisplayName {
+                    operation_id: operation_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    session_id,
+                    expected_workspace_revision: revision,
+                    display_name: None,
+                },
+            )?;
+            let protocol::RoutedOperationResult::AgentSessionDisplayName { outcome: result } =
+                result
+            else {
+                return Err("remote Node returned an unexpected Session reset response".into());
+            };
+            print_session_display_name_result(
+                CommandKey::SessionResetName,
+                &result,
+                Some(&registration.node_id),
+                json,
+            )?;
+        }
+        SessionCommands::Hide {
+            session_id,
+            workspace,
+            ..
+        } => {
+            let workspace_snapshot = client.route_node_operation(
+                &registration.node_id,
+                protocol::RoutedOperation::GetWorkspace {
+                    workspace_id: workspace.clone(),
+                },
+            )?;
+            let protocol::RoutedOperationResult::Workspace {
+                workspace: workspace_snapshot,
+            } = workspace_snapshot
+            else {
+                return Err("remote Node returned an unexpected Workspace response".into());
+            };
+            let result = client.route_node_operation(
+                &registration.node_id,
+                protocol::RoutedOperation::HideAgentSession {
+                    operation_id: Uuid::new_v4().to_string(),
+                    session_id,
+                    workspace_id: workspace,
+                    expected_workspace_revision: workspace_snapshot.revision,
+                },
+            )?;
+            let protocol::RoutedOperationResult::AgentSessionHidden { outcome: result } = result
+            else {
+                return Err("remote Node returned an unexpected Session hide response".into());
+            };
+            print_session_hide_result(
+                CommandKey::SessionHide,
+                &result,
+                Some(&registration.node_id),
+                json,
+            )?;
+        }
     }
+    Ok(())
+}
+
+fn print_host_session_inspection(
+    session: &protocol::HostAgentSessionInspection,
+    node: Option<(&str, &str)>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if json {
+        let mut value = serde_json::to_value(&session.summary)?;
+        let object = value
+            .as_object_mut()
+            .expect("Session summary serializes as object");
+        object.insert(
+            "source_cwd".into(),
+            serde_json::to_value(&session.source_cwd)?,
+        );
+        object.insert(
+            "occurrences".into(),
+            serde_json::to_value(&session.projected_occurrences)?,
+        );
+        let mut data = serde_json::json!({ "session": value });
+        if let Some((node_id, _)) = node {
+            data.as_object_mut()
+                .expect("Session inspection data is an object")
+                .insert("node_id".into(), node_id.into());
+        }
+        return print_json(CommandKey::SessionInspect, data);
+    }
+    if let Some((_, alias)) = node {
+        println!("NODE\t{alias}");
+    }
+    println!("ID\t{}", session.summary.id);
+    println!("WORKSPACE\t{}", session.summary.workspace_name);
+    println!("DESCRIPTION\t{}", session.summary.description);
+    println!("INTEGRATION\t{}", session.summary.integration);
+    println!("OCCURRENCES\t{}", session.summary.occurrence_count);
+    Ok(())
+}
+
+fn print_session_display_name_result(
+    command: CommandKey,
+    result: &protocol::AgentSessionDisplayNameResult,
+    node_id: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if json {
+        let mut data = serde_json::json!({ "result": result });
+        if let Some(node_id) = node_id {
+            data.as_object_mut()
+                .expect("Session mutation data is an object")
+                .insert("node_id".into(), node_id.into());
+        }
+        return print_json(command, data);
+    }
+    println!("SESSION ID\t{}", result.session_id);
+    println!("WORKSPACE ID\t{}", result.workspace_id);
+    println!(
+        "USER DISPLAY NAME\t{}",
+        result.user_display_name.as_deref().unwrap_or("-")
+    );
+    println!("WORKSPACE REVISION\t{}", result.workspace_revision);
+    println!("CHANGED\t{}", result.changed);
+    Ok(())
+}
+
+fn print_session_hide_result(
+    command: CommandKey,
+    result: &protocol::AgentSessionHideResult,
+    node_id: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    if json {
+        let mut data = serde_json::json!({ "result": result });
+        if let Some(node_id) = node_id {
+            data.as_object_mut()
+                .expect("Session mutation data is an object")
+                .insert("node_id".into(), node_id.into());
+        }
+        return print_json(command, data);
+    }
+    println!("SESSION ID\t{}", result.session_id);
+    println!("WORKSPACE ID\t{}", result.workspace_id);
+    println!("WORKSPACE REVISION\t{}", result.workspace_revision);
+    println!("CHANGED\t{}", result.changed);
     Ok(())
 }
 
@@ -9603,7 +9990,7 @@ fn claude_hook_command() -> Result<(), Box<dyn Error>> {
         confidence: 100,
     };
     let client = client::connect_or_start()?;
-    let agent = client.ensure_agent(
+    let mut agent = client.ensure_agent(
         &shell_id,
         &run_id,
         AgentRegistrationSpec {
@@ -9620,7 +10007,10 @@ fn claude_hook_command() -> Result<(), Box<dyn Error>> {
             || agent.observation.evidence != report.evidence
             || agent.observation.confidence != report.confidence)
     {
-        client.report_agent(&agent.id, &run_id, report)?;
+        agent = client.report_agent(&agent.id, &run_id, report)?;
+    }
+    for path in update.working_contexts {
+        let _ = client.observe_agent_working_context(&agent.id, &shell_id, &run_id, path);
     }
     let bridge_session_id = if update.session_ended {
         None
@@ -9659,7 +10049,7 @@ fn codex_hook_command() -> Result<(), Box<dyn Error>> {
         confidence: 100,
     };
     let client = client::connect_or_start()?;
-    let agent = client.ensure_agent(
+    let mut agent = client.ensure_agent(
         &shell_id,
         &run_id,
         AgentRegistrationSpec {
@@ -9675,7 +10065,10 @@ fn codex_hook_command() -> Result<(), Box<dyn Error>> {
             || agent.observation.evidence != report.evidence
             || agent.observation.confidence != report.confidence)
     {
-        client.report_agent(&agent.id, &run_id, report)?;
+        agent = client.report_agent(&agent.id, &run_id, report)?;
+    }
+    for path in update.working_contexts {
+        let _ = client.observe_agent_working_context(&agent.id, &shell_id, &run_id, path);
     }
     Ok(())
 }
@@ -9758,7 +10151,11 @@ fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
         evidence: observation.evidence.into(),
         confidence: 100,
     };
-    client.report_kiro_hook(holder_id, update.session_id, report)?;
+    let agent = client.report_kiro_hook(holder_id, update.session_id, report)?;
+    for path in update.working_contexts {
+        let _ =
+            client.observe_agent_working_context(&agent.id, &agent.shell_id, &agent.run_id, path);
+    }
     Ok(())
 }
 
@@ -11967,6 +12364,7 @@ mod tests {
                 confidence: 95,
                 observed_at_ms: 11,
             },
+            working_contexts: Vec::new(),
         }
     }
 
@@ -13493,6 +13891,71 @@ mod tests {
                 .contains("--json is not supported for session.open")
         );
 
+        let rename = Cli::try_parse_from([
+            "boomux",
+            "session",
+            "rename",
+            "opaque",
+            "Checkout retry investigation",
+            "--revision",
+            "11",
+            "--node",
+            "workbox",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(rename.command_descriptor().key, "session.rename");
+        assert!(matches!(
+            rename.command,
+            Some(Commands::Session {
+                command: SessionCommands::Rename {
+                    session_id,
+                    name,
+                    revision: 11,
+                    node: Some(node),
+                    ..
+                }
+            }) if session_id == "opaque"
+                && name == "Checkout retry investigation"
+                && node == "workbox"
+        ));
+        let reset = Cli::try_parse_from([
+            "boomux",
+            "session",
+            "reset-name",
+            "opaque",
+            "--revision",
+            "12",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(reset.command_descriptor().key, "session.reset-name");
+
+        let hide = Cli::try_parse_from([
+            "boomux",
+            "session",
+            "hide",
+            "opaque",
+            "--workspace",
+            "workspace-id",
+            "--node",
+            "workbox",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(hide.command_descriptor().key, "session.hide");
+        assert!(matches!(
+            hide.command,
+            Some(Commands::Session {
+                command: SessionCommands::Hide {
+                    session_id,
+                    workspace,
+                    node: Some(node),
+                }
+            }) if session_id == "opaque" && workspace == "workspace-id" && node == "workbox"
+        ));
+        assert!(Cli::try_parse_from(["boomux", "session", "hide", "opaque"]).is_err());
+
         assert!(Cli::try_parse_from(["boomux", "session", "read", "opaque"]).is_err());
     }
 
@@ -14408,6 +14871,8 @@ mod tests {
             integration: "opencode".into(),
             external_session_id: Some("ses_exact".into()),
             description: "review".into(),
+            user_display_name: None,
+            workspace_revision: 1,
             state: AgentState::Inactive,
             state_is_current: false,
             started_at_ms: 1,
@@ -15124,7 +15589,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 49);
+        assert_eq!(protocol::PROTOCOL_VERSION, 51);
     }
 
     #[test]
@@ -15211,6 +15676,9 @@ mod tests {
                 "integration.verify",
                 "session.list",
                 "session.inspect",
+                "session.rename",
+                "session.reset-name",
+                "session.hide",
                 "daemon.status",
             ]
         );
@@ -15571,6 +16039,9 @@ mod tests {
                 workspace_id: "workspace-id".into(),
                 workspace_name: "workspace".into(),
                 description: "review".into(),
+                latest_agent_name: None,
+                user_display_name: None,
+                workspace_revision: 1,
                 integration: "opencode".into(),
                 external_session_id: Some("external-id".into()),
                 state,
@@ -15578,9 +16049,14 @@ mod tests {
                 started_at_ms: 10,
                 last_at_ms: 20,
                 occurrence_count: 1,
+                attentions: Vec::new(),
+                git_branch: None,
+                working_contexts: Vec::new(),
+                working_context_count: 0,
             },
             source_cwd: cwd.map(PathBuf::from),
             occurrences: Vec::new(),
+            projected_occurrences: Vec::new(),
         }
     }
 
@@ -15594,6 +16070,9 @@ mod tests {
             workspace_id: workspace_id.into(),
             workspace_name: format!("workspace-{workspace_id}"),
             description: format!("Session {id}"),
+            latest_agent_name: None,
+            user_display_name: None,
+            workspace_revision: 1,
             integration: "opencode".into(),
             external_session_id: Some(format!("external-{id}")),
             state: AgentState::Inactive,
@@ -15601,6 +16080,10 @@ mod tests {
             started_at_ms: last_at_ms.saturating_sub(10),
             last_at_ms,
             occurrence_count: 1,
+            attentions: Vec::new(),
+            git_branch: None,
+            working_contexts: Vec::new(),
+            working_context_count: 0,
         }
     }
 
@@ -15654,6 +16137,7 @@ mod tests {
                     id: "a-local".into(),
                     alias: "local".into(),
                     local: true,
+                    session_display_names: true,
                 },
                 result: Ok(vec![host_session_summary("same", "z-workspace", 100)]),
             },
@@ -15662,6 +16146,7 @@ mod tests {
                     id: "b-remote".into(),
                     alias: "work".into(),
                     local: false,
+                    session_display_names: false,
                 },
                 result: Ok(vec![
                     host_session_summary("newest", "remote-workspace", 200),
@@ -15673,6 +16158,7 @@ mod tests {
                     id: "c-unavailable".into(),
                     alias: "offline".into(),
                     local: false,
+                    session_display_names: false,
                 },
                 result: Err("authentication required".into()),
             },

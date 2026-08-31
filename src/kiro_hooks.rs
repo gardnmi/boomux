@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 use boomux::protocol::AgentState;
 use serde::Deserialize;
@@ -25,6 +26,12 @@ enum HookEvent {
 struct HookInput {
     session_id: String,
     hook_event_name: HookEvent,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default, alias = "toolName")]
+    tool_name: Option<String>,
+    #[serde(default, alias = "toolInput")]
+    tool_input: Option<serde_json::Value>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -37,6 +44,7 @@ pub(crate) struct LifecycleObservation {
 pub(crate) struct HookUpdate {
     pub(crate) session_id: String,
     pub(crate) observation: LifecycleObservation,
+    pub(crate) working_contexts: Vec<PathBuf>,
 }
 
 pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::error::Error>> {
@@ -53,9 +61,15 @@ pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::
             format!("invalid Kiro session identity: {error}"),
         )
     })?;
+    let working_contexts = crate::hook_input::structured_working_contexts(
+        input.cwd.clone(),
+        input.tool_name.as_deref(),
+        input.tool_input.as_ref(),
+    );
     Ok(HookUpdate {
         session_id: input.session_id,
         observation: reduce(input.hook_event_name),
+        working_contexts,
     })
 }
 
@@ -113,6 +127,22 @@ mod tests {
         ] {
             assert_eq!(update(event).observation.state, state, "{event}");
         }
+    }
+
+    #[test]
+    fn v3_structured_cwd_and_tool_paths_are_projected() {
+        let update = read_update(
+            br#"{"session_id":"session-1","hook_event_name":"PreToolUse","cwd":"/worktrees/boomux","tool_name":"Read","tool_input":{"file_path":"/worktrees/omarchy/Panel.qml"}}"#
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            update.working_contexts,
+            [
+                PathBuf::from("/worktrees/boomux"),
+                PathBuf::from("/worktrees/omarchy/Panel.qml"),
+            ]
+        );
     }
 
     #[test]

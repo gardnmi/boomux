@@ -11,6 +11,33 @@ function text(value) {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function absolutePath(value) {
+  const path = text(value);
+  return path?.startsWith("/") ? path : undefined;
+}
+
+function workingContextPaths(ctx, event) {
+  const paths = new Set([absolutePath(ctx?.cwd)].filter(Boolean));
+  const tool = text(event?.toolName ?? event?.tool)?.toLowerCase();
+  const input = event?.input ?? event?.args;
+  if (!tool || !input || typeof input !== "object" || Array.isArray(input)) {
+    return [...paths];
+  }
+  let fields = [];
+  if (["read", "write", "edit", "multiedit"].includes(tool)) {
+    fields = ["filePath", "file_path", "path"];
+  } else if (["grep", "find", "ls", "list"].includes(tool)) {
+    fields = ["path"];
+  } else if (["bash", "shell"].includes(tool)) {
+    fields = ["workdir", "cwd"];
+  }
+  for (const field of fields) {
+    const path = absolutePath(input[field]);
+    if (path) paths.add(path);
+  }
+  return [...paths].slice(0, 8);
+}
+
 function boundedEvidence(value) {
   const clean = String(value ?? "Pi lifecycle event")
     .replace(/\s+/g, " ")
@@ -196,6 +223,21 @@ function reportArgv(agentID, shellID, runID, state, evidence) {
   ];
 }
 
+function observeWorkingContextArgv(agentID, shellID, runID, path) {
+  return [
+    "boomux",
+    "agent",
+    "observe-working-context",
+    agentID,
+    path,
+    "--shell-id",
+    shellID,
+    "--run-id",
+    runID,
+    "--json",
+  ];
+}
+
 function agentFromJSON(result) {
   return result?.data?.agent ?? result?.agent ?? result?.data;
 }
@@ -282,16 +324,37 @@ function createLifecycle({ env, run, log = console.error, now }) {
     throw lastError;
   }
 
-  function enqueue(nextSessionID, state, evidence, attempts = 1) {
+  async function observe(paths) {
+    if (!agentID) return;
+    for (const path of paths) {
+      try {
+        await run(observeWorkingContextArgv(agentID, shellID, runID, path));
+      } catch (error) {
+        reportError(error);
+      }
+    }
+  }
+
+  function enqueue(nextSessionID, state, evidence, attempts = 1, paths = []) {
     if (!text(nextSessionID)) return Promise.resolve();
-    const pending = queue.then(() =>
-      sendWithAttempts(nextSessionID, state, evidence, attempts),
-    );
+    const pending = queue.then(async () => {
+      await sendWithAttempts(nextSessionID, state, evidence, attempts);
+      await observe(paths);
+    });
     queue = pending.catch(reportError);
     return queue;
   }
 
-  return { enqueue };
+  function enqueueContexts(nextSessionID, paths) {
+    if (!text(nextSessionID)) return Promise.resolve();
+    const pending = queue.then(async () => {
+      if (nextSessionID === sessionID) await observe(paths);
+    });
+    queue = pending.catch(reportError);
+    return queue;
+  }
+
+  return { enqueue, enqueueContexts };
 }
 
 function currentSessionID(ctx) {
@@ -302,7 +365,13 @@ function registerLifecycleHandlers(pi, lifecycle) {
   const outcomes = createOutcomeTracker();
 
   const report = (ctx, state, evidence) =>
-    lifecycle.enqueue(currentSessionID(ctx), state, evidence);
+    lifecycle.enqueue(
+      currentSessionID(ctx),
+      state,
+      evidence,
+      1,
+      workingContextPaths(ctx),
+    );
 
   pi.on("session_start", (_event, ctx) => {
     outcomes.clear(currentSessionID(ctx));
@@ -319,6 +388,12 @@ function registerLifecycleHandlers(pi, lifecycle) {
     const outcome = outcomes.settled(currentSessionID(ctx));
     return report(ctx, outcome.state, outcome.evidence);
   });
+  pi.on("tool_call", (event, ctx) =>
+    lifecycle.enqueueContexts(
+      currentSessionID(ctx),
+      workingContextPaths(ctx, event),
+    ),
+  );
   pi.on("session_shutdown", (_event, ctx) => {
     outcomes.clear(currentSessionID(ctx));
     return lifecycle.enqueue(
@@ -326,6 +401,7 @@ function registerLifecycleHandlers(pi, lifecycle) {
       "inactive",
       "Pi session inactive",
       2,
+      workingContextPaths(ctx),
     );
   });
 }
@@ -345,4 +421,6 @@ export const __internal = Object.freeze({
   createOutcomeTracker,
   createProcessRunner,
   registerLifecycleHandlers,
+  observeWorkingContextArgv,
+  workingContextPaths,
 });

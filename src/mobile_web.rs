@@ -1689,6 +1689,7 @@ mod tests {
                 observed_at_ms: 20,
             },
             attention: None,
+            working_contexts: Vec::new(),
         };
         let mut historical_agent = local_agent.clone();
         historical_agent.id = "00000000-0000-0000-0000-000000000006".into();

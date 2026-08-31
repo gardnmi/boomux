@@ -22,12 +22,31 @@ pub(crate) struct SessionProjection {
     pub(crate) integration: String,
     pub(crate) external_session_id: Option<String>,
     pub(crate) description: String,
+    pub(crate) user_display_name: Option<String>,
+    pub(crate) workspace_revision: u64,
     pub(crate) state: AgentState,
     pub(crate) state_is_current: bool,
     pub(crate) started_at_ms: u64,
     pub(crate) last_at_ms: u64,
     pub(crate) source_cwd: Option<PathBuf>,
     pub(crate) occurrences: Vec<SessionOccurrence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionDisplayNameMetadata {
+    pub(crate) workspace_id: String,
+    pub(crate) integration: String,
+    pub(crate) external_session_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HiddenSessionMetadata {
+    pub(crate) workspace_id: String,
+    pub(crate) integration: String,
+    pub(crate) external_session_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +114,63 @@ pub(crate) fn resolve_exact<'a>(
     Ok(session)
 }
 
+pub(crate) fn apply_display_names(
+    sessions: &mut [SessionProjection],
+    metadata: &[SessionDisplayNameMetadata],
+) {
+    for session in sessions {
+        let agent_id = session
+            .external_session_id
+            .is_none()
+            .then(|| {
+                session
+                    .occurrences
+                    .first()
+                    .map(|occurrence| occurrence.agent_id.as_str())
+            })
+            .flatten();
+        if let Some(record) = metadata.iter().find(|record| {
+            record.workspace_id == session.workspace_id
+                && record.integration == session.integration
+                && match (&session.external_session_id, &record.external_session_id) {
+                    (Some(session_id), Some(record_id)) => session_id == record_id,
+                    (None, None) => record.agent_id.as_deref() == agent_id,
+                    _ => false,
+                }
+        }) {
+            session.user_display_name = Some(record.display_name.clone());
+            session.description = record.display_name.clone();
+        }
+    }
+}
+
+pub(crate) fn filter_hidden(
+    sessions: &mut Vec<SessionProjection>,
+    metadata: &[HiddenSessionMetadata],
+) {
+    sessions.retain(|session| {
+        let agent_id = session
+            .external_session_id
+            .is_none()
+            .then(|| {
+                session
+                    .occurrences
+                    .first()
+                    .map(|occurrence| occurrence.agent_id.as_str())
+            })
+            .flatten();
+        !metadata.iter().any(|record| {
+            record.workspace_id == session.workspace_id
+                && record.integration == session.integration
+                && match (&session.external_session_id, &record.external_session_id) {
+                    (Some(session_id), Some(record_id)) => session_id == record_id,
+                    (None, None) => record.agent_id.as_deref() == agent_id,
+                    _ => false,
+                }
+        })
+    });
+}
+
 fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
     let shells: BTreeMap<_, _> = workspace
         .shells
@@ -133,7 +209,16 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
                     .then_with(|| left.id.cmp(&right.id))
             });
             let first = agents[0];
-            let latest = agents
+            let latest_agent = agents
+                .iter()
+                .copied()
+                .max_by(|left, right| {
+                    left.started_at_ms
+                        .cmp(&right.started_at_ms)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .expect("session group is non-empty");
+            let latest_observation = agents
                 .iter()
                 .copied()
                 .max_by(|left, right| {
@@ -160,7 +245,7 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
                         })
                         .then_with(|| left.id.cmp(&right.id))
                 })
-                .map_or((latest, false), |active| (active, true));
+                .map_or((latest_observation, false), |active| (active, true));
             let last_at_ms = agents
                 .iter()
                 .map(|agent| {
@@ -200,7 +285,9 @@ fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
                 workspace_name: workspace.name.clone(),
                 integration,
                 external_session_id: first.external_session_id.clone(),
-                description: latest.name.clone(),
+                description: latest_agent.name.clone(),
+                user_display_name: None,
+                workspace_revision: workspace.revision,
                 state: state_source.observation.state,
                 state_is_current,
                 started_at_ms: first.started_at_ms,
@@ -270,6 +357,13 @@ fn merge_catalog(
                 continue;
             }
 
+            if !boomux::integrations::by_key(&record.integration)
+                .and_then(|descriptor| descriptor.titles)
+                .is_some_and(|titles| titles.provides_catalog)
+            {
+                continue;
+            }
+
             let session_index = sessions.len();
             sessions.push(SessionProjection {
                 id: stable_session_id(&workspace.id, &record.integration, &identity),
@@ -278,6 +372,8 @@ fn merge_catalog(
                 integration: record.integration.clone(),
                 external_session_id: Some(record.root_id.clone()),
                 description: record.title.clone(),
+                user_display_name: None,
+                workspace_revision: workspace.revision,
                 state: AgentState::Unknown,
                 state_is_current: false,
                 started_at_ms: record.created_at_ms,
@@ -309,6 +405,10 @@ fn workspace_directories(workspace: &WorkspaceSnapshot) -> BTreeSet<PathBuf> {
         )
         .filter_map(normalized_directory)
         .collect()
+}
+
+pub(crate) fn catalog_directories(workspaces: &[WorkspaceSnapshot]) -> BTreeSet<PathBuf> {
+    workspaces.iter().flat_map(workspace_directories).collect()
 }
 
 fn normalized_directory(directory: &Path) -> Option<PathBuf> {
@@ -548,6 +648,7 @@ pub mod benchmark_support {
                 observed_at_ms: agent_index as u64 + 2,
             },
             attention: None,
+            working_contexts: Vec::new(),
         }
     }
 
@@ -705,6 +806,17 @@ mod tests {
         }
     }
 
+    fn title_only_record(integration: &str, id: &str, directory: &str) -> HostSession {
+        HostSession {
+            integration: integration.into(),
+            root_id: id.into(),
+            title: format!("Host {id}"),
+            directory: PathBuf::from(directory),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
     fn workspace(id: &str, agent_ids: &[&str]) -> WorkspaceSnapshot {
         let shell = boomux::protocol::ShellSnapshot {
             id: "shell".into(),
@@ -756,9 +868,118 @@ mod tests {
                         confidence: 100,
                         observed_at_ms: 20 + index as u64,
                     },
+                    working_contexts: Vec::new(),
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn user_display_name_precedes_catalog_title_and_is_workspace_scoped() {
+        let left = workspace("left", &["agent-left", "agent-left-new"]);
+        let right = workspace("right", &["agent-right"]);
+        let catalog = [catalog_session("external", "/tmp/project")];
+        let mut sessions = project_workspaces_with_catalog(&[left, right], Some(&catalog));
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.description == "Catalog external")
+        );
+
+        apply_display_names(
+            &mut sessions,
+            &[SessionDisplayNameMetadata {
+                workspace_id: "left".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("external".into()),
+                agent_id: None,
+                display_name: "Checkout retry investigation".into(),
+            }],
+        );
+
+        let left = sessions
+            .iter()
+            .find(|session| session.workspace_id == "left")
+            .unwrap();
+        assert_eq!(left.description, "Checkout retry investigation");
+        assert_eq!(
+            left.user_display_name.as_deref(),
+            Some("Checkout retry investigation")
+        );
+        let right = sessions
+            .iter()
+            .find(|session| session.workspace_id == "right")
+            .unwrap();
+        assert_eq!(right.description, "Catalog external");
+        assert!(right.user_display_name.is_none());
+    }
+
+    #[test]
+    fn title_only_records_enrich_exact_observed_sessions_without_creating_history() {
+        for integration in ["pi", "claude", "kiro"] {
+            let mut workspace = workspace("title-workspace", &["title-agent"]);
+            workspace.agents[0].integration = integration.into();
+            workspace.agents[0].external_session_id = Some("observed".into());
+            let records = [
+                title_only_record(integration, "observed", "/tmp/project"),
+                title_only_record(integration, "historical", "/tmp/project"),
+            ];
+
+            let sessions = project_workspaces_with_catalog(&[workspace], Some(&records));
+
+            assert_eq!(sessions.len(), 1, "{integration}");
+            assert_eq!(sessions[0].external_session_id.as_deref(), Some("observed"));
+            assert_eq!(sessions[0].description, "Host observed");
+            assert_eq!(sessions[0].started_at_ms, 10);
+            assert_eq!(sessions[0].occurrences.len(), 1);
+        }
+    }
+
+    #[test]
+    fn hidden_session_keys_use_external_identity_then_exact_agent_fallback() {
+        let external = workspace("external-workspace", &["external-agent"]);
+        let mut fallback = workspace("fallback-workspace", &["fallback-agent"]);
+        fallback.agents[0].external_session_id = None;
+        let mut sessions = project_workspaces_with_catalog(&[external, fallback], None);
+
+        filter_hidden(
+            &mut sessions,
+            &[HiddenSessionMetadata {
+                workspace_id: "external-workspace".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("external".into()),
+                agent_id: None,
+            }],
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].workspace_id, "fallback-workspace");
+
+        filter_hidden(
+            &mut sessions,
+            &[HiddenSessionMetadata {
+                workspace_id: "fallback-workspace".into(),
+                integration: "opencode".into(),
+                external_session_id: None,
+                agent_id: Some("fallback-agent".into()),
+            }],
+        );
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn fallback_name_uses_latest_agent_identity_not_latest_observation() {
+        let mut workspace = workspace("w1", &["older", "newer"]);
+        workspace.shells.clear();
+        workspace.agents[0].observation.state = AgentState::Blocked;
+        workspace.agents[0].observation.observed_at_ms = 100;
+        workspace.agents[1].observation.state = AgentState::Idle;
+        workspace.agents[1].observation.observed_at_ms = 20;
+
+        let sessions = project_workspaces(&[workspace]);
+
+        assert_eq!(sessions[0].description, "Agent 1");
+        assert_eq!(sessions[0].state, AgentState::Blocked);
+        assert!(!sessions[0].state_is_current);
     }
 
     #[test]

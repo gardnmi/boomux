@@ -31,6 +31,8 @@
 | `src/mobile_web.rs`, `src/web_terminal.rs`, `assets/mobile-web/` | Loopback-only HTTP gateway, Node-qualified Agent projection, exact local attention dismissal, native harness handoff, integration-independent exact-run terminal control, and embedded installable web assets |
 | `src/tailscale_serve.rs` | Explicit Tailscale Serve preflight, conflict detection, exact route mutation, and ephemeral ownership cleanup for `boomux web --tailscale` |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
+| `src/host_services.rs` | Owner-local project, launcher, integration, Session-catalog, and bounded Git working-context services |
+| `src/hook_input.rs` | Shared allowlist for structured absolute cwd and tool-path observations from lifecycle integrations |
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
@@ -240,6 +242,89 @@ event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
 default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
 unchanged because owner Workspaces already persist `default_cwd`.
+Protocol 50 adds `session_display_names` and `session_presentation_context`. The
+owner resolves one exact projected Agent Session, requires its owning Workspace
+revision, and persists normalized
+display-name metadata under the semantic integration plus external-Session or
+Agent fallback identity. State schema 15 explicitly migrates schema 14 with empty
+metadata and replay ledgers. Each Workspace retains at most 1,024 names and 256
+operation replays; names contain at most 160 normalized characters. Each replay
+receipt stores the semantic Session identity, integration, request arguments,
+and only the immutable accepted mutation result: Session ID, Workspace ID,
+nullable explicit user name, resulting Workspace revision, and `changed`. It
+never stores a projected summary, harness title, catalog data, lifecycle state,
+or occurrences. An exact retry returns that minimal result before projection or
+revision validation even after later mutations, restart, or catalog loss. Reuse
+of the operation UUID for different arguments fails closed. The owner increments
+the Workspace revision, persists before publishing
+`agent_session_display_name_changed`, and routes remote requests only over a live
+identity-verified protocol-50 connection. Protocol-49 responses clear the
+additive override and authoritative projected-occurrence details, default the
+Workspace revision to zero, and filter the event while advancing the cursor. A
+protocol-50 client normalizes absent projected occurrences from the retained
+legacy Agent occurrences returned by a protocol-49 owner.
+
+The same protocol advertises `observed_agent_working_contexts`. State schema 16
+explicitly migrates schema 15 with empty working-context lists. While one exact
+Agent, Shell, and ShellRun remain active, a private observation request carries
+one structured absolute path. The owning Node canonicalizes the existing file or
+directory, resolves its Git worktree root, common-repository label, and symbolic
+branch or verified detached state, then durably records the observation before
+publishing `agent_working_context_observed`. Git probes run outside mutation
+locks with null stdin, one-second deadlines, isolated process groups, and 4 KiB
+limits on each output stream. Non-repositories and integration-side observation
+failures do not alter lifecycle reporting.
+
+Each Agent retains at most eight roots newest-first. Reobserving the current
+root/repository/branch tuple is an event-free no-op; observing the same root with
+changed metadata replaces and promotes it. Session projection resolves the
+registration-time source cwd with the same bounded Git inspection, excludes that
+canonical launch root from observed-work presentation, deduplicates the remaining
+roots across exact Agent occurrences, reports their total distinct count, and
+returns at most the four newest repository/branch/timestamp summaries in lists.
+Exact inspection returns up to 64 deduplicated contexts while limiting response-
+time Git push and worktree inspection to the first four. The Agent retains its
+launch-root observation. The independent nullable `git_branch`
+remains owner inspection of the registration-time Session source cwd, so older
+clients and launch-context presentation retain their prior meaning. Catalog-only
+Sessions receive no fabricated Agent contexts. Exact
+outstanding Agent attention references remain matched by occurrence Agent ID.
+
+Protocol 51 adds `session_latest_agent_attribution`,
+`session_working_context_push_status`,
+`session_working_context_worktree_status`, and `workspace_session_hiding`.
+Session summaries may expose the latest occurrence's Agent name separately from
+the effective description. For each projected Working Context whose recorded
+branch still matches the owner's current symbolic branch, the owner performs
+bounded no-fetch response-time inspection. Existing local tracking refs produce
+the separate up-to-date, committed-ahead count, or unpublished push status. A
+porcelain-v1 status command with branch output and normal untracked files
+produces only `staged` and `unstaged_or_untracked` booleans; conflicts may set
+both. The two probes fail independently after the shared exact-branch gate. No
+file names, file counts, file contents, or behind count are exposed, and neither
+status is persisted or published as an event. Protocol-50 responses omit latest
+Agent attribution, `push_status`, and `worktree_status` from list, inspect, and
+resolved Session shapes.
+
+State schema 17 explicitly migrates schema 16 with empty hidden-Session
+tombstones and hide-operation receipts. A hide mutation resolves the unfiltered
+owner projection, requires the exact owning Workspace and current revision, and
+stores only integration plus external Session identity or exact Agent fallback.
+Each Workspace retains at most 1,024 tombstones and 256 immutable replay
+receipts. Hiding suppresses protocol-51 list results before response truncation
+and makes exact inspect, resolve, open, and resume return `not_found`; it does not
+delete host history, Agents, Shells, processes, display-name metadata, or
+lifecycle state. A fresh request for an existing tombstone returns `changed:
+false` without advancing the Workspace revision or publishing an event. The
+first change persists before `agent_session_hidden` publication. Protocol-50
+callers retain prior visibility and resume behavior, and filtered event readers
+still advance their cursor.
+
+Protocol-49 responses omit working contexts, filter their events and reduced
+`session_context` transitions while preserving cursors, and clear the other
+protocol-50 presentation additions. Successful Session activation acknowledges
+listed attention revisions only after terminal launch; a newer revision fails
+closed and remains outstanding.
 Remote notification presentation reuses protocol-32 atomic reduced transitions,
 so it does not require a later protocol. Node-cache schema 2 adds bounded local
 at-most-once individual and reconnect-digest claims with an explicit schema-1
@@ -380,6 +465,10 @@ collections, their invariants, mutation-specific undo, and persistence
 projection. Undo records retain complete affected entities or complete mutable
 state rather than mirroring the registry shape, so unrelated mutations do not
 clone the registry and new entity fields remain part of rollback automatically.
+Workspace-owned Session display-name metadata and hidden-Session tombstones are
+part of that registry without making projected Agent Sessions durable entities.
+Their semantic keys survive projected UUID mechanics and temporary catalog
+disappearance, while Workspace closure removes the metadata with its sole owner.
 `EventStream` owns retained events, cursors, long-poll wakeups, and
 the transition frontier that orders durable and runtime publication.
 `ShellRuntimeManager` owns daemon-wide runtime stopping and focus policy and
@@ -824,15 +913,38 @@ external ID. It retains original shell/run identity and observations even when a
 shell no longer exists. UUID v5 IDs use a fixed namespace and a versioned,
 length-prefixed encoding of workspace ID, integration, and the external-or-agent
 grouping identity. IDs are globally unique and deterministic but opaque to
-consumers. Bounded OpenCode root-session and Codex thread catalogs add historical, `unknown`
-sessions without fabricating Agent occurrences and merge with a later durable
-registration under the same stable ID. Catalog records associate to each
-workspace that references their exact normalized directory. The dashboard maps
+consumers. Bounded OpenCode root-session and Codex thread catalogs add
+historical, `unknown` sessions without fabricating Agent occurrences and merge
+with a later durable registration under the same stable ID. Pi's bounded local
+Session store, Claude's bounded local transcript discovery, and Kiro's bounded
+local Session listing may title an already-durable Session only when their exact
+external ID and normalized Workspace directory match; unmatched title records
+never create historical Sessions. Catalog records associate to each workspace
+that references their exact normalized directory. The dashboard maps
 the active or latest exact match into a durable Agent's contextual preview and
 discovers catalogs asynchronously; session CLI listing performs the same bounded
-discovery synchronously. Pi, Claude, and Kiro have no complete catalog adapter,
-so their Sessions enter the projection only through durably observed Agent
-Instances.
+discovery synchronously. Exact inspection and resume resolve durable projection
+state first and may enrich it from the existing catalog cache without refreshing
+unrelated hosts; a catalog-only ID performs discovery only when no cached catalog
+can resolve it. Pi, Claude, and Kiro have no complete catalog projection: their
+Sessions enter the projection only through durably observed Agent Instances, and
+host records can change only their title.
+
+Synchronous discovery plans normalized `(integration, directory)` requests before
+inspection. OpenCode and Codex inspect every bounded projection directory because
+they can contribute history; Pi, Claude, and Kiro inspect only directories with a
+matching durable external Session. The owner keeps at most 256 ephemeral per-key
+results, with 30-second success and five-second failure freshness, and coalesces
+concurrent misses into one demand-driven refresh. Discovery runs outside the cache
+lock with at most four concurrent tasks. One short-lived Codex app-server serves
+all missing Codex directories in a refresh batch. The cache is neither persisted
+nor transferred, and no startup, timer, or background process warms it.
+
+Session summaries can project outstanding Agent attention and Git branch context
+without changing ownership. Attention remains durable Agent state and carries
+its exact acknowledgment revision; Git context is transient, deduplicated by
+source cwd for one list, and inspected only on the owning Node. Neither field is
+stored in owner state, coordinator projection caches, or handoff manifests.
 
 The dashboard primary kinds are Workspaces, Agents, Sessions, Shells, and Nodes.
 Sessions is this canonical projection, not a rename of ShellRun-bound Agent
@@ -877,7 +989,8 @@ The integration descriptor registry is the authority for integration keys,
 display names, and optional typed capabilities. A title capability selects its
 host adapter and independently declares catalog support. The shared title layer
 owns asynchronous cache, refresh, deduplication, sanitization, and fallback
-policy; OpenCode, Pi, and Codex modules own host command execution and title extraction.
+policy; OpenCode, Pi, Claude, Codex, and Kiro modules own host discovery or
+command execution and title extraction.
 Neutral host source modules own shared path normalization and secure catalog
 discovery. Title and catalog support remain independent from installation,
 foreground recognition, and recovery eligibility, so a future harness can
@@ -1123,8 +1236,14 @@ Sessions without ending the old one, both histories remain truthful and cold
 recovery refuses the resulting ambiguity rather than guessing.
 
 Exact resume uses `kiro-cli --v3 chat --resume-id <session-id>`. Cold-recovery
-launches use the run-scoped launcher. Kiro title and cloud catalogs are not
-projected. Although Kiro cloud sessions can be viewed in
+launches use the run-scoped launcher. For each exact normalized Workspace
+directory, the title adapter runs bounded
+`kiro-cli chat --list-sessions --format json` discovery. A sanitized title may
+replace the `Kiro CLI` fallback only for an already-durable Kiro Session with the
+same external ID. Listing failures, malformed or oversized output, unsupported
+host versions, unmatched IDs, and all additional historical or cloud records
+fail open without creating Sessions or changing lifecycle, resume, or persistence
+semantics. Although Kiro cloud sessions can be viewed in
 Kiro Web and Mobile, Kiro documents no exact browser URL derivable from a local
 CLI Session ID, and cloud hooks execute in Kiro's sandbox rather than under the
 local ShellRun. Boomux therefore exposes no Kiro native web handoff or cloud
@@ -1193,7 +1312,15 @@ surviving ShellRuns; cold startup has none.
 
 The descriptor recognizes the exact `claude` executable and foreground process
 and resumes an exact canonical Session with `claude --resume ID`. It advertises
-no title or catalog capability.
+a title capability but no catalog capability. The title adapter is validated
+against Claude Code `2.1.251` and is deliberately fail-open because Claude has no
+documented title-list API. It inspects only direct regular `.jsonl` files under
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<encoded-cwd>`, rejects symlinks,
+and reads bounded prefixes. A title is eligible only when the filename stem,
+transcript `sessionId`, and normalized transcript `cwd` agree with the durable
+Agent and Workspace. The latest sanitized `ai-title` may enrich that exact
+Session; transcript text is never used as a fallback and unmatched files never
+project history.
 
 ### OpenCode Lifecycle Plugins
 
@@ -1264,6 +1391,26 @@ agent ID and ensure the new canonical session identity. Reports are serialized,
 use exact argument vectors and bounded JSON output, and fail open with
 rate-limited diagnostics. Session shutdown makes one bounded retry so a
 transient reporting failure is less likely to leave the old session active.
+
+Pi advertises a title capability but no catalog capability. Its bounded local
+adapter reads direct regular JSONL files from
+`${PI_CODING_AGENT_SESSION_DIR:-$PI_CODING_AGENT_DIR/sessions}` (falling back to
+`~/.pi/agent/sessions`), rejects symlinks, and requires the `session` header's
+exact ID and normalized cwd to match the durable Agent and Workspace. The latest
+valid `session_info.name` supplies the title; when absent, the existing bounded
+first-user-message fallback applies. Unmatched Pi records never project history.
+
+All five lifecycle integrations may submit working-context observations only
+after ensuring or reporting the exact Agent. OpenCode uses its initializer
+directory/worktree and structured tool events; Pi uses `ctx.cwd` and typed tool
+calls; Claude, Codex, and Kiro use their documented top-level cwd and structured
+tool input. Claude additionally registers context-only `CwdChanged` and
+`DirectoryAdded` hooks, which do not change lifecycle state. Tool extraction is
+restricted by tool family to absolute file/notebook paths, directory-search
+paths, or explicit shell workdir/cwd fields. Command text, transcripts, tool
+output, arbitrary nested payloads, and relative paths are ignored. Observation
+failure is isolated from the successful lifecycle report so host execution
+remains fail-open.
 
 Protocol 12 adds `inactive`. Protocol-9 through protocol-11 clients receive that
 observation as `unknown`, while protocol-12 clients can distinguish a resumable

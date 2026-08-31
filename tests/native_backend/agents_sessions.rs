@@ -443,14 +443,15 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
 }
 
 #[test]
-fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
+fn one_codex_app_server_catalogs_multiple_workspace_directories() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("codex-catalog-bin");
         fs::create_dir(&bin).unwrap();
+        fs::create_dir(runtime_dir.join("other")).unwrap();
         let codex = bin.join("codex");
         fs::write(
             &codex,
-            "#!/bin/sh\nprintf x >> \"$CODEX_CATALOG_COUNT\"\n/bin/sleep 1\n[ \"$1\" = app-server ] || exit 64\nIFS= read -r line || exit 65\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nIFS= read -r line || exit 66\nIFS= read -r line || exit 67\nprintf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"id\":\"codex-history\",\"name\":\"Historical Codex thread\",\"preview\":\"fallback\",\"ephemeral\":false,\"createdAt\":10,\"updatedAt\":20}],\"nextCursor\":null}}'\n",
+            "#!/bin/sh\nprintf x >> \"$CODEX_CATALOG_COUNT\"\n/bin/sleep 1\n[ \"$1\" = app-server ] || exit 64\nIFS= read -r line || exit 65\nprintf '%s\\n' '{\"id\":1,\"result\":{}}'\nIFS= read -r line || exit 66\nfor id in 2 3; do\n  IFS= read -r line || exit 67\n  printf '{\"id\":%s,\"result\":{\"data\":[{\"id\":\"codex-history-%s\",\"name\":\"Historical Codex thread %s\",\"preview\":\"fallback\",\"ephemeral\":false,\"createdAt\":10,\"updatedAt\":20}],\"nextCursor\":null}}\\n' \"$id\" \"$id\" \"$id\"\ndone\n",
         )
         .unwrap();
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
@@ -462,7 +463,10 @@ fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
         .client
         .create_workspace(
             "codex-catalog",
-            vec![ShellSpec::login("shell", &daemon.runtime_dir)],
+            vec![
+                ShellSpec::login("shell", &daemon.runtime_dir),
+                ShellSpec::login("other", daemon.runtime_dir.join("other")),
+            ],
         )
         .unwrap();
 
@@ -480,12 +484,12 @@ fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
     );
     let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let sessions = output["data"]["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0]["integration"], "codex");
-    assert_eq!(sessions[0]["external_session_id"], "codex-history");
-    assert_eq!(sessions[0]["description"], "Historical Codex thread");
-    assert_eq!(sessions[0]["state"], "unknown");
-    assert_eq!(sessions[0]["occurrence_count"], 0);
+    assert_eq!(sessions.len(), 2, "{sessions:#?}");
+    assert!(sessions.iter().all(|session| {
+        session["integration"] == "codex"
+            && session["state"] == "unknown"
+            && session["occurrence_count"] == 0
+    }));
     let session_id = sessions[0]["id"].as_str().unwrap();
     let inspect_started = Instant::now();
     assert!(matches!(
@@ -515,6 +519,291 @@ fn codex_app_server_catalog_projects_named_historical_threads_without_agents() {
         "cold Session catalog took {list_elapsed:?}; cached inspection took {inspect_elapsed:?}"
     );
 
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn kiro_catalog_titles_exact_observed_session_without_projecting_history() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("kiro-catalog-bin");
+        fs::create_dir(&bin).unwrap();
+        let kiro = bin.join("kiro-cli");
+        fs::write(
+            &kiro,
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$KIRO_CATALOG_ARGS\"\n[ \"$1\" = chat ] || exit 64\n[ \"$2\" = --list-sessions ] || exit 65\n[ \"$3\" = --format ] || exit 66\n[ \"$4\" = json ] || exit 67\nprintf '[{\"cwd\":\"%s\",\"sessions\":[{\"sessionId\":\"kiro-observed\",\"source\":\"v3\",\"title\":\"Triage Slack issue thread\",\"executionTarget\":\"local\"},{\"sessionId\":\"kiro-history\",\"source\":\"v2\",\"title\":\"Unobserved history\"}],\"complete\":true}]\\n' \"$KIRO_CATALOG_CWD\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&kiro, fs::Permissions::from_mode(0o755)).unwrap();
+        command
+            .env("PATH", &bin)
+            .env("KIRO_CATALOG_CWD", runtime_dir)
+            .env("KIRO_CATALOG_ARGS", runtime_dir.join("kiro-catalog-args"));
+    });
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "kiro-catalog",
+            vec![ShellSpec {
+                name: "kiro".into(),
+                command: vec!["/bin/sleep".into(), "300".into()],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "Kiro CLI".into(),
+                integration: "kiro".into(),
+                external_session_id: Some("kiro-observed".into()),
+                report: AgentReport {
+                    state: AgentState::Inactive,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "historical Session".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+
+    let output = daemon
+        .command()
+        .args(["session", "list", "--workspace", &workspace.id, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = output["data"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["integration"], "kiro");
+    assert_eq!(sessions[0]["external_session_id"], "kiro-observed");
+    assert_eq!(sessions[0]["description"], "Triage Slack issue thread");
+    assert_eq!(sessions[0]["occurrence_count"], 1);
+    assert_eq!(
+        fs::read(daemon.runtime_dir.join("kiro-catalog-args")).unwrap(),
+        b"chat\0--list-sessions\0--format\0json\0"
+    );
+
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn pi_and_claude_titles_enrich_exact_observed_sessions_without_projecting_history() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let pi_sessions = runtime_dir.join("pi-title-sessions");
+        fs::create_dir(&pi_sessions).unwrap();
+        for (id, title) in [
+            ("pi-observed", "Named Pi session"),
+            ("pi-history", "Unobserved Pi history"),
+        ] {
+            fs::write(
+                pi_sessions.join(format!("{id}.jsonl")),
+                format!(
+                    "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":\"{}\"}}\n{{\"type\":\"session_info\",\"name\":\"{title}\"}}\n",
+                    runtime_dir.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        let claude_config = runtime_dir.join("claude-title-config");
+        let encoded_directory = runtime_dir
+            .to_string_lossy()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        let claude_sessions = claude_config.join("projects").join(encoded_directory);
+        fs::create_dir_all(&claude_sessions).unwrap();
+        for (id, title) in [
+            ("claude-observed", "Claude exact title"),
+            ("claude-history", "Unobserved Claude history"),
+        ] {
+            fs::write(
+                claude_sessions.join(format!("{id}.jsonl")),
+                format!(
+                    "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{}\"}}\n{{\"type\":\"ai-title\",\"sessionId\":\"{id}\",\"aiTitle\":\"{title}\"}}\n",
+                    runtime_dir.display()
+                ),
+            )
+            .unwrap();
+        }
+        command
+            .env("PI_CODING_AGENT_SESSION_DIR", pi_sessions)
+            .env("CLAUDE_CONFIG_DIR", claude_config);
+    });
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "title-only-hosts",
+            vec![ShellSpec {
+                name: "agents".into(),
+                command: vec!["/bin/sleep".into(), "300".into()],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    for (integration, external_session_id, name) in [
+        ("pi", "pi-observed", "Pi"),
+        ("claude", "claude-observed", "Claude Code"),
+    ] {
+        daemon
+            .client
+            .register_agent(
+                &shell_id,
+                &run_id,
+                AgentRegistrationSpec {
+                    name: name.into(),
+                    integration: integration.into(),
+                    external_session_id: Some(external_session_id.into()),
+                    report: AgentReport {
+                        state: AgentState::Inactive,
+                        authority: AgentAuthority::LifecycleIntegration,
+                        evidence: "historical Session".into(),
+                        confidence: 100,
+                    },
+                },
+            )
+            .unwrap();
+    }
+
+    let output = daemon
+        .command()
+        .args(["session", "list", "--workspace", &workspace.id, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sessions = output["data"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    for (integration, external_session_id, title) in [
+        ("pi", "pi-observed", "Named Pi session"),
+        ("claude", "claude-observed", "Claude exact title"),
+    ] {
+        let session = sessions
+            .iter()
+            .find(|session| session["integration"] == integration)
+            .unwrap();
+        assert_eq!(session["external_session_id"], external_session_id);
+        assert_eq!(session["description"], title);
+        assert_eq!(session["occurrence_count"], 1);
+        assert_eq!(session["state"], "inactive");
+    }
+
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn exact_durable_session_inspection_bypasses_host_catalogs() {
+    let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
+        let bin = runtime_dir.join("slow-catalog-bin");
+        fs::create_dir(&bin).unwrap();
+        for executable in ["opencode", "codex", "kiro-cli"] {
+            let path = bin.join(executable);
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf x >> \"{}\"\n/bin/sleep 5\nexit 1\n",
+                    runtime_dir.join("catalog-invoked").display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        command.env("PATH", bin);
+    });
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "fast-session-inspect",
+            vec![ShellSpec {
+                name: "agent".into(),
+                command: vec!["/bin/sleep".into(), "300".into()],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let agent = daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "Kiro CLI".into(),
+                integration: "kiro".into(),
+                external_session_id: Some("fast-session".into()),
+                report: AgentReport {
+                    state: AgentState::Inactive,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "historical Session".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    let session_id = match daemon
+        .client
+        .request(Request::HostService {
+            operation: protocol::HostServiceOperation::ResolveAgentSession {
+                workspace_id: workspace.id,
+                agent_id: agent.id,
+            },
+        })
+        .unwrap()
+    {
+        Response::HostService {
+            result: protocol::HostServiceResult::ResolvedAgentSession { session },
+        } => session.id,
+        response => panic!("unexpected Session resolution: {response:?}"),
+    };
+
+    let started = Instant::now();
+    assert!(matches!(
+        daemon
+            .client
+            .request(Request::HostService {
+                operation: protocol::HostServiceOperation::InspectAgentSession { session_id },
+            })
+            .unwrap(),
+        Response::HostService {
+            result: protocol::HostServiceResult::AgentSession { .. }
+        }
+    ));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "exact durable Session inspection took {elapsed:?}"
+    );
+    assert!(!daemon.runtime_dir.join("catalog-invoked").exists());
+
+    drop(attachment);
     daemon.stop_with_cli();
 }
 
@@ -1493,6 +1782,57 @@ fn agent_runtime_is_revisioned_and_durable() {
         1
     );
 
+    let host_bin = daemon.runtime_dir.join("host-bin");
+    fs::create_dir(&host_bin).unwrap();
+    let terminal_resolver = host_bin.join("xdg-terminal-exec");
+    fs::write(
+        &terminal_resolver,
+        "#!/bin/sh\nif [ \"${1-}\" = --print-id ]; then printf 'test.desktop\\n'; else printf '/bin/true\\0'; fi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&terminal_resolver, fs::Permissions::from_mode(0o755)).unwrap();
+    let blocked_sessions = daemon
+        .command()
+        .args(["session", "list", "--workspace", &workspace.id, "--json"])
+        .env("PATH", &host_bin)
+        .output()
+        .unwrap();
+    assert!(blocked_sessions.status.success());
+    let blocked_sessions: serde_json::Value =
+        serde_json::from_slice(&blocked_sessions.stdout).unwrap();
+    let blocked_session_id = blocked_sessions["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["attentions"][0]["agent_id"] == adapter_id)
+        .and_then(|session| session["id"].as_str())
+        .expect("blocked Agent attention was not projected onto its Session");
+    let opened = daemon
+        .command()
+        .args([
+            "--terminal",
+            "test.desktop",
+            "session",
+            "open",
+            blocked_session_id,
+        ])
+        .env("PATH", &host_bin)
+        .output()
+        .unwrap();
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    assert!(
+        daemon
+            .client
+            .get_agent(&adapter_id)
+            .unwrap()
+            .attention
+            .is_none()
+    );
+
     let completion = AgentReport {
         state: AgentState::Done,
         authority: AgentAuthority::LifecycleIntegration,
@@ -1549,6 +1889,24 @@ fn agent_runtime_is_revisioned_and_durable() {
         attention["data"]["attention"][0]["observation"]["revision"],
         3
     );
+    let session_attention = daemon
+        .command()
+        .args(["session", "list", "--workspace", &workspace.id, "--json"])
+        .env("PATH", &host_bin)
+        .output()
+        .unwrap();
+    assert!(session_attention.status.success());
+    let session_attention: serde_json::Value =
+        serde_json::from_slice(&session_attention.stdout).unwrap();
+    let adapter_session = session_attention["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["attentions"][0]["agent_id"] == adapter_id)
+        .expect("completed Agent attention was not projected onto its Session");
+    assert_eq!(adapter_session["attentions"][0]["reason"], "completed");
+    assert_eq!(adapter_session["attentions"][0]["observation_revision"], 3);
+    assert!(adapter_session["git_branch"].is_null());
 
     let restart = daemon
         .command()
@@ -1697,8 +2055,6 @@ fn agent_runtime_is_revisioned_and_durable() {
     assert_eq!(list["command"], "agent.list");
     assert_eq!(list["data"]["agents"][0]["id"], agent_id);
     assert_eq!(list["data"]["agents"][0]["observation"]["revision"], 1);
-    let host_bin = daemon.runtime_dir.join("host-bin");
-    fs::create_dir(&host_bin).unwrap();
     let session_list = daemon
         .command()
         .args(["session", "list", "--workspace", &workspace.id, "--json"])
@@ -1726,6 +2082,82 @@ fn agent_runtime_is_revisioned_and_durable() {
     let session_id = projected["id"].as_str().unwrap();
     assert_eq!(projected["description"], generated_name);
     assert_eq!(projected["occurrence_count"], 1);
+    let workspace_revision = projected["workspace_revision"].as_u64().unwrap();
+
+    let renamed = daemon
+        .command()
+        .args([
+            "session",
+            "rename",
+            session_id,
+            "Checkout retry investigation",
+            "--revision",
+            &workspace_revision.to_string(),
+            "--json",
+        ])
+        .env("PATH", &host_bin)
+        .output()
+        .unwrap();
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    let renamed: serde_json::Value = serde_json::from_slice(&renamed.stdout).unwrap();
+    assert_eq!(renamed["command"], "session.rename");
+    assert_eq!(
+        renamed["data"]["result"]["user_display_name"],
+        "Checkout retry investigation"
+    );
+    assert_eq!(renamed["data"]["result"]["session_id"], session_id);
+    assert_eq!(renamed["data"]["result"]["workspace_id"], workspace.id);
+    assert_eq!(renamed["data"]["result"]["changed"], true);
+    let renamed_revision = renamed["data"]["result"]["workspace_revision"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(renamed_revision, workspace_revision + 1);
+
+    let stale = daemon
+        .command()
+        .args([
+            "session",
+            "reset-name",
+            session_id,
+            "--revision",
+            &workspace_revision.to_string(),
+            "--json",
+        ])
+        .env("PATH", &host_bin)
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+    let stale: serde_json::Value = serde_json::from_slice(&stale.stderr).unwrap();
+    assert_eq!(stale["command"], "session.reset-name");
+    assert_eq!(stale["error"]["code"], "revision_ahead");
+
+    let reset = daemon
+        .command()
+        .args([
+            "session",
+            "reset-name",
+            session_id,
+            "--revision",
+            &renamed_revision.to_string(),
+            "--json",
+        ])
+        .env("PATH", &host_bin)
+        .output()
+        .unwrap();
+    assert!(
+        reset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    let reset: serde_json::Value = serde_json::from_slice(&reset.stdout).unwrap();
+    assert_eq!(reset["command"], "session.reset-name");
+    assert!(reset["data"]["result"]["user_display_name"].is_null());
+    assert_eq!(reset["data"]["result"]["session_id"], session_id);
+    assert_eq!(reset["data"]["result"]["changed"], true);
 
     let session_inspect = daemon
         .command()
@@ -1860,6 +2292,38 @@ fn session_context_survives_shell_removal_and_cold_restart() {
     let mut daemon = TestDaemon::start();
     let project = daemon.runtime_dir.join("durable-source-project");
     fs::create_dir(&project).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "feat/durable-context"])
+            .arg(&project)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let observed_project = daemon.runtime_dir.join("durable-observed-project");
+    fs::create_dir(&observed_project).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "feat/observed-context"])
+            .arg(&observed_project)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(observed_project.join("staged.txt"), "staged\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                observed_project.to_str().unwrap(),
+                "add",
+                "staged.txt",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(observed_project.join("untracked.txt"), "untracked\n").unwrap();
     let workspace = daemon
         .client
         .create_workspace(
@@ -1889,12 +2353,113 @@ fn session_context_survives_shell_removal_and_cold_restart() {
         )
         .unwrap();
     assert_eq!(agent.cwd.as_deref(), Some(project.as_path()));
+    let context_cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+    let (launch_observed, changed) = daemon
+        .client
+        .observe_agent_working_context(&agent.id, &shell_id, &run_id, project.clone())
+        .unwrap();
+    assert!(changed);
+    assert_eq!(launch_observed.working_contexts.len(), 1);
+    assert_eq!(
+        launch_observed.working_contexts[0].repository,
+        "durable-source-project"
+    );
+    assert_eq!(
+        launch_observed.working_contexts[0].branch,
+        "feat/durable-context"
+    );
+    let (observed, changed) = daemon
+        .client
+        .observe_agent_working_context(&agent.id, &shell_id, &run_id, observed_project.clone())
+        .unwrap();
+    assert!(changed);
+    assert_eq!(observed.working_contexts.len(), 2);
+    assert_eq!(
+        observed.working_contexts[0].repository,
+        "durable-observed-project"
+    );
+    assert_eq!(observed.working_contexts[0].branch, "feat/observed-context");
+    assert!(
+        daemon
+            .client
+            .events(Some(context_cursor), 256, 0)
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| matches!(
+                &event.kind,
+                protocol::DaemonEventKind::AgentWorkingContextObserved { agent, .. }
+                    if agent.id == observed.id
+            ))
+    );
+
+    let result = daemon
+        .client
+        .host_service(protocol::HostServiceOperation::ListAgentSessions {
+            workspace_id: Some(workspace.id.clone()),
+        })
+        .unwrap();
+    let protocol::HostServiceResult::AgentSessions { sessions } = result else {
+        panic!("unexpected Session list response");
+    };
+    let projected = &sessions[0];
+    assert_eq!(
+        projected.git_branch.as_deref(),
+        Some("feat/durable-context")
+    );
+    assert_eq!(projected.working_context_count, 1);
+    assert_eq!(
+        projected.working_contexts[0].repository,
+        "durable-observed-project"
+    );
+    assert_eq!(
+        projected.working_contexts[0].branch,
+        "feat/observed-context"
+    );
+    assert_eq!(projected.working_contexts[0].push_status, None);
+    assert_eq!(
+        projected.working_contexts[0].worktree_status,
+        Some(protocol::HostGitWorktreeStatus {
+            staged: true,
+            unstaged_or_untracked: true,
+        })
+    );
+    let operation_id = Uuid::new_v4().to_string();
+    let session_id = projected.id.clone();
+    let expected_revision = projected.workspace_revision;
+    let accepted = daemon
+        .client
+        .set_agent_session_display_name(
+            operation_id.clone(),
+            session_id.clone(),
+            expected_revision,
+            Some("Durable investigation".into()),
+        )
+        .unwrap();
+    daemon
+        .client
+        .rename_workspace(&workspace.id, "renamed-durable-source")
+        .unwrap();
 
     daemon.client.close_shell(&shell_id).unwrap();
     drop(attachment);
     assert!(daemon.client.get_shell(&shell_id).is_err());
     daemon.stop_with_cli();
     daemon.restart();
+
+    let restored_agent = daemon.client.get_agent(&agent.id).unwrap();
+    assert_eq!(restored_agent.working_contexts, observed.working_contexts);
+
+    let replayed = daemon
+        .client
+        .set_agent_session_display_name(
+            operation_id,
+            session_id,
+            expected_revision,
+            Some("Durable investigation".into()),
+        )
+        .unwrap();
+    assert_eq!(replayed, accepted);
 
     let sessions = daemon
         .command()
@@ -1903,6 +2468,48 @@ fn session_context_survives_shell_removal_and_cold_restart() {
         .unwrap();
     assert!(sessions.status.success());
     let sessions: serde_json::Value = serde_json::from_slice(&sessions.stdout).unwrap();
+    assert_eq!(
+        sessions["data"]["sessions"][0]["description"],
+        "Durable investigation"
+    );
+    assert_eq!(
+        sessions["data"]["sessions"][0]["user_display_name"],
+        "Durable investigation"
+    );
+    assert_eq!(
+        sessions["data"]["sessions"][0]["workspace_name"],
+        "renamed-durable-source"
+    );
+    assert_eq!(sessions["data"]["sessions"][0]["working_context_count"], 1);
+    assert_eq!(
+        sessions["data"]["sessions"][0]["working_contexts"][0]["repository"],
+        "durable-observed-project"
+    );
+    assert_eq!(
+        sessions["data"]["sessions"][0]["working_contexts"][0]["branch"],
+        "feat/observed-context"
+    );
+    assert_eq!(
+        sessions["data"]["sessions"][0]["working_contexts"][0]["worktree_status"]["staged"],
+        true
+    );
+    assert_eq!(
+        sessions["data"]["sessions"][0]["working_contexts"][0]["worktree_status"]["unstaged_or_untracked"],
+        true
+    );
+    let protocol_fifty = versioned_raw_request(
+        &daemon.client,
+        50,
+        Request::HostService {
+            operation: protocol::HostServiceOperation::ListAgentSessions {
+                workspace_id: Some(workspace.id.clone()),
+            },
+        },
+    );
+    let old_context = &protocol_fifty.message["result"]["sessions"][0]["working_contexts"][0];
+    assert_eq!(protocol_fifty.version, 50);
+    assert!(old_context.get("push_status").is_none());
+    assert!(old_context.get("worktree_status").is_none());
     let session_id = sessions["data"]["sessions"][0]["id"].as_str().unwrap();
     let inspect = daemon
         .command()
@@ -2131,6 +2738,232 @@ fn cold_recovery_presents_resumable_agent() {
     daemon.stop_with_cli();
 }
 
+#[test]
+fn session_hide_is_durable_non_destructive_and_protocol_scoped() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "hidden-session",
+            vec![ShellSpec {
+                name: "agent".into(),
+                command: vec!["/bin/sleep".into(), "300".into()],
+                cwd: std::env::temp_dir(),
+            }],
+        )
+        .unwrap();
+    let shell_id = workspace.shells[0].id.clone();
+    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
+    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
+    let agent = daemon
+        .client
+        .ensure_agent(
+            &shell_id,
+            &run_id,
+            AgentRegistrationSpec {
+                name: "hidden agent".into(),
+                integration: "opencode".into(),
+                external_session_id: Some("hidden-external".into()),
+                report: AgentReport {
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "ready".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    let protocol::HostServiceResult::AgentSessions { sessions } = daemon
+        .client
+        .host_service(protocol::HostServiceOperation::ListAgentSessions {
+            workspace_id: Some(workspace.id.clone()),
+        })
+        .unwrap()
+    else {
+        panic!("unexpected Session list response");
+    };
+    let session_id = sessions[0].id.clone();
+    assert!(matches!(
+        versioned_request(
+            &daemon.client,
+            50,
+            Request::HideAgentSession {
+                operation_id: Uuid::new_v4().to_string(),
+                session_id: session_id.clone(),
+                workspace_id: workspace.id.clone(),
+                expected_workspace_revision: sessions[0].workspace_revision,
+            },
+        ),
+        Response::Error {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }
+    ));
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
+
+    let hidden = daemon
+        .command()
+        .args([
+            "session",
+            "hide",
+            &session_id,
+            "--workspace",
+            &workspace.id,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        hidden.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hidden.stderr)
+    );
+    let hidden: serde_json::Value = serde_json::from_slice(&hidden.stdout).unwrap();
+    assert_eq!(hidden["command"], "session.hide");
+    assert_eq!(hidden["data"]["result"]["session_id"], session_id);
+    assert_eq!(hidden["data"]["result"]["workspace_id"], workspace.id);
+    assert_eq!(hidden["data"]["result"]["changed"], true);
+    let hidden_revision = hidden["data"]["result"]["workspace_revision"]
+        .as_u64()
+        .unwrap();
+
+    let protocol::HostServiceResult::AgentSessions { sessions } = daemon
+        .client
+        .host_service(protocol::HostServiceOperation::ListAgentSessions {
+            workspace_id: Some(workspace.id.clone()),
+        })
+        .unwrap()
+    else {
+        panic!("unexpected Session list response");
+    };
+    assert!(sessions.is_empty());
+    for request in [
+        Request::HostService {
+            operation: protocol::HostServiceOperation::InspectAgentSession {
+                session_id: session_id.clone(),
+            },
+        },
+        Request::HostService {
+            operation: protocol::HostServiceOperation::ResolveAgentSession {
+                workspace_id: workspace.id.clone(),
+                agent_id: agent.id.clone(),
+            },
+        },
+        Request::ResumeAgentSession {
+            session_id: session_id.clone(),
+            profile: profile(),
+        },
+    ] {
+        assert!(matches!(
+            versioned_request(&daemon.client, 51, request),
+            Response::Error {
+                code: Some(ErrorCode::NotFound),
+                ..
+            }
+        ));
+    }
+
+    let Response::HostService {
+        result: protocol::HostServiceResult::AgentSessions { sessions },
+    } = versioned_request(
+        &daemon.client,
+        50,
+        Request::HostService {
+            operation: protocol::HostServiceOperation::ListAgentSessions {
+                workspace_id: Some(workspace.id.clone()),
+            },
+        },
+    )
+    else {
+        panic!("unexpected protocol-50 Session list response");
+    };
+    assert_eq!(sessions.len(), 1);
+    assert!(matches!(
+        versioned_request(
+            &daemon.client,
+            50,
+            Request::HostService {
+                operation: protocol::HostServiceOperation::InspectAgentSession {
+                    session_id: session_id.clone(),
+                },
+            },
+        ),
+        Response::HostService {
+            result: protocol::HostServiceResult::AgentSession { .. }
+        }
+    ));
+
+    let current_events = daemon.client.events(Some(cursor.clone()), 256, 0).unwrap();
+    assert!(current_events.events.iter().any(|event| matches!(
+        event.kind,
+        protocol::DaemonEventKind::AgentSessionHidden { .. }
+    )));
+    let Response::Events {
+        cursor: old_cursor,
+        events: old_events,
+        ..
+    } = versioned_request(
+        &daemon.client,
+        50,
+        Request::Events {
+            after: Some(cursor),
+            limit: 256,
+            wait_ms: 0,
+        },
+    )
+    else {
+        panic!("unexpected protocol-50 events response");
+    };
+    assert_eq!(old_cursor, current_events.cursor);
+    assert!(old_events.is_empty());
+    assert_eq!(daemon.client.get_agent(&agent.id).unwrap(), agent);
+    let shell = daemon.client.get_shell(&shell_id).unwrap();
+    assert_eq!(
+        shell.run.as_ref().map(|run| run.id.as_str()),
+        Some(run_id.as_str())
+    );
+
+    let repeated = daemon
+        .command()
+        .args([
+            "session",
+            "hide",
+            &session_id,
+            "--workspace",
+            &workspace.id,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["data"]["result"]["changed"], false);
+    assert_eq!(
+        repeated["data"]["result"]["workspace_revision"],
+        hidden_revision
+    );
+
+    let persisted = fs::read_to_string(daemon.runtime_dir.join("state/boomux/state.json")).unwrap();
+    assert!(persisted.contains("\"version\": 17"));
+    assert!(persisted.contains("\"hidden_sessions\""));
+    drop(attachment);
+    daemon.crash();
+    daemon.restart();
+    let protocol::HostServiceResult::AgentSessions { sessions } = daemon
+        .client
+        .host_service(protocol::HostServiceOperation::ListAgentSessions {
+            workspace_id: Some(workspace.id.clone()),
+        })
+        .unwrap()
+    else {
+        panic!("unexpected restored Session list response");
+    };
+    assert!(sessions.is_empty());
+    assert_eq!(daemon.client.get_agent(&agent.id).unwrap().id, agent.id);
+
+    daemon.stop_with_cli();
+}
+
 fn versioned_request(
     client: &Client,
     version: u32,
@@ -2146,4 +2979,18 @@ fn versioned_request(
         protocol::read_message(&mut stream).unwrap();
     assert_eq!(response.version, version);
     response.message
+}
+
+fn versioned_raw_request(
+    client: &Client,
+    version: u32,
+    request: protocol::Request,
+) -> protocol::Envelope<serde_json::Value> {
+    let mut stream = UnixStream::connect(client.socket_path()).unwrap();
+    protocol::write_message(
+        &mut stream,
+        &protocol::Envelope::with_version(version, request),
+    )
+    .unwrap();
+    protocol::read_message(&mut stream).unwrap()
 }
