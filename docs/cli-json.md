@@ -771,8 +771,8 @@ current mapping to another ShellRun returns `busy`.
 ```
 
 Release takes exact `--generation`, `--holder`, and `--claim-id`, addresses one
-holder, and is idempotent. The final holder removes report authority, not durable
-Agent history.
+holder, and is idempotent. The final holder removes report authority and records
+the resumable Agent as `inactive`; it does not remove durable Agent history.
 
 ```json
 {
