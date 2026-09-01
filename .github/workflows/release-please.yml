@@ -233,7 +233,7 @@ jobs:
       - publish-release
     permissions:
       contents: read
-    uses: gardnmi/omarchy-boomux/.github/workflows/boomux-compatibility.yml@6c26ce52c5dbfad6185037b374d98d0933f4b8fe
+    uses: gardnmi/omarchy-boomux/.github/workflows/boomux-compatibility.yml@77a25abfc294bd101901d743c5153e3a13608d20
     with:
       boomux_tag: ${{ needs.release-please.outputs.tag-name }}
-      plugin_ref: 6c26ce52c5dbfad6185037b374d98d0933f4b8fe
+      plugin_ref: 77a25abfc294bd101901d743c5153e3a13608d20
