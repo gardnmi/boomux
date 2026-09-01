@@ -174,11 +174,54 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  validate-omarchy-boomux:
+    name: Validate omarchy-boomux compatibility
+    needs:
+      - release-please
+      - build-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.release-please.outputs.tag-name }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - name: Check out pinned omarchy-boomux
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: gardnmi/omarchy-boomux
+          ref: 77a25abfc294bd101901d743c5153e3a13608d20 # v2.8.1
+          path: omarchy-boomux
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Download x86_64 release candidate
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: boomux-${{ env.TAG }}-${{ env.TARGET }}
+          path: dist
+
+      - name: Validate release candidate
+        run: |
+          archive="boomux-${TAG}-${TARGET}.tar.gz"
+          (
+            cd dist
+            sha256sum --check "${archive}.sha256"
+            tar -xzf "$archive"
+          )
+          bun omarchy-boomux/scripts/check-boomux-capabilities.js \
+            "dist/boomux-${TAG}-${TARGET}/boomux"
+
   publish-release:
     name: Publish GitHub release assets
     needs:
       - release-please
       - build-release
+      - validate-omarchy-boomux
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
@@ -225,15 +268,3 @@ jobs:
             printf 'release publication verification failed for %s\n' "$TAG" >&2
             exit 1
           fi
-
-  validate-omarchy-boomux:
-    name: Validate omarchy-boomux compatibility
-    needs:
-      - release-please
-      - publish-release
-    permissions:
-      contents: read
-    uses: gardnmi/omarchy-boomux/.github/workflows/boomux-compatibility.yml@77a25abfc294bd101901d743c5153e3a13608d20
-    with:
-      boomux_tag: ${{ needs.release-please.outputs.tag-name }}
-      plugin_ref: 77a25abfc294bd101901d743c5153e3a13608d20
