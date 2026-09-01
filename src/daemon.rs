@@ -11696,10 +11696,18 @@ impl DaemonService {
             for claim in claims.state.claims.values_mut() {
                 claim.holders.remove(&holder_id);
             }
-            claims
+            let removed_roots = claims
                 .state
                 .claims
-                .retain(|root, claim| root == &root_session_id || !claim.holders.is_empty());
+                .iter()
+                .filter(|(root, claim)| *root != &root_session_id && claim.holders.is_empty())
+                .map(|(root, _)| root.clone())
+                .collect::<Vec<_>>();
+            let removed = removed_roots
+                .into_iter()
+                .filter_map(|root| claims.state.claims.remove(&root))
+                .collect();
+            events.extend(self.inactivate_released_opencode_agents(undo, removed)?);
             let expires_at_ms = unix_time_ms().saturating_add(
                 u64::try_from(OPENCODE_CLAIM_HOLDER_TTL.as_millis()).unwrap_or(u64::MAX),
             );
@@ -11785,29 +11793,83 @@ impl DaemonService {
         validate_opencode_uuid("OpenCode runtime generation ID", generation_id)?;
         validate_opencode_claim_id("OpenCode claim holder ID", holder_id)?;
         validate_opencode_uuid("OpenCode claim ID", claim_id)?;
-        let mut coordinator = lock(&self.opencode.state)?;
-        coordinator.require_generation(generation_id)?;
-        coordinator.prune_claims(Instant::now());
-        let root = coordinator.claims.iter().find_map(|(root, claim)| {
-            (claim.claim_id == claim_id && claim.holders.contains_key(holder_id))
-                .then(|| root.clone())
-        });
-        let released = if let Some(root) = root {
-            let claim = coordinator
-                .claims
-                .get_mut(&root)
-                .expect("matching claim disappeared while locked");
-            claim.holders.remove(holder_id);
-            if claim.holders.is_empty() {
-                coordinator.claims.remove(&root);
-            } else if claim.selected_holder_id == holder_id {
-                claim.selected_holder_id = claim.holders.keys().min().cloned().unwrap();
+        let (released, claims) = self.durable_mutation_outcome(|undo| {
+            let coordinator = lock(&self.opencode.state)?;
+            let mut claims = OpenCodeClaimsMutation::new(coordinator);
+            claims.state.require_generation(generation_id)?;
+            claims.state.prune_claims(Instant::now());
+            let root = claims.state.claims.iter().find_map(|(root, claim)| {
+                (claim.claim_id == claim_id && claim.holders.contains_key(holder_id))
+                    .then(|| root.clone())
+            });
+            let mut removed = Vec::new();
+            let released = if let Some(root) = root {
+                let claim = claims
+                    .state
+                    .claims
+                    .get_mut(&root)
+                    .expect("matching claim disappeared while locked");
+                claim.holders.remove(holder_id);
+                if claim.holders.is_empty() {
+                    removed.push(
+                        claims
+                            .state
+                            .claims
+                            .remove(&root)
+                            .expect("empty OpenCode claim disappeared while locked"),
+                    );
+                } else if claim.selected_holder_id == holder_id {
+                    claim.selected_holder_id = claim.holders.keys().min().cloned().unwrap();
+                }
+                true
+            } else {
+                false
+            };
+            let events = self.inactivate_released_opencode_agents(undo, removed)?;
+            let value = (released, claims);
+            if events.is_empty() {
+                Ok(DurableMutation::Unchanged(value))
+            } else {
+                Ok(DurableMutation::Changed(value, events))
             }
-            true
-        } else {
-            false
-        };
+        })?;
+        claims.commit();
         Ok(Response::OpenCodeSessionClaimReleased { released })
+    }
+
+    fn inactivate_released_opencode_agents(
+        &self,
+        undo: &mut DurableUndoLog,
+        removed: Vec<OpenCodeRootClaim>,
+    ) -> DaemonResult<Vec<DaemonEventKind>> {
+        let mut events = Vec::new();
+        let mut handled = HashSet::new();
+        for claim in removed {
+            if !handled.insert(claim.agent_id.clone())
+                || !lock(&self.durable.state)?
+                    .agents
+                    .contains_key(&claim.agent_id)
+            {
+                continue;
+            }
+            let report = AgentReport {
+                state: AgentState::Inactive,
+                authority: AgentAuthority::LifecycleIntegration,
+                evidence: "OpenCode session claim released".into(),
+                confidence: 100,
+            };
+            let (agent, changed, completed) =
+                self.report_agent_mutation(undo, &claim.agent_id, &claim.run_id, report)?;
+            debug_assert!(!completed);
+            if changed {
+                events.push(DaemonEventKind::AgentStateChanged {
+                    workspace_id: agent.workspace_id.clone(),
+                    shell_id: agent.shell_id.clone(),
+                    agent,
+                });
+            }
+        }
+        Ok(events)
     }
 
     fn report_claimed_opencode_agent(
@@ -19541,6 +19603,178 @@ mod tests {
 
         assert!(state.claims.is_empty());
         assert_eq!(state.holder_count(), 0);
+    }
+
+    #[test]
+    fn opencode_final_claim_release_inactivates_agent_transactionally() {
+        let registry = DaemonService::default();
+        let (_, shell, _runtime) = running_shell(&registry);
+        let generation_id = install_test_opencode_runtime(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let holder_id = Uuid::new_v4().to_string();
+        let final_holder_id = Uuid::new_v4().to_string();
+        let (claim, agent) = match registry
+            .dispatch(Request::EnsureOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: holder_id.clone(),
+                root_session_id: "ses_release".into(),
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: opencode_agent_spec("ses_release", AgentState::Working),
+            })
+            .unwrap()
+        {
+            Response::OpenCodeSessionClaim { claim, agent } => (claim, agent),
+            response => panic!("unexpected response: {response:?}"),
+        };
+        registry
+            .dispatch(Request::EnsureOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: final_holder_id.clone(),
+                root_session_id: "ses_release".into(),
+                shell_id: shell.id.clone(),
+                run_id,
+                spec: opencode_agent_spec("ses_release", AgentState::Working),
+            })
+            .unwrap();
+
+        let event_id = lock(&registry.events.state).unwrap().latest_id;
+        assert!(matches!(
+            registry
+                .dispatch(Request::ReleaseOpenCodeSessionClaim {
+                    generation_id: generation_id.clone(),
+                    holder_id,
+                    claim_id: claim.claim_id.clone(),
+                })
+                .unwrap(),
+            Response::OpenCodeSessionClaimReleased { released: true }
+        ));
+        assert_eq!(
+            registry
+                .durable
+                .agent(&agent.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Working
+        );
+        assert_eq!(lock(&registry.events.state).unwrap().latest_id, event_id);
+
+        registry.fail_after_mutation.store(true, Ordering::Release);
+        registry
+            .dispatch(Request::ReleaseOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: final_holder_id.clone(),
+                claim_id: claim.claim_id.clone(),
+            })
+            .unwrap_err();
+        assert_eq!(
+            registry
+                .durable
+                .agent(&agent.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Working
+        );
+        assert!(
+            lock(&registry.opencode.state)
+                .unwrap()
+                .claims
+                .contains_key("ses_release")
+        );
+
+        assert!(matches!(
+            registry
+                .dispatch(Request::ReleaseOpenCodeSessionClaim {
+                    generation_id: generation_id.clone(),
+                    holder_id: final_holder_id.clone(),
+                    claim_id: claim.claim_id.clone(),
+                })
+                .unwrap(),
+            Response::OpenCodeSessionClaimReleased { released: true }
+        ));
+        let inactive = registry
+            .durable
+            .agent(&agent.id)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(inactive.observation.state, AgentState::Inactive);
+        assert_eq!(
+            inactive.observation.evidence,
+            "OpenCode session claim released"
+        );
+        assert!(inactive.ended_at_ms.is_none());
+        assert!(inactive.attention.is_none());
+        let events = lock(&registry.events.state).unwrap();
+        assert_eq!(events.latest_id, event_id + 1);
+        assert!(matches!(
+            events.events.back().map(|event| &event.kind),
+            Some(DaemonEventKind::AgentStateChanged { agent, .. })
+                if agent.id == inactive.id && agent.observation.state == AgentState::Inactive
+        ));
+        drop(events);
+
+        assert!(matches!(
+            registry
+                .dispatch(Request::ReleaseOpenCodeSessionClaim {
+                    generation_id,
+                    holder_id: final_holder_id,
+                    claim_id: claim.claim_id,
+                })
+                .unwrap(),
+            Response::OpenCodeSessionClaimReleased { released: false }
+        ));
+        assert_eq!(
+            lock(&registry.events.state).unwrap().latest_id,
+            event_id + 1
+        );
+        registry.opencode.shutdown().unwrap();
+    }
+
+    #[test]
+    fn opencode_switching_a_sole_holder_inactivates_the_previous_agent() {
+        let registry = DaemonService::default();
+        let (_, shell, _runtime) = running_shell(&registry);
+        let generation_id = install_test_opencode_runtime(&registry);
+        let run_id = shell.snapshot().unwrap().run.unwrap().id;
+        let holder_id = Uuid::new_v4().to_string();
+        let ensure = |root_session_id: &str| match registry
+            .dispatch(Request::EnsureOpenCodeSessionClaim {
+                generation_id: generation_id.clone(),
+                holder_id: holder_id.clone(),
+                root_session_id: root_session_id.into(),
+                shell_id: shell.id.clone(),
+                run_id: run_id.clone(),
+                spec: opencode_agent_spec(root_session_id, AgentState::Working),
+            })
+            .unwrap()
+        {
+            Response::OpenCodeSessionClaim { agent, .. } => agent,
+            response => panic!("unexpected response: {response:?}"),
+        };
+
+        let previous = ensure("ses_previous");
+        let current = ensure("ses_current");
+
+        assert_eq!(
+            registry
+                .durable
+                .agent(&previous.id)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .observation
+                .state,
+            AgentState::Inactive
+        );
+        assert_eq!(current.observation.state, AgentState::Working);
+        registry.opencode.shutdown().unwrap();
     }
 
     #[test]
