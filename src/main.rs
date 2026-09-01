@@ -136,7 +136,6 @@ const BOOMUX_SKILL: &str = include_str!("../.agents/skills/boomux/SKILL.md");
 const BOOMUX_OPENCODE_PLUGIN: &str = integration_management::OPENCODE_ASSET;
 #[cfg(test)]
 const BOOMUX_PI_EXTENSION: &str = integration_management::PI_ASSET;
-const MAX_HOST_CATALOG_DIRECTORIES: usize = 8;
 const NON_PROTOCOL_FEATURES: &[&str] = &[
     "opencode_lifecycle_plugin",
     "pi_lifecycle_extension",
@@ -148,7 +147,6 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "persistent_workspace_selection",
     "create_and_open_shell",
     "atomic_workspace_shell_creation",
-    "exact_session_open",
     "hyprland_special_workspaces",
     "contextual_desktop_terminal",
     "coordinated_shell_desktop_placement",
@@ -369,7 +367,8 @@ enum Commands {
         #[command(subcommand)]
         command: NotificationCommands,
     },
-    /// Discover projected agent sessions
+    /// Legacy Agent Session commands retained for argument compatibility
+    #[command(hide = true)]
     Session {
         #[command(subcommand)]
         command: SessionCommands,
@@ -884,7 +883,8 @@ impl From<CliNotificationReason> for daemon::NotificationTestReason {
 
 #[derive(Subcommand)]
 enum SessionCommands {
-    /// List projected agent sessions
+    /// Retired compatibility syntax
+    #[command(hide = true)]
     List {
         #[arg(long, value_name = "NAME_OR_ID")]
         workspace: Option<String>,
@@ -892,15 +892,16 @@ enum SessionCommands {
         #[arg(long)]
         node: Option<String>,
     },
-    /// Show a projected session by exact opaque ID
-    #[command(alias = "get")]
+    /// Retired compatibility syntax
+    #[command(alias = "get", hide = true)]
     Inspect {
         session_id: String,
         /// Exact registered Node alias or Node ID
         #[arg(long)]
         node: Option<String>,
     },
-    /// Open one exact current or historical Session in a native terminal
+    /// Retired compatibility syntax
+    #[command(hide = true)]
     Open {
         session_id: String,
         /// Exact registered Node alias or Node ID
@@ -910,14 +911,16 @@ enum SessionCommands {
         #[arg(long, value_name = "COORDINATED_WORKSPACE")]
         workspace: Option<String>,
     },
-    /// Resume one exact projected session in a native terminal
+    /// Retired compatibility syntax
+    #[command(hide = true)]
     Resume {
         session_id: String,
         /// Exact registered Node alias or Node ID
         #[arg(long)]
         node: Option<String>,
     },
-    /// Set a Boomux display name on one exact projected Session
+    /// Retired compatibility syntax
+    #[command(hide = true)]
     Rename {
         session_id: String,
         name: String,
@@ -929,7 +932,8 @@ enum SessionCommands {
         #[arg(long)]
         operation_id: Option<String>,
     },
-    /// Reset the Boomux display name on one exact projected Session
+    /// Retired compatibility syntax
+    #[command(hide = true)]
     ResetName {
         session_id: String,
         #[arg(long)]
@@ -940,7 +944,8 @@ enum SessionCommands {
         #[arg(long)]
         operation_id: Option<String>,
     },
-    /// Hide one exact Session from this Workspace without deleting host history
+    /// Retired compatibility syntax
+    #[command(hide = true)]
     Hide {
         session_id: String,
         #[arg(long)]
@@ -1616,7 +1621,8 @@ impl Cli {
 fn json_commands() -> impl Iterator<Item = &'static str> {
     CommandKey::ALL.iter().filter_map(|key| {
         let descriptor = key.descriptor();
-        (descriptor.output == OutputMode::Json).then_some(descriptor.key)
+        (descriptor.output == OutputMode::Json && !descriptor.key.starts_with("session."))
+            .then_some(descriptor.key)
     })
 }
 
@@ -1701,6 +1707,9 @@ fn requests_json(arguments: impl IntoIterator<Item = OsString>) -> bool {
 
 fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     let descriptor = cli.command_descriptor();
+    if matches!(cli.command.as_ref(), Some(Commands::Session { .. })) {
+        return Err(removed_session_error());
+    }
     if cli.json && descriptor.output == OutputMode::HumanOnly {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1832,8 +1841,8 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             return Ok(CliExit::Success);
         }
         Some(Commands::ResumeSession { session_id, node }) => {
-            attach::run_agent_session(session_id, node.as_deref())?;
-            return Ok(CliExit::Success);
+            let _ = (session_id, node);
+            return Err(removed_session_error());
         }
         Some(Commands::FederationStdio) => {
             federation::run_stdio_helper()?;
@@ -1974,7 +1983,8 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             command: NotificationCommands::Test { reason },
         }) => test_notification(reason),
         Some(Commands::Session { command }) => {
-            session_command(command, cli.json, cli.terminal.as_deref())
+            let _ = command;
+            Err(removed_session_error())
         }
         Some(Commands::Integration { command }) => integration_command(command, cli.json),
         Some(Commands::Skill {
@@ -2064,6 +2074,13 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
     };
     result?;
     Ok(CliExit::Success)
+}
+
+fn removed_session_error() -> Box<dyn Error> {
+    client::ClientError::Protocol(client::ProtocolError::UnsupportedVersion(
+        "Agent Session commands have been removed".into(),
+    ))
+    .into()
 }
 
 fn print_cli_help() -> Result<(), Box<dyn Error>> {
@@ -3475,7 +3492,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
     let client = client::connect_or_start()?;
     let local_node_id = client.node_identity()?;
     let mut git_cache = git::Cache::default();
-    let mut title_cache = host_session_titles::Cache::default();
     let mut refresh = DashboardRefresh::baseline(&client)?;
     let snapshot = refresh.snapshot().clone();
     let combined = combined_node_snapshot_for_dashboard(&client)?;
@@ -3501,14 +3517,7 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
         roots_configured,
     };
 
-    let initial_state = dashboard_state(
-        snapshot,
-        combined,
-        &refresh,
-        &mut git_cache,
-        &mut title_cache,
-        false,
-    );
+    let initial_state = dashboard_state(snapshot, combined, &refresh, &mut git_cache, false);
     let selected_workspace_id = workspace_selection::load_from_environment()
         .ok()
         .flatten()
@@ -3573,7 +3582,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                                     combined,
                                     &refresh,
                                     &mut git_cache,
-                                    &mut title_cache,
                                     reset_focus_revision,
                                 )))
                             }
@@ -4042,7 +4050,6 @@ fn dashboard(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                             .map_err(|error| error.to_string())?,
                         &refresh,
                         &mut git_cache,
-                        &mut title_cache,
                         reset_focus_revision,
                     ))
                 })();
@@ -4081,14 +4088,14 @@ fn dashboard_state(
     combined: Option<protocol::CombinedNodeSnapshot>,
     refresh: &DashboardRefresh,
     git_cache: &mut git::Cache,
-    title_cache: &mut host_session_titles::Cache,
     reset_focus_revision: bool,
 ) -> tui::DashboardState {
     let qualified_focused_terminal = combined
         .as_ref()
         .and_then(|snapshot| snapshot.focused_terminal.clone());
-    let mut workspaces = dashboard_views_with_catalog(&snapshot.workspaces, git_cache, title_cache);
-    enrich_session_titles(&mut workspaces, title_cache);
+    let sessions = session_projection::project_snapshot_with_catalog(&snapshot, None);
+    let mut workspaces =
+        dashboard_projection::project_with_sessions(&snapshot.workspaces, git_cache, &sessions);
     let mut nodes = Vec::new();
     if let Some(combined) = combined {
         let global_workspaces = combined.workspaces;
@@ -5198,91 +5205,6 @@ fn dashboard_views(
     git_cache: &mut git::Cache,
 ) -> Vec<tui::WorkspaceView> {
     dashboard_projection::project(workspaces, git_cache)
-}
-
-fn dashboard_views_with_catalog(
-    workspaces: &[WorkspaceSnapshot],
-    git_cache: &mut git::Cache,
-    title_cache: &mut host_session_titles::Cache,
-) -> Vec<tui::WorkspaceView> {
-    let catalog = cached_host_catalog(workspaces, title_cache);
-    let sessions = session_projection::project_workspaces_with_catalog(workspaces, Some(&catalog));
-    dashboard_projection::project_with_sessions(workspaces, git_cache, &sessions)
-}
-
-fn workspace_source_directories(workspaces: &[WorkspaceSnapshot]) -> BTreeSet<PathBuf> {
-    workspaces
-        .iter()
-        .flat_map(|workspace| {
-            workspace
-                .default_cwd
-                .iter()
-                .cloned()
-                .chain(workspace.shells.iter().map(|shell| shell.cwd.clone()))
-                .chain(
-                    workspace
-                        .launchers
-                        .iter()
-                        .map(|launcher| launcher.cwd.clone()),
-                )
-                .chain(
-                    workspace
-                        .agents
-                        .iter()
-                        .filter_map(|agent| agent.cwd.clone()),
-                )
-        })
-        .collect()
-}
-
-fn cached_host_catalog(
-    workspaces: &[WorkspaceSnapshot],
-    cache: &mut host_session_titles::Cache,
-) -> Vec<host_session_titles::HostSession> {
-    let mut catalog = Vec::new();
-    for directory in workspace_source_directories(workspaces)
-        .into_iter()
-        .take(MAX_HOST_CATALOG_DIRECTORIES)
-    {
-        for integration in host_session_titles::projection_integrations() {
-            if let Some(sessions) = cache.projection_records(integration, &directory) {
-                catalog.extend(sessions);
-            }
-        }
-    }
-    catalog
-}
-
-fn discover_host_catalog(
-    workspaces: &[WorkspaceSnapshot],
-) -> Vec<host_session_titles::HostSession> {
-    let directories = workspace_source_directories(workspaces)
-        .into_iter()
-        .take(MAX_HOST_CATALOG_DIRECTORIES)
-        .collect::<Vec<_>>();
-    let requests = directories.into_iter().flat_map(|directory| {
-        host_session_titles::projection_integrations()
-            .map(move |integration| (integration, directory.clone()))
-    });
-    thread::scope(|scope| {
-        requests
-            .map(|(integration, directory)| {
-                scope
-                    .spawn(move || host_session_titles::projection_records(integration, &directory))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .filter_map(|handle| handle.join().ok().flatten())
-            .flatten()
-            .collect()
-    })
-}
-
-fn enrich_session_titles(
-    workspaces: &mut [tui::WorkspaceView],
-    title_cache: &mut host_session_titles::Cache,
-) {
-    dashboard_projection::enrich_session_titles(workspaces, title_cache);
 }
 
 fn open_directory(
@@ -13834,7 +13756,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_session_discovery_and_human_only_open_commands() {
+    fn parses_legacy_session_arguments_for_typed_rejection() {
         let list = Cli::try_parse_from([
             "boomux",
             "session",
@@ -13884,11 +13806,10 @@ mod tests {
 
         let json_open =
             Cli::try_parse_from(["boomux", "--json", "session", "open", "opaque"]).unwrap();
-        assert!(
-            run(json_open)
-                .unwrap_err()
-                .to_string()
-                .contains("--json is not supported for session.open")
+        let error = run(json_open).unwrap_err();
+        assert_eq!(
+            cli_output::classify_for_test("session.open", error.as_ref()),
+            "unsupported_version"
         );
 
         let rename = Cli::try_parse_from([
@@ -13960,18 +13881,18 @@ mod tests {
     }
 
     #[test]
-    fn session_open_help_is_public_and_documents_exact_identity_and_node() {
+    fn session_commands_are_not_advertised() {
         let session_help = match Cli::try_parse_from(["boomux", "session", "--help"]) {
             Err(error) => error.to_string(),
             Ok(_) => panic!("Session help must exit before command dispatch"),
         };
-        assert!(session_help.contains("open"));
-        let open_help = match Cli::try_parse_from(["boomux", "session", "open", "--help"]) {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("Session open help must exit before command dispatch"),
-        };
-        assert!(open_help.contains("SESSION_ID"));
-        assert!(open_help.contains("--node <NODE>"));
+        for command in ["open", "list", "rename"] {
+            assert!(
+                !session_help
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{command} ")))
+            );
+        }
     }
 
     #[test]
@@ -15514,7 +15435,7 @@ mod tests {
         assert!(json_commands.contains(&"shell.suggest-name"));
         assert!(json_commands.contains(&"workspace.create"));
         assert!(NON_PROTOCOL_FEATURES.contains(&"atomic_workspace_shell_creation"));
-        assert!(NON_PROTOCOL_FEATURES.contains(&"exact_session_open"));
+        assert!(!NON_PROTOCOL_FEATURES.contains(&"exact_session_open"));
         assert!(!json_commands.contains(&"session.open"));
         for command in [
             "agent.register",
@@ -15526,9 +15447,22 @@ mod tests {
         ] {
             assert!(json_commands.contains(&command));
         }
-        for command in ["session.list", "session.inspect"] {
-            assert!(json_commands.contains(&command));
+        for command in [
+            "session.list",
+            "session.inspect",
+            "session.rename",
+            "session.reset-name",
+            "session.hide",
+        ] {
+            assert!(!json_commands.contains(&command));
         }
+        assert!(!protocol::protocol_capabilities().any(|feature| {
+            feature == "projected_agent_sessions"
+                || feature == "remote_agent_session_catalog"
+                || feature == "remote_exact_session_resume"
+                || feature.starts_with("session_")
+                || feature == "workspace_session_hiding"
+        }));
         for command in [
             "integration.list",
             "integration.status",
@@ -15674,11 +15608,6 @@ mod tests {
                 "integration.install",
                 "integration.uninstall",
                 "integration.verify",
-                "session.list",
-                "session.inspect",
-                "session.rename",
-                "session.reset-name",
-                "session.hide",
                 "daemon.status",
             ]
         );
@@ -15884,9 +15813,6 @@ mod tests {
             "boomux attention list",
             "boomux attention acknowledge",
             "boomux notification test",
-            "boomux session list",
-            "boomux session inspect",
-            "boomux session resume",
             "boomux integration list",
             "boomux integration status",
             "boomux integration install",
@@ -15915,7 +15841,7 @@ mod tests {
         assert!(BOOMUX_SKILL.contains("--node"));
         assert!(BOOMUX_SKILL.contains("--revision"));
         assert!(BOOMUX_SKILL.contains("--terminal"));
-        assert!(!BOOMUX_SKILL.contains("boomux session read"));
+        assert!(!BOOMUX_SKILL.contains("boomux session "));
         assert!(!BOOMUX_SKILL.contains("workspace create \"<name>\" --cwd"));
     }
 

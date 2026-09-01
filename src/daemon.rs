@@ -1947,26 +1947,34 @@ fn handle_connection_inner(
     }
 
     if let Request::ResumeNodeAgentSession {
-        node_id,
-        session_id,
-        profile,
+        node_id: _,
+        session_id: _,
+        profile: _,
     } = request.message
     {
-        return registry.handle_remote_session_resume(
-            stream,
+        return send_response(
+            &mut stream,
             response_version,
-            &node_id,
-            &session_id,
-            profile,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "Agent Session resume has been removed",
+            ),
         );
     }
 
     if let Request::ResumeAgentSession {
-        session_id,
-        profile,
+        session_id: _,
+        profile: _,
     } = request.message
     {
-        return registry.handle_session_resume(stream, response_version, &session_id, profile);
+        return send_response(
+            &mut stream,
+            response_version,
+            error_response(
+                ErrorCode::UnsupportedVersion,
+                "Agent Session resume has been removed",
+            ),
+        );
     }
 
     if let Request::Attach {
@@ -9075,6 +9083,16 @@ impl DaemonService {
         requester_version: u32,
         before_request: &mut dyn FnMut() -> io::Result<()>,
     ) -> Response {
+        if matches!(
+            operation,
+            RoutedOperation::SetAgentSessionDisplayName { .. }
+                | RoutedOperation::HideAgentSession { .. }
+        ) {
+            return error_response(
+                ErrorCode::UnsupportedVersion,
+                "Agent Session mutation has been removed",
+            );
+        }
         if let RoutedOperation::SetAgentSessionDisplayName { operation_id, .. } = &operation
             && let Err(error) = validate_uuid(operation_id, "Session display-name operation ID")
         {
@@ -9321,7 +9339,7 @@ impl DaemonService {
     fn host_service_for_version(
         &self,
         operation: HostServiceOperation,
-        requester_version: u32,
+        _requester_version: u32,
     ) -> DaemonResult<HostServiceResult> {
         match operation {
             HostServiceOperation::DiscoverProjects => Ok(HostServiceResult::Projects {
@@ -9426,78 +9444,12 @@ impl DaemonService {
                 shell_id,
                 run_id,
             }),
-            HostServiceOperation::ListAgentSessions { workspace_id } => {
-                let snapshot = self.snapshot()?;
-                let mut projected = self.host_sessions(&snapshot, workspace_id.as_deref())?;
-                let hidden = if protocol::ProtocolFeature::WorkspaceSessionHiding
-                    .is_supported_by(requester_version)
-                {
-                    self.hidden_session_metadata()?
-                } else {
-                    Vec::new()
-                };
-                apply_session_visibility_limit(&mut projected, &hidden, requester_version);
-                let sessions = host_services::session_summaries(&snapshot, &projected);
-                Ok(HostServiceResult::AgentSessions { sessions })
-            }
-            HostServiceOperation::InspectAgentSession { session_id } => {
-                let snapshot = self.snapshot()?;
-                let mut sessions = self.exact_host_sessions(&snapshot, &session_id)?;
-                if protocol::ProtocolFeature::WorkspaceSessionHiding
-                    .is_supported_by(requester_version)
-                {
-                    crate::session_projection::filter_hidden(
-                        &mut sessions,
-                        &self.hidden_session_metadata()?,
-                    );
-                }
-                Ok(HostServiceResult::AgentSession {
-                    session: host_services::inspect_projected_session(
-                        &snapshot,
-                        &sessions,
-                        &session_id,
-                    )
-                    .map_err(DaemonError::from)?,
-                })
-            }
-            HostServiceOperation::ResolveAgentSession {
-                workspace_id,
-                agent_id,
-            } => {
-                let snapshot = self.snapshot()?;
-                let mut sessions = self.durable_host_sessions(&snapshot)?;
-                if protocol::ProtocolFeature::WorkspaceSessionHiding
-                    .is_supported_by(requester_version)
-                {
-                    crate::session_projection::filter_hidden(
-                        &mut sessions,
-                        &self.hidden_session_metadata()?,
-                    );
-                }
-                let matches = sessions
-                    .into_iter()
-                    .filter(|session| {
-                        session.workspace_id == workspace_id
-                            && session
-                                .occurrences
-                                .iter()
-                                .any(|occurrence| occurrence.agent_id == agent_id)
-                    })
-                    .collect::<Vec<_>>();
-                let [session] = matches.as_slice() else {
-                    return Err(DaemonError::lifecycle(
-                        if matches.is_empty() {
-                            ErrorCode::NotFound
-                        } else {
-                            ErrorCode::AmbiguousTarget
-                        },
-                        "exact Agent occurrence did not resolve to one Agent Session",
-                    ));
-                };
-                Ok(HostServiceResult::ResolvedAgentSession {
-                    session: host_services::session_summary_with_snapshot(&snapshot, session),
-                })
-            }
+            HostServiceOperation::ListAgentSessions { .. }
+            | HostServiceOperation::InspectAgentSession { .. }
+            | HostServiceOperation::ResolveAgentSession { .. } => Err(DaemonError::lifecycle(
+                ErrorCode::UnsupportedVersion,
+                "Agent Session services have been removed",
+            )),
         }
     }
 
@@ -9831,6 +9783,17 @@ impl DaemonService {
         operation: HostServiceOperation,
         requester_version: u32,
     ) -> Response {
+        if matches!(
+            operation,
+            HostServiceOperation::ListAgentSessions { .. }
+                | HostServiceOperation::InspectAgentSession { .. }
+                | HostServiceOperation::ResolveAgentSession { .. }
+        ) {
+            return error_response(
+                ErrorCode::UnsupportedVersion,
+                "Agent Session services have been removed",
+            );
+        }
         let registrations = match self.node_registrations() {
             Ok(registrations) => registrations,
             Err(error) => return error.into_response(),
@@ -12871,28 +12834,12 @@ impl DaemonService {
                     vec![event],
                 ))
             }),
-            Request::SetAgentSessionDisplayName {
-                operation_id,
-                session_id,
-                expected_workspace_revision,
-                display_name,
-            } => self.set_agent_session_display_name(
-                operation_id,
-                session_id,
-                expected_workspace_revision,
-                display_name,
-            ),
-            Request::HideAgentSession {
-                operation_id,
-                session_id,
-                workspace_id,
-                expected_workspace_revision,
-            } => self.hide_agent_session(
-                operation_id,
-                session_id,
-                workspace_id,
-                expected_workspace_revision,
-            ),
+            Request::SetAgentSessionDisplayName { .. } | Request::HideAgentSession { .. } => {
+                Err(DaemonError::lifecycle(
+                    ErrorCode::UnsupportedVersion,
+                    "Agent Session mutation has been removed",
+                ))
+            }
             Request::CreateWorkspace {
                 name,
                 default_cwd,
@@ -18412,9 +18359,9 @@ mod tests {
         assert!(matches!(
             response,
             Response::Error {
-                code: Some(ErrorCode::InvalidArgument),
+                code: Some(ErrorCode::UnsupportedVersion),
                 ref message,
-            } if message.contains("invalid Session display-name operation ID")
+            } if message.contains("Agent Session mutation has been removed")
         ));
 
         let response = registry
@@ -18556,53 +18503,24 @@ mod tests {
             agent_id
         );
 
-        let HostServiceResult::AgentSessions { sessions } = registry
-            .host_service_for_version(
+        for version in [50, 51] {
+            for operation in [
                 HostServiceOperation::ListAgentSessions {
                     workspace_id: Some(workspace.id.clone()),
                 },
-                51,
-            )
-            .unwrap()
-        else {
-            panic!("unexpected current Session list response");
-        };
-        assert!(sessions.is_empty());
-        let HostServiceResult::AgentSessions { sessions } = registry
-            .host_service_for_version(
-                HostServiceOperation::ListAgentSessions {
-                    workspace_id: Some(workspace.id.clone()),
+                HostServiceOperation::InspectAgentSession {
+                    session_id: session_id.clone(),
                 },
-                50,
-            )
-            .unwrap()
-        else {
-            panic!("unexpected old Session list response");
-        };
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(
-            registry
-                .host_service_for_version(
-                    HostServiceOperation::InspectAgentSession {
-                        session_id: session_id.clone(),
-                    },
-                    51,
-                )
-                .unwrap_err()
-                .wire_code(),
-            ErrorCode::NotFound
-        );
-        assert!(matches!(
-            registry
-                .host_service_for_version(
-                    HostServiceOperation::InspectAgentSession {
-                        session_id: session_id.clone(),
-                    },
-                    50,
-                )
-                .unwrap(),
-            HostServiceResult::AgentSession { .. }
-        ));
+            ] {
+                assert_eq!(
+                    registry
+                        .host_service_for_version(operation, version)
+                        .unwrap_err()
+                        .wire_code(),
+                    ErrorCode::UnsupportedVersion
+                );
+            }
+        }
 
         let replay = registry
             .hide_agent_session(

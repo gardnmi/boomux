@@ -47,27 +47,10 @@ not appear in `json_commands`, and do not provide remote configuration mutation.
 `config validate` covers the complete global plus optional `BOOMUX_CONFIG`
 layered result without starting the daemon.
 
-`boomux session open SESSION_ID [--node NODE] [--workspace WORKSPACE]` is also human-only and absent
-from `json_commands`. The static `exact_session_open` feature advertises this
-CLI orchestration surface, not a new daemon request. It launches a terminal that
-opens an exact current ShellRun with expected-run attachment and takeover, or
-uses exact owner-routed resume for a historical Session; done, missing,
-ambiguous, unavailable, and changed targets fail closed. A successful command
-exit confirms terminal launch, while owner-side attachment or resume errors
-remain visible in that terminal and never fall back to another target. After
-launch, Boomux acknowledges each outstanding Agent attention reference projected
-onto that exact Session using its original observation revision. A newer
-attention revision remains outstanding, and an acknowledgment failure is
-reported as a post-launch warning rather than misreporting the terminal launch
-as failed.
-When `--workspace` names a non-closing coordinated Workspace, Boomux presents that
-desktop Workspace and places an exact current ShellRun terminal there without
-changing durable Shell membership. For a historical Session, it creates a
-managed command-backed Shell on the Session's owning Node in the selected
-Workspace and runs the exact harness resume argv through `agent supervise`.
-The supervisor immediately registers the exact Session as an unknown Agent;
-lifecycle integration then supersedes it with authoritative state. Without `--workspace`, the legacy
-unmanaged historical resume remains available.
+Session commands and Session feature names are absent from `json_commands` and
+`features`. Protocol 51 retains legacy request and response shapes only for safe
+decoding of mixed-version peers; current daemons reject Session catalog, inspect,
+mutation, open, and resume operations with `unsupported_version`.
 
 `boomux setup` is a human-only local discovery and mutation workflow. It requires
 an interactive terminal, does not support `--json`, and is absent from
@@ -296,11 +279,6 @@ The following commands support `--json`:
 - `boomux agent report`
 - `boomux attention list`
 - `boomux attention acknowledge`
-- `boomux session list`
-- `boomux session inspect`
-- `boomux session rename SESSION_ID NAME --revision N [--node NODE]`
-- `boomux session reset-name SESSION_ID --revision N [--node NODE]`
-- `boomux session hide SESSION_ID --workspace WORKSPACE_ID [--node NODE]`
 - `boomux integration list`
 - `boomux integration status [opencode|pi|claude|codex]`
 - `boomux integration install <opencode|pi|claude|codex>`
@@ -543,28 +521,14 @@ Protocol 49 adds `protocol_49` and `workspace_placement_default_cwd` plus the
 coordinated Workspace, exact existing Node placement, fresh global and owner
 Workspace revisions, and an owner-resolved existing directory. Repeating the
 same path returns `unchanged` without incrementing either revision.
-Protocol 50 adds `protocol_50`, `session_display_names`,
-`session_presentation_context`, and `observed_agent_working_contexts` plus the stable
-`session.rename` and `session.reset-name` JSON commands. Mutation is optional for
-consumers of Session browsing and is never inferred from the package version.
-Protocol-50 inspection also carries owner-projected occurrence details so local
-and remote `session.inspect` serialize the same authoritative response without
-client-side catalog rediscovery. Session presentation context consists only of
-bounded exact Agent attention references, nullable owner-inspected launch Git
-branch context, and bounded observed repository/branch contexts. It adds no
-durable Session lifecycle or transcript state. The integration-only
-`agent observe-working-context` command is private JSON plumbing, not a stable
-automation command.
-Protocol 51 adds `protocol_51`, `session_latest_agent_attribution`,
-`session_working_context_push_status`,
-`session_working_context_worktree_status`, and `workspace_session_hiding` plus
-the stable `session.hide` JSON command. Latest Agent attribution and the two Git
-status objects are optional additive presentation fields. Hide is an
-owner-authoritative, Workspace-scoped tombstone mutation and is never inferred
-from package version. Protocol-50 list, inspect, resolve, and resume callers
-retain their previous visibility; protocol-50 responses omit
-`latest_agent_name`, `push_status`, `worktree_status`, and the hide event while
-event cursors still advance.
+Protocols 50 and 51 historically added Session presentation fields, mutations,
+and capabilities. ADR 0014 retires those public interfaces. Their wire shapes
+remain decodable for protocol-51 compatibility, but current daemons do not
+advertise Session capabilities and reject Session commands, host services,
+resume requests, and mutations with `unsupported_version`. Persisted Session
+presentation metadata is inert. The integration-only
+`agent observe-working-context` command remains private JSON plumbing for Agent
+lifecycle context, not a Session automation command.
 
 Protocol-38 `workspace create NAME` without placement flags creates empty
 coordinator metadata without a default Node or cwd and remains human-only.

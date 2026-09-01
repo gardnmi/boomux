@@ -1,6 +1,6 @@
 # Hide Projected Sessions With Workspace Tombstones
 
-Status: Accepted
+Status: Superseded by ADR 0014
 
 Agent Sessions are projections assembled from durable Agent Instances and
 ephemeral host catalogs. Removing provider history is outside Boomux authority,

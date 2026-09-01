@@ -494,6 +494,23 @@ pub fn protocol_capabilities() -> impl Iterator<Item = &'static str> {
         .filter(|feature| feature.is_supported_by(PROTOCOL_VERSION))
         .flat_map(ProtocolFeature::capability_names)
         .copied()
+        .filter(|capability| !is_retired_session_capability(capability))
+}
+
+fn is_retired_session_capability(capability: &str) -> bool {
+    matches!(
+        capability,
+        "projected_agent_sessions"
+            | "durable_session_source_context"
+            | "remote_agent_session_catalog"
+            | "remote_exact_session_resume"
+            | "session_display_names"
+            | "session_presentation_context"
+            | "session_working_context_push_status"
+            | "session_working_context_worktree_status"
+            | "session_latest_agent_attribution"
+            | "workspace_session_hiding"
+    )
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4422,6 +4439,7 @@ mod tests {
             expected
                 .into_iter()
                 .flat_map(|(_, capabilities)| capabilities.iter().copied())
+                .filter(|capability| !is_retired_session_capability(capability))
                 .collect::<Vec<_>>()
         );
     }

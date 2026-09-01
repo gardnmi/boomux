@@ -178,7 +178,7 @@ boomux ui
 | **Command** | The dashboard presentation of a Shell whose stored startup argument vector is nonempty. |
 | **Launcher** | A durable exact-argument command invoked on every explicit Workspace open or restore. Each invocation is detached, ephemeral, and has no PTY. |
 | **Agent Instance** | A durable identity for one external Agent session associated with one Shell run; process exit alone never establishes completion. |
-| **Agent Session** | An external conversation projected from Agent Instances or host history. It owns no process, PTY, or lifecycle observation. |
+| **External session ID** | An opaque harness identity retained on an Agent Instance for lifecycle correlation and exact recovery. It is not a Boomux resource or user-facing history object. |
 
 Boomux preserves exact argument vectors and does not add shell interpolation to
 launchers or adapters.
@@ -258,48 +258,19 @@ Use `boomux --help` and `boomux <command> --help` for the complete current CLI.
 
 ## Native Dashboard
 
-Run `boomux ui` in a terminal. The dashboard provides five primary views:
+Run `boomux ui` in a terminal. The dashboard provides four primary views:
 
 - **Workspaces**: coordinated tasks, placement state, attention, and ownership.
 - **Agents**: current ShellRun-bound Agent lifecycle.
-- **Sessions**: canonical Agent Sessions across harnesses and live Nodes.
 - **Shells**: durable Shell slots, commands, and exact run state.
 - **Nodes**: registration, route health, compatibility, and upgrade actions.
-
-The Sessions view is a projection of existing Agent Instances and host history,
-not a renamed Agent view or a new durable identity. It combines local Sessions
-with live catalogs from online registered Nodes, keeps identity qualified by
-owning Node, and reports per-Node failures without giving stale remote
-projections authority. Rows are ordered by last activity for presentation only;
-timestamps do not establish causal order across Nodes. Every row names its
-harness, and columns adapt from the compact age, harness, and title view to add
-state, Node, Workspace, and occurrence information as space permits.
-Session details distinguish the registration-time source directory and launch
-branch from bounded repository/branch contexts observed by the Session's exact
-Agent occurrences. Observed contexts are owner-authoritative hints, may be
-incomplete, and are never fabricated for catalog-only history. Protocol-51
-owners may also report the latest Agent name plus separate push and worktree
-status for the context's exact current branch. The owner uses bounded no-fetch
-response-time inspection of local tracking refs and porcelain state; worktree
-status exposes only `staged` and `unstaged_or_untracked` booleans, never file
-names, file counts, or file contents. These derived fields are not persisted or
-published as events, and protocol-50 responses omit them.
-
-`Enter` opens the selected Session. A current Session opens its exact managed
-Shell; historical resume runs the exact owner-side harness. An unavailable,
-missing-cwd, done, or otherwise invalid Session reports an error and never opens
-a substitute. OpenCode and Codex may contribute catalog-only history; Pi,
-Claude, and Kiro appear only after Boomux has durably observed an Agent Instance,
-but exact bounded host records may supply their displayed titles.
-Press `i` for Session details and `Esc` to return. With the mouse, the first click
-selects a Session row and a second click on that selected row opens it.
 
 Core keys:
 
 | Keys | Action |
 | --- | --- |
 | Arrow keys or `h/j/k/l` | Navigate |
-| `Tab`, `Shift-Tab`, `1`-`5` | Change view |
+| `Tab`, `Shift-Tab`, `1`-`4` | Change view |
 | `Enter` | Open or activate the selected item |
 | `a`, `e`, `x` | Add, rename/edit, or close/remove where available |
 | `/` or `:` | Open the command palette |
@@ -386,27 +357,6 @@ delete the remote Node.
 
 Cached remote projections are presentation-only. Mutations require a live,
 identity-verified owner connection and are never queued for later.
-
-Open an exact projected Agent Session in a native terminal with:
-
-```console
-boomux session open <session-id>
-boomux session open <session-id> --node <node>
-```
-
-Current Sessions open their exact current ShellRun with takeover. Historical
-Sessions resume on their exact owning Node. Invalid or changed targets fail
-closed rather than substituting another Shell, run, Session, path, or Node.
-
-Hide a projected Session from one owning Workspace without deleting provider
-history, Agents, Shells, or processes:
-
-```console
-boomux session hide <session-id> --workspace <workspace-id>
-boomux session hide <session-id> --workspace <workspace-id> --node <node>
-```
-
-Hiding is persistent and Workspace-scoped. There is no unhide command.
 
 See [Remote Nodes](docs/remote-nodes.md) for routing, bootstrap, upgrade, and
 failure semantics.
