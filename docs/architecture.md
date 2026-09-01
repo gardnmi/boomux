@@ -545,9 +545,10 @@ is idempotent per runtime generation, root Session, ShellRun, and TUI holder; it
 also ensures the durable Agent Instance. Multiple holders for the same mapping
 are allowed, while a different current ShellRun for the same runtime Session is
 `busy`. Release removes one holder, expiry removes abandoned holders, and the
-last holder removes report authority. Run or runtime replacement invalidates the
-mapping. The bounded claim map is not persisted, projected, handed off, or
-event-published, so `STATE_VERSION` and all durable schemas remain unchanged.
+last holder removes report authority and records the resumable Agent as
+Inactive. Run or runtime replacement invalidates the mapping. The bounded claim
+map is not persisted, projected, handed off, or event-published, so
+`STATE_VERSION` and all durable schemas remain unchanged.
 
 The Shared Harness Runtime is neither a durable resource nor part of the Shell
 registry. The daemon starts one generation on the first eligible bare interactive

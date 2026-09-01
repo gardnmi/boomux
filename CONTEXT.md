@@ -190,6 +190,8 @@ server lifecycle plugin to resolve reports; it is not an Agent Instance, Agent
 Session, process, controller, projection, event, or durable identity.
 Expiry, final-holder release, ShellRun replacement, or runtime-generation
 replacement removes authority without deleting or moving durable Agent history.
+Final-holder release also records the resumable Agent Instance as Inactive so it
+no longer decorates the ShellRun after the TUI exits.
 Claims are not persisted, projected, event-published, or transferred during
 daemon handoff; surviving TUIs reacquire them from the replacement daemon. When
 cold recovery resumes one exact OpenCode Session on a replacement ShellRun, its
