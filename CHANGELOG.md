@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.9.1](https://github.com/gardnmi/boomux/compare/v1.9.0...v1.9.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* **opencode:** inactivate agents when claims release ([#338](https://github.com/gardnmi/boomux/issues/338)) ([4015c68](https://github.com/gardnmi/boomux/commit/4015c689e276470241efb5b1769937554f52c39a))
+* **session:** retire public session interfaces ([#341](https://github.com/gardnmi/boomux/issues/341)) ([b69fbe9](https://github.com/gardnmi/boomux/commit/b69fbe980ebf2212ca5ace3e838ed2532795274e))
+
 ## [1.9.0](https://github.com/gardnmi/boomux/compare/v1.8.0...v1.9.0) (2026-08-31)
 
 
