@@ -34,6 +34,7 @@ jobs:
       tag-name: ${{ inputs.tag || steps.release.outputs.tag_name }}
       release-sha: ${{ steps.release.outputs.sha }}
       source-ref: ${{ steps.dispatch-release.outputs.source-ref || steps.release.outputs.sha }}
+      release-published: ${{ steps.dispatch-release.outputs.published }}
     steps:
       - name: Verify triggering CI commit is current
         if: ${{ github.event_name == 'workflow_run' }}
@@ -125,16 +126,24 @@ jobs:
           fi
           draft=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .draft)
           if [[ "$draft" == true ]]; then
-            source_ref=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .target_commitish)
+            target_commitish=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .target_commitish)
+            source_ref=$(gh api "repos/$GH_REPO/commits/$target_commitish" --jq .sha)
+            gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+              -f target_commitish="$source_ref" >/dev/null
+            published=false
           else
             source_ref=$TAG
+            published=true
           fi
           printf 'source-ref=%s\n' "$source_ref" >> "$GITHUB_OUTPUT"
+          printf 'published=%s\n' "$published" >> "$GITHUB_OUTPUT"
 
   build-release:
     name: Build Linux ${{ matrix.arch }} release
     needs: release-please
-    if: ${{ needs.release-please.outputs.release-created == 'true' || inputs.tag != '' }}
+    if: >-
+      ${{ needs.release-please.outputs.release-created == 'true' ||
+          (inputs.tag != '' && needs.release-please.outputs.release-published != 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -268,3 +277,14 @@ jobs:
             printf 'release publication verification failed for %s\n' "$TAG" >&2
             exit 1
           fi
+
+  validate-published-omarchy-boomux:
+    name: Validate published omarchy-boomux compatibility
+    if: ${{ inputs.tag != '' && needs.release-please.outputs.release-published == 'true' }}
+    needs: release-please
+    permissions:
+      contents: read
+    uses: gardnmi/omarchy-boomux/.github/workflows/boomux-compatibility.yml@77a25abfc294bd101901d743c5153e3a13608d20
+    with:
+      boomux_tag: ${{ needs.release-please.outputs.tag-name }}
+      plugin_ref: 77a25abfc294bd101901d743c5153e3a13608d20
