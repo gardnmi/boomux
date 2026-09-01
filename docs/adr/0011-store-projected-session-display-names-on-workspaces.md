@@ -1,6 +1,6 @@
 # Store Projected Session Display Names On Workspaces
 
-Status: Accepted
+Status: Superseded by ADR 0014
 
 Agent Sessions remain projections assembled from durable Agent Instances and
 ephemeral host catalogs. Making the projected Session UUID a durable entity would

@@ -1,10 +1,10 @@
 ---
 name: boomux
-description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, projected sessions, local configuration, notifications, the OpenCode Shared Harness Runtime, process supervision, and integrations. Use when asked to discover Nodes, shells, agents, or sessions, read terminal output, inspect, validate, or edit local Boomux configuration, supervise an explicitly identified external session, report agent lifecycle state, configure or test notifications, install or remove an OpenCode, Pi, Claude Code, Codex, or Kiro integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
+description: Inspect and manage Boomux Nodes, coordinated persistent terminal Workspaces, launchers, shells, run-scoped agent instances, attention, local configuration, notifications, the OpenCode Shared Harness Runtime, process supervision, and integrations. Use when asked to discover Nodes, shells, or agents, read terminal output, inspect, validate, or edit local Boomux configuration, supervise an explicitly identified external harness run, report agent lifecycle state, configure or test notifications, install or remove an OpenCode, Pi, Claude Code, Codex, or Kiro integration, create or open Workspaces and shells, inspect status, rename or close targets, or manage the local Boomux daemon.
 compatibility: Requires boomux on PATH. Federated resource identity is the pair of owning Node ID and Node-local inner ID. Some name operations require Workspace context or an explicit --workspace/--node; agent mutation and supervision require exact shell-run context, and supervision requires caller-supplied exact canonical session identity.
 metadata:
   author: boomux
-  version: "17"
+  version: "18"
 ---
 
 # Boomux
@@ -62,7 +62,7 @@ as illustrative; `capabilities.data.json_commands` is authoritative.
 
 Most daemon-backed inspection commands automatically start Boomux when it is
 not running. This includes `list`, `shells`, `read`, `events`, workspace, shell,
-and launcher inspection, Agent, attention, and session inspection, and
+and launcher inspection, Agent and attention inspection, and
 `doctor`. Use `boomux daemon status` first when starting the daemon would be an
 unwanted side effect. `capabilities`, `project list`, `integration list`, and
 `integration status` do not start it.
@@ -118,7 +118,7 @@ temporary verified connection and does not persist registration. Registered and
 ad hoc routes do not make hostnames or addresses resource identities.
 
 Node-qualified host operations include `project list`, launcher invocation,
-integration management, Session catalogs/resume, and `open`. Preserve the same explicit `--node` on every follow-up
+integration management and `open`. Preserve the same explicit `--node` on every follow-up
 operation. Remote paths, commands, catalogs, and integration assets are resolved
 only by their owning Node. Daemon status, restart, and stop remain local and are
 not routed through registration.
@@ -303,41 +303,9 @@ startup-sampled configuration until `boomux daemon restart`. Restart applies
 the invoking client's resolved notification settings, even when the old daemon
 inherited a different config environment.
 
-Session discovery is not limited to daemon metadata. It may execute the
-PATH-resolved OpenCode, Codex, or Kiro CLI and inspect bounded Pi or Claude host
-files in workspace-derived directories, exposing sanitized but potentially
-private Session titles. Require authorization appropriate to the host-history
-metadata before listing or inspecting Sessions.
-
-Discover projected session metadata with:
-
-```console
-boomux session list --json
-boomux session list --workspace "<workspace-name-or-id>" --json
-boomux session inspect "<exact-session-id>" --json
-boomux session open "<exact-session-id>"
-boomux session resume "<exact-session-id>"
-boomux session list --node "<node>" --json
-boomux session inspect "<exact-session-id>" --node "<same-node>" --json
-boomux session open "<exact-session-id>" --node "<same-node>"
-boomux session resume "<exact-session-id>" --node "<same-node>"
-```
-
-Use the exact opaque session ID returned by `session list`. Never guess or
-resolve it from an external session ID, description, shell ID, or Agent ID.
-Session state is marked current only when an occurrence is active on the current
-run of a running retained shell; otherwise it is last-known. Catalog-only
-OpenCode or Codex history has state `unknown`, no fabricated occurrence, and a
-sanitized host title. Exact Pi, Claude, or Kiro host records may title only an
-already-observed Session and never create history. A user override still takes
-precedence over every host title.
-Protocol-13 sessions retain a `source_cwd` after shell removal so an exact
-canonical session can be resumed in its original context. Open attaches the exact
-current ShellRun with takeover or resumes an exact historical Session, and fails
-closed if that target is done, missing, ambiguous, unavailable, or changed.
-Resume always launches a native host process and requires authorization. A
-remote Session ID is exact only within its owning Node; keep the same `--node`
-used for discovery.
+Boomux no longer exposes a Session catalog, Session history, or Session resume
+command. External session IDs remain opaque integration input for exact Agent
+lifecycle correlation and supervision; never use one as a Boomux resource ID.
 
 Exact shell IDs are global only within one Node. Shell names resolve in the current workspace,
 or through `--workspace` for `shell inspect`, `shell rename`, and `shell close`.

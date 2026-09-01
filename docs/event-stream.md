@@ -49,6 +49,10 @@ part of the protocol-47 wire contract.
 Protocol 49 adds `workspace_default_cwd_changed` after the owner Workspace and
 its revision are durably persisted. Protocol-48 clients do not receive the new
 event, but their returned cursor still advances across it.
+Current daemons no longer accept the Session mutations that produced
+`agent_session_display_name_changed` or `agent_session_hidden`. Their event
+variants remain decodable for protocol-51 handoff and cursor compatibility but
+are not part of the advertised current surface.
 Protocol 50 adds `agent_session_display_name_changed` only after the owning
 Workspace metadata and incremented revision are durable. It also adds
 `agent_working_context_observed` after an exact Agent working-context observation

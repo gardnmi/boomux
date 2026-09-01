@@ -83,7 +83,6 @@ fn native_daemon_lifecycle() {
         "integration.status",
         "integration.install",
         "integration.verify",
-        "session.hide",
     ] {
         assert!(json_commands.iter().any(|current| current == command));
     }
@@ -91,6 +90,12 @@ fn native_daemon_lifecycle() {
         "opencode.claim.ensure",
         "opencode.claim.release",
         "opencode.claim.report",
+        "session.list",
+        "session.inspect",
+        "session.open",
+        "session.rename",
+        "session.reset-name",
+        "session.hide",
     ] {
         assert!(!json_commands.iter().any(|current| current == command));
     }
@@ -124,7 +129,6 @@ fn native_daemon_lifecycle() {
         "protocol_42",
         "protocol_47",
         "protocol_51",
-        "workspace_session_hiding",
         "opencode_shared_runtime_claims",
         "node_registration_management",
         "node_projection_sync",
@@ -139,8 +143,6 @@ fn native_daemon_lifecycle() {
         "remote_project_discovery",
         "remote_launcher_invocation",
         "remote_integration_management",
-        "remote_agent_session_catalog",
-        "remote_exact_session_resume",
         "global_workspaces",
         "multi_node_workspace_placements",
         "guarded_workspace_adoption",

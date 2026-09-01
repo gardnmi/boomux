@@ -661,6 +661,12 @@ federation and event lock is released.
 
 ## Reads, Mutations, And Failure
 
+Agent Session host services and exact Session resume are retired. Current owners
+reject the retained legacy list, inspect, resolve, mutation, and resume wire
+variants with `unsupported_version`; external session identity remains internal
+to Agent lifecycle and recovery. The historical protocol paragraphs below
+describe compatibility shapes, not advertised current operations.
+
 Protocol 34 routes one closed `RoutedOperation` union. It is not an arbitrary
 daemon-request envelope: creation, daemon stop/restart, Node rekey, integration
 mutation, launcher execution, attachment/session resume, and every unlisted

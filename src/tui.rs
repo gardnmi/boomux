@@ -1070,13 +1070,7 @@ enum PrimaryTab {
 }
 
 impl PrimaryTab {
-    const ALL: [Self; 5] = [
-        Self::Workspaces,
-        Self::Agents,
-        Self::Sessions,
-        Self::Shells,
-        Self::Nodes,
-    ];
+    const ALL: [Self; 4] = [Self::Workspaces, Self::Agents, Self::Shells, Self::Nodes];
 
     fn kind(self) -> Option<ItemKind> {
         match self {
@@ -8222,11 +8216,11 @@ mod tests {
         app.cycle_tab(false);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(false);
-        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
-        app.cycle_tab(false);
         assert_eq!(app.primary_tab, PrimaryTab::Shells);
+        app.cycle_tab(false);
+        assert_eq!(app.primary_tab, PrimaryTab::Nodes);
         app.cycle_tab(true);
-        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
+        assert_eq!(app.primary_tab, PrimaryTab::Shells);
         app.cycle_tab(true);
         assert_eq!(app.primary_tab, PrimaryTab::Agents);
         app.cycle_tab(true);
@@ -8332,18 +8326,16 @@ mod tests {
 
         assert!(text.contains("WORKSPACES 1"));
         assert!(text.contains("AGENTS 1"));
-        assert!(text.contains("SESSIONS 0"));
+        assert!(!text.contains("SESSIONS"));
         assert!(!text.contains("LAUNCHERS 1"));
         assert!(text.contains("SHELLS 1"));
         assert!(!text.contains("COMMANDS 1"));
         assert!(!text.contains("active agents"));
         let workspace_tab = text.find("WORKSPACES 1").expect("workspace tab");
         let agent_tab = text.find("AGENTS 1").expect("agent tab");
-        let session_tab = text.find("SESSIONS 0").expect("Session tab");
         let shell_tab = text.find("SHELLS 1").expect("Shell tab");
         assert!(workspace_tab < agent_tab);
-        assert!(agent_tab < session_tab);
-        assert!(session_tab < shell_tab);
+        assert!(agent_tab < shell_tab);
         assert!(!text.contains("NODES:"));
         assert!(!text.contains("NODE:all"));
         assert!(lines.iter().any(|line| line.contains("> mixed")));
@@ -10667,23 +10659,14 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_the_third_tab_and_first_entry_starts_one_live_load() {
+    fn sessions_are_absent_from_primary_navigation() {
         let mut app = app();
         app.nodes[0].id = "local-node".into();
 
         let effect = app.update_key(KeyCode::Char('3'), KeyModifiers::NONE);
 
-        assert_eq!(app.primary_tab, PrimaryTab::Sessions);
-        assert!(matches!(
-            effect,
-            Some(DashboardEffect::LoadSessions { nodes })
-                if nodes == vec![SessionNodeView {
-                    id: "local-node".into(),
-                    alias: "local".into(),
-                    local: true,
-                    session_display_names: false,
-                }]
-        ));
+        assert_eq!(app.primary_tab, PrimaryTab::Shells);
+        assert_eq!(effect, None);
         assert_eq!(app.update_key(KeyCode::Char('3'), KeyModifiers::NONE), None);
     }
 

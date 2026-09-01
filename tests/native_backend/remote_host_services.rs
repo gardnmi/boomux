@@ -1,15 +1,14 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use boomux::protocol::{
-    AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, AttachFrame,
-    HostServiceIntegrationAction, HostServiceOperation, HostServiceResult, RoutedOperation,
-    RoutedOperationResult, ShellSpec, WorkspaceLauncherSpec,
+    AgentAuthority, AgentRegistrationSpec, AgentReport, AgentState, ErrorCode,
+    HostServiceIntegrationAction, HostServiceOperation, HostServiceResult, ShellSpec,
+    WorkspaceLauncherSpec,
 };
 
-use crate::support::{CONTROL_MASTER_PREFIX, TestDaemon, profile, wait_until};
+use crate::support::{CONTROL_MASTER_PREFIX, TestDaemon, assert_remote_code, profile, wait_until};
 
 #[test]
 fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv() {
@@ -41,27 +40,6 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
     )
     .unwrap();
     fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
-    let resume_output = root.join("owner-resume-output");
-    let pi = owner_bin.join("pi");
-    fs::write(
-        &pi,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$1\" \"$2\" \"$PWD\" > '{}'\nprintf 'owner resume\\n'\n",
-            resume_output.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&pi, fs::Permissions::from_mode(0o700)).unwrap();
-    let pi_sessions = root.join("owner-pi-sessions");
-    fs::create_dir(&pi_sessions).unwrap();
-    fs::write(
-        pi_sessions.join("owner-session.jsonl"),
-        format!(
-            "{{\"type\":\"session\",\"version\":3,\"id\":\"pi-exact; touch local-session-pwned\",\"cwd\":\"{}\"}}\n{{\"type\":\"session_info\",\"name\":\"Owner Pi title\"}}\n",
-            owner_projects.join("remote-only").display()
-        ),
-    )
-    .unwrap();
     let kiro = owner_bin.join("kiro-cli");
     fs::write(&kiro, "#!/bin/sh\nexit 1\n").unwrap();
     fs::set_permissions(&kiro, fs::Permissions::from_mode(0o700)).unwrap();
@@ -71,7 +49,6 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
         command
             .env("PATH", &owner_path)
             .env("BOOMUX_CONFIG", &owner_config)
-            .env("PI_CODING_AGENT_SESSION_DIR", &pi_sessions)
             .env("HOME", root.join("owner-home"));
     });
     let owner_id = owner.client.node_identity().unwrap();
@@ -191,68 +168,29 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
             },
         )
         .unwrap();
-    let current_sessions = local
+    for operation in [
+        HostServiceOperation::ListAgentSessions {
+            workspace_id: Some(session_workspace.id.clone()),
+        },
+        HostServiceOperation::InspectAgentSession {
+            session_id: "retired-session".into(),
+        },
+        HostServiceOperation::ResolveAgentSession {
+            workspace_id: session_workspace.id.clone(),
+            agent_id: agent.id.clone(),
+        },
+    ] {
+        let error = local
+            .client
+            .route_node_host_service(&owner_id, operation)
+            .unwrap_err();
+        assert_remote_code(&error, ErrorCode::UnsupportedVersion);
+    }
+    let error = local
         .client
-        .route_node_host_service(
-            &owner_id,
-            HostServiceOperation::ListAgentSessions {
-                workspace_id: Some(session_workspace.id.clone()),
-            },
-        )
-        .unwrap();
-    let HostServiceResult::AgentSessions {
-        sessions: current_sessions,
-    } = current_sessions
-    else {
-        panic!("unexpected current Agent Session response");
-    };
-    assert_eq!(current_sessions.len(), 1);
-    assert!(current_sessions[0].state_is_current);
-    assert_eq!(current_sessions[0].description, "Owner Pi title");
-    let current_inspection = local
-        .client
-        .route_node_host_service(
-            &owner_id,
-            HostServiceOperation::InspectAgentSession {
-                session_id: current_sessions[0].id.clone(),
-            },
-        )
-        .unwrap();
-    let HostServiceResult::AgentSession {
-        session: current_inspection,
-    } = current_inspection
-    else {
-        panic!("unexpected current Agent Session inspection response");
-    };
-    assert_eq!(current_inspection.occurrences.len(), 1);
-    assert_eq!(current_inspection.occurrences[0].shell_id, shell_id);
-    assert_eq!(current_inspection.occurrences[0].run_id, run_id);
-    let renamed = local
-        .client
-        .route_node_operation(
-            &owner_id,
-            RoutedOperation::SetAgentSessionDisplayName {
-                operation_id: uuid::Uuid::new_v4().to_string(),
-                session_id: current_sessions[0].id.clone(),
-                expected_workspace_revision: current_sessions[0].workspace_revision,
-                display_name: Some("Remote owner name".into()),
-            },
-        )
-        .unwrap();
-    let RoutedOperationResult::AgentSessionDisplayName { outcome: renamed } = renamed else {
-        panic!("unexpected routed Session display-name response");
-    };
-    assert_eq!(
-        renamed.user_display_name.as_deref(),
-        Some("Remote owner name")
-    );
-    assert_eq!(
-        renamed.workspace_revision,
-        current_sessions[0].workspace_revision + 1
-    );
-    assert_eq!(renamed.session_id, current_sessions[0].id);
-    assert_eq!(renamed.workspace_id, session_workspace.id);
-    assert!(renamed.changed);
+        .resume_agent_session(Some(&owner_id), "retired-session", profile())
+        .unwrap_err();
+    assert_remote_code(&error, ErrorCode::UnsupportedVersion);
     assert!(local.client.snapshot().unwrap().workspaces.is_empty());
     owner
         .client
@@ -267,104 +205,14 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
             },
         )
         .unwrap();
-    let sessions = local
-        .client
-        .route_node_host_service(
-            &owner_id,
-            HostServiceOperation::ListAgentSessions {
-                workspace_id: Some(session_workspace.id.clone()),
-            },
-        )
-        .unwrap();
-    let HostServiceResult::AgentSessions { sessions } = sessions else {
-        panic!("unexpected Agent Session response");
-    };
-    assert_eq!(sessions.len(), 1);
-    let mut resumed = local
-        .client
-        .resume_agent_session(Some(&owner_id), &sessions[0].id, profile())
-        .unwrap();
-    let mut terminal_output = Vec::new();
-    loop {
-        match AttachFrame::read_from(&mut resumed.stream).unwrap() {
-            AttachFrame::Output(bytes) => terminal_output.extend(bytes),
-            AttachFrame::Detached => break,
-            _ => {}
-        }
-    }
-    assert!(String::from_utf8_lossy(&terminal_output).contains("owner resume"));
+    let recovered_agent = owner.client.get_agent(&agent.id).unwrap();
     assert_eq!(
-        fs::read_to_string(&resume_output).unwrap(),
-        format!(
-            "--session\n{}\n{}\n",
-            hostile_session_id,
-            owner_projects.join("remote-only").display(),
-        )
+        recovered_agent.external_session_id.as_deref(),
+        Some(hostile_session_id)
     );
-    assert!(!root.join("local-session-pwned").exists());
+    assert_eq!(recovered_agent.observation.state, AgentState::Inactive);
     assert!(local.client.snapshot().unwrap().workspaces.is_empty());
     drop(owner_attachment);
-
-    let hidden = local
-        .client
-        .route_node_operation(
-            &owner_id,
-            RoutedOperation::HideAgentSession {
-                operation_id: uuid::Uuid::new_v4().to_string(),
-                session_id: sessions[0].id.clone(),
-                workspace_id: session_workspace.id.clone(),
-                expected_workspace_revision: sessions[0].workspace_revision,
-            },
-        )
-        .unwrap();
-    assert!(matches!(
-        hidden,
-        RoutedOperationResult::AgentSessionHidden { ref outcome } if outcome.changed
-    ));
-    assert!(
-        local
-            .client
-            .resume_agent_session(Some(&owner_id), &sessions[0].id, profile())
-            .is_err()
-    );
-    let HostServiceResult::AgentSessions { sessions: current } = local
-        .client
-        .route_node_host_service(
-            &owner_id,
-            HostServiceOperation::ListAgentSessions {
-                workspace_id: Some(session_workspace.id.clone()),
-            },
-        )
-        .unwrap()
-    else {
-        panic!("unexpected hidden Agent Session response");
-    };
-    assert!(current.is_empty());
-
-    let mut stream = UnixStream::connect(local.client.socket_path()).unwrap();
-    boomux::protocol::write_message(
-        &mut stream,
-        &boomux::protocol::Envelope::with_version(
-            50,
-            boomux::protocol::Request::RouteNodeHostService {
-                node_id: owner_id.clone(),
-                operation: HostServiceOperation::ListAgentSessions {
-                    workspace_id: Some(session_workspace.id.clone()),
-                },
-            },
-        ),
-    )
-    .unwrap();
-    let response: boomux::protocol::Envelope<boomux::protocol::Response> =
-        boomux::protocol::read_message(&mut stream).unwrap();
-    let boomux::protocol::Response::HostService {
-        result: HostServiceResult::AgentSessions { sessions: old },
-    } = response.message
-    else {
-        panic!("unexpected protocol-50 remote Session response");
-    };
-    assert_eq!(response.version, 50);
-    assert_eq!(old.len(), 1);
 
     let preview = local
         .client

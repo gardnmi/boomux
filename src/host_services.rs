@@ -13,15 +13,19 @@ use serde::Deserialize;
 
 use crate::generated_names;
 use crate::integration_management::{self, IntegrationId};
+#[cfg(test)]
 use crate::protocol::{
-    AgentAttentionReason, AgentInstanceSnapshot, AgentWorkingContextSnapshot,
-    HostAgentSessionAttention, HostAgentSessionInspection, HostAgentSessionResumePlan,
+    AgentAttentionReason, HostAgentSessionAttention, HostAgentSessionInspection,
     HostAgentSessionSummary, HostAgentSessionWorkingContext, HostGitPushStatus,
-    HostGitWorktreeStatus, HostIntegrationMutationResult, HostIntegrationPlan,
-    HostIntegrationStatus, HostProjectDiscovery, HostProjectSnapshot, HostServiceIntegrationAction,
-    MAX_HOST_SERVICE_PROJECTS, MAX_HOST_SERVICE_SESSIONS, MAX_HOST_SERVICE_WARNINGS,
-    MAX_SESSION_INSPECTION_WORKING_CONTEXTS, MAX_SESSION_WORKING_CONTEXTS, Snapshot,
-    WorkspaceLauncherSnapshot, WorkspaceSnapshot,
+    HostGitWorktreeStatus, MAX_HOST_SERVICE_SESSIONS, MAX_SESSION_INSPECTION_WORKING_CONTEXTS,
+    MAX_SESSION_WORKING_CONTEXTS,
+};
+use crate::protocol::{
+    AgentInstanceSnapshot, AgentWorkingContextSnapshot, HostAgentSessionResumePlan,
+    HostIntegrationMutationResult, HostIntegrationPlan, HostIntegrationStatus,
+    HostProjectDiscovery, HostProjectSnapshot, HostServiceIntegrationAction,
+    MAX_HOST_SERVICE_PROJECTS, MAX_HOST_SERVICE_WARNINGS, Snapshot, WorkspaceLauncherSnapshot,
+    WorkspaceSnapshot,
 };
 use crate::session_projection::{self, SessionProjection};
 
@@ -106,12 +110,14 @@ pub(crate) fn inspect_working_context(
     }))
 }
 
+#[cfg(test)]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct WorkingContextPresentationStatus {
     push_status: Option<HostGitPushStatus>,
     worktree_status: Option<HostGitWorktreeStatus>,
 }
 
+#[cfg(test)]
 fn inspect_presentation_status(
     context: &AgentWorkingContextSnapshot,
 ) -> WorkingContextPresentationStatus {
@@ -134,6 +140,7 @@ fn inspect_presentation_status(
     }
 }
 
+#[cfg(test)]
 fn inspect_push_status(
     context: &AgentWorkingContextSnapshot,
 ) -> io::Result<Option<HostGitPushStatus>> {
@@ -164,6 +171,7 @@ fn inspect_push_status(
     Ok(git_output(&context.worktree_root, &["remote"])?.map(|_| HostGitPushStatus::Unpublished))
 }
 
+#[cfg(test)]
 fn inspect_worktree_status(
     context: &AgentWorkingContextSnapshot,
 ) -> io::Result<Option<HostGitWorktreeStatus>> {
@@ -183,6 +191,7 @@ fn inspect_worktree_status(
     parse_worktree_status(&output, &context.branch)
 }
 
+#[cfg(test)]
 fn parse_worktree_status(
     output: &str,
     expected_branch: &str,
@@ -913,6 +922,7 @@ pub(crate) fn sessions_with_catalog(
     session_projection::project_snapshot_with_catalog(snapshot, Some(catalog))
 }
 
+#[cfg(test)]
 pub(crate) fn session_summaries(
     snapshot: &Snapshot,
     sessions: &[SessionProjection],
@@ -920,6 +930,7 @@ pub(crate) fn session_summaries(
     session_summaries_with_context_limit(snapshot, sessions, MAX_SESSION_WORKING_CONTEXTS)
 }
 
+#[cfg(test)]
 fn session_summaries_with_context_limit(
     snapshot: &Snapshot,
     sessions: &[SessionProjection],
@@ -1041,6 +1052,7 @@ fn session_summaries_with_context_limit(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn session_summary_with_snapshot(
     snapshot: &Snapshot,
     session: &SessionProjection,
@@ -1050,6 +1062,7 @@ pub(crate) fn session_summary_with_snapshot(
         .expect("one Session produces one summary")
 }
 
+#[cfg(test)]
 fn session_inspection_summary_with_snapshot(
     snapshot: &Snapshot,
     session: &SessionProjection,
@@ -1063,6 +1076,7 @@ fn session_inspection_summary_with_snapshot(
     .expect("one Session produces one inspection summary")
 }
 
+#[cfg(test)]
 fn session_summary(
     session: &SessionProjection,
     latest_agent_name: Option<String>,
@@ -1093,6 +1107,7 @@ fn session_summary(
     }
 }
 
+#[cfg(test)]
 fn attention_rank(reason: AgentAttentionReason) -> u8 {
     match reason {
         AgentAttentionReason::Blocked => 0,
@@ -1100,6 +1115,7 @@ fn attention_rank(reason: AgentAttentionReason) -> u8 {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn inspect_projected_session(
     snapshot: &Snapshot,
     sessions: &[SessionProjection],
