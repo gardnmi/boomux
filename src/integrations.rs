@@ -18,6 +18,7 @@ pub fn validate_external_session_id(value: &str) -> Result<(), &'static str> {
 pub enum InstallTargetKind {
     OpenCode,
     Pi,
+    Omp,
     Claude,
     Codex,
     Kiro,
@@ -156,6 +157,27 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
     run_scoped_launcher: None,
 };
 
+pub const OMP: IntegrationDescriptor = IntegrationDescriptor {
+    key: "omp",
+    display_name: "Oh My Pi",
+    installation: Some(InstallationCapability {
+        package: "omp",
+        validated_version: "18.0.4",
+        asset_name: "extension",
+        content: include_str!("../integrations/omp/boomux.ts"),
+        executable: "omp",
+        reload_message: "Restart any running Oh My Pi process to activate the extension",
+        target: InstallTargetKind::Omp,
+    }),
+    titles: None,
+    resume: Some(ResumeCapability {
+        executable: "omp",
+        arguments_before_session: &["--resume"],
+    }),
+    foreground: Some(ForegroundCapability { process_name: "omp" }),
+    run_scoped_launcher: None,
+};
+
 pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
     key: "claude",
     display_name: "Claude Code",
@@ -234,7 +256,7 @@ pub const KIRO: IntegrationDescriptor = IntegrationDescriptor {
     run_scoped_launcher: Some(RunScopedLauncher::Kiro),
 };
 
-pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE, CODEX, KIRO];
+pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, OMP, CLAUDE, CODEX, KIRO];
 
 pub fn by_key(key: &str) -> Option<&'static IntegrationDescriptor> {
     descriptor_by_key(ALL, key)
@@ -387,6 +409,10 @@ mod tests {
                 "--resume-id".into(),
                 "session-3".into()
             ])
+        );
+        assert_eq!(
+            OMP.resume.unwrap().command(&[], "session-omp"),
+            Some(vec!["omp".into(), "--resume".into(), "session-omp".into()])
         );
     }
 }

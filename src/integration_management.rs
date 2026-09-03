@@ -72,6 +72,7 @@ pub(crate) struct IntegrationId(&'static IntegrationDescriptor);
 impl IntegrationId {
     pub(crate) const OPENCODE: Self = Self(&boomux::integrations::OPENCODE);
     pub(crate) const PI: Self = Self(&boomux::integrations::PI);
+    pub(crate) const OMP: Self = Self(&boomux::integrations::OMP);
     pub(crate) const CODEX: Self = Self(&boomux::integrations::CODEX);
     pub(crate) const KIRO: Self = Self(&boomux::integrations::KIRO);
     #[allow(non_upper_case_globals)]
@@ -950,6 +951,10 @@ fn config_root(id: IntegrationId, environment: &Environment) -> Result<PathBuf, 
             environment.pi_coding_agent_dir.clone(),
             environment.home.clone(),
         ),
+        InstallTargetKind::Omp => omp_config_root(
+            environment.pi_coding_agent_dir.clone(),
+            environment.home.clone(),
+        ),
         InstallTargetKind::Claude => claude_config_root(
             environment.claude_config_dir.clone(),
             environment.home.clone(),
@@ -973,6 +978,10 @@ fn target_at(id: IntegrationId, config_root: &Path) -> InstallTarget {
             directory: config_root.join("extensions"),
             path: config_root.join("extensions/boomux.js"),
         },
+        InstallTargetKind::Omp => InstallTarget {
+            directory: config_root.join("extensions"),
+            path: config_root.join("extensions/boomux.ts"),
+        },
         InstallTargetKind::Claude => InstallTarget {
             directory: config_root.join("skills/boomux/.claude-plugin"),
             path: config_root.join("skills/boomux/.claude-plugin/plugin.json"),
@@ -993,6 +1002,7 @@ const fn config_root_name(id: IntegrationId) -> &'static str {
     match id.installation().target {
         InstallTargetKind::OpenCode => "XDG configuration root",
         InstallTargetKind::Pi => "Pi configuration root",
+        InstallTargetKind::Omp => "Oh My Pi configuration root",
         InstallTargetKind::Claude => "Claude configuration root",
         InstallTargetKind::Codex => "Codex configuration root",
         InstallTargetKind::Kiro => "Kiro configuration root",
@@ -1042,6 +1052,34 @@ pub(crate) fn pi_config_root(
         None => home()?.join(".pi/agent"),
     };
     require_absolute_root(&root, "Pi configuration root")?;
+    Ok(root)
+}
+
+pub(crate) fn omp_config_root(
+    pi_coding_agent_dir: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let home = || -> Result<PathBuf, Box<dyn Error>> {
+        home.clone().map(PathBuf::from).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HOME must be set to install the Boomux Oh My Pi extension",
+            )
+            .into()
+        })
+    };
+    let root = match pi_coding_agent_dir.filter(|value| !value.is_empty()) {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            if let Ok(suffix) = root.strip_prefix("~") {
+                home()?.join(suffix)
+            } else {
+                root
+            }
+        }
+        None => home()?.join(".omp/agent"),
+    };
+    require_absolute_root(&root, "Oh My Pi configuration root")?;
     Ok(root)
 }
 
@@ -1691,6 +1729,19 @@ mod tests {
             pi_config_root(Some("~/.config/pi".into()), Some("/home/example".into())).unwrap(),
             Path::new("/home/example/.config/pi")
         );
+        assert_eq!(
+            omp_config_root(None, Some("/home/example".into())).unwrap(),
+            Path::new("/home/example/.omp/agent")
+        );
+        assert_eq!(
+            omp_config_root(Some("~/.config/omp".into()), Some("/home/example".into())).unwrap(),
+            Path::new("/home/example/.config/omp")
+        );
+        assert!(omp_config_root(Some("relative".into()), None).is_err());
+        assert_eq!(
+            omp_config_root(None, None).unwrap_err().to_string(),
+            "HOME must be set to install the Boomux Oh My Pi extension"
+        );
         assert!(pi_config_root(Some("relative".into()), None).is_err());
         assert_eq!(
             claude_config_root(Some("/claude".into()), Some("/home/example".into())).unwrap(),
@@ -2032,6 +2083,27 @@ mod tests {
         );
         assert!(!path.exists());
         assert!(path.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn omp_install_and_uninstall_leave_herdr_agent_state_untouched() {
+        let home = TestDirectory::new("omp-install");
+        let environment = environment(&home.0);
+        let extensions = home.0.join(".omp/agent/extensions");
+        fs::create_dir_all(&extensions).unwrap();
+        let neighbor = extensions.join("herdr-omp-agent-state.ts");
+        fs::write(&neighbor, "dummy").unwrap();
+
+        let installed = install(IntegrationId::OMP, &environment, false).unwrap();
+        let path = PathBuf::from(&installed.path);
+        assert_eq!(path, home.0.join(".omp/agent/extensions/boomux.ts"));
+        assert!(!installed.path.contains("herdr-omp-agent-state.ts"));
+        assert_eq!(fs::read_to_string(&neighbor).unwrap(), "dummy");
+
+        let removed = uninstall(IntegrationId::OMP, &environment, false).unwrap();
+        assert_eq!(removed.result, UninstallOutcome::Removed);
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&neighbor).unwrap(), "dummy");
     }
 
     #[test]
