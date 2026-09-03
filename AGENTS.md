@@ -58,6 +58,36 @@ exercise process, socket, PTY, and daemon lifecycle behavior.
 | OpenCode, Pi, Claude, Codex, or Kiro reducer | The corresponding focused reducer tests, including `boomux-tui.test.js` for OpenCode TUI claims |
 | Host compatibility claim | Focused fixtures plus an update to `docs/lifecycle-validation.md` when validated live |
 
+## Performance And Memory
+
+Treat CPU efficiency and memory use as design constraints for every runtime
+change, not as cleanup work deferred until after correctness. Consider both the
+fixed daemon footprint and the marginal cost of each Shell, active terminal,
+Agent, attachment, and remote Node.
+
+- Evaluate idle and output-heavy behavior at realistic scale. A change that is
+  cheap for one terminal or client may be unacceptable across hundreds or
+  thousands.
+- Avoid per-Shell or per-attachment heavyweight runtimes, duplicate terminal
+  state, unnecessary output copies, polling loops, and work proportional to all
+  managed resources when only one resource changed.
+- Bound queues, buffers, histories, caches, projections, and persisted
+  collections. Define overload behavior explicitly rather than allowing memory
+  growth to become implicit backpressure.
+- Reclaim runtime state promptly after attachments disconnect and Shells,
+  Agents, or Nodes close. Test repeated create/attach/detach/close cycles when a
+  change could retain allocations, tasks, descriptors, or subprocesses.
+- Preserve idle efficiency. Background maintenance should be event-driven or
+  use bounded adaptive intervals, and should not wake per managed resource
+  without evidence that the cost is necessary.
+- For performance-sensitive changes, measure before and after using the same
+  machine, build profile, fixtures, and workload. Report fixed cost, marginal
+  cost per scaled resource, steady-state CPU, peak memory, and retained memory
+  after cleanup when applicable.
+- Do not trade correctness, lifecycle authority, or bounded behavior for a
+  benchmark result. Document any intentional performance or memory regression
+  with evidence and rationale in the PR.
+
 ## Safety And Compatibility
 
 - `boomux daemon stop` terminates every managed process. Prefer
