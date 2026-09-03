@@ -518,6 +518,9 @@ The daemon supports:
 - Bounded VT state and sanitized reconnect reconstruction
 - One primary writable attachment with explicit takeover and up to four
   collaborative exact-run attachments
+- Bounded backpressured output delivery to the primary attachment, while a
+  saturated collaborative attachment is disconnected rather than stalling PTY
+  output
 - Serialized whole-frame PTY input from every participant, with resize authority
   retained exclusively by the primary
 - Pending shell metadata and first-attachment terminal negotiation

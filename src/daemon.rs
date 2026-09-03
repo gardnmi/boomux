@@ -6919,7 +6919,7 @@ impl ShellRuntimeManager {
             let disconnect = controller.as_ref().is_some_and(|current| {
                 current
                     .output
-                    .try_send(ControllerOutput::Data(bytes.to_vec()))
+                    .send(ControllerOutput::Data(bytes.to_vec()))
                     .is_err()
             });
             if disconnect && let Some(current) = controller.take() {
@@ -16561,6 +16561,12 @@ impl ShellRuntimeManager {
                         }
                     }
                 }
+                // A primary controller applies backpressure to the PTY reader so
+                // bursty, indivisible protocols such as Kitty graphics are not
+                // truncated when the small output queue fills. Drop the receiver
+                // before taking the controller lock so a blocked sender can wake
+                // up if the socket writer fails.
+                drop(receiver);
                 if !reconnect {
                     let _ = AttachFrame::Detached.write_to(&mut output_stream);
                 }
@@ -20098,6 +20104,74 @@ mod tests {
             collaborator.recv().unwrap(),
             ControllerOutput::Data(bytes) if bytes == b"queued"
         ));
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn primary_output_applies_backpressure_instead_of_disconnect() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let primary = install_test_controller(&runtime, "primary");
+        lock(&runtime.controller)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .output
+            .send(ControllerOutput::Data(b"queued".to_vec()))
+            .unwrap();
+        let (started_sender, started_receiver) = mpsc::sync_channel(0);
+        let (completed_sender, completed_receiver) = mpsc::sync_channel(0);
+        let runtime_for_output = Arc::clone(&runtime);
+        let output = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            ShellRuntimeManager::fanout_output(&runtime_for_output, b"next");
+            completed_sender.send(()).unwrap();
+        });
+
+        started_receiver.recv().unwrap();
+        assert!(matches!(
+            completed_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            primary.recv().unwrap(),
+            ControllerOutput::Data(bytes) if bytes == b"queued"
+        ));
+        completed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        output.join().unwrap();
+        assert!(matches!(
+            primary.recv().unwrap(),
+            ControllerOutput::Data(bytes) if bytes == b"next"
+        ));
+        assert!(lock(&runtime.controller).unwrap().is_some());
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn disconnected_primary_unblocks_backpressured_output() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let primary = install_test_controller(&runtime, "primary");
+        lock(&runtime.controller)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .output
+            .send(ControllerOutput::Data(b"queued".to_vec()))
+            .unwrap();
+        let runtime_for_output = Arc::clone(&runtime);
+        let output =
+            thread::spawn(move || ShellRuntimeManager::fanout_output(&runtime_for_output, b"next"));
+
+        drop(primary);
+        output.join().unwrap();
+        assert!(lock(&runtime.controller).unwrap().is_none());
+
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
     }
