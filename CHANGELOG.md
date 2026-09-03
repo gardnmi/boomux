@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.2](https://github.com/gardnmi/boomux/compare/v1.9.1...v1.9.2) (2026-09-03)
+
+
+### Bug Fixes
+
+* **codex:** clear cached bash command paths ([#347](https://github.com/gardnmi/boomux/issues/347)) ([62d8d01](https://github.com/gardnmi/boomux/commit/62d8d01c0dfec4def761a0dba44845523b74bedb))
+
 ## [1.9.1](https://github.com/gardnmi/boomux/compare/v1.9.0...v1.9.1) (2026-09-01)
 
 
