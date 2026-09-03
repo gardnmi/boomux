@@ -99,6 +99,7 @@ function installHandlers(lifecycle, options = {}) {
       idleDebounceMs: options.idleDebounceMs ?? 25,
       retryGraceMs: options.retryGraceMs ?? 50,
       log: options.log ?? (() => {}),
+      renamer: options.renamer,
     },
   );
   return { handlers, clock };
@@ -118,6 +119,61 @@ function recordingLifecycle() {
 function states(calls) {
   return calls.map((argv) => argv[argv.indexOf("--state") + 1]);
 }
+
+function renameArgv(calls) {
+  return calls.filter(
+    (argv) => argv[0] === "boomux" && argv[1] === "shell" && argv[2] === "rename",
+  );
+}
+
+function renameContext(userText, extras = {}) {
+  const model = extras.model ?? {
+    provider: "lm-studio",
+    id: "google/gemma-4-e4b",
+  };
+  const find =
+    extras.find ??
+    ((provider, id) =>
+      provider === "lm-studio" && id === "google/gemma-4-e4b" ? model : null);
+  const branch =
+    extras.branch ??
+    (userText == null
+      ? []
+      : [
+          {
+            type: "message",
+            message: {
+              role: "user",
+              content: [{ type: "text", text: userText }],
+            },
+          },
+        ]);
+  const sessionManager = {
+    getSessionId: () => extras.sessionID ?? "session-1",
+  };
+  if (extras.getBranch !== false) {
+    sessionManager.getBranch = extras.getBranch ?? (() => branch);
+  }
+  const ctx = {
+    hasUI: true,
+    sessionManager,
+  };
+  if (extras.modelRegistry !== null) {
+    ctx.modelRegistry = {
+      find,
+      hasConfiguredAuth: extras.hasConfiguredAuth ?? (() => true),
+      complete: extras.complete,
+    };
+  }
+  return ctx;
+}
+
+function alreadyExists(message = "shell name already exists") {
+  const error = new Error(message);
+  error.code = "already_exists";
+  return error;
+}
+
 
 describe("OMP lifecycle", () => {
   test("registers no handlers unless both Boomux env vars are set", () => {
@@ -623,3 +679,181 @@ describe("OMP lifecycle", () => {
     expect(child.stderr.destroyed).toBe(true);
   });
 });
+
+describe("OMP turn rename", () => {
+  test('sanitizeShellName("Fix Auth Token!") === "fix-auth-token"', () => {
+    expect(__internal.sanitizeShellName("Fix Auth Token!")).toBe(
+      "fix-auth-token",
+    );
+  });
+
+  test('sanitizeShellName("!!!") === undefined', () => {
+    expect(__internal.sanitizeShellName("!!!")).toBeUndefined();
+  });
+
+  test('sanitizeShellName("9lives") starts with t-', () => {
+    expect(__internal.sanitizeShellName("9lives")).toStartWith("t-");
+  });
+
+  test("does not emit shell rename argv when Boomux env vars are missing", async () => {
+    const calls = [];
+    const run = async (argv) => {
+      calls.push(argv);
+      return { data: { ok: true } };
+    };
+    expect(__internal.createTurnRenamer({ env: {}, run })).toBeUndefined();
+    expect(
+      __internal.createTurnRenamer({
+        env: { BOOMUX_SHELL_ID: "shell-1" },
+        run,
+      }),
+    ).toBeUndefined();
+    expect(
+      __internal.createTurnRenamer({ env: { BOOMUX_RUN_ID: "run-1" }, run }),
+    ).toBeUndefined();
+
+    withBoomuxEnv({}, () => {
+      BoomuxOmpExtension({
+        on: () => {
+          throw new Error("should not register handlers");
+        },
+      });
+    });
+
+    expect(renameArgv(calls)).toEqual([]);
+  });
+
+  test("skips rename when model find returns null", async () => {
+    const calls = [];
+    const completeCalls = [];
+    const renamer = __internal.createTurnRenamer({
+      env: { BOOMUX_SHELL_ID: "shell-1", BOOMUX_RUN_ID: "run-1" },
+      run: async (argv) => {
+        calls.push(argv);
+        return { data: { ok: true } };
+      },
+      log: () => {},
+    });
+    const ctx = renameContext("Fix the login bug", {
+      find: () => null,
+      complete: async (...args) => {
+        completeCalls.push(args);
+        return { content: [{ type: "text", text: "Fix the login bug" }] };
+      },
+    });
+
+    await renamer.enqueue(ctx, { type: "agent_start" });
+    await renamer.idle();
+
+    expect(renameArgv(calls)).toEqual([]);
+    expect(completeCalls).toEqual([]);
+  });
+
+  test("renames the Boomux shell from complete text", async () => {
+    const calls = [];
+    const completeCalls = [];
+    const model = { provider: "lm-studio", id: "google/gemma-4-e4b" };
+    const renamer = __internal.createTurnRenamer({
+      env: { BOOMUX_SHELL_ID: "shell-1", BOOMUX_RUN_ID: "run-1" },
+      run: async (argv) => {
+        calls.push(argv);
+        return { data: { ok: true } };
+      },
+      log: () => {},
+    });
+    const ctx = renameContext("Please fix the login bug", {
+      model,
+      complete: async (...args) => {
+        completeCalls.push(args);
+        return { content: [{ type: "text", text: "Fix the login bug" }] };
+      },
+    });
+
+    await renamer.enqueue(ctx, { type: "agent_start" });
+    await renamer.idle();
+
+    expect(renameArgv(calls)).toEqual([
+      ["boomux", "shell", "rename", "shell-1", "fix-the-login-bug", "--json"],
+    ]);
+    expect(completeCalls).toHaveLength(1);
+    expect(completeCalls[0][0]).toBe(model);
+  });
+
+  test("re-completes once on already_exists without a local -2 suffix", async () => {
+    const calls = [];
+    const completeTexts = [];
+    const model = { provider: "lm-studio", id: "google/gemma-4-e4b" };
+    let renameAttempts = 0;
+    const renamer = __internal.createTurnRenamer({
+      env: { BOOMUX_SHELL_ID: "shell-1", BOOMUX_RUN_ID: "run-1" },
+      run: async (argv) => {
+        calls.push(argv);
+        if (argv[1] === "shell" && argv[2] === "rename") {
+          renameAttempts += 1;
+          if (renameAttempts === 1) throw alreadyExists();
+        }
+        return { data: { ok: true } };
+      },
+      log: () => {},
+    });
+    const ctx = renameContext("Please fix the login bug", {
+      model,
+      complete: async (_model, request) => {
+        const text = request.messages
+          .flatMap((message) => message.content)
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("\n");
+        completeTexts.push(text);
+        if (completeTexts.length === 1) {
+          return { content: [{ type: "text", text: "Fix the login bug" }] };
+        }
+        return { content: [{ type: "text", text: "repair login flow" }] };
+      },
+    });
+
+    await renamer.enqueue(ctx, { type: "agent_start" });
+    await renamer.idle();
+
+    expect(completeTexts).toHaveLength(2);
+    expect(completeTexts[1]).toContain(
+      "That name is taken. Pick a different name.",
+    );
+    expect(renameArgv(calls)).toEqual([
+      ["boomux", "shell", "rename", "shell-1", "fix-the-login-bug", "--json"],
+      ["boomux", "shell", "rename", "shell-1", "repair-login-flow", "--json"],
+    ]);
+    expect(calls.some((argv) => argv.includes("fix-the-login-bug-2"))).toBe(
+      false,
+    );
+  });
+
+  test("rename failure does not throw from agent_start", async () => {
+    const lifecycle = recordingLifecycle();
+    const run = async (argv) => {
+      if (argv[1] === "shell") {
+        const error = new Error("boomux unavailable");
+        error.code = "daemon_unavailable";
+        throw error;
+      }
+      return { data: { ok: true } };
+    };
+    const renamer = __internal.createTurnRenamer({
+      env: { BOOMUX_SHELL_ID: "shell-1", BOOMUX_RUN_ID: "run-1" },
+      run,
+      log: () => {},
+    });
+    const { handlers } = installHandlers(lifecycle, { renamer });
+    const ctx = renameContext("Fix the login bug", {
+      complete: async () => ({
+        content: [{ type: "text", text: "Fix the login bug" }],
+      }),
+    });
+
+    await handlers.get("agent_start")({ type: "agent_start" }, ctx);
+    await renamer.idle();
+
+    expect(lifecycle.calls.map((call) => call[1])).toEqual(["working"]);
+  });
+});
+

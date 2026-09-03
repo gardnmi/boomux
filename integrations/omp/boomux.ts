@@ -6,6 +6,9 @@ const COMMAND_TIMEOUT_MS = 1_000;
 const LOG_INTERVAL_MS = 30_000;
 const IDLE_DEBOUNCE_MS = 250;
 const RETRY_GRACE_MS = 2500;
+const RENAME_COMPLETE_MS = 8_000;
+const RENAME_USER_TEXT_MAX = 500;
+
 const LIFECYCLE_AUTHORITY = "lifecycle_integration";
 const LIFECYCLE_CONFIDENCE = 100;
 const DEFAULT_EVIDENCE = "Oh My Pi lifecycle event";
@@ -392,6 +395,211 @@ function currentSessionID(ctx) {
   return text(ctx?.sessionManager?.getSessionId?.());
 }
 
+function sanitizeShellName(raw) {
+  let s = String(raw || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
+  if (s.length < 2) return undefined;
+  if (!/^[a-z]/.test(s)) s = `t-${s}`.slice(0, 40);
+  return s;
+}
+
+function extractTextParts(content) {
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return [];
+  const parts = [];
+  for (const part of content) {
+    if (part?.type === "text" && typeof part.text === "string") {
+      parts.push(part.text);
+    }
+  }
+  return parts;
+}
+
+function latestUserText(ctx, event) {
+  const branch = ctx?.sessionManager?.getBranch?.();
+  if (Array.isArray(branch)) {
+    for (let index = branch.length - 1; index >= 0; index -= 1) {
+      const entry = branch[index];
+      if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+      const value = extractTextParts(entry.message.content).join("\n").trim();
+      if (value) return value;
+    }
+  }
+  return (
+    text(event?.prompt) ?? text(event?.text) ?? text(event?.userText)
+  );
+}
+
+function renamePrompt(userText, takenHint) {
+  const lines = [
+    "Reply with only a Boomux shell name: 2 to 4 lowercase words joined by hyphens. Characters [a-z0-9-] only. Maximum 40 characters. No quotes, punctuation, or explanation.",
+    "",
+    "User request:",
+    String(userText).slice(0, RENAME_USER_TEXT_MAX),
+  ];
+  if (takenHint) lines.push("That name is taken. Pick a different name.");
+  return lines.join("\n");
+}
+
+function createTurnRenamer({
+  env,
+  run,
+  log = console.error,
+  now,
+  completeTimeoutMs = RENAME_COMPLETE_MS,
+} = {}) {
+  const shellID = text(env?.BOOMUX_SHELL_ID);
+  const runID = text(env?.BOOMUX_RUN_ID);
+  if (!shellID || !runID) return undefined;
+
+  const reportError = rateLimitedLogger(log, now);
+  let queue = Promise.resolve();
+  let generating = false;
+  let pendingText;
+  let pendingCtx;
+
+  async function completeName(ctx, userText, takenHint) {
+    try {
+      const model = ctx?.modelRegistry?.find?.(
+        "lm-studio",
+        "google/gemma-4-e4b",
+      );
+      if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
+        return undefined;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), completeTimeoutMs);
+      timer.unref?.();
+      try {
+        const response = await ctx.modelRegistry.complete(
+          model,
+          {
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: renamePrompt(userText, takenHint) },
+                ],
+              },
+            ],
+          },
+          {
+            reasoningEffort: "off",
+            cacheRetention: "none",
+            signal: controller.signal,
+          },
+        );
+        const content = Array.isArray(response?.content)
+          ? response.content
+          : [];
+        return sanitizeShellName(
+          content
+            .filter((part) => part?.type === "text")
+            .map((part) => part.text)
+            .join(""),
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (error) {
+      reportError(error);
+      return undefined;
+    }
+  }
+
+  async function currentName() {
+    try {
+      const result = await run([
+        "boomux",
+        "shell",
+        "inspect",
+        shellID,
+        "--json",
+      ]);
+      return (
+        text(result?.data?.shell?.name) ??
+        text(result?.shell?.name) ??
+        text(result?.data?.name)
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function runOnce(ctx, userText) {
+    const name = await completeName(ctx, userText, false);
+    if (!name) return;
+    if ((await currentName()) === name) return;
+    try {
+      await run(["boomux", "shell", "rename", shellID, name, "--json"]);
+    } catch (error) {
+      if (error?.code === "invalid_argument") return;
+      if (error?.code !== "already_exists") throw error;
+      const retryName = await completeName(ctx, userText, true);
+      if (!retryName || retryName === name) return;
+      if ((await currentName()) === retryName) return;
+      try {
+        await run([
+          "boomux",
+          "shell",
+          "rename",
+          shellID,
+          retryName,
+          "--json",
+        ]);
+      } catch (retryError) {
+        if (
+          retryError?.code === "already_exists" ||
+          retryError?.code === "invalid_argument"
+        ) {
+          return;
+        }
+        throw retryError;
+      }
+    }
+  }
+
+  function enqueue(ctx, event) {
+    const userText = latestUserText(ctx, event);
+    if (!userText || userText.startsWith("/")) return queue;
+    pendingText = userText;
+    pendingCtx = ctx;
+    if (generating) return queue;
+    generating = true;
+    const pending = queue.then(async () => {
+      try {
+        while (pendingText) {
+          const nextText = pendingText;
+          const nextCtx = pendingCtx;
+          pendingText = undefined;
+          pendingCtx = undefined;
+          try {
+            await runOnce(nextCtx, nextText);
+          } catch (error) {
+            reportError(error);
+          }
+        }
+      } finally {
+        generating = false;
+      }
+      if (pendingText) enqueue(pendingCtx, event);
+    });
+    queue = pending.catch(reportError);
+    return queue;
+  }
+
+  return {
+    enqueue,
+    idle() {
+      return queue;
+    },
+  };
+}
+
 function registerLifecycleHandlers(pi, lifecycle, options = {}) {
   const outcomes = createOutcomeTracker();
   const schedule = options.setTimeout ?? setTimeout;
@@ -565,13 +773,15 @@ function registerLifecycleHandlers(pi, lifecycle, options = {}) {
   );
   pi.on(
     "agent_start",
-    guard((_event, ctx) => {
+    guard((event, ctx) => {
       if (!requireRoot(ctx)) return;
       outcomes.clear(currentSessionID(ctx));
       clearPendingTimers();
       clearFailureState();
       agentActive = true;
-      return publish(ctx);
+      const published = publish(ctx);
+      options.renamer?.enqueue(ctx, event);
+      return published;
     }),
   );
   pi.on(
@@ -648,12 +858,13 @@ function registerLifecycleHandlers(pi, lifecycle, options = {}) {
 }
 
 export default function BoomuxOmpExtension(pi) {
-  const lifecycle = createLifecycle({
-    env: globalThis.process?.env ?? {},
-    run: createProcessRunner(),
-  });
+  const env = globalThis.process?.env ?? {};
+  const run = createProcessRunner();
+  const lifecycle = createLifecycle({ env, run });
   if (!lifecycle) return;
-  registerLifecycleHandlers(pi, lifecycle);
+  registerLifecycleHandlers(pi, lifecycle, {
+    renamer: createTurnRenamer({ env, run }),
+  });
 }
 
 export const __internal = Object.freeze({
@@ -661,12 +872,14 @@ export const __internal = Object.freeze({
   createLifecycle,
   createOutcomeTracker,
   createProcessRunner,
+  createTurnRenamer,
   registerLifecycleHandlers,
   observeWorkingContextArgv,
   workingContextPaths,
   retryableErrorPattern,
   retryableErrorMessage,
   askEvidence,
+  sanitizeShellName,
   IDLE_DEBOUNCE_MS,
   RETRY_GRACE_MS,
 });
