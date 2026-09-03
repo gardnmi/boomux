@@ -161,6 +161,7 @@ done
 BOOMUX_ORIGINAL_PATH="$(IFS=:; printf '%s' "${_boomux_filtered[*]}")"
 PATH="$BOOMUX_OPENCODE_SHIM_DIR${BOOMUX_ORIGINAL_PATH:+:$BOOMUX_ORIGINAL_PATH}"
 export BOOMUX_ORIGINAL_PATH PATH
+builtin hash -r
 unset _boomux_entry _boomux_filtered _boomux_path
 "#;
 const OPENCODE_ZSH_ENV: &[u8] = br#"if [[ -r "$BOOMUX_USER_ZDOTDIR/.zshenv" ]]; then
@@ -18064,6 +18065,11 @@ mod tests {
                     .contains("BOOMUX_OPENCODE_SHIM_DIR")
             );
         }
+        assert!(
+            std::str::from_utf8(OPENCODE_BASH_RC)
+                .unwrap()
+                .contains("builtin hash -r")
+        );
     }
 
     #[test]
