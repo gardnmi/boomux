@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.3](https://github.com/gardnmi/boomux/compare/v1.9.2...v1.9.3) (2026-09-03)
+
+
+### Bug Fixes
+
+* **attachment:** backpressure primary output ([#350](https://github.com/gardnmi/boomux/issues/350)) ([b172475](https://github.com/gardnmi/boomux/commit/b172475c328edb651892ffe6485fb615dc72353c))
+
 ## [1.9.2](https://github.com/gardnmi/boomux/compare/v1.9.1...v1.9.2) (2026-09-03)
 
 
