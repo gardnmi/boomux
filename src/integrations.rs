@@ -174,7 +174,9 @@ pub const OMP: IntegrationDescriptor = IntegrationDescriptor {
         executable: "omp",
         arguments_before_session: &["--resume"],
     }),
-    foreground: Some(ForegroundCapability { process_name: "omp" }),
+    foreground: Some(ForegroundCapability {
+        process_name: "omp",
+    }),
     run_scoped_launcher: None,
 };
 
