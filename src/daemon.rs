@@ -161,7 +161,7 @@ done
 BOOMUX_ORIGINAL_PATH="$(IFS=:; printf '%s' "${_boomux_filtered[*]}")"
 PATH="$BOOMUX_OPENCODE_SHIM_DIR${BOOMUX_ORIGINAL_PATH:+:$BOOMUX_ORIGINAL_PATH}"
 export BOOMUX_ORIGINAL_PATH PATH
-builtin hash -r
+builtin hash -r 2>/dev/null || :
 unset _boomux_entry _boomux_filtered _boomux_path
 "#;
 const OPENCODE_ZSH_ENV: &[u8] = br#"if [[ -r "$BOOMUX_USER_ZDOTDIR/.zshenv" ]]; then
@@ -18074,8 +18074,34 @@ mod tests {
         assert!(
             std::str::from_utf8(OPENCODE_BASH_RC)
                 .unwrap()
-                .contains("builtin hash -r")
+                .contains("builtin hash -r 2>/dev/null || :")
         );
+    }
+
+    #[test]
+    fn bash_startup_silences_cache_reset_when_hashing_is_disabled() {
+        let directory = env::temp_dir().join(format!("boomux-bashrc-{}", Uuid::new_v4()));
+        let startup = directory.join("boomux.bashrc");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join(".bashrc"), b"set +h\n").unwrap();
+        fs::write(&startup, OPENCODE_BASH_RC).unwrap();
+
+        let output = Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", ". \"$BOOMUX_TEST_RC\""])
+            .env("HOME", &directory)
+            .env("PATH", "/usr/bin:/bin")
+            .env("BOOMUX_OPENCODE_SHIM_DIR", directory.join("shims"))
+            .env("BOOMUX_TEST_RC", startup)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
