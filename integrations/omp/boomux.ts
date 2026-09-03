@@ -515,6 +515,7 @@ function registerLifecycleHandlers(pi, lifecycle, options = {}) {
   }
 
   function settleNow(ctx) {
+    if (retryHoldActive) return;
     clearPendingTimers();
     retryHoldActive = false;
     agentActive = false;
