@@ -1112,9 +1112,11 @@ and exports `BOOMUX_CODEX_RUN_SCOPED=1`. Option-led invocations including
 explicit `--remote`, other Codex subcommands, an absent or modified installation,
 and use outside Boomux remain untracked. An exact configured primary executable
 is forwarded through `BOOMUX_REAL_CODEX`; typing an absolute path in a login
-Shell bypasses the scoped shim. Hooks silently do nothing unless the run-scoped
-marker and exact `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID` are present. An explicitly
-remote TUI therefore cannot claim authority inherited from its app-server.
+Shell bypasses the scoped shim. Bash startup clears cached executable paths after
+reasserting the shim-first `PATH`, so a prior direct Codex resolution cannot bypass
+the scoped launcher. Hooks silently do nothing unless the run-scoped marker and
+exact `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID` are present. An explicitly remote TUI
+therefore cannot claim authority inherited from its app-server.
 
 Codex hook `session_id` is the canonical thread identity and ensures the exact
 `(codex, thread, shell, run)` Agent key. SessionStart reports Idle, except compact
