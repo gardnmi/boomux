@@ -378,6 +378,7 @@ Command payloads are:
   time. Protocol-38 responses also include exact `node_id` for local and routed
   owners; older local responses omit it.
 - `shell.inspect`: one `shell` object.
+- `shell.rename`: exact `shell_id` plus the applied `name`.
 - `launcher.list`: workspace identity plus a `launchers` array.
 - `launcher.inspect`: one `launcher` object.
 - `agent.list`: an `agents` array, optionally limited by `--workspace`.

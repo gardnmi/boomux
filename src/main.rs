@@ -1301,6 +1301,7 @@ command_keys! {
     NodeRekey => ("node.rekey", HumanOnly),
     ShellSuggestName => ("shell.suggest-name", Json),
     ShellInspect => ("shell.inspect", Json),
+    ShellRename => ("shell.rename", Json),
     Shell => ("shell", HumanOnly),
     LauncherList => ("launcher.list", Json),
     LauncherInspect => ("launcher.inspect", Json),
@@ -1443,6 +1444,9 @@ impl Cli {
             Some(Commands::Shell {
                 command: ShellCommands::Inspect { .. },
             }) => CommandKey::ShellInspect,
+            Some(Commands::Shell {
+                command: ShellCommands::Rename { .. },
+            }) => CommandKey::ShellRename,
             Some(Commands::Launcher {
                 command: LauncherCommands::List { .. },
             }) => CommandKey::LauncherList,
@@ -1539,10 +1543,7 @@ impl Cli {
             }) => CommandKey::Workspace,
             Some(Commands::Desktop { .. }) => CommandKey::Desktop,
             Some(Commands::Shell {
-                command:
-                    ShellCommands::Create { .. }
-                    | ShellCommands::Rename { .. }
-                    | ShellCommands::Close { .. },
+                command: ShellCommands::Create { .. } | ShellCommands::Close { .. },
             }) => CommandKey::Shell,
             Some(Commands::Launcher {
                 command:
@@ -8712,6 +8713,15 @@ fn shell_command(
             )?;
             let shell = resolve_cli_shell(&snapshot, &target, workspace.as_deref())?;
             client.rename_shell(&shell.id, &name)?;
+            if json {
+                return print_json(
+                    CommandKey::ShellRename,
+                    serde_json::json!({
+                        "shell_id": shell.id,
+                        "name": name,
+                    }),
+                );
+            }
             println!("Renamed shell {} to {name}", shell.name);
         }
         ShellCommands::Close { target, workspace } => {
@@ -15557,6 +15567,27 @@ mod tests {
     }
 
     #[test]
+    fn shell_rename_json_is_not_human_only() {
+        let cli = Cli::try_parse_from([
+            "boomux",
+            "shell",
+            "rename",
+            "shell-1",
+            "fix-the-login-bug",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        assert_eq!(cli.command_descriptor().key, "shell.rename");
+        assert_eq!(cli.command_descriptor().output, OutputMode::Json);
+        assert_ne!(cli.command_descriptor().output, OutputMode::HumanOnly);
+        assert!(
+            json_commands().any(|command| command == "shell.rename"),
+            "shell.rename must be advertised so --json is not InvalidInput"
+        );
+    }
+
+    #[test]
     fn command_descriptors_have_unique_names_and_drive_json_capabilities() {
         let mut names = CommandKey::ALL
             .iter()
@@ -15593,6 +15624,7 @@ mod tests {
                 "node.forget",
                 "shell.suggest-name",
                 "shell.inspect",
+                "shell.rename",
                 "launcher.list",
                 "launcher.inspect",
                 "agent.list",
