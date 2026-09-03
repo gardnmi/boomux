@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.4](https://github.com/gardnmi/boomux/compare/v1.9.3...v1.9.4) (2026-09-03)
+
+
+### Bug Fixes
+
+* **shell:** silence disabled bash hashing ([#352](https://github.com/gardnmi/boomux/issues/352)) ([3ed2c21](https://github.com/gardnmi/boomux/commit/3ed2c215a0dd9847e2026676b2b88da2a6b9e1f5))
+
 ## [1.9.3](https://github.com/gardnmi/boomux/compare/v1.9.2...v1.9.3) (2026-09-03)
 
 
