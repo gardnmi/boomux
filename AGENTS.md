@@ -38,7 +38,7 @@ cargo check --benches --all-features --locked
 cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
 cargo bench --bench wire --locked -- --test
 cargo deny check
-bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
+bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js integrations/omp/boomux.test.js
 ```
 
 Run the narrowest relevant tests while iterating, then run the complete set

@@ -174,7 +174,7 @@ jobs:
 
       - name: Run integration tests
         if: env.RUN_CODE == 'true'
-        run: bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
+        run: bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js integrations/omp/boomux.test.js
 
   release-packaging:
     name: Release packaging (${{ matrix.arch }})

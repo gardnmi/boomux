@@ -168,7 +168,8 @@ Run the integration reducers with:
 ```console
 bun test integrations/opencode/boomux.test.js \
   integrations/opencode/boomux-tui.test.js \
-  integrations/pi/boomux.test.js
+  integrations/pi/boomux.test.js \
+  integrations/omp/boomux.test.js
 ```
 
 ## Performance Benchmarks
@@ -204,7 +205,7 @@ cargo check --benches --all-features --locked
 cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
 cargo bench --bench wire --locked -- --test
 cargo deny check
-bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
+bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js integrations/omp/boomux.test.js
 ```
 
 Pull requests that modify only Markdown skip code, dependency, integration, and

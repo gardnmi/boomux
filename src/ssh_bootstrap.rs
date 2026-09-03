@@ -250,7 +250,7 @@ fn remote_integration_cleanup_plan(
         .pointer("/data/integrations")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| invalid_probe("remote integration status omitted integrations"))?;
-    let allowed = ["opencode", "pi", "claude", "codex", "kiro"];
+    let allowed = ["opencode", "pi", "omp", "claude", "codex", "kiro"];
     let mut current = Vec::new();
     let mut preserved = Vec::new();
     for row in rows {
@@ -1792,6 +1792,7 @@ impl BootstrapSession {
             let arguments = match integration.as_str() {
                 "opencode" => "integration uninstall opencode --json",
                 "pi" => "integration uninstall pi --json",
+                "omp" => "integration uninstall omp --json",
                 "claude" => "integration uninstall claude --json",
                 "codex" => "integration uninstall codex --json",
                 "kiro" => "integration uninstall kiro --json",
@@ -6698,12 +6699,12 @@ mod tests {
         let node_id = Uuid::new_v4().to_string();
         let helper = compatible_helper_script(&node_id);
         let executable = "/home/person/.local/bin/boomux";
-        let status = r#"{"schema":"boomux.cli/v1","command":"integration.status","data":{"integrations":[{"name":"opencode","display_name":"OpenCode","asset":{"state":"current","path":"/current"}},{"name":"pi","display_name":"Pi","asset":{"state":"modified","path":"/modified"}}]}}"#;
+        let status = r#"{"schema":"boomux.cli/v1","command":"integration.status","data":{"integrations":[{"name":"opencode","display_name":"OpenCode","asset":{"state":"current","path":"/current"}},{"name":"pi","display_name":"Pi","asset":{"state":"modified","path":"/modified"}},{"name":"omp","display_name":"Oh My Pi","asset":{"state":"current","path":"/omp"}}]}}"#;
         let removed = r#"{"schema":"boomux.cli/v1","command":"integration.uninstall","data":{"integrations":[]}}"#;
         let ssh = write_session_bootstrap_ssh(
             &runtime,
             &format!(
-                "  \"'{executable}' __federation-stdio\") {helper} ;;\n  \"'{executable}' --version\") printf 'boomux 1.0.1\\n' ;;\n  *'__uninstall-fingerprint'*) printf 'boomux-uninstall-fingerprint-v1 token\\n' ;;\n  *'integration status --json'*) printf '%s' '{status}' ;;\n  *'integration uninstall opencode --json'*) printf '%s' '{removed}' ;;\n  *'__uninstall-remote'*) : > {} ;;",
+                "  \"'{executable}' __federation-stdio\") {helper} ;;\n  \"'{executable}' --version\") printf 'boomux 1.0.1\\n' ;;\n  *'__uninstall-fingerprint'*) printf 'boomux-uninstall-fingerprint-v1 token\\n' ;;\n  *'integration status --json'*) printf '%s' '{status}' ;;\n  *'integration uninstall opencode --json'*) printf '%s' '{removed}' ;;\n  *'integration uninstall omp --json'*) printf '%s' '{removed}' ;;\n  *'__uninstall-remote'*) : > {} ;;",
                 quote_posix_shell(marker.to_str().unwrap())
             ),
             "/home/person/.local/bin/boomux\\0",
