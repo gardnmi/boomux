@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.6](https://github.com/gardnmi/boomux/compare/v1.9.5...v1.9.6) (2026-09-04)
+
+
+### Bug Fixes
+
+* **terminal:** preserve color scheme reporting ([#360](https://github.com/gardnmi/boomux/issues/360)) ([f515c9d](https://github.com/gardnmi/boomux/commit/f515c9d15b4f1d5ccfa98c4733c1e31358ddcc36))
+
 ## [1.9.5](https://github.com/gardnmi/boomux/compare/v1.9.4...v1.9.5) (2026-09-04)
 
 
