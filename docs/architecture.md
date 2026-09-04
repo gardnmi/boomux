@@ -1570,8 +1570,9 @@ resume fallback.
 Plain-text terminal history is a separate opt-in recovery field because output
 can contain secrets. The shadow terminal checkpoints a UTF-8-safe suffix of at
 most 256 KiB per shell while output is active. A new run presents that text as
-historical context before its own banner; the text is not replayed to the child
-and does not reconstruct terminal modes or process state.
+historical context after a recovery notice; the text is not replayed to the
+child and does not reconstruct terminal modes or process state. New runs without
+recovered history begin with no Boomux-injected terminal output.
 
 `boomux daemon restart` transfers the existing listener and both ownership locks
 to a replacement process through a private, versioned `SCM_RIGHTS` handshake.

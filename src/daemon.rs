@@ -15452,13 +15452,7 @@ fn create_pending_shell_with_id(
     }))
 }
 
-fn initial_terminal_state(
-    rows: u16,
-    cols: u16,
-    workspace_name: &str,
-    shell_name: &str,
-    history: Option<&str>,
-) -> TerminalState {
+fn initial_terminal_state(rows: u16, cols: u16, history: Option<&str>) -> TerminalState {
     let mut terminal = TerminalState::new(rows, cols);
     if let Some(history) = history.filter(|history| !history.is_empty()) {
         terminal.process(b"\x1b[2mBoomux: restored bounded history from previous run\x1b[0m\r\n");
@@ -15467,7 +15461,6 @@ fn initial_terminal_state(
             terminal.process(b"\r\n");
         }
     }
-    terminal.process(format!("\x1b[2mBoomux: {workspace_name}/{shell_name}\x1b[0m\r\n").as_bytes());
     terminal
 }
 
@@ -15708,13 +15701,7 @@ impl ShellRuntimeManager {
         drop(pty.slave);
         drop(pty.master);
 
-        let terminal = initial_terminal_state(
-            profile.rows,
-            profile.cols,
-            workspace_name,
-            shell_name,
-            recovery.history,
-        );
+        let terminal = initial_terminal_state(profile.rows, profile.cols, recovery.history);
 
         Ok((
             Arc::new(ShellRuntime {
@@ -17750,19 +17737,18 @@ mod tests {
     }
 
     #[test]
-    fn new_shell_terminal_starts_with_its_workspace_and_shell_name() {
-        let terminal = initial_terminal_state(24, 80, "project", "build", None);
+    fn new_shell_terminal_starts_without_injected_output() {
+        let terminal = initial_terminal_state(24, 80, None);
 
-        assert!(terminal.plain_text().contains("Boomux: project/build"));
+        assert!(terminal.plain_text().is_empty());
     }
 
     #[test]
-    fn cold_terminal_history_is_presented_before_the_new_run_banner() {
-        let terminal = initial_terminal_state(24, 80, "project", "agent", Some("old output\n"));
+    fn cold_terminal_history_is_presented_with_a_recovery_notice() {
+        let terminal = initial_terminal_state(24, 80, Some("old output\n"));
         let text = terminal.plain_text();
 
         assert!(text.contains("restored bounded history from previous run\nold output"));
-        assert!(text.find("old output").unwrap() < text.find("Boomux: project/agent").unwrap());
     }
 
     fn test_environment(values: &[(&str, &Path)]) -> UnixEnvironment {
