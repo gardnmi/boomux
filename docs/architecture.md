@@ -518,6 +518,9 @@ The daemon supports:
 - Bounded VT state and sanitized reconnect reconstruction
 - One primary writable attachment with explicit takeover and up to four
   collaborative exact-run attachments
+- Bounded backpressured output delivery to the primary attachment, while a
+  saturated collaborative attachment is disconnected rather than stalling PTY
+  output
 - Serialized whole-frame PTY input from every participant, with resize authority
   retained exclusively by the primary
 - Pending shell metadata and first-attachment terminal negotiation
@@ -1116,9 +1119,11 @@ and exports `BOOMUX_CODEX_RUN_SCOPED=1`. Option-led invocations including
 explicit `--remote`, other Codex subcommands, an absent or modified installation,
 and use outside Boomux remain untracked. An exact configured primary executable
 is forwarded through `BOOMUX_REAL_CODEX`; typing an absolute path in a login
-Shell bypasses the scoped shim. Hooks silently do nothing unless the run-scoped
-marker and exact `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID` are present. An explicitly
-remote TUI therefore cannot claim authority inherited from its app-server.
+Shell bypasses the scoped shim. Bash startup clears cached executable paths after
+reasserting the shim-first `PATH`, so a prior direct Codex resolution cannot bypass
+the scoped launcher. Hooks silently do nothing unless the run-scoped marker and
+exact `BOOMUX_SHELL_ID` and `BOOMUX_RUN_ID` are present. An explicitly remote TUI
+therefore cannot claim authority inherited from its app-server.
 
 Codex hook `session_id` is the canonical thread identity and ensures the exact
 `(codex, thread, shell, run)` Agent key. SessionStart reports Idle, except compact
@@ -1569,8 +1574,9 @@ resume fallback.
 Plain-text terminal history is a separate opt-in recovery field because output
 can contain secrets. The shadow terminal checkpoints a UTF-8-safe suffix of at
 most 256 KiB per shell while output is active. A new run presents that text as
-historical context before its own banner; the text is not replayed to the child
-and does not reconstruct terminal modes or process state.
+historical context after a recovery notice; the text is not replayed to the
+child and does not reconstruct terminal modes or process state. New runs without
+recovered history begin with no Boomux-injected terminal output.
 
 `boomux daemon restart` transfers the existing listener and both ownership locks
 to a replacement process through a private, versioned `SCM_RIGHTS` handshake.

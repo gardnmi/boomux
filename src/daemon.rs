@@ -161,6 +161,7 @@ done
 BOOMUX_ORIGINAL_PATH="$(IFS=:; printf '%s' "${_boomux_filtered[*]}")"
 PATH="$BOOMUX_OPENCODE_SHIM_DIR${BOOMUX_ORIGINAL_PATH:+:$BOOMUX_ORIGINAL_PATH}"
 export BOOMUX_ORIGINAL_PATH PATH
+builtin hash -r 2>/dev/null || :
 unset _boomux_entry _boomux_filtered _boomux_path
 "#;
 const OPENCODE_ZSH_ENV: &[u8] = br#"if [[ -r "$BOOMUX_USER_ZDOTDIR/.zshenv" ]]; then
@@ -6918,7 +6919,7 @@ impl ShellRuntimeManager {
             let disconnect = controller.as_ref().is_some_and(|current| {
                 current
                     .output
-                    .try_send(ControllerOutput::Data(bytes.to_vec()))
+                    .send(ControllerOutput::Data(bytes.to_vec()))
                     .is_err()
             });
             if disconnect && let Some(current) = controller.take() {
@@ -15451,13 +15452,7 @@ fn create_pending_shell_with_id(
     }))
 }
 
-fn initial_terminal_state(
-    rows: u16,
-    cols: u16,
-    workspace_name: &str,
-    shell_name: &str,
-    history: Option<&str>,
-) -> TerminalState {
+fn initial_terminal_state(rows: u16, cols: u16, history: Option<&str>) -> TerminalState {
     let mut terminal = TerminalState::new(rows, cols);
     if let Some(history) = history.filter(|history| !history.is_empty()) {
         terminal.process(b"\x1b[2mBoomux: restored bounded history from previous run\x1b[0m\r\n");
@@ -15466,7 +15461,6 @@ fn initial_terminal_state(
             terminal.process(b"\r\n");
         }
     }
-    terminal.process(format!("\x1b[2mBoomux: {workspace_name}/{shell_name}\x1b[0m\r\n").as_bytes());
     terminal
 }
 
@@ -15707,13 +15701,7 @@ impl ShellRuntimeManager {
         drop(pty.slave);
         drop(pty.master);
 
-        let terminal = initial_terminal_state(
-            profile.rows,
-            profile.cols,
-            workspace_name,
-            shell_name,
-            recovery.history,
-        );
+        let terminal = initial_terminal_state(profile.rows, profile.cols, recovery.history);
 
         Ok((
             Arc::new(ShellRuntime {
@@ -16560,6 +16548,12 @@ impl ShellRuntimeManager {
                         }
                     }
                 }
+                // A primary controller applies backpressure to the PTY reader so
+                // bursty, indivisible protocols such as Kitty graphics are not
+                // truncated when the small output queue fills. Drop the receiver
+                // before taking the controller lock so a blocked sender can wake
+                // up if the socket writer fails.
+                drop(receiver);
                 if !reconnect {
                     let _ = AttachFrame::Detached.write_to(&mut output_stream);
                 }
@@ -17743,19 +17737,18 @@ mod tests {
     }
 
     #[test]
-    fn new_shell_terminal_starts_with_its_workspace_and_shell_name() {
-        let terminal = initial_terminal_state(24, 80, "project", "build", None);
+    fn new_shell_terminal_starts_without_injected_output() {
+        let terminal = initial_terminal_state(24, 80, None);
 
-        assert!(terminal.plain_text().contains("Boomux: project/build"));
+        assert!(terminal.plain_text().is_empty());
     }
 
     #[test]
-    fn cold_terminal_history_is_presented_before_the_new_run_banner() {
-        let terminal = initial_terminal_state(24, 80, "project", "agent", Some("old output\n"));
+    fn cold_terminal_history_is_presented_with_a_recovery_notice() {
+        let terminal = initial_terminal_state(24, 80, Some("old output\n"));
         let text = terminal.plain_text();
 
         assert!(text.contains("restored bounded history from previous run\nold output"));
-        assert!(text.find("old output").unwrap() < text.find("Boomux: project/agent").unwrap());
     }
 
     fn test_environment(values: &[(&str, &Path)]) -> UnixEnvironment {
@@ -18064,6 +18057,37 @@ mod tests {
                     .contains("BOOMUX_OPENCODE_SHIM_DIR")
             );
         }
+        assert!(
+            std::str::from_utf8(OPENCODE_BASH_RC)
+                .unwrap()
+                .contains("builtin hash -r 2>/dev/null || :")
+        );
+    }
+
+    #[test]
+    fn bash_startup_silences_cache_reset_when_hashing_is_disabled() {
+        let directory = env::temp_dir().join(format!("boomux-bashrc-{}", Uuid::new_v4()));
+        let startup = directory.join("boomux.bashrc");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join(".bashrc"), b"set +h\n").unwrap();
+        fs::write(&startup, OPENCODE_BASH_RC).unwrap();
+
+        let output = Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", ". \"$BOOMUX_TEST_RC\""])
+            .env("HOME", &directory)
+            .env("PATH", "/usr/bin:/bin")
+            .env("BOOMUX_OPENCODE_SHIM_DIR", directory.join("shims"))
+            .env("BOOMUX_TEST_RC", startup)
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -20092,6 +20116,74 @@ mod tests {
             collaborator.recv().unwrap(),
             ControllerOutput::Data(bytes) if bytes == b"queued"
         ));
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn primary_output_applies_backpressure_instead_of_disconnect() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let primary = install_test_controller(&runtime, "primary");
+        lock(&runtime.controller)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .output
+            .send(ControllerOutput::Data(b"queued".to_vec()))
+            .unwrap();
+        let (started_sender, started_receiver) = mpsc::sync_channel(0);
+        let (completed_sender, completed_receiver) = mpsc::sync_channel(0);
+        let runtime_for_output = Arc::clone(&runtime);
+        let output = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            ShellRuntimeManager::fanout_output(&runtime_for_output, b"next");
+            completed_sender.send(()).unwrap();
+        });
+
+        started_receiver.recv().unwrap();
+        assert!(matches!(
+            completed_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(matches!(
+            primary.recv().unwrap(),
+            ControllerOutput::Data(bytes) if bytes == b"queued"
+        ));
+        completed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        output.join().unwrap();
+        assert!(matches!(
+            primary.recv().unwrap(),
+            ControllerOutput::Data(bytes) if bytes == b"next"
+        ));
+        assert!(lock(&runtime.controller).unwrap().is_some());
+
+        shell.kill().unwrap();
+        registry.close_workspace(&workspace.id).unwrap();
+    }
+
+    #[test]
+    fn disconnected_primary_unblocks_backpressured_output() {
+        let registry = DaemonService::default();
+        let (workspace, shell, runtime) = running_shell(&registry);
+        let primary = install_test_controller(&runtime, "primary");
+        lock(&runtime.controller)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .output
+            .send(ControllerOutput::Data(b"queued".to_vec()))
+            .unwrap();
+        let runtime_for_output = Arc::clone(&runtime);
+        let output =
+            thread::spawn(move || ShellRuntimeManager::fanout_output(&runtime_for_output, b"next"));
+
+        drop(primary);
+        output.join().unwrap();
+        assert!(lock(&runtime.controller).unwrap().is_none());
+
         shell.kill().unwrap();
         registry.close_workspace(&workspace.id).unwrap();
     }

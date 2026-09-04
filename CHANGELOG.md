@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.9.5](https://github.com/gardnmi/boomux/compare/v1.9.4...v1.9.5) (2026-09-04)
+
+
+### Bug Fixes
+
+* **shell:** remove startup banner ([#355](https://github.com/gardnmi/boomux/issues/355)) ([9fb7a0e](https://github.com/gardnmi/boomux/commit/9fb7a0e54c2ad5ef24634f4c8a4e2e73bca839c6))
+
+## [1.9.4](https://github.com/gardnmi/boomux/compare/v1.9.3...v1.9.4) (2026-09-03)
+
+
+### Bug Fixes
+
+* **shell:** silence disabled bash hashing ([#352](https://github.com/gardnmi/boomux/issues/352)) ([3ed2c21](https://github.com/gardnmi/boomux/commit/3ed2c215a0dd9847e2026676b2b88da2a6b9e1f5))
+
+## [1.9.3](https://github.com/gardnmi/boomux/compare/v1.9.2...v1.9.3) (2026-09-03)
+
+
+### Bug Fixes
+
+* **attachment:** backpressure primary output ([#350](https://github.com/gardnmi/boomux/issues/350)) ([b172475](https://github.com/gardnmi/boomux/commit/b172475c328edb651892ffe6485fb615dc72353c))
+
+## [1.9.2](https://github.com/gardnmi/boomux/compare/v1.9.1...v1.9.2) (2026-09-03)
+
+
+### Bug Fixes
+
+* **codex:** clear cached bash command paths ([#347](https://github.com/gardnmi/boomux/issues/347)) ([62d8d01](https://github.com/gardnmi/boomux/commit/62d8d01c0dfec4def761a0dba44845523b74bedb))
+
 ## [1.9.1](https://github.com/gardnmi/boomux/compare/v1.9.0...v1.9.1) (2026-09-01)
 
 
