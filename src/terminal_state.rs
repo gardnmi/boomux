@@ -1,7 +1,7 @@
 use crate::protocol::{
     TerminalColor, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan, TerminalStyle,
 };
-use crate::terminal_focus::FocusMode;
+use crate::terminal_modes::TerminalModes;
 
 const SCROLLBACK_ROWS: usize = 2_000;
 const MAX_RECONSTRUCTION_BYTES: usize = 1024 * 1024;
@@ -9,7 +9,7 @@ const MAX_RECONSTRUCTION_BYTES: usize = 1024 * 1024;
 pub(crate) struct TerminalState {
     parser: vt100::Parser,
     primary_before_alternate: Option<vt100::Screen>,
-    focus_mode: FocusMode,
+    terminal_modes: TerminalModes,
 }
 
 pub(crate) struct TerminalSnapshot {
@@ -22,12 +22,12 @@ impl TerminalState {
         Self {
             parser,
             primary_before_alternate: None,
-            focus_mode: FocusMode::default(),
+            terminal_modes: TerminalModes::default(),
         }
     }
 
     pub(crate) fn process(&mut self, bytes: &[u8]) {
-        self.focus_mode.process(bytes);
+        self.terminal_modes.process(bytes);
         let was_alternate = self.parser.screen().alternate_screen();
         if !was_alternate && let Some(offset) = alternate_screen_start(bytes) {
             self.parser.process(&bytes[..offset]);
@@ -64,7 +64,8 @@ impl TerminalState {
             });
         }
         reconstruction.extend(screen.input_mode_formatted());
-        reconstruction.extend(self.focus_mode.restore_sequence());
+        self.terminal_modes
+            .append_restore_sequence(&mut reconstruction);
 
         let mut resized = Self::new(rows, cols);
         resized.process(&reconstruction);
@@ -83,7 +84,7 @@ impl TerminalState {
             output.extend(screen.contents_formatted());
         }
         output.extend(screen.input_mode_formatted());
-        output.extend(self.focus_mode.restore_sequence());
+        self.terminal_modes.append_restore_sequence(&mut output);
         if output.len() <= MAX_RECONSTRUCTION_BYTES {
             return output;
         }
@@ -93,13 +94,13 @@ impl TerminalState {
             fallback.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
         }
         let suffix = state_suffix(screen);
-        let focus_mode = self.focus_mode.restore_sequence();
+        let terminal_modes_len = self.terminal_modes.restore_sequence_len();
         let text_limit = MAX_RECONSTRUCTION_BYTES
             .saturating_sub(suffix.len())
-            .saturating_sub(focus_mode.len());
+            .saturating_sub(terminal_modes_len);
         append_terminal_text_bounded(&mut fallback, &screen.contents(), text_limit);
         fallback.extend(suffix);
-        fallback.extend(focus_mode);
+        self.terminal_modes.append_restore_sequence(&mut fallback);
         fallback
     }
 
@@ -898,6 +899,37 @@ mod tests {
     }
 
     #[test]
+    fn reconstruction_restores_child_color_scheme_reporting_mode() {
+        let mut state = TerminalState::new(4, 40);
+        state.process(b"\x1b[?2031h");
+        assert!(state.reconstruction().ends_with(b"\x1b[?2031h"));
+
+        state.process(b"\x1b[?1004;2031l");
+        assert!(
+            !state
+                .reconstruction()
+                .windows(8)
+                .any(|bytes| bytes == b"\x1b[?2031h")
+        );
+    }
+
+    #[test]
+    fn bounded_reconstruction_retains_terminal_reporting_modes() {
+        let mut state = TerminalState::new(4, 600);
+        let line = vec![b'x'; 600];
+        for _ in 0..SCROLLBACK_ROWS + 10 {
+            state.process(&line);
+            state.process(b"\r\n");
+        }
+        state.process(b"\x1b[?1004;2031h");
+
+        let reconstruction = state.reconstruction();
+
+        assert!(reconstruction.len() <= MAX_RECONSTRUCTION_BYTES);
+        assert!(reconstruction.ends_with(b"\x1b[?1004h\x1b[?2031h"));
+    }
+
+    #[test]
     fn reconstruction_preserves_scrollback_styles() {
         let mut source = TerminalState::new(2, 20);
         source.process(b"\x1b[31mRRRR\x1b[0m\r\nnext\r\ncurrent");
@@ -951,6 +983,15 @@ mod tests {
         state.resize(10, 30);
 
         assert_eq!(state.parser.screen().size(), (10, 30));
+    }
+
+    #[test]
+    fn resize_preserves_color_scheme_reporting_mode() {
+        let mut state = TerminalState::new(4, 20);
+        state.process(b"\x1b[?2031h");
+        state.resize(10, 30);
+
+        assert!(state.reconstruction().ends_with(b"\x1b[?2031h"));
     }
 
     #[test]

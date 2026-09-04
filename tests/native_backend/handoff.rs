@@ -352,7 +352,7 @@ fn graceful_restart_preserves_exited_run_and_terminal_state() {
         .attach(&shell_id, false, profile())
         .unwrap()
         .stream;
-    AttachFrame::Input(b"printf 'final-exited-output\\n'; exit 7\n".to_vec())
+    AttachFrame::Input(b"printf '\\033[?2031hfinal-exited-output\\n'; exit 7\n".to_vec())
         .write_to(&mut attachment)
         .unwrap();
     assert!(contains(
@@ -396,6 +396,7 @@ fn graceful_restart_preserves_exited_run_and_terminal_state() {
     assert_eq!(after_output, before_output);
     let mut restored = daemon.client.attach(&shell_id, false, profile()).unwrap();
     assert!(contains(&restored.reconstruction, b"final-exited-output"));
+    assert!(restored.reconstruction.ends_with(b"\x1b[?2031h"));
     assert!(matches!(
         AttachFrame::read_from(&mut restored.stream).unwrap(),
         AttachFrame::Detached

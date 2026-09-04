@@ -8,7 +8,7 @@ use crossterm::terminal;
 
 use crate::client;
 use crate::protocol::{AttachFrame, ProtocolFeature, TerminalProfile};
-use crate::terminal_focus::FocusMode;
+use crate::terminal_modes::TerminalModes;
 
 const POLL_INTERVAL_MS: i32 = 100;
 const ESCAPE_DISAMBIGUATION_MS: i32 = 10;
@@ -39,7 +39,7 @@ const FOCUS_LOST: &[u8] = b"\x1b[O";
 #[derive(Default)]
 struct FocusTracking {
     enabled: bool,
-    child_mode: FocusMode,
+    child_mode: TerminalModes,
     input: FocusInput,
 }
 
@@ -108,7 +108,7 @@ impl FocusInput {
 impl FocusTracking {
     fn reset(&mut self, enabled: bool) {
         self.enabled = enabled;
-        self.child_mode = FocusMode::default();
+        self.child_mode = TerminalModes::default();
         self.input.flush_pending();
     }
 }
@@ -461,7 +461,7 @@ fn pump_attachment(
             if focus.enabled {
                 let (forwarded, gained) = focus
                     .input
-                    .process(&input[..count], focus.child_mode.enabled());
+                    .process(&input[..count], focus.child_mode.focus_reporting());
                 if !forwarded.is_empty() {
                     AttachFrame::Input(forwarded).write_to(stream)?;
                 }
@@ -712,6 +712,16 @@ mod tests {
         assert_eq!(
             input.process(b"before\x1b[I\x1b[Oafter", true),
             (b"before\x1b[I\x1b[Oafter".to_vec(), 1)
+        );
+    }
+
+    #[test]
+    fn color_scheme_reports_are_forwarded_as_ordinary_input() {
+        let mut input = FocusInput::default();
+
+        assert_eq!(
+            input.process(b"\x1b[?997;1n", false),
+            (b"\x1b[?997;1n".to_vec(), 0)
         );
     }
 
