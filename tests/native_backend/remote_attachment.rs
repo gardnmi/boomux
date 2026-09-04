@@ -6,7 +6,8 @@ use boomux::protocol::{AttachFrame, QualifiedIdentity, ShellSpec};
 use uuid::Uuid;
 
 use crate::support::{
-    CONTROL_MASTER_PREFIX, TestDaemon, contains, parse_pid, profile, read_until, wait_until,
+    CONTROL_MASTER_PREFIX, TestDaemon, contains, parse_pid, profile, read_until, read_until_after,
+    wait_until,
 };
 
 fn install_fake_ssh(
@@ -328,7 +329,12 @@ fn two_daemon_remote_attachment_keeps_environment_and_runtime_on_owner() {
             profile(),
         )
         .unwrap();
-    let output = read_until(&mut attachment.stream, b"term=attachment-term");
+    let reconstruction = std::mem::take(&mut attachment.reconstruction);
+    let output = read_until_after(
+        &mut attachment.stream,
+        b"term=attachment-term",
+        reconstruction,
+    );
     assert!(contains(&output, b"remote=owner-only"));
     assert!(contains(&output, b"local=unset"));
     let pid = parse_pid(&output, "pid=").expect("remote shell PID");
