@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.5](https://github.com/gardnmi/boomux/compare/v1.9.4...v1.9.5) (2026-09-04)
+
+
+### Bug Fixes
+
+* **shell:** remove startup banner ([#355](https://github.com/gardnmi/boomux/issues/355)) ([9fb7a0e](https://github.com/gardnmi/boomux/commit/9fb7a0e54c2ad5ef24634f4c8a4e2e73bca839c6))
+
 ## [1.9.4](https://github.com/gardnmi/boomux/compare/v1.9.3...v1.9.4) (2026-09-03)
 
 
