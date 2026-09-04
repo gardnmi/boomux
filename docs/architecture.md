@@ -26,7 +26,7 @@
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
 | `src/hyprland.rs` | Bounded Hyprland client discovery, special-workspace navigation, and exact-address window placement |
 | `src/terminal_state.rs` | Shadow VT parsing, bounded reconstruction, logical output, and structured previews |
-| `src/terminal_focus.rs` | Stateful parsing and restoration of child focus-reporting mode |
+| `src/terminal_modes.rs` | Stateful parsing and restoration of child focus- and color-scheme-reporting modes |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
 | `src/mobile_web.rs`, `src/web_terminal.rs`, `assets/mobile-web/` | Loopback-only HTTP gateway, Node-qualified Agent projection, exact local attention dismissal, native harness handoff, integration-independent exact-run terminal control, and embedded installable web assets |
 | `src/tailscale_serve.rs` | Explicit Tailscale Serve preflight, conflict detection, exact route mutation, and ephemeral ownership cleanup for `boomux web --tailscale` |
@@ -617,6 +617,10 @@ clone the bounded shadow screen under the per-shell terminal lock, then format
 that snapshot after releasing the lock. They traverse physical rows from newest
 to oldest and stop once the requested byte, logical-line, and span bounds are
 satisfied, so retained history does not extend PTY-writer lock hold time.
+DEC private modes 1004 (focus reporting) and 2031 (color-scheme reporting) are
+tracked across split or combined output sequences and restored after attachment,
+resize reconstruction, reconnect, and daemon handoff. Color-scheme reports remain
+ordinary terminal input; the daemon does not choose or rewrite presentation colors.
 
 ### Terminal Launcher
 

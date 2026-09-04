@@ -29,5 +29,5 @@ pub mod protocol;
 mod session_projection;
 pub mod ssh_bootstrap;
 mod state_store;
-mod terminal_focus;
+mod terminal_modes;
 mod terminal_state;

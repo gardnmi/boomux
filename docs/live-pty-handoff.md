@@ -20,6 +20,8 @@ handoff is an explicit, acknowledged upgrade path.
 - A failed replacement resumes the old daemon without killing shells.
 - Every active primary controller and collaborator acknowledges a reconnect
   boundary before PTY transfer.
+- Sanitized terminal reconstruction retains active focus- and color-scheme-
+  reporting subscriptions within the attachment frame bound.
 - Received descriptors are close-on-exec, strictly typed by marker, and closed
   on every malformed transfer.
 
