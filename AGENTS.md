@@ -25,7 +25,8 @@ module map, then read its colocated tests and the relevant contract document.
 
 ## Validation
 
-Run the same checks as CI:
+Run the complete validation set below. CI selection and reuse rules are in
+`docs/ci.md`; Clippy already checks every benchmark target:
 
 ```console
 cargo fmt --all -- --check
@@ -34,9 +35,7 @@ cargo test --lib --bins --locked -- --test-threads=1
 cargo test --test config_cli --locked -- --test-threads=1
 cargo test --test native_backend --locked -- --test-threads=1
 cargo test --test benchmark_harness --features benchmark-internals --locked
-cargo check --benches --all-features --locked
-cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
-cargo bench --bench wire --locked -- --test
+cargo bench --bench core_cpu --bench wire --features benchmark-internals --locked -- --test
 cargo deny check
 bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
 ```

@@ -180,9 +180,7 @@ the deterministic benchmark fixtures and smoke suite:
 
 ```console
 cargo test --test benchmark_harness --features benchmark-internals --locked
-cargo check --benches --all-features --locked
-cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
-cargo bench --bench wire --locked -- --test
+cargo bench --bench core_cpu --bench wire --features benchmark-internals --locked -- --test
 ```
 
 Criterion timing on shared runners is evidence, not a merge gate. Gungraun provides
@@ -200,16 +198,17 @@ cargo test --lib --bins --locked -- --test-threads=1
 cargo test --test config_cli --locked -- --test-threads=1
 cargo test --test native_backend --locked -- --test-threads=1
 cargo test --test benchmark_harness --features benchmark-internals --locked
-cargo check --benches --all-features --locked
-cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
-cargo bench --bench wire --locked -- --test
+cargo bench --bench core_cpu --bench wire --features benchmark-internals --locked -- --test
 cargo deny check
 bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
 ```
 
-Pull requests that modify only Markdown skip code, dependency, integration, and
-packaging jobs after a lightweight CI path check. Any non-Markdown change runs
-the complete CI matrix.
+CI selects work by changed inputs and prior validation, as documented in
+[`docs/ci.md`](docs/ci.md). Documentation skips use an explicit allowlist;
+embedded skill Markdown, notices, and the packaged README still receive checks.
+Version-only release changes can reuse successful base CI while building and
+smoke testing the new release version. Clippy covers every benchmark target;
+optimized benchmark smoke runs for Rust, benchmark, build, and CI changes.
 
 ## Compatibility Checklist
 
@@ -251,10 +250,14 @@ title becomes the squash commit consumed by Release Please.
 
 After CI succeeds for the exact current `main` commit, Release Please creates or
 updates the release pull request. Merging that pull request updates the package
-version and changelog. CI validates the release commit before the release
-workflow builds x86_64 and aarch64 Linux artifacts, renders the installer,
-uploads checksums, and publishes the completed GitHub release. Manual tag
-dispatch is reserved for explicit release recovery.
+version and changelog. CI builds and smoke tests x86_64 and aarch64 artifacts
+for that exact commit. When only release metadata changed and the base has
+successful push CI, it reuses that validation instead of rerunning the test
+suites. The release workflow downloads the exact CI artifacts, checks their
+source metadata and checksums, validates consumer compatibility, renders the
+installer, and publishes the completed release. Manual tag dispatch is reserved
+for explicit recovery, including rebuilding when the CI artifacts have expired.
+See [`docs/ci.md`](docs/ci.md) for the stage-by-stage contract.
 
 ## Clean Up
 
