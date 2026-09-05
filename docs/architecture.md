@@ -604,14 +604,19 @@ serialization boundary so bytes within a frame cannot interleave. Collaborative
 resize is ignored; only the primary can update the PTY and retained terminal
 dimensions. Explicit takeover detaches the prior primary and all
 collaborators; graceful handoff instead reconnects and awaits every participant.
-The listener admits at most 64 concurrent connection handlers and closes newly
-accepted sockets while that capacity is exhausted. Management responses and
-attachment output use bounded write deadlines. Attachments retain one admission
-slot for their lifetime, and their input handler joins the output worker after
-either side closes the shared socket, so abandoned clients cannot delay shutdown
-indefinitely.
+The listener admits at most 64 concurrent handshake and management handlers and
+closes newly accepted sockets while that capacity is exhausted. Decoded native,
+collaborative, and routed attachment requests move to a separate pool of at most
+1,024 handlers; saturation returns `busy` and preserves management capacity.
+Each pool releases its permit when its handler exits. Management responses and
+attachment output use bounded write deadlines. Attachment input handlers join
+the output worker after either side closes the shared socket, so abandoned
+clients cannot delay shutdown indefinitely.
 It also feeds a shadow `vt100` parser while forwarding the original PTY bytes
-unchanged. Reattachment receives a bounded reconstruction of rendered state,
+unchanged. Alternate-screen reconstruction reads the primary grid and saved
+cursor from a temporary copy of that parser's screen. It does not depend on PTY
+chunk boundaries or retain a second primary-screen snapshot while output runs.
+Reattachment receives a bounded reconstruction of rendered state,
 not historical OSC or graphics commands. Plain reads and structured previews
 clone the bounded shadow screen under the per-shell terminal lock, then format
 that snapshot after releasing the lock. They traverse physical rows from newest
@@ -1530,7 +1535,18 @@ per-shell synchronization. It publishes the latest revision at most once per
 boundaries. Output events may therefore skip intermediate revisions and event
 IDs describe publication order rather than byte-arrival order. Revision-aware
 reads use a per-runtime condition variable and do not depend on global event
-publication for wakeups.
+publication for wakeups. An idle reader blocks on its PTY, an eventfd for control
+commands and pause cancellation, and a pidfd for process exit. Only pending
+output publication supplies a timer; if pidfd acquisition is unavailable, a
+100-millisecond process-check fallback applies. The eventfd and pidfd are
+runtime-local, close on reader teardown, and are recreated after handoff.
+
+The dashboard Git cache uses one worker, at most 64 outstanding inspections,
+bounded request/result queues, and 256 entries evicted by least recent access.
+Saturation serves cached or unknown metadata and retries on a later refresh.
+Each exact-argv Git command has a one-second deadline and a one-MiB stdout limit;
+failure reports unavailable metadata, and cleanup terminates its private process
+group and reaps the child. Dropping the cache discards queued inspections.
 
 Agent registration, ensure, reports, and attention acknowledgment use the same
 durable mutation coordinator.
