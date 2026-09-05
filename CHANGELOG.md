@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.7](https://github.com/gardnmi/boomux/compare/v1.9.6...v1.9.7) (2026-09-05)
+
+
+### Bug Fixes
+
+* **runtime:** bound background work and preserve terminal state ([#362](https://github.com/gardnmi/boomux/issues/362)) ([00c5961](https://github.com/gardnmi/boomux/commit/00c5961d9c9ec8a9d50502bb34c854b0ccaec272))
+
 ## [1.9.6](https://github.com/gardnmi/boomux/compare/v1.9.5...v1.9.6) (2026-09-04)
 
 
