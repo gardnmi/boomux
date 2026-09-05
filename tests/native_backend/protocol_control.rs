@@ -12,6 +12,50 @@ use uuid::Uuid;
 use crate::support::{TestDaemon, assert_remote_code, contains, profile, read_until, wait_until};
 
 #[test]
+fn attached_terminals_do_not_exhaust_management_connections() {
+    let daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "attachment-capacity",
+            (0..70)
+                .map(|index| ShellSpec {
+                    name: format!("shell-{index}"),
+                    command: vec!["/bin/sleep".into(), "120".into()],
+                    cwd: daemon.runtime_dir.clone(),
+                })
+                .collect(),
+        )
+        .unwrap();
+    for _ in 0..2 {
+        let attachments = workspace
+            .shells
+            .iter()
+            .map(|shell| daemon.client.attach(&shell.id, true, profile()).unwrap())
+            .collect::<Vec<_>>();
+        daemon.client.ping().unwrap();
+        assert_eq!(
+            daemon
+                .client
+                .get_workspace(&workspace.id)
+                .unwrap()
+                .shells
+                .len(),
+            70
+        );
+        daemon
+            .client
+            .rename_workspace(&workspace.id, "still-manageable")
+            .unwrap();
+        drop(attachments);
+    }
+    daemon.client.ping().unwrap();
+    for shell in &workspace.shells {
+        daemon.client.close_shell(&shell.id).unwrap();
+    }
+}
+
+#[test]
 fn daemon_bounds_stalled_connections_and_recovers_capacity() {
     let daemon = TestDaemon::start();
     let mut stalled = (0..64)

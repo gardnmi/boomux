@@ -14,7 +14,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child as StdChild, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread;
@@ -76,6 +76,7 @@ use crate::terminal_state::TerminalState;
 const CONTROLLER_QUEUE: usize = 64;
 const MAX_COLLABORATORS_PER_SHELL: usize = 4;
 const MAX_CONNECTION_HANDLERS: usize = 64;
+const MAX_ATTACHMENT_HANDLERS: usize = 1_024;
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -529,6 +530,7 @@ fn run_daemon(
     let mut handed_off = false;
     let mut last_persistence_retry = Instant::now();
     let mut last_kiro_reconciliation = Instant::now();
+    let admission = Arc::new(ConnectionAdmission::default());
 
     while !shutdown.load(Ordering::Acquire) {
         if last_kiro_reconciliation.elapsed() >= KIRO_HOLDER_RECONCILE_INTERVAL {
@@ -577,10 +579,10 @@ fn run_daemon(
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                if handlers.len() >= MAX_CONNECTION_HANDLERS {
+                let Some(permit) = admission.admit() else {
                     drop(stream);
                     continue;
-                }
+                };
                 let registry = Arc::clone(&registry);
                 let shutdown = Arc::clone(&shutdown);
                 let transition = Arc::clone(&transition);
@@ -595,6 +597,7 @@ fn run_daemon(
                                 shutdown,
                                 transition,
                                 restart_sender,
+                                permit,
                             );
                         })?,
                 );
@@ -1778,12 +1781,70 @@ fn select_replacement_executable(current: PathBuf, argument_zero: Option<PathBuf
     current
 }
 
+#[derive(Default)]
+struct ConnectionAdmission {
+    management: AtomicUsize,
+    attachments: AtomicUsize,
+}
+
+struct ConnectionPermit {
+    admission: Arc<ConnectionAdmission>,
+    attachment: bool,
+}
+
+impl ConnectionAdmission {
+    fn admit(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        self.management
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_CONNECTION_HANDLERS).then_some(count + 1)
+            })
+            .ok()?;
+        Some(ConnectionPermit {
+            admission: Arc::clone(self),
+            attachment: false,
+        })
+    }
+}
+
+impl ConnectionPermit {
+    fn attach(&mut self) -> bool {
+        if self.attachment {
+            return true;
+        }
+        if self
+            .admission
+            .attachments
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_ATTACHMENT_HANDLERS).then_some(count + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.attachment = true;
+        self.admission.management.fetch_sub(1, Ordering::AcqRel);
+        true
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let counter = if self.attachment {
+            &self.admission.attachments
+        } else {
+            &self.admission.management
+        };
+        counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn handle_connection(
     stream: UnixStream,
     registry: Arc<DaemonService>,
     shutdown: Arc<AtomicBool>,
     transition: Arc<AtomicU8>,
     restart_sender: mpsc::Sender<RestartRequest>,
+    permit: ConnectionPermit,
 ) -> io::Result<()> {
     handle_connection_inner(
         stream,
@@ -1791,7 +1852,7 @@ fn handle_connection(
         shutdown,
         transition,
         restart_sender,
-        true,
+        permit,
         None,
     )
 }
@@ -1802,7 +1863,7 @@ fn handle_connection_inner(
     shutdown: Arc<AtomicBool>,
     transition: Arc<AtomicU8>,
     restart_sender: mpsc::Sender<RestartRequest>,
-    allow_federation_upgrade: bool,
+    mut permit: ConnectionPermit,
     federation_lease: Option<NodeIdentityLease>,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -1832,7 +1893,7 @@ fn handle_connection_inner(
     }
 
     if matches!(&request.message, Request::OpenFederationChannel) {
-        if !allow_federation_upgrade {
+        if federation_lease.is_some() {
             return send_response(
                 &mut stream,
                 response_version,
@@ -1875,8 +1936,23 @@ fn handle_connection_inner(
             shutdown,
             transition,
             restart_sender,
-            false,
+            permit,
             Some(lease),
+        );
+    }
+
+    if matches!(
+        &request.message,
+        Request::Attach { .. } | Request::AttachCollaborative { .. } | Request::AttachNode { .. }
+    ) && !permit.attach()
+    {
+        return send_daemon_error(
+            &mut stream,
+            response_version,
+            DaemonError::lifecycle(
+                ErrorCode::Busy,
+                "attachment connection capacity is exhausted",
+            ),
         );
     }
 
@@ -7418,8 +7494,129 @@ struct PtyReader {
 }
 
 struct ReaderTask {
-    commands: mpsc::Sender<ReaderCommand>,
+    commands: ReaderCommands,
     handle: Mutex<Option<thread::JoinHandle<io::Result<()>>>>,
+}
+
+// One coalescing eventfd wakes the reader for control messages and pause
+// cancellation. Closing the sender also wakes it to observe disconnection.
+struct ReaderWake(OwnedFd);
+
+impl ReaderWake {
+    fn notify(&self) {
+        let value = 1u64;
+        loop {
+            // The eventfd is nonblocking; saturation already means it is readable.
+            let result =
+                unsafe { libc::write(self.0.as_raw_fd(), (&value as *const u64).cast(), 8) };
+            if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+    }
+
+    fn clear(&self) {
+        let mut value = 0u64;
+        loop {
+            // One read drains every coalesced wakeup without allocating a queue.
+            let result =
+                unsafe { libc::read(self.0.as_raw_fd(), (&mut value as *mut u64).cast(), 8) };
+            if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+    }
+
+    fn wait(
+        &self,
+        reader: Option<&PtyReader>,
+        process: Option<&OwnedFd>,
+        deadline: Option<Instant>,
+    ) -> io::Result<()> {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: reader.map_or(-1, |reader| reader.descriptor.as_raw_fd()),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: process.map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            let timeout = deadline.map_or(-1, |deadline| {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                remaining
+                    .as_millis()
+                    .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+                    .min(i32::MAX as u128) as i32
+            });
+            // All descriptors remain owned throughout poll; -1 entries are ignored.
+            let result = unsafe {
+                libc::poll(
+                    descriptors.as_mut_ptr(),
+                    descriptors.len() as libc::nfds_t,
+                    timeout,
+                )
+            };
+            if result >= 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+struct ReaderCommands {
+    sender: Option<mpsc::Sender<ReaderCommand>>,
+    wake: Arc<ReaderWake>,
+}
+
+impl ReaderCommands {
+    fn channel() -> io::Result<(Self, mpsc::Receiver<ReaderCommand>, Arc<ReaderWake>)> {
+        // eventfd returns a new, exclusively owned, close-on-exec descriptor.
+        let descriptor = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if descriptor == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let wake = Arc::new(ReaderWake(unsafe { OwnedFd::from_raw_fd(descriptor) }));
+        let (sender, receiver) = mpsc::channel();
+        Ok((
+            Self {
+                sender: Some(sender),
+                wake: Arc::clone(&wake),
+            },
+            receiver,
+            wake,
+        ))
+    }
+
+    fn send(&self, command: ReaderCommand) -> Result<(), mpsc::SendError<ReaderCommand>> {
+        let result = self
+            .sender
+            .as_ref()
+            .expect("live reader command sender")
+            .send(command);
+        self.wake.notify();
+        result
+    }
+}
+
+impl Drop for ReaderCommands {
+    fn drop(&mut self) {
+        self.sender.take();
+        self.wake.notify();
+    }
 }
 
 enum ReaderCommand {
@@ -7720,6 +7917,7 @@ impl ReaderTask {
                 Err(mpsc::TryRecvError::Empty) if self.is_finished() => return self.finish(),
                 Err(mpsc::TryRecvError::Empty) if Instant::now() >= deadline => {
                     cancelled.store(true, Ordering::Release);
+                    self.commands.wake.notify();
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "PTY reader did not pause",
@@ -15728,7 +15926,10 @@ impl ShellRuntimeManager {
         mut reader: PtyReader,
         start_paused: bool,
     ) -> io::Result<()> {
-        let (commands, command_receiver) = mpsc::channel();
+        let (commands, command_receiver, wake) = ReaderCommands::channel()?;
+        let process_wake = lock(&runtime.process)?
+            .process_id()
+            .and_then(|pid| open_pidfd(pid).ok());
         let reader_runtime = Arc::clone(&runtime);
         let reader_run = Arc::clone(&run);
         let handle = thread::Builder::new()
@@ -15742,6 +15943,7 @@ impl ShellRuntimeManager {
                 let mut pending_output_revision = None;
                 let mut output_publication_deadline = None;
                 loop {
+                    wake.clear();
                     if paused {
                         if pause_cancellation
                             .as_ref()
@@ -15751,7 +15953,7 @@ impl ShellRuntimeManager {
                             pause_cancellation = None;
                             continue;
                         }
-                        match command_receiver.recv_timeout(IO_RETRY_DELAY) {
+                        match command_receiver.try_recv() {
                             Ok(ReaderCommand::Pause {
                                 acknowledge,
                                 cancelled,
@@ -15771,11 +15973,11 @@ impl ShellRuntimeManager {
                                 paused = false;
                                 pause_cancellation = None;
                             }
-                            Ok(ReaderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            Ok(ReaderCommand::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
                                 stopped = true;
                                 break;
                             }
-                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::TryRecvError::Empty) => wake.wait(None, None, None)?,
                         }
                         continue;
                     }
@@ -15912,7 +16114,14 @@ impl ShellRuntimeManager {
                             if process_exited {
                                 break;
                             }
-                            thread::sleep(IO_RETRY_DELAY);
+                            // A deadline is needed only for coalesced output, or
+                            // the compatibility fallback if pidfd_open is unavailable.
+                            let deadline = output_publication_deadline.or_else(|| {
+                                process_wake
+                                    .is_none()
+                                    .then(|| Instant::now() + Duration::from_millis(100))
+                            });
+                            wake.wait(Some(&reader), process_wake.as_ref(), deadline)?;
                         }
                         Err(_) => break,
                     }
@@ -24750,8 +24959,54 @@ mod tests {
     }
 
     #[test]
+    fn attachment_admission_preserves_management_capacity_and_releases_permits() {
+        let admission = Arc::new(ConnectionAdmission::default());
+        let mut attachments = Vec::new();
+        for _ in 0..MAX_ATTACHMENT_HANDLERS {
+            let mut permit = admission.admit().unwrap();
+            assert!(permit.attach());
+            attachments.push(permit);
+        }
+        let mut management = Vec::new();
+        for _ in 0..MAX_CONNECTION_HANDLERS {
+            let mut permit = admission.admit().unwrap();
+            assert!(!permit.attach());
+            management.push(permit);
+        }
+        assert!(admission.admit().is_none());
+        attachments.pop();
+        assert!(management[0].attach());
+        assert!(admission.admit().is_some());
+        drop(attachments);
+        drop(management);
+        assert_eq!(admission.management.load(Ordering::Acquire), 0);
+        assert_eq!(admission.attachments.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn reader_wait_wakes_for_commands_and_disconnection() {
+        let (commands, receiver, wake) = ReaderCommands::channel().unwrap();
+        let (observed, observation) = mpsc::sync_channel(0);
+        let waiter = thread::spawn(move || {
+            wake.wait(None, None, None).unwrap();
+            wake.clear();
+            assert!(matches!(receiver.try_recv(), Ok(ReaderCommand::Resume)));
+            observed.send(()).unwrap();
+            wake.wait(None, None, None).unwrap();
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+        });
+        commands.send(ReaderCommand::Resume).unwrap();
+        observation.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(commands);
+        waiter.join().unwrap();
+    }
+
+    #[test]
     fn timed_out_reader_pause_cancels_queued_command() {
-        let (commands, receiver) = mpsc::channel();
+        let (commands, receiver, _wake) = ReaderCommands::channel().unwrap();
         let (observed, observation) = mpsc::sync_channel(1);
         let handle = thread::spawn(move || {
             thread::sleep(Duration::from_millis(30));

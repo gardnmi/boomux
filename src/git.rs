@@ -1,12 +1,20 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_CACHE_ENTRIES: usize = 256;
+const MAX_PENDING_INSPECTIONS: usize = 64;
+const MAX_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Metadata {
@@ -30,12 +38,14 @@ impl Default for Metadata {
 struct CachedMetadata {
     value: Metadata,
     inspected_at: Instant,
+    accessed_at: Instant,
 }
 
 pub(crate) struct Cache {
     entries: HashMap<PathBuf, CachedMetadata>,
     pending: HashSet<PathBuf>,
-    requests: Sender<PathBuf>,
+    requests: SyncSender<PathBuf>,
+    stopped: Arc<AtomicBool>,
     results: Receiver<(PathBuf, Metadata)>,
 }
 
@@ -47,10 +57,16 @@ impl Default for Cache {
 
 impl Cache {
     fn with_inspector(inspector: Arc<dyn Fn(&Path) -> Metadata + Send + Sync>) -> Self {
-        let (request_sender, request_receiver) = mpsc::channel::<PathBuf>();
-        let (result_sender, result_receiver) = mpsc::channel();
+        let (request_sender, request_receiver) =
+            mpsc::sync_channel::<PathBuf>(MAX_PENDING_INSPECTIONS);
+        let (result_sender, result_receiver) = mpsc::sync_channel(MAX_PENDING_INSPECTIONS);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
         thread::spawn(move || {
             while let Ok(directory) = request_receiver.recv() {
+                if worker_stopped.load(Ordering::Acquire) {
+                    break;
+                }
                 let metadata = inspector(&directory);
                 if result_sender.send((directory, metadata)).is_err() {
                     break;
@@ -61,6 +77,7 @@ impl Cache {
             entries: HashMap::new(),
             pending: HashSet::new(),
             requests: request_sender,
+            stopped,
             results: result_receiver,
         }
     }
@@ -68,24 +85,36 @@ impl Cache {
     pub(crate) fn inspect(&mut self, directory: &Path) -> Metadata {
         for (directory, value) in self.results.try_iter() {
             self.pending.remove(&directory);
+            if !self.entries.contains_key(&directory)
+                && self.entries.len() >= MAX_CACHE_ENTRIES
+                && let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.accessed_at)
+                    .map(|(path, _)| path.clone())
+            {
+                self.entries.remove(&oldest);
+            }
             self.entries.insert(
                 directory,
                 CachedMetadata {
                     value,
                     inspected_at: Instant::now(),
+                    accessed_at: Instant::now(),
                 },
             );
         }
 
-        if let Some(cached) = self.entries.get(directory)
-            && cached.inspected_at.elapsed() < REFRESH_INTERVAL
-        {
-            return cached.value.clone();
+        if let Some(cached) = self.entries.get_mut(directory) {
+            cached.accessed_at = Instant::now();
+            if cached.inspected_at.elapsed() < REFRESH_INTERVAL {
+                return cached.value.clone();
+            }
         }
 
-        if !self.pending.contains(directory) {
+        if self.pending.len() < MAX_PENDING_INSPECTIONS && !self.pending.contains(directory) {
             let directory = directory.to_owned();
-            if self.requests.send(directory.clone()).is_ok() {
+            if self.requests.try_send(directory.clone()).is_ok() {
                 self.pending.insert(directory);
             }
         }
@@ -96,24 +125,142 @@ impl Cache {
     }
 }
 
+impl Drop for Cache {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+}
+
+// Drain a nonblocking pipe in this worker, with one absolute deadline covering
+// both process exit and EOF. A descendant keeping stdout open cannot wedge it.
+fn command_output(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    let group = child.id() as libc::pid_t;
+    let result = (|| {
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("Git stdout is unavailable"))?;
+        let descriptor = stdout.as_raw_fd();
+        // The pipe remains owned by stdout until the operation finishes.
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if flags == -1
+            || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let deadline = Instant::now() + timeout;
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 8192];
+        let mut eof = false;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Git metadata inspection timed out",
+                ));
+            }
+            if !eof {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => eof = true,
+                    Ok(count) => {
+                        if bytes.len().saturating_add(count) > limit {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Git output exceeds the size limit",
+                            ));
+                        }
+                        bytes.extend_from_slice(&buffer[..count]);
+                        continue;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if eof {
+                // Observe exit without reaping, so its process-group ID cannot
+                // be reused before we clean up any remaining Git helpers.
+                let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child.id(),
+                        &mut status,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                } == -1
+                {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if unsafe { status.si_pid() } != 0 {
+                    return Ok(bytes);
+                }
+            }
+            let mut descriptor = libc::pollfd {
+                fd: if eof { -1 } else { descriptor },
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(20) as i32;
+            // Only active Git work polls; an idle cache sleeps on its queue.
+            if unsafe { libc::poll(&mut descriptor, 1, timeout) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    })();
+    // Git helpers share this dedicated process group. Reap the direct child on
+    // every path and close the pipe before accepting the next inspection.
+    unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    }
+    let status = child.wait();
+    let bytes = result?;
+    Ok(status?.success().then_some(bytes))
+}
+
+fn git_output(directory: &Path, arguments: &[&str]) -> Option<Vec<u8>> {
+    command_output(
+        Command::new("git").arg("-C").arg(directory).args(arguments),
+        GIT_COMMAND_TIMEOUT,
+        MAX_GIT_OUTPUT_BYTES,
+    )
+    .ok()
+    .flatten()
+}
+
 fn inspect(directory: &Path) -> Option<Metadata> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args([
+    let output = git_output(
+        directory,
+        &[
             "rev-parse",
             "--path-format=absolute",
             "--show-toplevel",
             "--git-dir",
             "--git-common-dir",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+        ],
+    )?;
 
-    let output = String::from_utf8_lossy(&output.stdout);
+    let output = String::from_utf8_lossy(&output);
     let mut lines = output.lines();
     let (Some(root), Some(git_directory), Some(common_directory), None) =
         (lines.next(), lines.next(), lines.next(), lines.next())
@@ -136,30 +283,17 @@ fn inspect(directory: &Path) -> Option<Metadata> {
 }
 
 fn inspect_branch(directory: &Path) -> String {
-    let symbolic = Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(["symbolic-ref", "--short", "-q", "HEAD"])
-        .output();
-    if let Ok(output) = symbolic
-        && output.status.success()
-    {
-        return String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    }
-    "detached".into()
+    git_output(directory, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .map(|output| String::from_utf8_lossy(&output).trim().to_owned())
+        .unwrap_or_else(|| "detached".into())
 }
 
 fn inspect_state(directory: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
-        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| summarize_status(&String::from_utf8_lossy(&output.stdout)))
+    git_output(
+        directory,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    )
+    .map(|output| summarize_status(&String::from_utf8_lossy(&output)))
 }
 
 fn summarize_status(status: &str) -> String {
@@ -247,6 +381,79 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn command_output_bounds_runtime_output_and_inherited_pipes() {
+        for script in ["sleep 10", "sleep 10 & exit 0", "exec 1>&-; sleep 10"] {
+            let started = Instant::now();
+            let error = command_output(
+                Command::new("/bin/sh").args(["-c", script]),
+                Duration::from_millis(50),
+                100,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+        let error = command_output(
+            Command::new("/bin/sh").args(["-c", "while :; do printf '0123456789'; done"]),
+            Duration::from_secs(2),
+            100,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            command_output(
+                Command::new("/bin/sh").args(["-c", "printf ready"]),
+                Duration::from_secs(1),
+                100
+            )
+            .unwrap(),
+            Some(b"ready".to_vec())
+        );
+    }
+
+    #[test]
+    fn cache_bounds_pending_work_and_stops_queued_inspections_on_drop() {
+        let (started, start) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let released = std::sync::Mutex::new(released);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let mut cache = Cache::with_inspector(Arc::new(move |_| {
+            worker_calls.fetch_add(1, Ordering::SeqCst);
+            started.send(()).unwrap();
+            released.lock().unwrap().recv().unwrap();
+            Metadata::default()
+        }));
+        cache.inspect(Path::new("/first"));
+        start.recv_timeout(Duration::from_secs(2)).unwrap();
+        for index in 0..MAX_PENDING_INSPECTIONS * 4 {
+            cache.inspect(&PathBuf::from(format!("/directory-{index}")));
+        }
+        assert_eq!(cache.pending.len(), MAX_PENDING_INSPECTIONS);
+        drop(cache);
+        release.send(()).unwrap();
+        assert!(start.recv_timeout(Duration::from_secs(2)).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cache_evicts_old_directories() {
+        let mut cache = Cache::with_inspector(Arc::new(|_| Metadata::default()));
+        for index in 0..MAX_CACHE_ENTRIES + 10 {
+            let path = PathBuf::from(format!("/directory-{index}"));
+            cache.inspect(&path);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while cache.pending.contains(&path) {
+                cache.inspect(&path);
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHE_ENTRIES);
+        assert!(!cache.entries.contains_key(Path::new("/directory-0")));
     }
 
     #[test]

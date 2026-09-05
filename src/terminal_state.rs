@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::protocol::{
     TerminalColor, TerminalPreview, TerminalPreviewLine, TerminalPreviewSpan, TerminalStyle,
 };
@@ -8,7 +10,6 @@ const MAX_RECONSTRUCTION_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct TerminalState {
     parser: vt100::Parser,
-    primary_before_alternate: Option<vt100::Screen>,
     terminal_modes: TerminalModes,
 }
 
@@ -21,27 +22,41 @@ impl TerminalState {
         let parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
         Self {
             parser,
-            primary_before_alternate: None,
             terminal_modes: TerminalModes::default(),
         }
     }
 
     pub(crate) fn process(&mut self, bytes: &[u8]) {
         self.terminal_modes.process(bytes);
-        let was_alternate = self.parser.screen().alternate_screen();
-        if !was_alternate && let Some(offset) = alternate_screen_start(bytes) {
-            self.parser.process(&bytes[..offset]);
-            self.primary_before_alternate = Some(self.parser.screen().clone());
-            self.parser.process(&bytes[offset..]);
-            if !self.parser.screen().alternate_screen() {
-                self.primary_before_alternate = None;
-            }
-            return;
-        }
         self.parser.process(bytes);
-        if was_alternate && !self.parser.screen().alternate_screen() {
-            self.primary_before_alternate = None;
+    }
+
+    fn primary_screen(&self) -> Cow<'_, vt100::Screen> {
+        let screen = self.parser.screen();
+        if !screen.alternate_screen() {
+            return Cow::Borrowed(screen);
         }
+        // Screen already retains both grids, including the saved primary cursor.
+        // Switch a temporary copy through the parser instead of recognizing raw
+        // escape sequences, whose boundaries need not match PTY reads.
+        let mut primary = vt100::Parser::new(1, 1, 0);
+        let mut screen = screen.clone();
+        std::mem::swap(primary.screen_mut(), &mut screen);
+        // Mode 47 does not save the cursor. Keep the primary grid's actual
+        // position even if an earlier DECSC saved a different one. Mode 1049
+        // also restores drawing attributes; cursor restoration can redraw the
+        // last cell of a wrapped row, so restore those attributes afterwards.
+        primary.process(b"\x1b[?47l");
+        let cursor = primary.screen().cursor_state_formatted();
+        primary.process(b"\x1b[?1049l");
+        let attributes = primary.screen().attributes_formatted();
+        // cursor_state_formatted uses physical coordinates, even when the
+        // primary grid had origin mode enabled within a scrolling region.
+        primary.process(b"\x1b[?6l");
+        primary.process(&cursor);
+        primary.process(&attributes);
+        std::mem::swap(primary.screen_mut(), &mut screen);
+        Cow::Owned(screen)
     }
 
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
@@ -50,8 +65,8 @@ impl TerminalState {
         }
 
         let screen = self.parser.screen();
-        let primary = self.primary_before_alternate.as_ref().unwrap_or(screen);
-        let mut reconstruction = reflowable_contents_formatted(primary);
+        let primary = self.primary_screen();
+        let mut reconstruction = reflowable_contents_formatted(&primary);
         if screen.alternate_screen() {
             reconstruction.extend_from_slice(b"\x1b[?1049h");
             reconstruction.extend(screen.contents_formatted());
@@ -74,9 +89,9 @@ impl TerminalState {
 
     pub(crate) fn reconstruction(&self) -> Vec<u8> {
         let screen = self.parser.screen();
-        let primary = self.primary_before_alternate.as_ref().unwrap_or(screen);
+        let primary = self.primary_screen();
         let mut output = b"\x1b[?1049l\x1b[0m\x1b[?25h\x1b[H\x1b[2J".to_vec();
-        append_scrollback(&mut output, primary);
+        append_scrollback(&mut output, &primary);
         output.extend_from_slice(b"\x1b[H\x1b[2J");
         output.extend(primary.contents_formatted());
         if screen.alternate_screen() {
@@ -605,17 +620,6 @@ fn preview_line_is_blank(line: &TerminalPreviewLine) -> bool {
     line.spans.iter().all(|span| span.text.trim().is_empty())
 }
 
-fn alternate_screen_start(bytes: &[u8]) -> Option<usize> {
-    [b"\x1b[?1049h".as_slice(), b"\x1b[?1047h", b"\x1b[?47h"]
-        .into_iter()
-        .filter_map(|sequence| {
-            bytes
-                .windows(sequence.len())
-                .position(|window| window == sequence)
-        })
-        .min()
-}
-
 #[cfg(test)]
 fn scrollback_text(screen: &vt100::Screen) -> String {
     let mut screen = screen.clone();
@@ -949,6 +953,76 @@ mod tests {
                 .iter()
                 .all(|cell| cell.fgcolor() == vt100::Color::Idx(1))
         );
+    }
+
+    #[test]
+    fn alternate_screen_reconstruction_is_independent_of_chunk_boundaries() {
+        for sequence in [b"\x1b[?1049h".as_slice(), b"\x1b[?25;1049h", b"\x1b[?47h"] {
+            for split in 0..=sequence.len() {
+                for resize in [false, true] {
+                    let mut source = TerminalState::new(4, 20);
+                    source.process(b"primary");
+                    source.process(&sequence[..split]);
+                    source.process(&sequence[split..]);
+                    source.process(b"alt");
+                    if resize {
+                        source.resize(5, 25);
+                    }
+                    let mut restored = TerminalState::new(5, 25);
+                    restored.process(&source.reconstruction());
+                    assert_eq!(restored.plain_text(), "alt");
+                    restored.process(b"\x1b[?1049l");
+                    assert_eq!(
+                        restored.plain_text(),
+                        "primary",
+                        "sequence={sequence:?}, split={split}, resize={resize}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alternate_reconstruction_preserves_primary_cursor_and_saved_attributes() {
+        let mut source = TerminalState::new(4, 30);
+        source.process(b"\x1b7primary\x1b[?47halt");
+        let mut restored = TerminalState::new(4, 30);
+        restored.process(&source.reconstruction());
+        restored.process(b"\x1b[?47l!");
+        assert_eq!(restored.plain_text(), "primary!");
+
+        let mut source = TerminalState::new(4, 30);
+        source.process(b"\x1b[31mprimary\x1b[?1049h\x1b[32malt");
+        let mut restored = TerminalState::new(4, 30);
+        restored.process(&source.reconstruction());
+        restored.process(b"\x1b[?1049l!");
+        assert_eq!(restored.plain_text(), "primary!");
+        assert_eq!(
+            restored.parser.screen().cell(0, 7).unwrap().fgcolor(),
+            vt100::Color::Idx(1)
+        );
+    }
+
+    #[test]
+    fn alternate_reconstruction_preserves_cursor_with_primary_origin_mode() {
+        let mut source = TerminalState::new(6, 20);
+        source.process(b"\x1b[2;5r\x1b[?6hprimary\x1b[?1049halt");
+        let mut restored = TerminalState::new(6, 20);
+        restored.process(&source.reconstruction());
+        restored.process(b"\x1b[?1049l!");
+        source.process(b"\x1b[?1049l!");
+        assert_eq!(restored.plain_text(), source.plain_text());
+    }
+
+    #[test]
+    fn repeated_alternate_transitions_capture_the_latest_primary() {
+        let mut source = TerminalState::new(4, 30);
+        source.process(b"first\x1b[?1049hone\x1b[?1049l second\x1b[?1049htwo");
+        let mut restored = TerminalState::new(4, 30);
+        restored.process(&source.reconstruction());
+        assert_eq!(restored.plain_text(), "two");
+        restored.process(b"\x1b[?1049l third");
+        assert_eq!(restored.plain_text(), "first second third");
     }
 
     #[test]
