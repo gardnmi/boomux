@@ -1,3 +1,6 @@
 /target
 /dist
 /node_modules
+
+# Python CI helper tests
+__pycache__/

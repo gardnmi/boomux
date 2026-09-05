@@ -2,6 +2,8 @@ name: CI
 
 on:
   pull_request:
+  workflow_dispatch:
+  merge_group:
   push:
     branches:
       - main
@@ -12,53 +14,48 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   changes:
     name: Classify changes
-    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
     outputs:
       run_code: ${{ steps.classify.outputs.run_code }}
+      run_package: ${{ steps.classify.outputs.run_package }}
+      run_benchmarks: ${{ steps.classify.outputs.run_benchmarks }}
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
 
-      - name: Detect non-Markdown changes
+      - name: Test CI selection and artifact provenance
+        run: python3 -m unittest discover -s .github/scripts -p 'test_ci_*.py'
+
+      - name: Select required validation
         id: classify
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.sha }}
-        run: |
-          run_code=false
-          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ || "$BASE_SHA" == 0000000000000000000000000000000000000000 ]]; then
-            run_code=true
-          else
-            while IFS= read -r -d '' path; do
-              case "$path" in
-                *.md) ;;
-                *) run_code=true; break ;;
-              esac
-            done < <(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA")
-          fi
-          printf 'run_code=%s\n' "$run_code" >> "$GITHUB_OUTPUT"
-          if [[ "$run_code" == false ]]; then
-            printf 'Only Markdown files changed; code and packaging steps will be skipped.\n' >> "$GITHUB_STEP_SUMMARY"
-          fi
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/classify-ci.py
 
   rust:
     name: Rust
     needs: changes
-    if: always()
-    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
     env:
       RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - name: Skip code checks for Markdown-only changes
+      - name: Skip code checks when covered or not required
         if: env.RUN_CODE != 'true'
-        run: printf 'Rust checks are not required for Markdown-only changes.\n'
+        run: printf 'Rust checks are covered by base CI or not needed; see Classify changes.\n'
 
       - name: Check out repository
         if: env.RUN_CODE == 'true'
@@ -67,6 +64,13 @@ jobs:
       - name: Install Rust toolchain
         if: env.RUN_CODE == 'true'
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Cache Rust dependencies
+        if: env.RUN_CODE == 'true'
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: ubuntu-24.04-checks
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
         if: env.RUN_CODE == 'true'
@@ -91,14 +95,15 @@ jobs:
   dependency-policy:
     name: Dependency policy
     needs: changes
-    if: always()
-    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
     env:
       RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
     steps:
-      - name: Skip dependency checks for Markdown-only changes
+      - name: Skip dependency checks when covered or not required
         if: env.RUN_CODE != 'true'
-        run: printf 'Dependency checks are not required for Markdown-only changes.\n'
+        run: printf 'Dependency checks are covered by base CI or not needed; see Classify changes.\n'
 
       - name: Check out repository
         if: env.RUN_CODE == 'true'
@@ -111,15 +116,16 @@ jobs:
   benchmarks:
     name: Benchmark smoke
     needs: changes
-    if: always()
+    if: ${{ !cancelled() }}
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     env:
-      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
+      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_benchmarks == 'false' && 'false' || 'true' }}
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - name: Skip benchmark checks for Markdown-only changes
+      - name: Skip benchmark checks when covered or not required
         if: env.RUN_CODE != 'true'
-        run: printf 'Benchmark checks are not required for Markdown-only changes.\n'
+        run: printf 'Benchmark checks are covered by base CI or not needed; see Classify changes.\n'
 
       - name: Check out repository
         if: env.RUN_CODE == 'true'
@@ -129,31 +135,33 @@ jobs:
         if: env.RUN_CODE == 'true'
         run: rustup toolchain install stable --profile minimal
 
+      - name: Cache Rust dependencies
+        if: env.RUN_CODE == 'true'
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: ubuntu-24.04-benchmarks
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
       - name: Validate deterministic benchmark fixtures
         if: env.RUN_CODE == 'true'
         run: cargo test --test benchmark_harness --features benchmark-internals --locked
 
-      - name: Compile every benchmark target
-        if: env.RUN_CODE == 'true'
-        run: cargo check --benches --all-features --locked
-
       - name: Smoke test Criterion benchmarks
         if: env.RUN_CODE == 'true'
-        run: |
-          cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
-          cargo bench --bench wire --locked -- --test
+        run: cargo bench --bench core_cpu --bench wire --features benchmark-internals --locked -- --test
 
   integrations:
     name: Integrations
     needs: changes
-    if: always()
-    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
     env:
       RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
     steps:
-      - name: Skip integration checks for Markdown-only changes
+      - name: Skip integration checks when covered or not required
         if: env.RUN_CODE != 'true'
-        run: printf 'Integration checks are not required for Markdown-only changes.\n'
+        run: printf 'Integration checks are covered by base CI or not needed; see Classify changes.\n'
 
       - name: Check out repository
         if: env.RUN_CODE == 'true'
@@ -179,7 +187,7 @@ jobs:
   release-packaging:
     name: Release packaging (${{ matrix.arch }})
     needs: changes
-    if: always()
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -190,16 +198,17 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+    timeout-minutes: 30
     runs-on: ${{ matrix.runner }}
     env:
       BOOMUX_DISTRIBUTION: github-release
-      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
+      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_package == 'false' && 'false' || 'true' }}
       RUSTUP_TOOLCHAIN: stable
       TARGET: ${{ matrix.target }}
     steps:
-      - name: Skip release packaging for Markdown-only changes
+      - name: Skip release packaging when covered or not required
         if: env.RUN_CODE != 'true'
-        run: printf 'Release packaging is not required for Markdown-only changes.\n'
+        run: printf 'Release packaging is covered by base CI or not needed; see Classify changes.\n'
 
       - name: Check out repository
         if: env.RUN_CODE == 'true'
@@ -208,6 +217,14 @@ jobs:
       - name: Install Rust toolchain
         if: env.RUN_CODE == 'true'
         run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Rust dependencies
+        if: env.RUN_CODE == 'true'
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          shared-key: release-${{ matrix.target }}
+          key: ubuntu-24.04-release-${{ matrix.target }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Read package version
         if: env.RUN_CODE == 'true'
@@ -223,12 +240,20 @@ jobs:
         if: env.RUN_CODE == 'true'
         run: bash .github/scripts/package-release.sh "$TAG" "$TARGET"
 
-      - name: Retain package for compatibility testing
-        if: ${{ env.RUN_CODE == 'true' && matrix.arch == 'x86_64' }}
+      - name: Record package source
+        if: env.RUN_CODE == 'true'
+        run: python3 .github/scripts/ci-release-source.py record dist "$(git rev-parse HEAD)" "$TAG" "$TARGET"
+
+      - name: Retain validated release candidate
+        if: env.RUN_CODE == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: compatibility-${{ matrix.target }}
-          path: dist/boomux-${{ env.TAG }}-${{ matrix.target }}.tar.gz
+          name: release-candidate-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/ci-source.json
+          retention-days: 14
           if-no-files-found: error
 
       - name: Validate release scripts
@@ -242,15 +267,16 @@ jobs:
   aur-package:
     name: AUR package metadata
     needs: changes
-    if: always()
+    if: ${{ !cancelled() }}
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     container: archlinux:base-devel@sha256:68bfc3b0d277b08a99101dc9b94aaa03e5ae70cf1b4fb965c03b2b87b915760d
     env:
       RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
     steps:
-      - name: Skip AUR validation for Markdown-only changes
+      - name: Skip AUR validation when covered or not required
         if: env.RUN_CODE != 'true'
-        run: printf 'AUR validation is not required for Markdown-only changes.\n'
+        run: printf 'AUR validation is covered by base CI or not needed; see Classify changes.\n'
 
       - name: Prepare Arch build user
         if: env.RUN_CODE == 'true'
@@ -286,21 +312,22 @@ jobs:
     needs:
       - changes
       - release-packaging
-    if: always()
+    if: ${{ !cancelled() && needs.release-packaging.result == 'success' }}
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     container: archlinux:base-devel@sha256:68bfc3b0d277b08a99101dc9b94aaa03e5ae70cf1b4fb965c03b2b87b915760d
     env:
-      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
+      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_package == 'false' && 'false' || 'true' }}
     steps:
-      - name: Skip compatibility testing for Markdown-only changes
+      - name: Skip compatibility testing when covered or not required
         if: env.RUN_CODE != 'true'
-        run: printf 'Pinned Arch compatibility is not required for Markdown-only changes.\n'
+        run: printf 'Pinned Arch compatibility is covered by base CI or not needed; see Classify changes.\n'
 
       - name: Download x86_64 release package
         if: env.RUN_CODE == 'true'
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
-          name: compatibility-x86_64-unknown-linux-gnu
+          name: release-candidate-x86_64-unknown-linux-gnu
           path: dist
 
       - name: Smoke test Ubuntu-built binary on pinned Arch

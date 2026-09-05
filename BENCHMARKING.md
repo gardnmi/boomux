@@ -36,9 +36,8 @@ Run the deterministic fixtures and compile every target:
 
 ```console
 cargo test --test benchmark_harness --features benchmark-internals --locked
-cargo check --benches --all-features --locked
-cargo bench --bench core_cpu --features benchmark-internals --locked -- --test
-cargo bench --bench wire --locked -- --test
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo bench --bench core_cpu --bench wire --features benchmark-internals --locked -- --test
 ```
 
 Smoke mode executes each Criterion case once. It verifies fixtures and benchmark
