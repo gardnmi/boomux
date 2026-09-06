@@ -11,15 +11,20 @@ Report suspected vulnerabilities privately through
 [GitHub Private Vulnerability Reporting](https://github.com/gardnmi/boomux/security/advisories/new).
 Do not open a public issue for a suspected vulnerability.
 
-Include the Boomux version, operating system, affected feature, reproduction
-steps, and impact when known. Do not include terminal contents, environment
-variables, credentials, SSH output, private paths, external session IDs, or
-configuration contents unless they are essential and have been redacted.
+Include the Boomux version, component (CLI or Desktop), operating system,
+affected feature, reproduction steps, and impact when known. Do not include
+terminal contents, environment variables, credentials, SSH output, private
+paths, external session IDs, or configuration contents unless they are essential
+and have been redacted.
 
 You should receive an acknowledgement within seven days. Please allow time for
 investigation and a coordinated release before publishing details.
 
 ## Security Boundaries
+
+Native Desktop reads and writes live Shells. Terminal contents, clipboard data,
+and Agent metadata may be sensitive; redact them when reporting a Desktop issue
+through the same private reporting channel above.
 
 Writable web-terminal access is equivalent to shell access. Boomux's web
 services bind to loopback; operators are responsible for authentication, TLS,

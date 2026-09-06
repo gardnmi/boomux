@@ -97,6 +97,12 @@ path.write_text(json.dumps(state))
         self.env['FAIL_LIST'] = '1'
         self.assertEqual(self.publish(False)['uploads'], [])
 
+    def test_upload_failure_keeps_release_draft(self):
+        self.env['FAIL_UPLOAD'] = '1'
+        state = self.publish(False)
+        self.assertEqual(state['uploads'], [])
+        self.assertTrue(state['draft'])
+
     def test_existing_conflict_is_preserved(self):
         state = json.loads(self.state.read_text())
         name = self.files[0].name

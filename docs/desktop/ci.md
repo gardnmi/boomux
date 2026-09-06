@@ -38,6 +38,8 @@ not evidence for a performance claim or a hard regression threshold.
 
 ## Repository cutover
 
+The final source revisions and file inventory are recorded in [the handoff](handoff.md).
+
 Before merging the migration, add `CI result` to the existing required status
 checks on `main`. Keep existing required checks until the aggregate is reporting
 successfully; it also covers Desktop build and display failures. Source workflow

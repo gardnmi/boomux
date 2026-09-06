@@ -1,34 +1,29 @@
 # Desktop source provenance
 
 Imported from https://github.com/gardnmi/boomux-desktop under its MIT license.
-Original commit history remains in that repository.
+Original commit and review history remains in that repository.
 
-- Desktop main: `0b4cb3cf00c9445455b03ae16141c8ee87ea1201`, including
-  [PR #9](https://github.com/gardnmi/boomux-desktop/pull/9), the CPU portability
-  patch and smoke harness (original commit `11fcdc0`).
-- [PR #10](https://github.com/gardnmi/boomux-desktop/pull/10):
-  `f149e0aa7b984f52077db93e8f0fdf67a099c80d`, dismissible update notices, adapted
-  to the unified Boomux release and bundle.
-- [PR #11](https://github.com/gardnmi/boomux-desktop/pull/11):
-  `0c9db9440a5f0650996460666af245353af803c8`. Its product change at
-  `b3a2bc2adc8c406e5a604ef643db9a69e9400701` adds distinct labels for Agents
-  sharing a Shell, including its regression test and documentation. This PR is
-  stacked on #10; both are included here. Its later CPU cache isolation fix
-  protects the older native-CPU Ghostty build on that branch. Here, PR #9's
-  `-Dcpu=baseline` patch and the dedicated `baseline-v1` Desktop cache keys
-  replace that workaround: cached Ghostty code uses the same portable target
-  across runner CPUs, without restoring the old native-CPU cache namespace.
-- Boomux migration base: `0fd34c8` (version 1.9.7).
+The final Desktop source for handoff is
+`95946c14413eeac039e619c96368577463c59a53` (`main`, audited 2026-09-06).
+Its tree is `22405df04c8d6c1221d106c2dc6ae131cfd837bc`. All 54 tracked files
+are accounted for in the [handoff inventory](../docs/desktop/handoff.md).
+No Desktop PRs were open at this audit; new Desktop work belongs in Boomux.
 
-PR #9 was merged and #10/#11 were open when checked on 2026-09-06. Their changes
-are carried into this migration; their GitHub discussion and review history
-remain in the source repository. After this migration merges, close the two
-source PRs with a link to the replacement instead of merging the same changes
-again. Recheck their heads before cutover if work continues in the old repo.
+| Source PR | Final merge | Carried into this workspace |
+| --- | --- | --- |
+| [#9](https://github.com/gardnmi/boomux-desktop/pull/9) | `0b4cb3cf00c9445455b03ae16141c8ee87ea1201` | Portable Ghostty build and CPU smoke coverage |
+| [#11](https://github.com/gardnmi/boomux-desktop/pull/11) | `29b4e250f1d20eaebaec2d12997ec2799d4e2b20` | Distinct shared-Shell Agent labels and regression test |
+| [#10](https://github.com/gardnmi/boomux-desktop/pull/10) | `95946c14413eeac039e619c96368577463c59a53` | Dismissible notices, adapted to the shared release |
 
-The root `vendor/libghostty-vt-sys/PATCH.md` records upstream patch provenance.
-Desktop is now a workspace member and shares Boomux's version, lockfile, CI,
-and release. It remains a presentation client of the daemon.
+The earlier PR #11 CPU fingerprint workaround was removed upstream before
+merging. Both final Desktop main and this workspace use the explicit baseline
+Ghostty target and `baseline-v1` cache keys. The vendored Ghostty files match the
+final source exactly; `vendor/libghostty-vt-sys/PATCH.md` records upstream provenance.
+
+The migration started from Boomux `0fd34c8` and now includes main at
+`526df3f8f303b7673c62b53494cb861ac0ffae17`, including the Codex lifecycle fix.
+Desktop shares Boomux's version, lockfile, CI, and release, while remaining a
+presentation client of the daemon.
 
 The shared lockfile starts from Desktop's locked dependency graph and adds the
 root package's benchmark/test dependencies. Existing exact UI/terminal pins are
