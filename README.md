@@ -142,7 +142,7 @@ CLI install keeps its own update ownership. Desktop never replaces it.
 Daemons installed before this release need a one-time upgrade through their
 existing installation method before Desktop can take over updates. For an eligible
 standalone release installation, use `boomux update`. Desktop leaves live terminals
-running if that prerequisite is not met.
+running if that prerequisite is not met. See the [older-install migration steps](docs/desktop/releases.md#distribution-and-installation).
 
 Eligible official release installations at `~/.local/bin/boomux` have an
 explicit guided updater:

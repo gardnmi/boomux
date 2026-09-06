@@ -64,6 +64,13 @@ Desktop can complete the switch (for an eligible standalone release install,
 Shells running; Desktop does not silently overwrite a separate CLI or cold-stop
 its sessions. Fresh combined installs include this support.
 
+For a pre-protocol-52 Desktop bundle or a development daemon that cannot update
+its existing executable in place, install the new bundle first, then finish all
+running work. Close Desktop, run `boomux daemon stop` from the old installation,
+and open the newly installed Desktop. **Stop terminates every managed process**;
+this is a user-scheduled one-time migration, never an automatic updater fallback.
+The new app starts its bundled daemon, enabling subsequent graceful updates.
+
 The old repository is retained until cutover. Existing development builds should
 rerun the canonical installer after the first unified release; their old update
 endpoint cannot be changed by moving source. Install paths and preferences need
