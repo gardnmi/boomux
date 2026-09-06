@@ -226,6 +226,15 @@ fn run_interactive(
     arguments: &[&str],
     input: &[u8],
 ) -> (std::process::ExitStatus, Vec<u8>) {
+    run_interactive_with_timeout(directory, arguments, input, Duration::from_secs(30))
+}
+
+fn run_interactive_with_timeout(
+    directory: &Path,
+    arguments: &[&str],
+    input: &[u8],
+    timeout: Duration,
+) -> (std::process::ExitStatus, Vec<u8>) {
     let mut master = 0;
     let mut slave = 0;
     assert_eq!(
@@ -271,7 +280,7 @@ fn run_interactive(
         -1
     );
     let mut output = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
     loop {
         let mut bytes = [0_u8; 4096];
         match master.read(&mut bytes) {
@@ -283,11 +292,14 @@ fn run_interactive(
         if let Some(status) = child.try_wait().unwrap() {
             return (status, output);
         }
-        assert!(
-            Instant::now() < deadline,
-            "interactive command timed out: {}",
-            String::from_utf8_lossy(&output)
-        );
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "interactive command timed out: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -854,7 +866,15 @@ fn interactive_missing_helper_first_install_still_succeeds_without_restart() {
     fs::create_dir_all(directory.join("runtime")).unwrap();
     fake_missing_install_ssh(&directory);
 
-    let (status, output) = run_interactive(&directory, &["--remote", "workbox"], b"y\n");
+    // This fixture checksums and uploads the real debug CLI. Workspace feature
+    // unification can enlarge that executable; its unoptimized checksum alone
+    // can exceed the short authentication-only fixtures' 30-second deadline.
+    let (status, output) = run_interactive_with_timeout(
+        &directory,
+        &["--remote", "workbox"],
+        b"y\n",
+        Duration::from_secs(120),
+    );
     assert!(
         status.success(),
         "missing-helper install failed with {status}: {}",
