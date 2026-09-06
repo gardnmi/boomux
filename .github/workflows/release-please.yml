@@ -205,11 +205,13 @@ jobs:
 
       - name: Build release binary for recovery
         if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: cargo build --release --locked --target "$TARGET"
+        run: cargo build -p boomux --release --locked --target "$TARGET"
 
       - name: Package and smoke test recovered release
         if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: bash .github/scripts/package-release.sh "$TAG" "$TARGET"
+        run: |
+          bash .github/scripts/package-release.sh "$TAG" "$TARGET"
+          python3 .github/scripts/ci-release-source.py record dist "$(git rev-parse HEAD)" "$TAG" "$TARGET"
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -218,8 +220,24 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/ci-source.json
           retention-days: 14
           if-no-files-found: error
+
+  desktop-bundle:
+    needs: [release-please, build-release]
+    uses: ./.github/workflows/desktop-build.yml
+    with:
+      source-ref: ${{ needs.release-please.outputs.source-ref }}
+      cli-artifact: boomux-${{ needs.release-please.outputs.tag-name }}-x86_64-unknown-linux-gnu
+      reuse-run-id: ${{ github.event_name == 'workflow_run' && format('{0}', github.event.workflow_run.id) || '' }}
+
+  desktop-recovery-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: [release-please, desktop-bundle]
+    uses: ./.github/workflows/desktop-smoke.yml
+    with:
+      source-ref: ${{ needs.release-please.outputs.source-ref }}
 
   validate-omarchy-boomux:
     name: Validate omarchy-boomux compatibility
@@ -266,10 +284,17 @@ jobs:
 
   publish-release:
     name: Publish GitHub release assets
+    if: >-
+      ${{ !cancelled() && needs.build-release.result == 'success' &&
+          needs.desktop-bundle.result == 'success' &&
+          needs.validate-omarchy-boomux.result == 'success' &&
+          (github.event_name == 'workflow_run' || needs.desktop-recovery-smoke.result == 'success') }}
     needs:
       - release-please
       - build-release
       - validate-omarchy-boomux
+      - desktop-bundle
+      - desktop-recovery-smoke
     timeout-minutes: 30
     runs-on: ubuntu-latest
     env:
@@ -290,11 +315,19 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Render release installer
-        run: packaging/render-installer.sh "$TAG" dist/boomux-installer.sh
+      - name: Download Desktop release artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: boomux-desktop-linux-x86_64
+          path: dist
+
+      - name: Render release installers
+        run: |
+          packaging/render-installer.sh "$TAG" dist/boomux-installer.sh
+          python3 desktop/scripts/render-installer.py "$TAG" dist/boomux-desktop-installer.sh
 
       - name: Upload assets to GitHub Release
-        run: bash .github/scripts/upload-release-assets.sh "$TAG" dist/*
+        run: bash .github/scripts/upload-release-assets.sh "$TAG" dist/*.tar.gz dist/*.sha256 dist/*-installer.sh
 
       - name: Add installation handoff to release notes
         run: bash .github/scripts/update-release-notes.sh "$TAG"

@@ -214,3 +214,18 @@ start and exit as Unknown at ProcessAdapter authority. Process exit is not agent
 process adapter cannot infer Done, Working, Blocked, or Idle. It does not discover canonical
 external session identity; callers must supply the complete integration, external session, shell,
 and run key. Reporting failures are fail-open and lifecycle-integration authority wins.
+
+## Native Desktop Client
+
+Boomux Desktop is the GPUI application in `desktop/`, a presentation client of
+the same daemon used by the CLI, TUI, web gateway, and external clients. It is
+separate from the optional Hyprland Desktop Workspace Layer described above.
+Its in-window layout does not create compositor workspaces or own durable
+Boomux resource identities.
+
+A **Pane** is a client view attached to an exact Boomux Shell/ShellRun. A **Tile**
+is a pane's position in the client's split layout. Closing a pane detaches it;
+permanently closing its Shell is a distinct daemon mutation. The **terminal core**
+is the pane-owned Ghostty decoder and render state; it does not own the PTY.
+Both executable packages share a repository and release version, but the daemon
+remains usable without the native Desktop application.

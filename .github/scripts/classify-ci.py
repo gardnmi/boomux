@@ -8,7 +8,7 @@ import tomllib
 
 DOCS = {"AGENTS.md", "CONTEXT.md", "DEVELOPMENT.md", "BENCHMARKING.md",
         "CHANGELOG.md", "SECURITY.md"}
-RELEASE_FILES = {"Cargo.toml", "Cargo.lock", ".release-please-manifest.json", "CHANGELOG.md"}
+RELEASE_FILES = {"desktop/Cargo.toml", "Cargo.toml", "Cargo.lock", ".release-please-manifest.json", "CHANGELOG.md"}
 FULL = {"run_code": True, "run_package": True, "run_benchmarks": True}
 
 
@@ -31,12 +31,19 @@ def release_only(base, head, paths):
     after["package"]["version"] = old
     if before != after:
         return False
+    members = [tomllib.loads(read(ref, "desktop/Cargo.toml")) for ref in (base, head)]
+    if members[0]["package"]["version"] != old or members[1]["package"]["version"] != new:
+        return False
+    members[1]["package"]["version"] = old
+    if members[0] != members[1]:
+        return False
     locks = [tomllib.loads(read(ref, "Cargo.lock")) for ref in (base, head)]
     for lock, version in zip(locks, (old, new)):
-        roots = [p for p in lock["package"] if p["name"] == "boomux" and "source" not in p]
-        if len(roots) != 1 or roots[0]["version"] != version:
-            return False
-        roots[0]["version"] = old
+        for name in ("boomux", "boomux-desktop"):
+            roots = [p for p in lock["package"] if p["name"] == name and "source" not in p]
+            if len(roots) != 1 or roots[0]["version"] != version:
+                return False
+            roots[0]["version"] = old
     if locks[0] != locks[1]:
         return False
     manifests = [json.loads(read(ref, ".release-please-manifest.json")) for ref in (base, head)]
@@ -63,10 +70,15 @@ def validated_base(sha):
     jobs = json.loads(subprocess.check_output([
         "gh", "api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"
     ], timeout=30))["jobs"]
-    required = {"Run Clippy", "Run Rust unit tests", "Run configuration CLI tests", "Run native backend tests"}
-    return any(job["name"] == "Rust" and job["conclusion"] == "success"
-               and required <= {step["name"] for step in job["steps"] if step["conclusion"] == "success"}
-               for job in jobs)
+    required = {
+        "Rust": {"Run Clippy", "Run Rust unit tests", "Run configuration CLI tests", "Run native backend tests"},
+        "Desktop Rust": {"Run Desktop Clippy", "Run Desktop tests"},
+        "Integrations": {"Verify embedded web terminal assets", "Run integration tests"},
+        "Dependency policy": {"Audit advisories, licenses, and dependency sources"},
+    }
+    return all(any(job["name"] == name and job["conclusion"] == "success"
+                   and steps <= {step["name"] for step in job["steps"] if step["conclusion"] == "success"}
+                   for job in jobs) for name, steps in required.items())
 
 
 
@@ -83,7 +95,7 @@ def classify(base, head, proof=validated_base):
             return FULL.copy(), "Version-only change has no successful base push CI; full validation."
         # Rust/core/build/CI changes retain benchmark smoke. Packaging and JS-only
         # changes still receive ordinary validation without optimized benchmarks.
-        benchmarks = any(path.startswith(("src/", "benches/", "tests/", ".cargo/", ".github/"))
+        benchmarks = any(path.startswith(("src/", "benches/", "tests/", "desktop/src/", "vendor/", ".cargo/", ".github/"))
                          or path in {"Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain", "rust-toolchain.toml"}
                          for path in paths)
         return {"run_code": True, "run_package": True, "run_benchmarks": benchmarks}, "Validate changed executable or packaging inputs."

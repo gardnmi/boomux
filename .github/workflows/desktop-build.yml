@@ -1,0 +1,87 @@
+name: Build Desktop bundle
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        required: true
+        type: string
+      cli-artifact:
+        required: true
+        type: string
+
+      reuse-run-id:
+        description: Successful main CI run whose exact Desktop artifact is published
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ${{ inputs.cli-artifact }}
+          path: incoming-cli
+      - name: Reuse validated Desktop candidate
+        if: inputs.reuse-run-id != ''
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: boomux-desktop-linux-x86_64
+          path: dist
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.reuse-run-id }}
+      - name: Verify reused source and checksums
+        if: inputs.reuse-run-id != ''
+        run: |
+          tag=v$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          python3 .github/scripts/ci-release-source.py verify incoming-cli "$(git rev-parse HEAD)" "$tag" "$TARGET"
+          python3 .github/scripts/ci-release-source.py verify dist "$(git rev-parse HEAD)" "$tag" "$TARGET" desktop
+      - name: Install graphics build dependencies
+        if: inputs.reuse-run-id == ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libfontconfig-dev libwayland-dev libx11-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev
+      - name: Install Rust
+        if: inputs.reuse-run-id == ''
+        run: rustup toolchain install stable --profile minimal
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: inputs.reuse-run-id == ''
+        with:
+          version: 0.15.2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        if: inputs.reuse-run-id == ''
+        with:
+          key: desktop-release-ubuntu-24.04-zig-0.15.2-baseline-v1
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Build Desktop and package the matching CLI
+        if: inputs.reuse-run-id == ''
+        run: |
+          tag=v$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          python3 .github/scripts/ci-release-source.py verify incoming-cli "$(git rev-parse HEAD)" "$tag" "$TARGET"
+          cargo build --release --locked --target "$TARGET" -p boomux-desktop
+          sh desktop/scripts/package-release.sh "incoming-cli/boomux-${tag}-${TARGET}.tar.gz"
+          python3 .github/scripts/ci-release-source.py record dist "$(git rev-parse HEAD)" "$tag" "$TARGET" desktop
+      - name: Upload Desktop candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: boomux-desktop-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/ci-source.json
+          retention-days: 14
+          if-no-files-found: error

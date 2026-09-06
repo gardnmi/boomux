@@ -1,0 +1,56 @@
+name: Desktop smoke
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  display:
+    name: Desktop smoke (${{ matrix.backend }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [x11, wayland]
+    steps:
+      - name: Check out matching test harness
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+      - name: Download candidate bundle
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: boomux-desktop-linux-x86_64
+          path: dist
+      - name: Install display and runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes python3 dbus xvfb x11-utils weston qemu-user \
+            mesa-vulkan-drivers libvulkan1 libegl1 libgl1-mesa-dri fonts-dejavu-core \
+            libfontconfig1 libwayland-client0 libx11-6 libxcb-shape0 libxcb-xfixes0 \
+            libxkbcommon0 libxkbcommon-x11-0
+      - name: Exercise bundled Desktop and Boomux
+        env:
+          BACKEND: ${{ matrix.backend }}
+          CPU_MODEL: ${{ matrix.backend == 'x11' && 'Nehalem' || '' }}
+        run: |
+          timeout --kill-after=15s 150s \
+            python3 desktop/scripts/smoke-desktop.py --backend "$BACKEND" --cpu-model "$CPU_MODEL" \
+              --archive dist/boomux-desktop-x86_64-unknown-linux-gnu.tar.gz \
+              --output "smoke-results/$BACKEND"
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-smoke-${{ matrix.backend }}
+          path: smoke-results/
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,75 @@
+name: Desktop performance
+
+on:
+  schedule:
+    - cron: "37 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  terminal-core:
+    name: Terminal core trend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libfontconfig-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+
+      - name: Build measurement targets
+        run: |
+          cargo test -p boomux-desktop --locked --no-run
+          cargo build -p boomux-desktop --release --locked
+
+      - name: Measure Doom-sized Kitty frame smoke
+        run: |
+          set -o pipefail
+          mkdir -p performance-results
+          /usr/bin/time -v \
+            -o performance-results/doom-frame-resources.txt \
+            cargo test -p boomux-desktop terminal::tests::ghostty_accepts_a_doom_sized_synchronized_frame \
+              --locked -- --exact --test-threads=1 \
+            | tee performance-results/doom-frame-test.txt
+          stat --printf='release_binary_bytes=%s\n' target/release/boomux-desktop \
+            | tee performance-results/release-binary.txt
+          rustc -Vv > performance-results/rustc.txt
+          uname -a > performance-results/uname.txt
+          lscpu > performance-results/cpu.txt
+
+      - name: Upload performance artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: performance-${{ github.sha }}-${{ github.run_attempt }}
+          path: performance-results/
+          if-no-files-found: warn
+          retention-days: 90

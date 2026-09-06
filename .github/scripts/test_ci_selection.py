@@ -40,7 +40,8 @@ class SelectionTests(unittest.TestCase):
 
     def write_version(self, version):
         self.write("Cargo.toml", f'[package]\nname = "boomux"\nversion = "{version}"\n')
-        self.write("Cargo.lock", f'version = 4\n[[package]]\nname = "boomux"\nversion = "{version}"\n[[package]]\nname = "dependency"\nversion = "2.0.0"\nsource = "registry"\n')
+        self.write("desktop/Cargo.toml", f'[package]\nname = "boomux-desktop"\nversion = "{version}"\n')
+        self.write("Cargo.lock", f'version = 4\n[[package]]\nname = "boomux"\nversion = "{version}"\n[[package]]\nname = "boomux-desktop"\nversion = "{version}"\n[[package]]\nname = "dependency"\nversion = "2.0.0"\nsource = "registry"\n')
         self.write(".release-please-manifest.json", json.dumps({".": version}))
         self.write("CHANGELOG.md", version)
 
@@ -94,6 +95,20 @@ class SelectionTests(unittest.TestCase):
             raise subprocess.TimeoutExpired("gh", 30)
         self.assertEqual(self.classify(unavailable), selection.FULL)
 
+    def test_backend_only_ci_cannot_justify_workspace_reuse(self):
+        valid = {"id": 123, "head_sha": self.base, "event": "push", "conclusion": "success", "head_branch": "main", "head_repository": {"full_name": "owner/repo"}}
+        jobs = {"jobs": [{"name": "Rust", "conclusion": "success", "steps": [
+            {"name": name, "conclusion": "success"} for name in
+            ["Run Clippy", "Run Rust unit tests", "Run configuration CLI tests", "Run native backend tests"]]}]}
+        with patch.dict(os.environ, GITHUB_REPOSITORY="owner/repo", DEFAULT_BRANCH="main"), patch.object(
+            selection.subprocess, "check_output", side_effect=[json.dumps({"workflow_runs": [valid]}).encode(), json.dumps(jobs).encode()]):
+            self.assertFalse(selection.validated_base(self.base))
+
+    def test_partial_workspace_version_change_runs_everything(self):
+        self.write_version("1.2.4")
+        self.write("desktop/Cargo.toml", '[package]\nname = "boomux-desktop"\nversion = "1.2.3"\n')
+        self.assertEqual(self.classify(), selection.FULL)
+
     def test_release_with_source_change_runs_full_validation(self):
         self.write_version("1.2.4")
         self.write("src/lib.rs", "changed")
@@ -136,6 +151,13 @@ class SelectionTests(unittest.TestCase):
                     {"name": name, "conclusion": "success"} for name in
                     ["Run Clippy", "Run Rust unit tests", "Run configuration CLI tests", "Run native backend tests"]
                 ]}]}
+                for name, steps in {
+                    "Desktop Rust": ["Run Desktop Clippy", "Run Desktop tests"],
+                    "Integrations": ["Verify embedded web terminal assets", "Run integration tests"],
+                    "Dependency policy": ["Audit advisories, licenses, and dependency sources"],
+                }.items():
+                    jobs["jobs"].append({"name": name, "conclusion": "success", "steps": [
+                        {"name": step, "conclusion": "success"} for step in steps]})
                 responses = [json.dumps({"workflow_runs": [run]}).encode(), json.dumps(jobs).encode()]
                 with patch.object(selection.subprocess, "check_output", side_effect=responses):
                     self.assertEqual(selection.validated_base(self.base), field is None)

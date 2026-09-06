@@ -76,21 +76,33 @@ jobs:
         if: env.RUN_CODE == 'true'
         run: cargo fmt --all -- --check
 
+      - name: Verify CLI dependency boundary
+        if: env.RUN_CODE == 'true'
+        run: |
+          cargo tree -p boomux --locked --edges normal,build --prefix none --format '{p}' > cli-dependencies.txt
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          names = {line.split()[0] for line in Path('cli-dependencies.txt').read_text().splitlines()}
+          forbidden = {name for name in names if name.startswith(('gpui', 'libghostty-vt'))}
+          if forbidden:
+              raise SystemExit(f'CLI acquired Desktop dependencies: {sorted(forbidden)}')
+          PYCODE
+
       - name: Run Clippy
         if: env.RUN_CODE == 'true'
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy -p boomux --all-targets --all-features --locked -- -D warnings
 
       - name: Run Rust unit tests
         if: env.RUN_CODE == 'true'
-        run: cargo test --lib --bins --locked -- --test-threads=1
+        run: cargo test -p boomux --lib --bins --locked -- --test-threads=1
 
       - name: Run configuration CLI tests
         if: env.RUN_CODE == 'true'
-        run: cargo test --test config_cli --locked -- --test-threads=1
+        run: cargo test -p boomux --test config_cli --locked -- --test-threads=1
 
       - name: Run native backend tests
         if: env.RUN_CODE == 'true'
-        run: cargo test --test native_backend --locked -- --test-threads=1
+        run: cargo test -p boomux --test native_backend --locked -- --test-threads=1
 
   dependency-policy:
     name: Dependency policy
@@ -144,11 +156,11 @@ jobs:
 
       - name: Validate deterministic benchmark fixtures
         if: env.RUN_CODE == 'true'
-        run: cargo test --test benchmark_harness --features benchmark-internals --locked
+        run: cargo test -p boomux --test benchmark_harness --features benchmark-internals --locked
 
       - name: Smoke test Criterion benchmarks
         if: env.RUN_CODE == 'true'
-        run: cargo bench --bench core_cpu --bench wire --features benchmark-internals --locked -- --test
+        run: cargo bench -p boomux --bench core_cpu --bench wire --features benchmark-internals --locked -- --test
 
   integrations:
     name: Integrations
@@ -183,6 +195,12 @@ jobs:
       - name: Run integration tests
         if: env.RUN_CODE == 'true'
         run: bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
+
+      - name: Test shared release versioning
+        if: env.RUN_CODE == 'true'
+        run: |
+          bun install --cwd .github/release-tests --frozen-lockfile
+          bun test --cwd .github/release-tests
 
   release-packaging:
     name: Release packaging (${{ matrix.arch }})
@@ -234,7 +252,7 @@ jobs:
 
       - name: Build native release binary
         if: env.RUN_CODE == 'true'
-        run: cargo build --release --locked --target "$TARGET"
+        run: cargo build -p boomux --release --locked --target "$TARGET"
 
       - name: Package and smoke test native release
         if: env.RUN_CODE == 'true'
@@ -339,3 +357,84 @@ jobs:
           tar -C dist -xzf "$archive"
           dist/"$package"/boomux --version
           dist/"$package"/boomux capabilities --json >/dev/null
+
+  desktop-rust:
+    name: Desktop Rust
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Skip Desktop checks when covered or not required
+        if: env.RUN_CODE != 'true'
+        run: printf 'Desktop checks are covered by base CI or not needed; see Classify changes.\n'
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: env.RUN_CODE == 'true'
+      - name: Install build dependencies
+        if: env.RUN_CODE == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libfontconfig-dev libwayland-dev libx11-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev
+          rustup toolchain install stable --profile minimal --component clippy
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: env.RUN_CODE == 'true'
+        with:
+          version: 0.15.2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        if: env.RUN_CODE == 'true'
+        with:
+          key: desktop-checks-ubuntu-24.04-zig-0.15.2-baseline-v1
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Run Desktop Clippy
+        if: env.RUN_CODE == 'true'
+        run: cargo clippy -p boomux-desktop --all-targets --all-features --locked -- -D warnings
+      - name: Run Desktop tests
+        if: env.RUN_CODE == 'true'
+        run: cargo test -p boomux-desktop --locked -- --test-threads=1
+      - name: Validate Desktop packaging fixtures
+        if: env.RUN_CODE == 'true'
+        run: |
+          sh -n desktop/install.sh desktop/packaging/boomux-desktop desktop/scripts/package-release.sh
+          python3 desktop/scripts/test-installer.py
+          python3 desktop/scripts/test-smoke.py
+          python3 -m unittest discover -s desktop/scripts -p 'test_package*.py'
+
+  desktop-bundle:
+    needs: [changes, release-packaging, desktop-rust]
+    if: ${{ !cancelled() && needs.release-packaging.result == 'success' && needs.desktop-rust.result == 'success' && needs.changes.outputs.run_package != 'false' }}
+    uses: ./.github/workflows/desktop-build.yml
+    with:
+      source-ref: ${{ github.sha }}
+      cli-artifact: release-candidate-x86_64-unknown-linux-gnu
+
+  desktop-smoke:
+    needs: desktop-bundle
+    uses: ./.github/workflows/desktop-smoke.yml
+    with:
+      source-ref: ${{ github.sha }}
+
+  result:
+    name: CI result
+    if: always()
+    needs: [changes, rust, dependency-policy, benchmarks, integrations, release-packaging, aur-package, arch-compatibility, desktop-rust, desktop-bundle, desktop-smoke]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every selected check
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          jobs = json.loads(os.environ['RESULTS'])
+          package = jobs['changes']['outputs'].get('run_package') != 'false'
+          for name, job in jobs.items():
+              expected = {'success'}
+              if not package and name in {'desktop-bundle', 'desktop-smoke'}:
+                  expected = {'skipped'}
+              if job['result'] not in expected:
+                  raise SystemExit(f"{name}: {job['result']}; expected {expected}")
+          PY

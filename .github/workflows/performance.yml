@@ -46,8 +46,8 @@ jobs:
         id: criterion
         run: |
           set -o pipefail
-          cargo bench --bench core_cpu --features benchmark-internals --locked 2>&1 | tee criterion-core.txt
-          cargo bench --bench wire --locked 2>&1 | tee criterion-wire.txt
+          cargo bench -p boomux --bench core_cpu --features benchmark-internals --locked 2>&1 | tee criterion-core.txt
+          cargo bench -p boomux --bench wire --locked 2>&1 | tee criterion-wire.txt
 
       - name: Upload Criterion reports
         if: always()
@@ -132,7 +132,7 @@ jobs:
         run: |
           set -o pipefail
           git checkout --detach "$BASE_SHA"
-          cargo bench --bench core_instructions --features benchmark-internals --locked -- --save-baseline=base 2>&1 | tee gungraun-base.txt
+          cargo bench -p boomux --bench core_instructions --features benchmark-internals --locked -- --save-baseline=base 2>&1 | tee gungraun-base.txt
 
       - name: Measure current revision
         id: head
@@ -143,9 +143,9 @@ jobs:
           set -o pipefail
           git checkout --detach "$HEAD_SHA"
           if [[ "$HAS_BASELINE" == true ]]; then
-            cargo bench --bench core_instructions --features benchmark-internals --locked -- --baseline=base 2>&1 | tee gungraun-head.txt
+            cargo bench -p boomux --bench core_instructions --features benchmark-internals --locked -- --baseline=base 2>&1 | tee gungraun-head.txt
           else
-            cargo bench --bench core_instructions --features benchmark-internals --locked 2>&1 | tee gungraun-head.txt
+            cargo bench -p boomux --bench core_instructions --features benchmark-internals --locked 2>&1 | tee gungraun-head.txt
           fi
 
       - name: Upload instruction-count reports

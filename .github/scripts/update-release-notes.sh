@@ -36,6 +36,16 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 
 The verified installer offers to run `boomux setup` immediately. If setup is
 deferred or interrupted, run `~/.local/bin/boomux setup` to continue.
+
+## Install Boomux Desktop (Boomux included)
+
+```console
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/gardnmi/boomux/releases/latest/download/boomux-desktop-installer.sh | sh
+```
+
+Desktop is experimental and currently available for GNU/Linux x86_64. Both
+executables share this release; the Desktop installer updates them together.
 <!-- /boomux-install-handoff -->
 EOF
 

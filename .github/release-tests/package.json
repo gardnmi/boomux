@@ -1,0 +1,6 @@
+{
+  "name": "boomux-release-fixtures",
+  "private": true,
+  "scripts": { "test": "bun test" },
+  "devDependencies": { "release-please": "17.6.0" }
+}

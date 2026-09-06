@@ -81,6 +81,20 @@
   registration, background reduced projection synchronization, and the typed
   routed management described by the current protocol history are implemented.
 
+## Native Desktop Workspace Member
+
+The root Cargo package remains the backend and CLI. `desktop/` is a separate
+binary package with a path dependency on the root library. Both use one lockfile
+and version; GUI dependencies and the Zig-built Ghostty core belong only to the
+Desktop build graph. See [Desktop architecture](desktop/architecture.md) for
+pane workers, rendering, preferences, and settings projection.
+
+The packaged Desktop launcher starts or reuses the daemon through the bundled
+CLI. It never calls the library's `connect_or_start`, which assumes its own
+executable is the CLI. One release includes standalone CLI archives and a Desktop
+bundle containing the identical x86_64 CLI bytes. Repository consolidation does
+not change resource identity, persistence, wire versions, or daemon authority.
+
 ## Product Boundary
 
 Boomux is a terminal session manager, not a harness-specific transcript UI or an
@@ -89,7 +103,7 @@ terminal selected through `xdg-terminal-exec`; the optional web gateway embeds a
 bounded renderer as another attachment client for exact current Agent runs.
 
 ```text
-native terminal or web renderer
+native terminal, GPUI Desktop, or web renderer
   -> boomux attachment client
   -> Unix socket
   -> Boomux daemon
