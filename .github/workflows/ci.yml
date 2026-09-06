@@ -31,6 +31,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify shared release version
+        run: python3 .github/scripts/check-workspace-version.py
+
       - name: Test CI selection and artifact provenance
         run: python3 -m unittest discover -s .github/scripts -p 'test_ci_*.py'
 
