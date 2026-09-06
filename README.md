@@ -101,6 +101,7 @@ For an explicit choice, append `sh -s -- --desktop` or `sh -s -- --cli` in place
 of `sh`. A noninteractive install requires an explicit choice. CLI automation can
 use `sh -s -- --cli --no-setup` to skip the interactive setup handoff. Desktop
 setup happens on first launch, not inside the installer.
+CLI mode offers to run `boomux setup` immediately after installation.
 
 Desktop installs a versioned bundle, an application-menu entry, and command links
 under `~/.local/bin`. An existing independent CLI installation is preserved.
