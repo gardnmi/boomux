@@ -74,6 +74,7 @@ pub struct WorkspaceChoice {
 pub struct AgentChoice {
     pub id: String,
     pub shell_name: String,
+    pub display_name: String,
     pub workspace: String,
     pub shell_id: String,
     pub integration: String,
@@ -655,6 +656,7 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
                     .find(|shell| shell.id == agent.shell_id)
                     .map(|shell| shell.name.clone())
                     .unwrap_or_else(|| agent.name.clone()),
+                display_name: String::new(),
                 workspace: workspace.name.clone(),
                 shell_id: agent.shell_id.clone(),
                 integration: agent.integration.clone(),
@@ -680,12 +682,55 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
             agent_count,
         });
     }
+    distinguish_agent_rows(&mut agents);
     agents.sort_by_key(|agent| std::cmp::Reverse(agent.updated_at_ms));
     Ok(BoomuxOverview {
         workspaces,
         agents,
         focused_shell_id,
     })
+}
+
+// Labels are presentation only; actions retain the exact Agent and Shell IDs.
+// Work is bounded by the visible overview and runs outside GPUI rendering.
+fn distinguish_agent_rows(agents: &mut [AgentChoice]) {
+    let mut order: Vec<usize> = (0..agents.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        (&agents[a].shell_id, &agents[a].id).cmp(&(&agents[b].shell_id, &agents[b].id))
+    });
+    for (position, &index) in order.iter().enumerate() {
+        let agent = &agents[index];
+        let mut shared_shell = false;
+        let mut prefix_len = 8;
+        for neighbor in [position.checked_sub(1), position.checked_add(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|position| order.get(position))
+        {
+            let other = &agents[*neighbor];
+            if agent.shell_id == other.shell_id {
+                shared_shell = true;
+                prefix_len = prefix_len.max(
+                    agent
+                        .id
+                        .chars()
+                        .zip(other.id.chars())
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                        + 1,
+                );
+            }
+        }
+        agents[index].display_name = if shared_shell {
+            format!(
+                "{} · {}",
+                agent.shell_name,
+                agent.id.chars().take(prefix_len).collect::<String>()
+            )
+        } else {
+            agent.shell_name.clone()
+        };
+    }
 }
 
 pub fn acknowledge_agent_attention(
@@ -1912,9 +1957,9 @@ mod tests {
     use libghostty_vt::terminal::Mode;
 
     use super::{
-        EmulatorCommand, EmulatorCore, SharedTerminal, agent_is_visible, blank_screen,
-        configure_terminal, encode_key, encode_mouse_wheel, encode_paste, image_bgra,
-        indexed_color, resynchronize_terminal_size, terminal_profile,
+        AgentChoice, EmulatorCommand, EmulatorCore, SharedTerminal, agent_is_visible, blank_screen,
+        configure_terminal, distinguish_agent_rows, encode_key, encode_mouse_wheel, encode_paste,
+        image_bgra, indexed_color, resynchronize_terminal_size, terminal_profile,
     };
     use crate::theme::TerminalTheme;
     use std::sync::Arc;
@@ -1934,6 +1979,51 @@ mod tests {
         assert!(!agent_is_visible(AgentState::Inactive, false, true));
         assert!(!agent_is_visible(AgentState::Done, false, true));
         assert!(agent_is_visible(AgentState::Done, true, false));
+    }
+
+    #[test]
+    fn shared_shell_agents_keep_distinct_labels_and_lifecycle_observations() {
+        let original = AgentChoice {
+            id: "12345678-original".into(),
+            shell_name: "fair-koala".into(),
+            display_name: String::new(),
+            workspace: "boomux-desktop".into(),
+            shell_id: "shell-1".into(),
+            integration: "codex".into(),
+            state: AgentState::Working,
+            updated_at_ms: 1,
+            needs_attention: false,
+            completed_attention: false,
+            attention_revision: None,
+        };
+        let mut continuation = original.clone();
+        continuation.id = "12345678-fork".into();
+        continuation.state = AgentState::Idle;
+        continuation.updated_at_ms = 2;
+        let mut agents = vec![original.clone(), continuation];
+        distinguish_agent_rows(&mut agents);
+        assert_eq!(agents[0].display_name, "fair-koala · 12345678-o");
+        assert_eq!(agents[1].display_name, "fair-koala · 12345678-f");
+        assert_eq!(agents[0].state, AgentState::Working);
+        assert_eq!(agents[1].state, AgentState::Idle);
+        assert_eq!(agents[0].shell_id, agents[1].shell_id);
+
+        // Activity ordering and refreshes must not renumber the threads.
+        let expected = agents.clone();
+        agents.reverse();
+        distinguish_agent_rows(&mut agents);
+        agents.reverse();
+        assert_eq!(agents, expected);
+
+        // Identical names in different Shells are not a shared-thread group.
+        agents[1].shell_id = "shell-2".into();
+        distinguish_agent_rows(&mut agents);
+        assert!(
+            agents
+                .iter()
+                .all(|agent| agent.display_name == "fair-koala")
+        );
+        assert_eq!(agents[0].id, original.id);
     }
 
     #[test]

@@ -7234,7 +7234,7 @@ impl Workspace {
                                     .text_sm()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(0xcdd6f4))
-                                    .child(agent.shell_name),
+                                    .child(agent.display_name),
                             )
                             .child(
                                 div()
@@ -9654,6 +9654,7 @@ mod pointer_tests {
             agents: vec![AgentChoice {
                 id: "agent-1".into(),
                 shell_name: "lively-dolphin".into(),
+                display_name: "lively-dolphin".into(),
                 workspace: "boomux-desktop".into(),
                 shell_id: "shell-1".into(),
                 integration: "codex".into(),

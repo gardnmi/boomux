@@ -99,6 +99,10 @@ creates a new pane attachment without changing Boomux's durable Shell identity.
 The sidebar is a bounded, read-only Boomux snapshot. Active Agent rows require an
 exact current ShellRun. Historical records appear only through explicit Boomux
 attention/history semantics; durable records are not assumed to be active.
+When multiple visible Agents share a Shell, each row includes a distinguishing
+prefix of its exact Boomux Agent ID. Labels do not infer which host thread is
+selected or retire an older observation. Clicking either row still opens the
+owning Shell; thread selection remains with the host application.
 The client keeps a bounded presentation marker for an observed `working` to
 `idle` transition so successful completion remains visible until the user
 dismisses it. This does not change the Agent lifecycle. Durable attention is

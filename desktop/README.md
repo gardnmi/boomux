@@ -13,6 +13,10 @@ The layout panes are managed inside one GPUI window, and every pane hosts an ind
 
 An Omarchy Boomux-inspired sidebar presents the local workspace tree, shell status, and current/attention-bearing agents. When an agent settles from working to idle, its row remains marked **finished** until **Dismiss** is clicked; durable Boomux attention is acknowledged with the exact observation revision. Workspace rows expand and collapse. Clicking a shell or agent focuses its existing tile, or attaches its shell in a new tile when it is not already open. The overview refreshes from Boomux in the background without putting daemon requests on the GPUI render path. Nodes and web controls remain outside this proof of concept.
 
+When several visible Agents share a Shell, their rows include distinct Agent ID
+prefixes. They represent separate threads, and clicking either row opens the
+shared terminal. Select the conversation inside the host application.
+
 ## Install release builds
 
 The Linux installer installs Boomux Desktop and its matching Boomux executable
