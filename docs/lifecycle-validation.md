@@ -7,6 +7,28 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-09-06: combined Desktop update handoff
+
+Source `138e6d9` was tested on Linux x86_64, kernel `7.2.3-arch1-2`, glibc
+`2.44`, Rust `1.98.1`, and Zig `0.15.2`. Both packages still carried development
+version `1.9.8`; this was an unreleased protocol-52 candidate, not a claim about
+the previously published 1.9.8 binary. The release bundle passed isolated Wayland
+and X11 startup/attachment tests; X11 also ran the GUI, daemon, and CLI under
+Nehalem CPU emulation. The bundle contained the exact standalone release CLI.
+
+A separate private Wayland GUI fixture started a live `sleep` command through a
+daemon at a different executable path. Later persisted the version dismissal
+without changing that daemon. Check for updates restored the notice. Restart now
+selected the bundled executable, changed the daemon PID, preserved the command
+PID and exact ShellRun, opened a replacement GUI process, and exited the old
+GUI. Set up agents opened the matching CLI's setup command inside a new Shell;
+the isolated environment had no supported harnesses and verification completed
+without installing an Omarchy companion. Native fixtures additionally cover
+failed replacement, reverse handoff, later cleanup, and protocol-51 rejection
+before mutation. Download/version/checksum failures and deferred activation are
+covered by installer fixtures; the live GUI check exercised executable movement
+between two builds of the same version, not a published cross-version upgrade.
+
 ## 2026-09-06
 
 Read-only diagnosis with Codex `0.153.4` and Boomux `1.9.6` found two exact
