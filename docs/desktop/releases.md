@@ -81,7 +81,8 @@ The harness creates private XDG directories, an isolated display and D-Bus, and
 uses Mesa software rendering. It checks mapped/committed frames, pending Shell
 attachment and PTY output, then close/reopen with the same daemon and ShellRun.
 The X11 path emulates the foreground daemon and CLI as well as Desktop, asserting
-that daemon/Desktop process identities remain QEMU. It does not exercise daemon
+that daemon/Desktop process identities remain QEMU. Desktop's CLI helpers use
+the same QEMU wrapper through PATH. It does not exercise daemon
 self-reexecution under QEMU; native backend handoff tests cover replacement.
 The Wayland path exercises the actual launcher, settings transactions, and
 bundle-owned CLI update refusal. Both binaries are part of the test contract.

@@ -164,6 +164,13 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
         processes, apps, logs = [], [], []
         shell_id = None
         emulated_daemon = None
+        emulated_bin = root / "emulated-bin"
+        if cpu_model:
+            emulated_bin.mkdir()
+            wrapper = emulated_bin / "boomux"
+            wrapper.write_text("#!/bin/sh\nexec " + shlex.join([
+                "qemu-x86_64", "-cpu", cpu_model, str(bundle / "bin/boomux")]) + ' "$@"\n')
+            wrapper.chmod(0o755)
 
         def start(command, name, child_env=None, **kwargs):
             log = (output / f"{name}.log").open("wb")
@@ -241,7 +248,9 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
                     # QEMU executes ELF binaries, so reproduce the bundled launcher's
                     # environment and daemon-start step before emulating Desktop.
                     cli("daemon", "start")
-                    child_env["PATH"] = str(bundle / "bin") + os.pathsep + child_env.get("PATH", "")
+                    # Desktop also launches CLI helpers (for example update
+                    # checks). Keep those invocations inside CPU emulation.
+                    child_env["PATH"] = str(emulated_bin) + os.pathsep + child_env.get("PATH", "")
                     command = ["qemu-x86_64", "-cpu", cpu_model, str(bundle / "libexec/boomux-desktop")]
                 app = start(command, name, child_env)
                 apps.append(app)
