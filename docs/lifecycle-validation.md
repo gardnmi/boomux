@@ -7,6 +7,26 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-09-06
+
+Read-only diagnosis with Codex `0.153.4` and Boomux `1.9.6` found two exact
+thread identities registered to the same ShellRun. Codex session metadata
+identified the newer thread as a fork of the original. This explains the two
+Agent records; it does not establish that the original thread ended or which
+thread a connected client currently selects.
+
+The [Codex hook reference](https://learn.chatgpt.com/docs/hooks) documents
+Interrupt for an interrupted root turn and says switching conversations does
+not immediately emit SessionEnd. Reducer and native CLI fixtures cover Interrupt
+returning the exact Agent to Idle and a subsequent prompt returning it to
+Working. This is fixture coverage, not a live Interrupt compatibility claim or
+a guarantee that a network failure emits Interrupt. Earlier hook installations
+need the updated Interrupt handler installed and trusted before reporting it.
+Source inspection of Codex's tagged `hook_config.rs` confirms that `0.153.4`
+accepts Interrupt. The earlier `0.147.0` event configuration ignores unknown
+event keys and has no Interrupt handler, so that host retains its earlier
+coverage; the additional event requires a host that emits it.
+
 ## 2026-08-31
 
 Pi Coding Agent `0.84.4` documentation and the installed session store were

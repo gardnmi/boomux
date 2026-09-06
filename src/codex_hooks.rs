@@ -21,6 +21,7 @@ enum HookEvent {
     SubagentStart,
     SubagentStop,
     Stop,
+    Interrupt,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +94,7 @@ fn reduce(input: &HookInput) -> LifecycleObservation {
         HookEvent::SubagentStart => (AgentState::Working, "Codex subagent working"),
         HookEvent::SubagentStop => (AgentState::Working, "Codex subagent stopped"),
         HookEvent::Stop => (AgentState::Idle, "Codex session idle"),
+        HookEvent::Interrupt => (AgentState::Idle, "Codex turn interrupted"),
     };
     LifecycleObservation { state, evidence }
 }
@@ -125,6 +127,7 @@ mod tests {
             ("SubagentStart", AgentState::Working),
             ("SubagentStop", AgentState::Working),
             ("Stop", AgentState::Idle),
+            ("Interrupt", AgentState::Idle),
         ];
         for (event, state) in cases {
             let update = update(event, "");
