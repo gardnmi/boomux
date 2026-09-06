@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.8](https://github.com/gardnmi/boomux/compare/v1.9.7...v1.9.8) (2026-09-06)
+
+
+### Bug Fixes
+
+* **codex:** handle interrupted turns in lifecycle hooks ([#365](https://github.com/gardnmi/boomux/issues/365)) ([526df3f](https://github.com/gardnmi/boomux/commit/526df3f8f303b7673c62b53494cb861ac0ffae17))
+
 ## [1.9.7](https://github.com/gardnmi/boomux/compare/v1.9.6...v1.9.7) (2026-09-05)
 
 
