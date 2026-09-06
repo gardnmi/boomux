@@ -1,6 +1,17 @@
 /target
 /dist
-/node_modules
-
-# Python CI helper tests
+node_modules/
+/performance-results/
+/smoke-results/
 __pycache__/
+*.pyc
+/.venv/
+.env
+.env.*
+!.env.example
+/mise.local.toml
+/.mise.local.toml
+*.swp
+*.swo
+*~
+.DS_Store

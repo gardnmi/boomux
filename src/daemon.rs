@@ -18661,7 +18661,11 @@ mod tests {
         let sessions = registry
             .host_sessions(&snapshot, Some(&workspace.id))
             .unwrap();
-        assert_eq!(sessions[0].description, "native-test");
+        let session = sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .unwrap();
+        assert_eq!(session.description, "native-test");
 
         let replay = registry
             .set_agent_session_display_name(
@@ -18714,8 +18718,18 @@ mod tests {
         let projected = registry
             .host_sessions(&registry.snapshot().unwrap(), Some(&workspace.id))
             .unwrap();
-        let session_id = projected[0].id.clone();
-        let revision = projected[0].workspace_revision;
+        // The local host catalog may also contain sessions for the fixture cwd.
+        let session = projected
+            .iter()
+            .find(|session| {
+                session
+                    .occurrences
+                    .iter()
+                    .any(|occurrence| occurrence.agent_id == agent_id)
+            })
+            .unwrap();
+        let session_id = session.id.clone();
+        let revision = session.workspace_revision;
         let operation_id = Uuid::new_v4().to_string();
 
         let response = registry

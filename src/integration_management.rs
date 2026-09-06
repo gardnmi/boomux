@@ -1754,8 +1754,10 @@ mod tests {
         let manifest: serde_json::Value = serde_json::from_str(CLAUDE_ASSET).unwrap();
         assert_eq!(manifest["name"], "boomux");
         let hooks = manifest["hooks"].as_object().unwrap();
+        let mut events = hooks.keys().map(String::as_str).collect::<Vec<_>>();
+        events.sort_unstable(); // serde_json may preserve insertion order in a workspace build.
         assert_eq!(
-            hooks.keys().map(String::as_str).collect::<Vec<_>>(),
+            events,
             [
                 "CwdChanged",
                 "DirectoryAdded",
