@@ -7,6 +7,11 @@ and graphics development libraries. `CI result` is the aggregate required check.
 Unknown classification inputs fail closed to full validation. Documentation-only
 changes skip executable work; packaged README/license changes do not.
 
+The vendored Ghostty build uses Zig's explicit baseline CPU target. Desktop
+cache keys include `baseline-v1` to prevent restoring artifacts from the previous
+native-CPU build. This makes those artifacts portable across hosted runner CPUs
+without fragmenting the cache by CPU model.
+
 PRs, merge groups, main pushes, and manual runs build and test the complete
 candidate bundle when executable inputs change. X11 emulates Desktop, the
 foreground Boomux daemon, and CLI invocations with QEMU's Nehalem CPU model;

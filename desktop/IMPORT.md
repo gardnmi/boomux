@@ -10,9 +10,14 @@ Original commit history remains in that repository.
   `f149e0aa7b984f52077db93e8f0fdf67a099c80d`, dismissible update notices, adapted
   to the unified Boomux release and bundle.
 - [PR #11](https://github.com/gardnmi/boomux-desktop/pull/11):
-  `b3a2bc2adc8c406e5a604ef643db9a69e9400701`, distinct labels for Agents sharing
-  a Shell, including its regression test and documentation. This PR is stacked
-  on #10; both are included here.
+  `0c9db9440a5f0650996460666af245353af803c8`. Its product change at
+  `b3a2bc2adc8c406e5a604ef643db9a69e9400701` adds distinct labels for Agents
+  sharing a Shell, including its regression test and documentation. This PR is
+  stacked on #10; both are included here. Its later CPU cache isolation fix
+  protects the older native-CPU Ghostty build on that branch. Here, PR #9's
+  `-Dcpu=baseline` patch and the dedicated `baseline-v1` Desktop cache keys
+  replace that workaround: cached Ghostty code uses the same portable target
+  across runner CPUs, without restoring the old native-CPU cache namespace.
 - Boomux migration base: `0fd34c8` (version 1.9.7).
 
 PR #9 was merged and #10/#11 were open when checked on 2026-09-06. Their changes
