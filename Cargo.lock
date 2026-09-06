@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "boomux"
-version = "1.9.7"
+version = "1.9.8"
 dependencies = [
  "axum",
  "clap",
