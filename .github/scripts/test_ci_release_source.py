@@ -2,6 +2,7 @@
 
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -50,6 +51,26 @@ class SourceTests(unittest.TestCase):
         for tag, target in [("v1.2.4", self.args[3]), (self.args[2], "aarch64-unknown-linux-gnu")]:
             with self.assertRaises(FileNotFoundError):
                 source.process("verify", self.directory, self.args[1], tag, target)
+
+    def test_desktop_provenance_binds_version_despite_unversioned_asset_name(self):
+        self.name = "boomux-desktop-x86_64-unknown-linux-gnu.tar.gz"
+        (self.directory / self.name).write_bytes(b"desktop fixture")
+        self.checksum()
+        source.process("record", *self.args, "desktop")
+        source.process("verify", *self.args, "desktop")
+        with self.assertRaisesRegex(ValueError, "validated release source"):
+            source.process("verify", self.directory, self.args[1], "v1.2.4", self.args[3], "desktop")
+        record = self.directory / "ci-source.json"
+        metadata = json.loads(record.read_text())
+        metadata["kind"] = "cli"
+        record.write_text(json.dumps(metadata))
+        with self.assertRaisesRegex(ValueError, "validated release source"):
+            source.process("verify", *self.args, "desktop")
+
+    def test_unknown_artifact_and_unsupported_desktop_target_are_rejected(self):
+        for target, kind in [(self.args[3], "unknown"), ("aarch64-unknown-linux-gnu", "desktop")]:
+            with self.assertRaisesRegex(ValueError, "artifact kind or target"):
+                source.process("record", self.directory, self.args[1], self.args[2], target, kind)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+# Resolve once so an update cannot mix executables from different releases.
+bundle=$(dirname "$(dirname "$(readlink -f "$0")")")
+PATH="$bundle/bin:$PATH"
+export PATH
+"$bundle/bin/boomux" daemon start
+exec "$bundle/libexec/boomux-desktop" "$@"

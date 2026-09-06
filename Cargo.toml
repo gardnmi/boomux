@@ -4,6 +4,15 @@ version = "1.9.8"
 edition = "2024"
 license = "MIT"
 
+[workspace]
+members = ["desktop"]
+default-members = ["."]
+resolver = "3"
+exclude = ["vendor/libghostty-vt-sys"]
+
+[patch.crates-io]
+libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
+
 [features]
 benchmark-internals = []
 

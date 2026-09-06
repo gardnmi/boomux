@@ -78,6 +78,28 @@ cargo build --release --locked
 Do not replace `~/.local/bin/boomux` during ordinary development. Development
 builds are intentionally ineligible for self-update.
 
+## Native Desktop Development
+
+The root package is the default Cargo workspace member. Existing CLI commands
+continue to work without Zig or graphics build dependencies. Desktop uses a path
+dependency on that root package and the same lockfile and version.
+
+Install Zig 0.15.2 (`mise install`) and the graphics development libraries listed
+in `.github/workflows/desktop-build.yml`. From the repository root:
+
+```console
+python3 desktop/scripts/run-dev.py
+cargo test -p boomux-desktop --locked -- --test-threads=1
+cargo clippy -p boomux-desktop --all-targets --all-features --locked -- -D warnings
+```
+
+The helper builds both executables, sets a matching CLI PATH, and uses XDG
+runtime/config/state directories under `target/desktop-dev/`. Closing the window
+keeps these development sessions alive. The helper prints the isolated runtime
+path; it does not replace installed binaries or use the ordinary daemon.
+See `desktop/AGENTS.md` for additional validation and `docs/desktop/releases.md`
+for packaging and headless GUI smoke tests.
+
 ## Use An Isolated Daemon
 
 By default, a development binary uses the same XDG socket, state, and

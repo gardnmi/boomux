@@ -21,6 +21,10 @@ fi
 
 declare -A expected_assets=()
 expected_assets[boomux-installer.sh]=1
+expected_assets[boomux-desktop-installer.sh]=1
+desktop_archive=boomux-desktop-x86_64-unknown-linux-gnu.tar.gz
+expected_assets["$desktop_archive"]=1
+expected_assets["$desktop_archive.sha256"]=1
 for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
   archive="boomux-${tag}-${target}.tar.gz"
   expected_assets["$archive"]=1
@@ -64,6 +68,19 @@ for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
     sha256sum --check "$(basename "${local_assets[${archive}.sha256]}")"
   )
 done
+(
+  cd "$(dirname "${local_assets[$desktop_archive]}")"
+  sha256sum --check "$desktop_archive.sha256"
+)
+desktop_installer=${local_assets[boomux-desktop-installer.sh]}
+sh -n "$desktop_installer"
+if ! grep -Fq "version=\${BOOMUX_DESKTOP_VERSION:-$tag} # release-version" "$desktop_installer" \
+  || ! grep -Fxq '    repository=https://github.com/gardnmi/boomux' "$desktop_installer"; then
+  printf 'Desktop installer does not match the release version or origin\n' >&2
+  exit 1
+fi
+python3 .github/scripts/verify-desktop-bundle.py "$tag" "$(git rev-parse HEAD)" \
+  "${local_assets[boomux-${tag}-x86_64-unknown-linux-gnu.tar.gz]}" "${local_assets[$desktop_archive]}"
 installer=${local_assets[boomux-installer.sh]}
 sh -n "$installer"
 if ! grep -Fq "tag='$tag'" "$installer"; then
@@ -88,6 +105,14 @@ if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
   printf 'could not resolve one release for %s\n' "$tag" >&2
   exit 1
 fi
+if [[ $(gh api "repos/${repo}/releases/$release_id" --jq .draft) != true ]]; then
+  printf 'refusing to change an already published release\n' >&2
+  exit 1
+fi
+tmp_dir=$(mktemp -d)
+trap 'rm -rf "$tmp_dir"' EXIT
+gh api --paginate "repos/${repo}/releases/${release_id}/assets?per_page=100" \
+  --jq '.[] | [.name, (.digest // ""), (.id | tostring)] | join("\u001f")' > "$tmp_dir/assets.tsv"
 declare -A remote_digests=()
 declare -A remote_ids=()
 
@@ -98,13 +123,7 @@ while IFS=$'\x1f' read -r name digest id; do
   fi
   remote_digests["$name"]=$digest
   remote_ids["$name"]=$id
-done < <(
-  gh api --paginate "repos/${repo}/releases/${release_id}/assets?per_page=100" \
-    --jq '.[] | [.name, (.digest // ""), (.id | tostring)] | join("\u001f")'
-)
-
-tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT
+done < "$tmp_dir/assets.tsv"
 
 for asset in "$@"; do
   name=$(basename "$asset")

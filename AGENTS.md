@@ -40,6 +40,26 @@ cargo deny check
 bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
 ```
 
+The workspace also contains `desktop/`; read `desktop/AGENTS.md` for GUI changes.
+Core commands above select the default root package and require no Zig or display
+SDK. Before a workspace PR also run:
+
+```console
+cargo clippy -p boomux-desktop --all-targets --all-features --locked -- -D warnings
+cargo test -p boomux-desktop --locked -- --test-threads=1
+cargo build -p boomux-desktop --release --locked
+python3 -m unittest discover -s .github/scripts -p 'test_ci_*.py'
+python3 desktop/scripts/test-installer.py
+python3 desktop/scripts/test-smoke.py
+python3 -m unittest discover -s desktop/scripts -p 'test_package*.py'
+bun install --cwd .github/release-tests --frozen-lockfile
+bun test --cwd .github/release-tests
+```
+
+Desktop requires Zig 0.15.2 and the graphics dependencies listed in
+`.github/workflows/desktop-build.yml`. Bundle changes also require X11 and
+Wayland smoke tests described in `docs/desktop/releases.md`.
+
 Run the narrowest relevant tests while iterating, then run the complete set
 before opening a PR. Native backend tests are intentionally serial because they
 exercise process, socket, PTY, and daemon lifecycle behavior.

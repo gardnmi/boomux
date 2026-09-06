@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Temporary four-tile mark, matching the Layout mode indicator. -->
+  <rect x="4" y="4" width="120" height="120" rx="18" fill="#151722"/>
+  <g fill="#7aa2f7">
+    <rect x="28" y="28" width="32" height="32" rx="5"/>
+    <rect x="68" y="28" width="32" height="32" rx="5"/>
+    <rect x="28" y="68" width="32" height="32" rx="5"/>
+    <rect x="68" y="68" width="32" height="32" rx="5"/>
+  </g>
+</svg>

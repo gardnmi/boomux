@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Boomux Desktop
+Comment=Persistent terminal workspaces with tiling panes
+Exec=boomux-desktop
+Icon=org.omarchy.boomux-desktop
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;workspace;boomux;
+StartupWMClass=org.omarchy.boomux-desktop

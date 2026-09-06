@@ -54,6 +54,24 @@ release installations use `~/.local/bin`. See the
 controls and safety behavior. For CLI-only creation, continue to
 [Workspace Creation](#workspace-creation).
 
+## Native Desktop
+
+Boomux Desktop is the experimental native GPUI client in [`desktop/`](desktop/).
+It shares Boomux's version and release, with both executables included in the
+Desktop download. CLI-only installation and remote Nodes retain their existing
+lightweight packages.
+
+After the first unified release publishes the Desktop assets, install with:
+
+```sh
+curl -fsSL https://github.com/gardnmi/boomux/releases/latest/download/boomux-desktop-installer.sh | sh
+```
+
+The Desktop bundle currently targets Linux x86_64 with glibc, X11 or Wayland,
+and system graphics libraries. CLI packages also support ARM64. See the
+[Desktop guide](desktop/README.md) and [release contract](docs/desktop/releases.md).
+For local development run `python3 desktop/scripts/run-dev.py` from this repository.
+
 ## Install And Update
 
 ### Requirements
