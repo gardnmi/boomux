@@ -54,6 +54,7 @@ def package(archive, root=ROOT):
         shutil.copy2(cli, bundle / "bin/boomux")
         shutil.copy2(binary, bundle / "libexec/boomux-desktop")
         shutil.copy2(desktop / "packaging/boomux-desktop", bundle / "bin/boomux-desktop")
+        (bundle / "bin/boomux-desktop").chmod(0o755)
         shutil.copytree(desktop / "packaging/share", bundle / "share")
         shutil.copy2(desktop / "LICENSE", bundle / "LICENSE")
         shutil.copy2(root / "LICENSE", bundle / "LICENSE.boomux")

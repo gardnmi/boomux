@@ -27,7 +27,7 @@ class PackageTests(unittest.TestCase):
         self.write("THIRD_PARTY_NOTICES.md", "notices")
         self.write("desktop/LICENSE", "desktop license")
         self.write("desktop/packaging/share/fixture", "app integration")
-        self.write("desktop/packaging/boomux-desktop", "#!/bin/sh\n", executable=True)
+        self.write("desktop/packaging/boomux-desktop", "#!/bin/sh\n")
         self.write(f"target/{TARGET}/release/boomux-desktop",
                    "#!/bin/sh\nprintf 'boomux-desktop 1.2.3\\n'\n", executable=True)
         subprocess.run(["git", "-C", self.root, "add", "."], check=True)
@@ -55,6 +55,7 @@ class PackageTests(unittest.TestCase):
         PACKAGE["package"](self.archive, self.root)
         with tarfile.open(self.root / "dist" / PACKAGE["ASSET"]) as tar:
             self.assertEqual(tar.extractfile("bin/boomux").read(), self.cli)
+            self.assertEqual(tar.getmember("bin/boomux-desktop").mode & 0o777, 0o755)
             source = subprocess.check_output(["git", "-C", self.root, "rev-parse", "HEAD"], text=True).strip()
             self.assertIn(f"source {source}\n", tar.extractfile("release.txt").read().decode())
             self.assertIn("THIRD_PARTY_NOTICES.md", tar.getnames())
