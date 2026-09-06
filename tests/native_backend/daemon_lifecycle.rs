@@ -129,6 +129,8 @@ fn native_daemon_lifecycle() {
         "protocol_42",
         "protocol_47",
         "protocol_51",
+        "protocol_52",
+        "restart_executable",
         "opencode_shared_runtime_claims",
         "node_registration_management",
         "node_projection_sync",

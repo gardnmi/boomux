@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -200,6 +200,7 @@ define_protocol_features! {
     WorkspaceSessionHiding => (51, "Workspace Agent Session hiding", [
         "workspace_session_hiding",
     ]),
+    RestartExecutable => (52, "restart executable", ["protocol_52", "restart_executable"]),
 }
 
 pub const MAX_NODE_PROJECTION_TRANSITIONS: u16 = 256;
@@ -1828,6 +1829,10 @@ pub enum Request {
         operation: HostServiceOperation,
     },
     Restart,
+    RestartWithExecutable {
+        executable: PathBuf,
+        notifications: NotificationDeliveryConfig,
+    },
     RestartWithNotificationConfig {
         notifications: NotificationDeliveryConfig,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2205,6 +2210,7 @@ impl Request {
             | Self::CreateShell {
                 workspace_id: None, ..
             } => Some(ProtocolFeature::WorkspaceDefaultCwd),
+            Self::RestartWithExecutable { .. } => Some(ProtocolFeature::RestartExecutable),
             Self::RestartWithNotificationConfig { .. } => {
                 Some(ProtocolFeature::RestartNotificationConfig)
             }
@@ -2827,9 +2833,30 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_fifty_one_with_forty_seven_floor() {
-        assert_eq!(PROTOCOL_VERSION, 51);
+    fn protocol_version_is_fifty_two_with_forty_seven_floor() {
+        assert_eq!(PROTOCOL_VERSION, 52);
         assert_eq!(MIN_PROTOCOL_VERSION, 47);
+    }
+
+    #[test]
+    fn executable_restart_requires_protocol_fifty_two_and_round_trips() {
+        let request = Request::RestartWithExecutable {
+            executable: "/opt/boomux/releases/v2/bin/boomux".into(),
+            notifications: NotificationDeliveryConfig::default(),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["request"], "restart_with_executable");
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+        assert_eq!(request.minimum_protocol_version(), 52);
+        assert_eq!(
+            request.required_feature(),
+            Some(ProtocolFeature::RestartExecutable)
+        );
+        assert!(!ProtocolFeature::RestartExecutable.is_supported_by(51));
+        assert_eq!(
+            Request::Restart.minimum_protocol_version(),
+            MIN_PROTOCOL_VERSION
+        );
     }
 
     #[test]
@@ -4426,6 +4453,7 @@ mod tests {
                 ][..],
             ),
             (51, &["workspace_session_hiding"][..]),
+            (52, &["protocol_52", "restart_executable"][..]),
         ];
 
         let actual = ProtocolFeature::ALL

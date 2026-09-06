@@ -139,6 +139,10 @@ notice. There are no automatic downloads or restarts.
 Rerunning the Desktop installer also updates the bundle. A running daemon is left
 alone; when the new app opens, it offers to finish the daemon handoff. A separate
 CLI install keeps its own update ownership. Desktop never replaces it.
+Daemons installed before this release need a one-time upgrade through their
+existing installation method before Desktop can take over updates. For an eligible
+standalone release installation, use `boomux update`. Desktop leaves live terminals
+running if that prerequisite is not met.
 
 Eligible official release installations at `~/.local/bin/boomux` have an
 explicit guided updater:

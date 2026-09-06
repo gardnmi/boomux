@@ -204,7 +204,8 @@ fn restart_daemon(release: &Path) -> Result<(), String> {
     command
         .args(["--kill-after=2s", "45s"])
         .arg(release.join("bin/boomux"))
-        .args(["daemon", "restart"]);
+        .args(["daemon", "restart", "--executable"])
+        .arg(release.join("bin/boomux"));
     run(command, None).map(|_| ())
 }
 
@@ -428,7 +429,10 @@ mod tests {
         assert!(!fixture.0.join(".install-lock").exists());
         assert_eq!(
             fs::read_to_string(fixture.0.join("handoffs")).unwrap(),
-            "1.1.0 daemon restart\n"
+            format!(
+                "1.1.0 daemon restart --executable {}\n",
+                prepared.release.join("bin/boomux").display()
+            )
         );
     }
 
@@ -443,7 +447,11 @@ mod tests {
         assert!(!fixture.0.join(".install-lock").exists());
         assert_eq!(
             fs::read_to_string(fixture.0.join("handoffs")).unwrap(),
-            "1.1.0 daemon restart\n1.0.0 daemon restart\n"
+            format!(
+                "1.1.0 daemon restart --executable {}\n1.0.0 daemon restart --executable {}\n",
+                prepared.release.join("bin/boomux").display(),
+                installation.running.join("bin/boomux").display()
+            )
         );
     }
 

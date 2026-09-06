@@ -52,12 +52,19 @@ Session commands and Session feature names are absent from `json_commands` and
 decoding of mixed-version peers; current daemons reject Session catalog, inspect,
 mutation, open, and resume operations with `unsupported_version`.
 
+`restart_executable` advertises protocol-52 graceful handoff to an explicit
+validated executable. `boomux daemon restart --executable /absolute/path/boomux`
+is human-facing, like ordinary restart; it does not add a JSON command. Older
+daemons reject the operation without restarting. The matching client negotiates
+this capability before sending the mutation; see [`live-pty-handoff.md`](live-pty-handoff.md).
+
 `boomux setup` is a human-only local discovery and mutation workflow. It requires
 an interactive terminal, does not support `--json`, and is absent from
 `json_commands`. Automation must compose the advertised integration status,
 install, and uninstall commands instead. The static `guided_setup` feature means
-the binary contains this workflow; it does not claim that a supported harness,
-Omarchy, Hyprland, `hyprctl`, or the companion plugin is currently available.
+the binary contains this workflow; it does not claim that a supported harness
+is currently available. Setup configures agent integrations and never installs
+the optional Omarchy companion or edits Hyprland configuration.
 
 `boomux desktop toggle`, `desktop show TARGET`, `desktop next`, `desktop previous`, `desktop terminal`,
 `desktop close`, `desktop pop`, `desktop return`, and `desktop gather` are also

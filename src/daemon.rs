@@ -561,6 +561,7 @@ fn run_daemon(
                     &registry,
                     request.notification_settings,
                     request.startup_environment,
+                    request.executable,
                 );
                 if result.is_ok() {
                     handed_off = true;
@@ -643,6 +644,7 @@ fn consume_native_test_handoff_import_failure() -> io::Result<bool> {
 }
 
 struct RestartRequest {
+    executable: Option<File>,
     reply: SyncSender<DaemonResult<()>>,
     notification_settings: Option<NotificationDeliverySettings>,
     startup_environment: Option<UnixEnvironment>,
@@ -1563,6 +1565,7 @@ fn launch_replacement(
     registry: &DaemonService,
     notification_settings: Option<NotificationDeliverySettings>,
     startup_environment: Option<UnixEnvironment>,
+    executable: Option<File>,
 ) -> DaemonResult<()> {
     registry.reconcile_dead_kiro_holders()?;
     let _mutation = lock(&registry.mutation_lock)?;
@@ -1597,6 +1600,7 @@ fn launch_replacement(
             &exited,
             &event_stream,
             ReplacementOptions {
+                executable,
                 focused_terminal,
                 presented_focused_terminal,
                 notification_settings,
@@ -1618,6 +1622,7 @@ fn launch_replacement(
 }
 
 struct ReplacementOptions {
+    executable: Option<File>,
     focused_terminal: Option<FocusedTerminalSnapshot>,
     presented_focused_terminal: Option<QualifiedFocusedTerminalSnapshot>,
     notification_settings: Option<NotificationDeliverySettings>,
@@ -1637,6 +1642,7 @@ fn launch_replacement_process(
     options: ReplacementOptions,
 ) -> io::Result<()> {
     let ReplacementOptions {
+        executable,
         focused_terminal,
         presented_focused_terminal,
         notification_settings,
@@ -1647,7 +1653,13 @@ fn launch_replacement_process(
     } = options;
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
-    let mut command = Command::new(replacement_executable()?);
+    // Keep the inspected executable open through exec. The descriptor is above
+    // CHANNEL_FD so the handoff channel duplication cannot overwrite it.
+    let replacement_path = match executable.as_ref() {
+        Some(file) => PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+        None => replacement_executable()?,
+    };
+    let mut command = Command::new(replacement_path);
     if let Some(environment) = startup_environment {
         command.env_clear();
         for variable in environment.variables {
@@ -1750,6 +1762,49 @@ fn launch_replacement_process(
         let _ = replacement.wait();
     }
     result
+}
+
+fn pin_replacement_executable(path: &Path) -> io::Result<File> {
+    if !path.is_absolute() || path.as_os_str().len() > 4096 || path.canonicalize()? != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replacement executable must be an absolute canonical path",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || ![0, unsafe { libc::geteuid() }].contains(&metadata.uid())
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "replacement must be a trusted, non-writable-by-others regular executable",
+        ));
+    }
+    let mut magic = [0; 4];
+    file.read_exact(&mut magic)?;
+    if magic != *b"\x7fELF" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replacement must be a native ELF executable",
+        ));
+    }
+    let descriptor = unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_DUPFD_CLOEXEC,
+            handoff::CHANNEL_FD + 1,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
 fn replacement_executable() -> io::Result<PathBuf> {
@@ -2194,7 +2249,7 @@ fn handle_connection_inner(
         };
     }
     let restart_settings = match &request.message {
-        Request::Restart => Some((None, None)),
+        Request::Restart => Some((None, None, None)),
         Request::RestartWithNotificationConfig {
             notifications,
             environment,
@@ -2208,11 +2263,31 @@ fn handle_connection_inner(
                     DaemonError::from(error).into_response(),
                 );
             }
-            Some((Some(notifications.clone().into()), environment.clone()))
+            Some((
+                Some(notifications.clone().into()),
+                environment.clone(),
+                None,
+            ))
+        }
+        Request::RestartWithExecutable {
+            executable,
+            notifications,
+        } => {
+            let executable = match pin_replacement_executable(executable) {
+                Ok(file) => file,
+                Err(error) => {
+                    return send_response(
+                        &mut stream,
+                        response_version,
+                        DaemonError::from(error).into_response(),
+                    );
+                }
+            };
+            Some((Some(notifications.clone().into()), None, Some(executable)))
         }
         _ => None,
     };
-    if let Some((notification_settings, startup_environment)) = restart_settings {
+    if let Some((notification_settings, startup_environment, executable)) = restart_settings {
         if transition
             .compare_exchange(
                 TRANSITION_IDLE,
@@ -2263,6 +2338,7 @@ fn handle_connection_inner(
         let (reply, response) = mpsc::sync_channel(1);
         if restart_sender
             .send(RestartRequest {
+                executable,
                 reply,
                 notification_settings,
                 startup_environment,
@@ -12974,7 +13050,9 @@ impl DaemonService {
             Request::RouteNodeHostService { node_id, operation } => Ok(
                 self.route_node_host_service_for_version(&node_id, operation, requester_version)
             ),
-            Request::Restart | Request::RestartWithNotificationConfig { .. } => {
+            Request::Restart
+            | Request::RestartWithNotificationConfig { .. }
+            | Request::RestartWithExecutable { .. } => {
                 unreachable!("restart is handled before dispatch")
             }
             Request::Shutdown | Request::ShutdownIfNodeIdentity { .. } => {
@@ -20654,6 +20732,38 @@ mod tests {
 
         assert!(registry.snapshot().unwrap().focused_terminal.is_none());
         assert_eq!(lock(&registry.runtimes.focus).unwrap().revision, 9);
+    }
+
+    #[test]
+    fn explicit_replacement_pins_the_inspected_inode_and_rejects_untrusted_paths() {
+        let directory = env::temp_dir().join(format!("boomux-pinned-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let candidate = directory.join("boomux");
+        fs::write(&candidate, b"\x7fELForiginal").unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+        let pinned = pin_replacement_executable(&candidate).unwrap();
+        assert!(pinned.as_raw_fd() > handoff::CHANNEL_FD);
+        assert_ne!(
+            unsafe { libc::fcntl(pinned.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let alternate = directory.join("alternate");
+        fs::write(&alternate, b"\x7fELFreplaced").unwrap();
+        fs::rename(&alternate, &candidate).unwrap();
+        let bytes = fs::read(format!("/proc/self/fd/{}", pinned.as_raw_fd())).unwrap();
+        assert_eq!(bytes, b"\x7fELForiginal");
+        for mode in [0o644, 0o777] {
+            fs::set_permissions(&candidate, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(pin_replacement_executable(&candidate).is_err());
+        }
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&candidate, &link).unwrap();
+        assert!(pin_replacement_executable(&link).is_err());
+        assert!(pin_replacement_executable(Path::new("relative/boomux")).is_err());
+        fs::write(&candidate, b"#!/bin/sh\nexit 0\n").unwrap();
+        assert!(pin_replacement_executable(&candidate).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

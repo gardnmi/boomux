@@ -25,6 +25,31 @@ handoff is an explicit, acknowledged upgrade path.
 - Received descriptors are close-on-exec, strictly typed by marker, and closed
   on every malformed transfer.
 
+## Selecting a release executable
+
+Ordinary `boomux daemon restart` replaces the daemon from its existing installed
+path. Invoking that command through a different CLI does not select that CLI's
+executable. Versioned Desktop bundles instead use:
+
+```sh
+boomux daemon restart --executable /absolute/release/path/bin/boomux
+```
+
+Protocol 52 adds `restart_executable` and `RestartWithExecutable`. The current
+client refuses this mutation on older daemons before requesting a restart. The
+owner daemon requires a canonical absolute path to a regular native ELF binary,
+owned by the user or root, executable and not writable by other users. It opens
+and pins the inspected inode before quiescing runtimes, then executes through
+that descriptor. The existing H8 prepare/finalize and rollback rules apply;
+this does not change the private handoff manifest or persisted state. The CLI
+also verifies the replacement's actual executable path before reporting success.
+
+A daemon from before protocol 52 needs a one-time upgrade through its owning
+installation method before Desktop can move it to a versioned bundle. Eligible
+standalone release installs can use `boomux update`, which replaces their existing
+installed path. Desktop does not overwrite independent installations or stop live
+Shells to bypass this compatibility boundary.
+
 ## Transfer Manifest
 
 The private handoff channel carries a versioned manifest followed by Unix

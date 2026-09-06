@@ -37,7 +37,8 @@ bounded worker. This downloads and verifies the complete bundle and atomically
 records a `pending` release link without changing `current` or restarting any
 process. **Restart now** acquires the same install lock, revalidates owned release
 paths and the current/pending selection, calls the candidate CLI's graceful
-`daemon restart`, switches `current`, and opens the candidate Desktop. It waits
+`daemon restart --executable <candidate>/bin/boomux`, verifies the daemon is
+running that executable, switches `current`, and opens the candidate Desktop. It waits
 up to 30 seconds for GPUI window creation before closing the old app. A failed
 window start switches back and requests graceful daemon recovery with the old
 CLI; recovery failures are surfaced. It never uses `daemon stop`.
@@ -55,6 +56,13 @@ or overwriting running executable files. On opening the newly installed app, a
 daemon running from another executable produces a **Restart now**/**Later**
 reminder to finish installation. Closing the old app alone does not restart its
 daemon. In-app restart opens the replacement window only after daemon handoff.
+
+Executable handoff requires a running daemon with protocol 52 or newer. Older
+daemons need a one-time upgrade through their owning installation method before
+Desktop can complete the switch (for an eligible standalone release install,
+`boomux update`). The compatibility error leaves the existing daemon and live
+Shells running; Desktop does not silently overwrite a separate CLI or cold-stop
+its sessions. Fresh combined installs include this support.
 
 The old repository is retained until cutover. Existing development builds should
 rerun the canonical installer after the first unified release; their old update

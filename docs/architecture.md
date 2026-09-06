@@ -256,6 +256,13 @@ event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
 default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
 unchanged because owner Workspaces already persist `default_cwd`.
+Protocol 52 adds `restart_executable` and `RestartWithExecutable` for graceful
+handoff to an explicit release path. The daemon pins a validated ELF inode before
+quiescence and executes it through a close-on-exec descriptor, preserving H8
+rollback and ShellRun identity. Clients reject this new mutation on older peers;
+ordinary restart keeps its existing executable selection. State schema and H8
+remain unchanged. See [`live-pty-handoff.md`](live-pty-handoff.md).
+
 Public Agent Session projection was retired after protocol 51. Current binaries
 do not advertise Session capabilities or JSON commands, the native dashboard has
 no Sessions view, and local or routed list, inspect, resolve, display-name, hide,

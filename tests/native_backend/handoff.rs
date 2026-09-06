@@ -729,6 +729,129 @@ fn native_daemon_handoffs_multiple_detached_shells() {
 }
 
 #[test]
+fn explicit_executable_handoff_preserves_live_runs_and_rolls_back_on_failure() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "release-handoff",
+            vec![ShellSpec::login("live", daemon.runtime_dir.clone())],
+        )
+        .unwrap();
+    let shell_id = &workspace.shells[0].id;
+    let mut attachment = daemon
+        .client
+        .attach(shell_id, false, profile())
+        .unwrap()
+        .stream;
+    AttachFrame::Input(b"stty -echo\n".to_vec())
+        .write_to(&mut attachment)
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    AttachFrame::Input(b"printf 'before=%s:end\n' \"$$\"\n".to_vec())
+        .write_to(&mut attachment)
+        .unwrap();
+    let output = read_until(&mut attachment, b":end");
+    let shell_pid = parse_pid(&output, "before=").unwrap();
+    let run_id = daemon.client.get_shell(shell_id).unwrap().run.unwrap().id;
+    drop(attachment);
+
+    let initial_pid = daemon.client.daemon_process_credentials().unwrap().pid;
+    let invalid = daemon.runtime_dir.join("invalid");
+    fs::copy("/bin/false", &invalid).unwrap();
+    fs::set_permissions(&invalid, fs::Permissions::from_mode(0o755)).unwrap();
+    let failed = daemon
+        .command()
+        .args(["daemon", "restart", "--executable"])
+        .arg(&invalid)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert_eq!(
+        daemon.client.daemon_process_credentials().unwrap().pid,
+        initial_pid
+    );
+    assert_eq!(
+        daemon.client.get_shell(shell_id).unwrap().run.unwrap().id,
+        run_id
+    );
+    assert!(process_exists(shell_pid));
+
+    // A legacy client remains supported, but cannot send this new mutation.
+    let mut legacy = UnixStream::connect(daemon.client.socket_path()).unwrap();
+    legacy.set_read_timeout(Some(TIMEOUT)).unwrap();
+    protocol::write_message(
+        &mut legacy,
+        &protocol::Envelope::with_version(
+            51,
+            protocol::Request::RestartWithExecutable {
+                executable: invalid.clone(),
+                notifications: Default::default(),
+            },
+        ),
+    )
+    .unwrap();
+    let reply: protocol::Envelope<protocol::Response> =
+        protocol::read_message(&mut legacy).unwrap();
+    assert!(matches!(
+        reply.message,
+        protocol::Response::Error {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }
+    ));
+    assert_eq!(
+        daemon.client.daemon_process_credentials().unwrap().pid,
+        initial_pid
+    );
+    drop(legacy);
+
+    let candidate = daemon.runtime_dir.join("new-release");
+    fs::copy(&daemon.executable, &candidate).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut previous_pid = initial_pid;
+    for executable in [&candidate, &daemon.executable] {
+        let output = daemon
+            .command()
+            .args(["daemon", "restart", "--executable"])
+            .arg(executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "handoff failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pid = daemon.client.daemon_process_credentials().unwrap().pid;
+        assert_ne!(pid, previous_pid);
+        previous_pid = pid;
+        assert_eq!(
+            fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+            *executable
+        );
+        assert_eq!(
+            daemon.client.get_shell(shell_id).unwrap().run.unwrap().id,
+            run_id
+        );
+        let mut attachment = daemon
+            .client
+            .attach(shell_id, false, profile())
+            .unwrap()
+            .stream;
+        AttachFrame::Input(b"printf 'after=%s:done\n' \"$$\"\n".to_vec())
+            .write_to(&mut attachment)
+            .unwrap();
+        let output = read_until(&mut attachment, b":done");
+        assert_eq!(parse_pid(&output, "after="), Some(shell_pid));
+    }
+    daemon.stop_with_cli();
+    wait_until(
+        || !process_exists(shell_pid),
+        "transferred shell survived daemon stop",
+    );
+}
+
+#[test]
 fn attachment_client_reconnects_across_daemon_restart() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
