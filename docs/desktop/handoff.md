@@ -1,7 +1,7 @@
 # Desktop source handoff
 
 Desktop feature work is frozen in the standalone repository. New Desktop changes
-belong in Boomux and the migration is tracked by [Boomux PR #367](https://github.com/gardnmi/boomux/pull/367).
+belong in Boomux. The migration merged in [Boomux PR #367](https://github.com/gardnmi/boomux/pull/367).
 
 The audited source is [Desktop main at 95946c1](https://github.com/gardnmi/boomux-desktop/tree/95946c14413eeac039e619c96368577463c59a53),
 including the final merges of #9, #11, and #10. The source tree contains 54 tracked
@@ -25,7 +25,7 @@ the final source and migration both use baseline CPU builds and cache keys.
   changes only comments and an internal error string to refer to the workspace.
 - `main.rs` adds `--version`, formats the update card, and removes the separate
   bundled-component notice. `updates.rs` follows the shared Boomux release,
-  requires Desktop assets, and offers one bundle update. Dismissal is preserved. Subsequent work in this PR adds explicit whole-bundle
+  requires Desktop assets, and offers one bundle update. Dismissal is preserved. Subsequent workspace development adds explicit whole-bundle
   Update/Restart actions and runtime diagnostics; see ADR 0016.
 - Packaging, installer, and smoke adaptations use the same workspace version and
   exact CLI candidate. CPU smoke also covers the daemon and CLI helpers.
