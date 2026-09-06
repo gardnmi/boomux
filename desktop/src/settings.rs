@@ -7,6 +7,7 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
+    pub onboarding_complete: bool,
     pub dismissed_desktop_update: String,
     pub dismissed_boomux_update: String,
     pub settings_restart_pending: bool,
@@ -23,6 +24,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            onboarding_complete: false,
             dismissed_desktop_update: String::new(),
             dismissed_boomux_update: String::new(),
             settings_restart_pending: false,
@@ -85,6 +87,9 @@ impl Settings {
                 }
                 "settings_restart_pending" => {
                     s.settings_restart_pending = value.as_bool().ok_or_else(invalid)?
+                }
+                "onboarding_complete" => {
+                    s.onboarding_complete = value.as_bool().ok_or_else(invalid)?
                 }
                 "sidebar_visible" => s.sidebar_visible = value.as_bool().ok_or_else(invalid)?,
                 "pane_headings_visible" => {
@@ -150,7 +155,7 @@ impl Settings {
     }
     fn encode(&self) -> String {
         format!(
-            "# Boomux Desktop preferences; shared Boomux configuration is separate.\nsidebar_visible = {}\npane_headings_visible = {}\npane_corner_style = \"{}\"\npane_gap = {}\nfocus_highlight_strength = {}\nmotion_speed = \"{}\"\nworkspace_pane_mode = \"{}\"\npane_layout_mode = \"{}\"\nconfirm_destructive_actions = {}\nsettings_restart_pending = {}\ndismissed_desktop_update = \"{}\"\ndismissed_boomux_update = \"{}\"\n",
+            "# Boomux Desktop preferences; shared Boomux configuration is separate.\nsidebar_visible = {}\npane_headings_visible = {}\npane_corner_style = \"{}\"\npane_gap = {}\nfocus_highlight_strength = {}\nmotion_speed = \"{}\"\nworkspace_pane_mode = \"{}\"\npane_layout_mode = \"{}\"\nconfirm_destructive_actions = {}\nonboarding_complete = {}\nsettings_restart_pending = {}\ndismissed_desktop_update = \"{}\"\ndismissed_boomux_update = \"{}\"\n",
             self.sidebar_visible,
             self.pane_headings_visible,
             match self.pane_corner_style {
@@ -174,6 +179,7 @@ impl Settings {
                 PaneLayoutMode::Tabbed => "tabbed",
             },
             self.confirm_destructive_actions,
+            self.onboarding_complete,
             self.settings_restart_pending,
             self.dismissed_desktop_update,
             self.dismissed_boomux_update

@@ -51,7 +51,7 @@ output=$(
   BOOMUX_INSTALL_FIXTURES="$root/release" \
   HOME="$root/home" \
   PATH="$root/bin:/usr/bin:/bin" \
-  "$root/installer" --no-setup
+  "$root/installer" --cli --no-setup
 )
 [[ "$output" == *"Boomux 1.2.3 installed"* ]]
 [[ "$output" == *"Next: $root/home/.local/bin/boomux setup"* ]]
@@ -60,14 +60,14 @@ output=$(
 if BOOMUX_INSTALL_FIXTURES="$root/release" \
   HOME="$root/home" \
   PATH="$root/bin:/usr/bin:/bin" \
-  "$root/installer" --no-setup >"$root/reinstall.out" 2>"$root/reinstall.err"; then
+  "$root/installer" --cli --no-setup >"$root/reinstall.out" 2>"$root/reinstall.err"; then
   printf 'installer replaced an existing Boomux installation\n' >&2
   exit 1
 fi
 grep -F 'Boomux is already installed' "$root/reinstall.err" >/dev/null
 
 if HOME="$root/home" PATH="$root/bin:/usr/bin:/bin" \
-  "$root/installer" --no-setup unexpected >/dev/null 2>&1; then
+  "$root/installer" --cli --no-setup unexpected >/dev/null 2>&1; then
   printf 'installer accepted an extra argument\n' >&2
   exit 1
 fi
@@ -76,7 +76,7 @@ unsafe_home="$root/unsafe-home"
 mkdir "$unsafe_home"
 chmod 0777 "$unsafe_home"
 if BOOMUX_INSTALL_FIXTURES="$root/release" HOME="$unsafe_home" \
-  PATH="$root/bin:/usr/bin:/bin" "$root/installer" --no-setup >/dev/null 2>&1; then
+  PATH="$root/bin:/usr/bin:/bin" "$root/installer" --cli --no-setup >/dev/null 2>&1; then
   printf 'installer accepted an unsafe HOME directory\n' >&2
   exit 1
 fi
@@ -85,7 +85,7 @@ checksum_home="$root/checksum-home"
 mkdir "$checksum_home"
 printf '%064d  %s\n' 0 "$archive" > "$root/release/${archive}.sha256"
 if BOOMUX_INSTALL_FIXTURES="$root/release" HOME="$checksum_home" \
-  PATH="$root/bin:/usr/bin:/bin" "$root/installer" --no-setup >/dev/null 2>&1; then
+  PATH="$root/bin:/usr/bin:/bin" "$root/installer" --cli --no-setup >/dev/null 2>&1; then
   printf 'installer accepted a checksum mismatch\n' >&2
   exit 1
 fi
@@ -94,7 +94,7 @@ archive_digest=$(sha256sum "$root/release/$archive")
 archive_digest=${archive_digest%% *}
 printf '%s  other-archive.tar.gz\n' "$archive_digest" > "$root/release/${archive}.sha256"
 if BOOMUX_INSTALL_FIXTURES="$root/release" HOME="$checksum_home" \
-  PATH="$root/bin:/usr/bin:/bin" "$root/installer" --no-setup >/dev/null 2>&1; then
+  PATH="$root/bin:/usr/bin:/bin" "$root/installer" --cli --no-setup >/dev/null 2>&1; then
   printf 'installer accepted a checksum for the wrong archive\n' >&2
   exit 1
 fi
@@ -118,7 +118,7 @@ chmod 755 "$root/bin/ln"
 if BOOMUX_INSTALL_FIXTURES="$root/release" \
   BOOMUX_RACE_DESTINATION="$race_home/.local/bin/boomux" \
   HOME="$race_home" PATH="$root/bin:/usr/bin:/bin" \
-  "$root/installer" --no-setup >/dev/null 2>&1; then
+  "$root/installer" --cli --no-setup >/dev/null 2>&1; then
   printf 'installer replaced a destination created during installation\n' >&2
   exit 1
 fi
@@ -131,7 +131,7 @@ if BOOMUX_INSTALL_FIXTURES="$root/release" \
   BOOMUX_RACE_DESTINATION="$race_directory_home/.local/bin/boomux" \
   BOOMUX_RACE_KIND=directory HOME="$race_directory_home" \
   PATH="$root/bin:/usr/bin:/bin" \
-  "$root/installer" --no-setup >/dev/null 2>&1; then
+  "$root/installer" --cli --no-setup >/dev/null 2>&1; then
   printf 'installer accepted a directory created at the destination\n' >&2
   exit 1
 fi

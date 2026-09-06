@@ -1,7 +1,9 @@
 mod boomux_settings;
+mod bundle_update;
 mod generated_names;
 mod layout;
 mod layout_badge;
+mod runtime;
 mod settings;
 mod terminal;
 mod theme;
@@ -1299,6 +1301,9 @@ struct Workspace {
     theme_error: Option<String>,
     update_check: updates::Check,
     updates_checking: bool,
+    update_busy: bool,
+    prepared_update: Option<bundle_update::Prepared>,
+    onboarding_complete: bool,
     updates_status: Option<String>,
     update_task: Option<gpui::Task<()>>,
     dismissed_desktop_update: String,
@@ -1464,6 +1469,9 @@ impl Workspace {
             theme_error: None,
             update_check: updates::Check::default(),
             updates_checking: false,
+            update_busy: false,
+            prepared_update: None,
+            onboarding_complete: saved.onboarding_complete,
             updates_status: None,
             update_task: None,
             dismissed_desktop_update: saved.dismissed_desktop_update,
@@ -1533,6 +1541,7 @@ impl Workspace {
     fn save_settings(&self) {
         if let Some(writer) = &self.settings_writer {
             let _ = writer.force_send(settings::Settings {
+                onboarding_complete: self.onboarding_complete,
                 sidebar_visible: self.sidebar_visible,
                 pane_headings_visible: self.pane_headings_visible,
                 pane_corner_style: self.pane_corner_style,
@@ -1566,7 +1575,7 @@ impl Workspace {
     }
 
     fn check_updates(&mut self, cx: &mut Context<Self>) {
-        if self.updates_checking {
+        if self.updates_checking || self.update_busy {
             return;
         }
         self.updates_checking = true;
@@ -1577,14 +1586,20 @@ impl Workspace {
                 .await;
             this.update(cx, |this, cx| {
                 this.updates_checking = false;
-                if this.updates_status.is_some() {
+                if this.updates_status.is_some() && !this.update_busy {
                     this.updates_status = if result.unavailable {
                         Some("Some update checks were unavailable. Try again later.".into())
-                    } else if result.desktop.is_none() && result.boomux.is_none() {
+                    } else if result.desktop.is_none()
+                        && result.boomux.is_none()
+                        && result.prepared.is_none()
+                    {
                         Some("No newer releases found.".into())
                     } else {
                         None
                     };
+                }
+                if !this.update_busy {
+                    this.prepared_update = result.prepared.clone();
                 }
                 this.update_check = result;
                 cx.notify();
@@ -1593,6 +1608,91 @@ impl Workspace {
         })
         .detach();
         cx.notify();
+    }
+
+    fn download_update(&mut self, version: String, cx: &mut Context<Self>) {
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        self.updates_status = Some(format!("Downloading and verifying {version}…"));
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    bundle_update::Installation::discover()
+                        .ok_or_else(|| {
+                            "Reopen an official Desktop installation to update".to_string()
+                        })?
+                        .prepare(&version)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.update_busy = false;
+                match result {
+                    Ok(prepared) => {
+                        this.prepared_update = Some(prepared);
+                        this.updates_status = None;
+                    }
+                    Err(error) => this.updates_status = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn restart_for_update(&mut self, cx: &mut Context<Self>) {
+        if self.update_busy {
+            return;
+        }
+        let Some(prepared) = self.prepared_update.clone() else {
+            return;
+        };
+        self.update_busy = true;
+        self.updates_status = Some("Restarting Boomux and reopening Desktop…".into());
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { prepared.restart() }).await;
+            this.update(cx, |this, cx| {
+                this.update_busy = false;
+                match result {
+                    Ok(()) => cx.quit(),
+                    Err(error) => {
+                        this.updates_status = Some(error);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn onboarding(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.onboarding_complete {
+            return None;
+        }
+        Some(div().mb_3().p_3().border_1().border_color(rgb(0x45475a))
+            .flex().flex_col().gap_2()
+            .child(div().text_sm().child("Welcome to Boomux"))
+            .child(div().text_xs().text_color(rgb(0xa6adc8))
+                .child("Connect your coding agents to show their status and notifications. Setup opens here and asks before changing any agent configuration."))
+            .child(Self::settings_option("setup-agents", "Set up agents", true)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.onboarding_complete = true;
+                    this.save_settings();
+                    this.create_and_attach_setup(window, cx);
+                })))
+            .child(Self::settings_option("skip-setup", "Start using Boomux", false)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.onboarding_complete = true;
+                    this.save_settings();
+                    cx.notify();
+                })))
+            .child(div().text_xs().text_color(rgb(0xa6adc8)).child("You can run setup later from the menu."))
+            .into_any_element())
     }
 
     fn update_notices(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -1606,6 +1706,27 @@ impl Workspace {
                     .child(status.clone())
                     .into_any_element(),
             );
+        }
+        if let Some(prepared) = &self.prepared_update
+            && prepared.version != self.dismissed_desktop_update
+        {
+            let version = prepared.version.clone();
+            rows.push(div().mb_3().p_3().border_1().border_color(rgb(0x45475a))
+                .flex().flex_col().gap_2()
+                .child(format!("Boomux {} is ready", prepared.version))
+                .child(div().text_xs().text_color(rgb(0xa6adc8))
+                    .child("Restart the app and its background service to finish updating. Running terminals and commands will be preserved."))
+                .child(Self::settings_option("restart-update", if self.update_busy { "Restarting…" } else { "Restart now" }, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.restart_for_update(cx))))
+                .child(Self::settings_option("later-update", "Later", false)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.update_busy {
+                            this.dismissed_desktop_update = version.clone();
+                            this.save_settings();
+                            cx.notify();
+                        }
+                    })))
+                .into_any_element());
         }
         for (index, notice, dismissed, name) in [
             (
@@ -1624,6 +1745,10 @@ impl Workspace {
             let Some(notice) = notice.as_ref().filter(|notice| notice.visible(dismissed)) else {
                 continue;
             };
+            if index == 0 && self.prepared_update.is_some() {
+                continue;
+            }
+            let download_version = notice.latest.clone();
             let version = notice.latest.clone();
             let url = notice.url.clone();
             rows.push(
@@ -1653,9 +1778,31 @@ impl Workspace {
                             .flex()
                             .gap_2()
                             .child(
-                                Self::settings_option(("view-update", index), "View release", true)
-                                    .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
+                                Self::settings_option(
+                                    ("view-update", index),
+                                    "View release",
+                                    false,
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
                             )
+                            .when(index == 0 && self.update_check.installable, |row| {
+                                row.child(
+                                    Self::settings_option(
+                                        "download-update",
+                                        if self.update_busy {
+                                            "Updating…"
+                                        } else {
+                                            "Update"
+                                        },
+                                        true,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.download_update(download_version.clone(), cx)
+                                        },
+                                    )),
+                                )
+                            })
                             .child(
                                 Self::settings_option(("dismiss-update", index), "Dismiss", false)
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -4284,6 +4431,19 @@ impl Workspace {
     }
 
     fn create_and_attach_new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_workspace_terminal(false, window, cx);
+    }
+
+    fn create_and_attach_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_workspace_terminal(true, window, cx);
+    }
+
+    fn create_workspace_terminal(
+        &mut self,
+        setup: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.sidebar_menu = None;
         self.navigation_region = NavigationRegion::Terminal;
         self.fullscreen = None;
@@ -4303,7 +4463,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let shell = terminal::create_workspace_with_shell()?;
+                    let shell = terminal::create_workspace_with_shell(setup)?;
                     let session = match TerminalSession::attach(
                         shell.clone(),
                         size.0,
@@ -4951,6 +5111,24 @@ impl Workspace {
                 )
                 .child(
                     div()
+                        .id("header-menu-setup")
+                        .h(px(36.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(rgb(0x313244)))
+                        .child("Set up agents")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.sidebar_header_menu_open = false;
+                            this.onboarding_complete = true;
+                            this.save_settings();
+                            this.create_and_attach_setup(window, cx);
+                        })),
+                )
+                .child(
+                    div()
                         .id("header-menu-updates")
                         .h(px(36.0))
                         .px_3()
@@ -5467,6 +5645,7 @@ impl Workspace {
                     .min_h_0()
                     .overflow_y_scroll()
                     .p_3()
+                    .children(self.onboarding(cx))
                     .children(self.update_notices(cx))
                     .child(
                         div()
@@ -8614,7 +8793,17 @@ fn main() {
         println!("boomux-desktop {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("--check-runtime") {
+        if let Err(error) = runtime::check() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let args = std::env::args_os().collect::<Vec<_>>();
+    let update_ready = (args.get(1).is_some_and(|arg| arg == "--update-ready"))
+        .then(|| args.get(2).map(std::path::PathBuf::from))
+        .flatten();
     if args
         .get(1)
         .is_some_and(|arg| arg == boomux_settings::EDITOR_FLAG)
@@ -8762,6 +8951,9 @@ fn main() {
         )
         .unwrap();
         cx.activate(true);
+        if let Some(path) = update_ready {
+            bundle_update::signal_ready(path);
+        }
     });
 }
 

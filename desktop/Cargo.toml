@@ -15,6 +15,7 @@ gpui = { package = "gpui-ce", version = "=0.2.2" }
 gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["wayland", "x11"] }
 image = { version = "0.25", default-features = false }
 libghostty-vt = { version = "=0.2.1", default-features = false, features = ["kitty-graphics"] }
+libc = "0.2"
 notify = { version = "=8.2.0", default-features = false }
 smallvec = "1.15"
 toml = "=0.9.12"

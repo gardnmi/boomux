@@ -19,12 +19,14 @@ the final source and migration both use baseline CPU builds and cache keys.
 
 ## Differences reviewed
 
-- Six Rust modules match exactly, including Agent labels, terminal behavior,
-  settings persistence, layout, animation, and themes. `boomux_settings.rs`
+- Four Rust modules match exactly: generated names, layout, layout animation,
+  and themes. Terminal and settings changes now add embedded agent setup and
+  persist its welcome-card dismissal. `boomux_settings.rs`
   changes only comments and an internal error string to refer to the workspace.
 - `main.rs` adds `--version`, formats the update card, and removes the separate
   bundled-component notice. `updates.rs` follows the shared Boomux release,
-  requires Desktop assets, and offers one bundle update. Dismissal is preserved.
+  requires Desktop assets, and offers one bundle update. Dismissal is preserved. Subsequent work in this PR adds explicit whole-bundle
+  Update/Restart actions and runtime diagnostics; see ADR 0016.
 - Packaging, installer, and smoke adaptations use the same workspace version and
   exact CLI candidate. CPU smoke also covers the daemon and CLI helpers.
 - Root CI, Release Please, publishing, configuration, lockfile, policy, and
@@ -38,7 +40,7 @@ the final source and migration both use baseline CPU builds and cache keys.
 
 ## File inventory
 
-Audit totals: 22 exact copies, 18 adapted files, 13 consolidated files, and
+Audit totals: 20 exact copies, 20 adapted files, 13 consolidated files, and
 1 historical snapshot.
 
 Paths are relative to the standalone source and the Boomux workspace respectively.
@@ -87,8 +89,8 @@ Paths are relative to the standalone source and the Boomux workspace respectivel
 | `src/layout.rs` | `desktop/src/layout.rs` | Exact copy |
 | `src/layout_badge.rs` | `desktop/src/layout_badge.rs` | Exact copy |
 | `src/main.rs` | `desktop/src/main.rs` | Adapted |
-| `src/settings.rs` | `desktop/src/settings.rs` | Exact copy |
-| `src/terminal.rs` | `desktop/src/terminal.rs` | Exact copy |
+| `src/settings.rs` | `desktop/src/settings.rs` | Adapted |
+| `src/terminal.rs` | `desktop/src/terminal.rs` | Adapted |
 | `src/theme.rs` | `desktop/src/theme.rs` | Exact copy |
 | `src/updates.rs` | `desktop/src/updates.rs` | Adapted |
 | `vendor/libghostty-vt-sys/Cargo.toml` | `vendor/libghostty-vt-sys/Cargo.toml` | Exact copy |
@@ -103,7 +105,8 @@ Paths are relative to the standalone source and the Boomux workspace respectivel
 ## Remaining repository cutover
 
 Both source feature PRs are already merged; no PR transfer or closure remains.
-Add `CI result` to Boomux's required checks before merging the migration. Keep
-existing requirements until the aggregate reports successfully. After the first
+`CI result` is now required on Boomux main, alongside the seven existing checks
+and strict branch freshness. Its first complete run passed before adding the
+requirement. After the first
 unified release and installer are verified, forward the old installer and archive
 the standalone repository. Its source and review history remain available.

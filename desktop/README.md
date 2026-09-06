@@ -28,9 +28,11 @@ first stable release bundle is published:
 curl -fsSL https://github.com/gardnmi/boomux/releases/latest/download/boomux-desktop-installer.sh | sh
 ```
 
-The initial release target is Linux x86-64 with glibc, built on Ubuntu 24.04.
+The initial release target is Linux x86-64 with glibc 2.39+, built on Ubuntu 24.04.
 It needs the system's graphics drivers and Fontconfig, Wayland/X11, XCB
-shape/xfixes, and xkbcommon libraries. Older distributions and musl-based
+shape/xfixes, xkbcommon, and Vulkan libraries plus a working GPU driver. The installer checks
+minimum glibc, executable versions, and graphics-library availability before
+activation; see [runtime packages](../README.md#requirements). Older glibc distributions and musl-based
 distributions such as Alpine are not supported by this bundle. macOS, Windows,
 and ARM builds are not provided yet.
 
@@ -40,11 +42,20 @@ or starts one; closing Desktop leaves the daemon and Shells running.
 
 Commands are linked in `~/.local/bin`. If that directory is absent from your
 PATH, add `export PATH="$HOME/.local/bin:$PATH"` to your shell configuration.
-Rerun the installer to download the latest stable release. Updates switch a
+The main `boomux-installer.sh` also offers Desktop or CLI-only installation.
+Rerun the Desktop installer to download the latest stable release. Updates switch a
 `current` link without overwriting running executables or restarting the daemon.
-Existing Boomux CLI installations are preserved. See
+When an existing daemon uses a different executable, the new app offers to
+finish updating it through graceful restart. Existing Boomux CLI installations
+are preserved. See
 [release packaging](../docs/desktop/releases.md) for version selection, install locations,
 release preparation, uninstall instructions, and the required platform smoke tests.
+
+On first launch, **Set up agents** opens the interactive Boomux agent setup in an
+embedded terminal. It asks before installing integrations or replacing modified
+agent settings. **Start using Boomux** skips setup; the header menu can reopen it
+later. Setup does not install the optional Omarchy plugin, change Hyprland, or
+require an external terminal emulator.
 
 Desktop appearance and behavior preferences save automatically to
 `~/.config/boomux-desktop/settings.toml` (`XDG_CONFIG_HOME` is respected).
@@ -56,10 +67,15 @@ geometry are not yet saved.
 See [preferences and uninstalling](../docs/desktop/releases.md#desktop-integration-and-preferences).
 
 Desktop checks for newer stable application releases shortly after startup
-and every six hours. Update cards offer **View release** and **Dismiss**. Dismissal
+and every six hours. Official installations offer **Update**, **View release**, and **Dismiss**. Dismissal
 is saved for that version; a newer release can notify you again. Use **Check for
-updates** in the header menu to revisit dismissed notices. Checks do not install
-software or restart anything. Official bundles show one update notice for the complete application.
+updates** in the header menu to revisit dismissed notices. Checks do not install software or restart anything. **Update** downloads and
+verifies the full application on a worker. Choose **Restart now** to gracefully
+restart Boomux and open the updated Desktop, or **Later** to keep working. The
+prepared update is retained across restarts. A failed replacement-window launch
+restores the old bundle and requests daemon recovery; an error remains visible.
+Official bundles show one notice for the complete application. Source and manually
+unpacked builds retain release links and are not eligible for in-app installation.
 
 ## Run from source
 

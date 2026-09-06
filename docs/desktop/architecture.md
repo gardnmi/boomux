@@ -163,7 +163,7 @@ owner-side validation failures against the matching Boomux executable.
 The direct `toml_edit` dependency pins the version already present through
 Boomux, enabling preservation of user comments without adding another version.
 
-## Update Notices
+## Installation, Setup, And Updates
 
 A window-owned task schedules read-only release checks ten seconds after startup
 and every six hours. One bounded worker checks the fixed Boomux GitHub release
@@ -175,4 +175,28 @@ Each process has a 20-second deadline and at most 128 KiB retained output; curl
 also has a 15-second limit. Closing the window cancels its scheduler; in-flight
 work completes within its bounds without retaining the window. Dismissals are
 saved per version and reset by an explicit manual check. Existing settings keys
-remain compatible. No update check installs software or restarts the daemon.
+remain compatible. No update check installs software or restarts the daemon. Explicit Update and
+Restart actions use the transaction below.
+
+`runtime.rs` provides a display-independent `--check-runtime` mode for fixed
+system graphics libraries. The installer first checks its glibc baseline, then
+both executable versions and this runtime check before committing any active
+release change. GPU/driver/display startup remains a separate smoke-test concern.
+
+The welcome card and menu launch `boomux setup` with an exact argument vector in
+a new daemon-owned Shell. The CLI keeps agent-integration authority and prompts;
+Desktop only presents its terminal. `onboarding_complete` is a persisted UI
+preference, not a record that integrations are installed or ready.
+
+`bundle_update.rs` owns the local Desktop installation transaction, not PTY or
+daemon authority. Release checks report eligibility and a prepared update on the
+background executor. A user action runs the embedded installer with `--prepare`;
+`pending` is retained without switching `current`. Restart obtains the install
+lock, validates owned versioned paths and unchanged selection, delegates graceful
+handoff to the candidate CLI, then activates and launches the replacement window.
+A bounded window-ready acknowledgment precedes closing the old app. Failure
+restores the prior link and delegates reverse handoff to the old CLI; failures
+remain visible and retryable. The update worker serializes operations, bounds
+process lifetime/output, and never starts per-pane tasks. Existing independent
+CLI binaries remain outside its install ownership. A daemon from a different
+executable gets a finish-installation reminder after launching a new bundle.
