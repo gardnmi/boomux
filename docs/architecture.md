@@ -1147,9 +1147,15 @@ therefore cannot claim authority inherited from its app-server.
 Codex hook `session_id` is the canonical thread identity and ensures the exact
 `(codex, thread, shell, run)` Agent key. SessionStart reports Idle, except compact
 starts remain Working; prompt, tool, compaction, and subagent activity report
-Working; PermissionRequest reports Blocked; Stop reports Idle; and SessionEnd
-reports Inactive. Codex hooks never report Done. Input, identity, and reporting
-are bounded and fail open for the host.
+Working; PermissionRequest reports Blocked; Stop and Interrupt report Idle;
+SessionEnd reports Inactive. Codex hooks never report Done. Input, identity, and
+reporting are bounded and fail open for the host.
+
+Interrupt records an interrupted turn, not permanent completion or thread
+inactivity. The documented hook interface does not identify the selected thread:
+switching away does not immediately emit SessionEnd. Multiple exact threads can
+therefore retain observations in one ShellRun. A new SessionStart never retires
+another thread based on recency, shared Shell identity, or fork metadata.
 
 Exact resume uses `codex resume <thread-id>`. The experimental catalog
 adapter starts bounded `codex app-server --stdio`, completes `initialize` and

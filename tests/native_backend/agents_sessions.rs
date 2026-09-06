@@ -148,7 +148,7 @@ fn codex_hook_requires_run_scoped_launch_and_reuses_exact_thread_agent() {
     let _attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
     let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
 
-    let run_hook = |event: &str, run_scoped: bool| {
+    let run_hook = |session_id: &str, event: &str, run_scoped: bool| {
         let mut command = daemon.command();
         command
             .args(["codex", "hook"])
@@ -164,7 +164,7 @@ fn codex_hook_requires_run_scoped_launch_and_reuses_exact_thread_agent() {
         let mut child = command.spawn().unwrap();
         write!(
             child.stdin.take().unwrap(),
-            "{{\"session_id\":\"codex-thread\",\"hook_event_name\":\"{event}\"}}"
+            "{{\"session_id\":\"{session_id}\",\"hook_event_name\":\"{event}\"}}"
         )
         .unwrap();
         let output = child.wait_with_output().unwrap();
@@ -172,7 +172,7 @@ fn codex_hook_requires_run_scoped_launch_and_reuses_exact_thread_agent() {
         assert!(output.stdout.is_empty());
     };
 
-    run_hook("SessionStart", false);
+    run_hook("codex-thread", "SessionStart", false);
     assert!(
         daemon.client.snapshot().unwrap().workspaces[0]
             .agents
@@ -184,10 +184,12 @@ fn codex_hook_requires_run_scoped_launch_and_reuses_exact_thread_agent() {
         ("UserPromptSubmit", AgentState::Working),
         ("PermissionRequest", AgentState::Blocked),
         ("PostToolUse", AgentState::Working),
+        ("Interrupt", AgentState::Idle),
+        ("UserPromptSubmit", AgentState::Working),
         ("Stop", AgentState::Idle),
         ("SessionEnd", AgentState::Inactive),
     ] {
-        run_hook(event, true);
+        run_hook("codex-thread", event, true);
         let agents = &daemon.client.snapshot().unwrap().workspaces[0].agents;
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].integration, "codex");
@@ -198,6 +200,45 @@ fn codex_hook_requires_run_scoped_launch_and_reuses_exact_thread_agent() {
         assert_eq!(agents[0].observation.state, expected, "{event}");
         assert_ne!(agents[0].observation.state, AgentState::Done);
     }
+
+    run_hook("codex-thread", "UserPromptSubmit", true);
+    run_hook("codex-fork", "SessionStart", true);
+    let before = daemon.client.snapshot().unwrap().workspaces[0]
+        .agents
+        .clone();
+    assert_eq!(before.len(), 2);
+    let original = before
+        .iter()
+        .find(|agent| agent.external_session_id.as_deref() == Some("codex-thread"))
+        .unwrap();
+    let fork = before
+        .iter()
+        .find(|agent| agent.external_session_id.as_deref() == Some("codex-fork"))
+        .unwrap();
+    assert_eq!(original.observation.state, AgentState::Working);
+    assert_eq!(fork.observation.state, AgentState::Idle);
+    assert_eq!(original.run_id, fork.run_id);
+    assert_ne!(original.id, fork.id);
+
+    // An explicit interruption affects only its exact thread, never its sibling.
+    run_hook("codex-thread", "Interrupt", true);
+    let after = daemon.client.snapshot().unwrap().workspaces[0]
+        .agents
+        .clone();
+    assert_eq!(after.len(), 2);
+    assert_eq!(
+        after
+            .iter()
+            .find(|agent| agent.id == original.id)
+            .unwrap()
+            .observation
+            .state,
+        AgentState::Idle
+    );
+    assert_eq!(
+        after.iter().find(|agent| agent.id == fork.id).unwrap(),
+        fork
+    );
 
     daemon.stop_with_cli();
 }

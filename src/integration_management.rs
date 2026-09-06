@@ -33,6 +33,7 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
     "SubagentStart",
     "SubagentStop",
     "Stop",
+    "Interrupt",
 ];
 
 #[cfg(test)]
