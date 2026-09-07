@@ -13,21 +13,35 @@ in the backend. GPUI rendering and input live in `desktop/`.
 
 ## Validation
 
-For Desktop Rust-only changes, run:
+Follow the root rule against over-applying validation. Use the smallest relevant
+check and stop after it passes. Do not stack compile checks, Clippy, full tests,
+and release builds for routine Desktop edits. Documentation-only changes need
+only link/claim review and `git diff --check`, not the Rust commands below.
+
+During Desktop development, start with formatting and a compile check:
 
 ```console
 cargo fmt --all -- --check
-cargo clippy -p boomux-desktop --all-targets --all-features --locked -- -D warnings
-cargo test -p boomux-desktop --locked -- --test-threads=1
-cargo build -p boomux-desktop --release --locked
+cargo check -p boomux-desktop --locked
 ```
 
-Building `libghostty-vt` requires Zig 0.15.2 on `PATH`. Run the narrowest
-relevant test while iterating, then the Desktop set above before opening a PR.
-Run `cargo deny check` and the complete root/desktop suite for dependency,
-Cargo/toolchain, backend, or vendored changes, as specified by root `AGENTS.md`.
-For docs-only or packaging/workflow-script changes, use the root validation
-matrix. All selected CI checks must pass before merging.
+Run focused tests for the changed behavior using a test-name filter, and build
+or launch the development app when a visual check is needed. A filtered test
+still compiles the test binary and its dependencies; a cosmetic change does not
+need a full test build solely to repeat unchanged tests.
+
+PR CI owns Desktop Clippy, the complete Desktop tests, and the release build.
+Do not run that full set locally before opening or updating a PR. Local release
+builds are for performance measurements, release-only diagnosis, and packaging
+validation. Broaden checks only for a concrete failure, an identified affected
+behavior, CI diagnosis, or an explicit user request; explain what the additional
+check will resolve. Do not rerun successful checks without a relevant change.
+All selected CI checks must pass before merging.
+
+Building `libghostty-vt` requires Zig 0.15.2 on `PATH`. For dependency,
+Cargo/toolchain, backend, vendored, docs, or packaging/workflow-script changes,
+use the root local-validation matrix. The full command reference in root
+`AGENTS.md` is available for reproducing CI failures.
 
 ### Testing By Change Type
 

@@ -271,6 +271,8 @@ enum Commands {
     Doctor,
     /// Discover and configure local Agent harnesses and desktop integration
     Setup,
+    #[command(name = "__desktop-setup", hide = true)]
+    DesktopSetup,
     /// Report stable integration capabilities without starting the daemon
     Capabilities,
     /// List all managed shells
@@ -1565,7 +1567,7 @@ impl Cli {
             }) => CommandKey::Daemon,
             Some(Commands::Ui) | None => CommandKey::Ui,
             Some(Commands::Doctor) => CommandKey::Doctor,
-            Some(Commands::Setup) => CommandKey::Setup,
+            Some(Commands::Setup | Commands::DesktopSetup) => CommandKey::Setup,
             Some(Commands::Close { .. }) => CommandKey::Close,
             Some(Commands::Skill {
                 command: SkillCommands::Install { .. },
@@ -1906,6 +1908,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Web { .. }) => unreachable!(),
         Some(Commands::Doctor) => doctor(cli.terminal.as_deref()),
         Some(Commands::Setup) => setup::guided_setup(),
+        Some(Commands::DesktopSetup) => setup::desktop_setup(),
         Some(Commands::Capabilities) => capabilities(cli.json),
         Some(Commands::List) => list_shells(cli.json),
         Some(Commands::Shells) => list_workspace_shells(cli.json),
@@ -12581,6 +12584,9 @@ mod tests {
         assert!(matches!(cli.command.as_ref(), Some(Commands::Setup)));
         assert_eq!(cli.command_descriptor().key, "setup");
         assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+        let desktop = Cli::try_parse_from(["boomux", "__desktop-setup"]).unwrap();
+        assert!(matches!(desktop.command, Some(Commands::DesktopSetup)));
+        assert_eq!(desktop.command_descriptor().output, OutputMode::HumanOnly);
     }
 
     #[test]

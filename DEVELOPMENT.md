@@ -89,13 +89,17 @@ in `.github/workflows/desktop-build.yml`. From the repository root:
 
 ```console
 python3 desktop/scripts/run-dev.py
-cargo test -p boomux-desktop --locked -- --test-threads=1
-cargo clippy -p boomux-desktop --all-targets --all-features --locked -- -D warnings
+cargo check -p boomux-desktop --locked
+cargo test -p boomux-desktop <test-name> --locked -- --test-threads=1
 ```
 
 The helper builds both executables, sets a matching CLI PATH, and uses XDG
 runtime/config/state directories under `target/desktop-dev/`. Closing the window
-keeps these development sessions alive. The helper prints the isolated runtime
+keeps these development sessions alive. After rebuilding, the helper starts an
+absent development daemon or gracefully restarts an existing one with the rebuilt
+CLI's explicit executable path, preserving compatible live Shells. A failed
+handoff aborts the launch rather than falling back to a destructive stop.
+The helper prints the isolated runtime
 path; it does not replace installed binaries or use the ordinary daemon.
 See `desktop/AGENTS.md` for additional validation and `docs/desktop/releases.md`
 for packaging and headless GUI smoke tests.
@@ -197,8 +201,9 @@ bun test integrations/opencode/boomux.test.js \
 
 Use [`BENCHMARKING.md`](BENCHMARKING.md) for the benchmark tiers, fixture policy,
 local commands, and interpretation rules. Before changing a benchmarked hot path,
-save a local Criterion baseline on the same machine. Before opening a code PR, run
-the deterministic benchmark fixtures and smoke suite:
+save a local Criterion baseline on the same machine. For benchmark changes or
+local reproduction of a benchmark CI failure, run the deterministic fixtures and
+smoke suite below. Ordinary edits leave the full benchmark checks to PR CI:
 
 ```console
 cargo test --test benchmark_harness --features benchmark-internals --locked
@@ -208,10 +213,23 @@ cargo bench --bench core_cpu --bench wire --features benchmark-internals --locke
 Criterion timing on shared runners is evidence, not a merge gate. Gungraun provides
 the deterministic instruction-count tier and requires Valgrind for execution.
 
-## Complete Validation
+## Local Feedback And PR Validation
 
-Before opening a pull request that changes code, configuration, packaging, or
-generated assets, run the same checks as CI:
+Use formatting, `cargo check --locked` (or `cargo check -p boomux-desktop --locked`),
+and the narrowest relevant tests during development. Build or run the app when
+needed to exercise the changed behavior. A filtered test still needs its test
+binary and dependencies compiled; start with a compile check for small edits.
+Avoid full suites and release builds for routine UI or implementation changes.
+
+Open or update the PR after focused local checks; CI runs the complete selected
+validation matrix. Do not duplicate that matrix locally as a pre-PR gate. Require
+all selected CI checks before merging. Use broader local runs to investigate a
+specific failure or cross-cutting risk, or when explicitly requested. Build an
+optimized binary when measuring performance or validating release/packaging
+behavior, rather than on every edit.
+
+The full commands below are a reference for reproducing CI failures or explicitly
+requested comprehensive local validation:
 
 ```console
 cargo fmt --all -- --check

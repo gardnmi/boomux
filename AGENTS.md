@@ -25,19 +25,41 @@ module map, then read its colocated tests and the relevant contract document.
 
 ## Validation
 
-Select local validation by changed inputs, matching `docs/ci.md`:
+Use focused local checks during development. PR CI owns the complete validation
+selected by `docs/ci.md`; do not run the full root/Desktop suites or a release
+build locally as a routine prerequisite to opening or updating a PR. Require all
+selected CI checks to pass before merging.
 
-| Change | Local validation before a PR |
+Do not over-apply validation. Choose the smallest check that answers a concrete
+question about the changed behavior, then stop when it passes. Do not stack
+`cargo check`, Clippy, full tests, and release builds "just to be safe," or treat
+the command lists below as mandatory local gates. Documentation-only edits need
+no Rust checks. Small UI edits do not automatically justify a full test build.
+Do not repeat successful checks unless subsequent changes affect what they
+validated. Report any unverified behavior plainly and leave comprehensive
+coverage to PR CI; do not delay reviewable work to duplicate CI locally.
+
+| Change | Local development validation |
 | --- | --- |
 | Unpackaged Markdown/guidance only | Review links and claims; `git diff --check` |
-| Desktop Rust only, optionally with guidance | Formatting, Desktop Clippy/tests, and Desktop release build below |
+| Desktop Rust only, optionally with guidance | Formatting and `cargo check -p boomux-desktop --locked`; focused tests or a manual UI check for the changed behavior |
 | CI/workflow or packaging scripts without Rust/dependency changes | Relevant Python/Bun/shell fixtures and shell syntax; actionlint for workflow changes |
-| Backend Rust, shared dependencies, Cargo/toolchain, or vendored code | Complete root and Desktop validation below |
+| Backend Rust | Formatting, `cargo check --locked`, and focused unit/integration tests for the changed behavior |
+| Shared dependencies, Cargo/toolchain, or vendored code | Check affected packages and run focused compatibility checks; let PR CI cover the full matrix |
 
-CI configuration changes still select the full hosted pipeline. Require its
-selected checks to pass before merging; script-only work does not require a
-second local run of unchanged Rust suites. Unknown or mixed code inputs use the
-complete set. Clippy already checks every benchmark target.
+Scale local checks to the change. A filtered Rust test still compiles its test
+binary and dependencies, so use `cargo check` first for small compile-only edits.
+Do not add tests that only mirror cosmetic UI changes. Broaden local validation
+only for a concrete failure, an identified affected behavior, CI diagnosis, or an
+explicit user request. State what the additional check will resolve; generic
+caution or a desire for extra confidence is not sufficient. Unknown or mixed
+inputs select full validation in CI, not automatically on
+the development machine. Use local release builds for performance measurements,
+release-only issues, or packaging work that needs the actual optimized artifact.
+
+The full commands below are a reference for reproducing CI failures or explicitly
+requested comprehensive local validation, not a per-edit or pre-PR checklist.
+Clippy already checks every benchmark target.
 
 The complete root validation set is:
 
@@ -55,7 +77,7 @@ bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.t
 
 The workspace also contains `desktop/`; read `desktop/AGENTS.md` for GUI changes.
 Core commands above select the default root package and require no Zig or display
-SDK. For backend/shared-code validation also run:
+SDK. For comprehensive backend/shared-code validation, the additional set is:
 
 ```console
 cargo clippy -p boomux-desktop --all-targets --all-features --locked -- -D warnings
@@ -73,9 +95,9 @@ Desktop requires Zig 0.15.2 and the graphics dependencies listed in
 `.github/workflows/desktop-build.yml`. Bundle changes also require X11 and
 Wayland smoke tests described in `docs/desktop/releases.md`.
 
-Run the narrowest relevant tests while iterating, then the applicable set above
-before opening a PR. Require all selected CI checks before merging. Native backend tests are intentionally serial because they
-exercise process, socket, PTY, and daemon lifecycle behavior.
+Run the narrowest relevant tests while iterating and leave the complete selected
+set to PR CI. Native backend tests are intentionally serial because they exercise
+process, socket, PTY, and daemon lifecycle behavior.
 
 ### Testing By Change Type
 

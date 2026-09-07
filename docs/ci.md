@@ -118,9 +118,11 @@ python3 -m unittest discover -s .github/scripts -p 'test_ci_*.py'
 They exercise actual Git diffs, version-only changes with/without CI proof,
 embedded Markdown, dependency changes, failure fallbacks, and artifact source
 and digest mismatches. The classifier job runs these fixtures on every event.
-Run actionlint for workflow expressions, plus the applicable local validation in
-`AGENTS.md` before opening a PR. CI/workflow-only changes require the full hosted
-pipeline before merging, without redundantly running unchanged Rust suites locally.
+Run actionlint for workflow expressions and the focused local checks in
+`AGENTS.md`. Opening or updating a PR delegates the complete selected matrix to
+CI; a full local run is not a prerequisite. CI/workflow-only changes require the
+full hosted pipeline before merging, without redundantly running unchanged Rust
+suites locally.
 
 Before this change, main CI run `33948018935` took 6m45s: Rust took 6m34s,
 benchmark smoke 6m22s, and x86-64/ARM packaging 2m10s/1m45s. Release run

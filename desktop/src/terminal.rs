@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use boomux::client::{self, Client};
 use boomux::protocol::{
-    AgentAttentionReason, AgentState, AttachFrame, ShellSnapshot, ShellSpec, ShellStatus,
-    TerminalProfile,
+    AgentAttentionReason, AgentState, AttachFrame, ErrorCode, Request, Response, ShellSnapshot,
+    ShellSpec, ShellStatus, TerminalProfile, WorkspaceSnapshot,
 };
 use compact_str::CompactString;
 use gpui::{Keystroke, Modifiers};
@@ -50,6 +50,7 @@ pub struct ShellChoice {
     pub cwd: PathBuf,
     pub status: ShellStatus,
     pub run_id: Option<String>,
+    pub desktop_setup: bool,
 }
 
 impl ShellChoice {
@@ -375,6 +376,7 @@ enum EmulatorCommand {
 pub struct TerminalSession {
     pub shell_id: String,
     pub shell_name: String,
+    pub setup_workspace_cleanup: Option<SetupWorkspaceCleanup>,
     shared: Arc<SharedTerminal>,
     last_size: Mutex<(u16, u16)>,
 }
@@ -390,6 +392,17 @@ impl TerminalSession {
         let client = client::connect_if_running()
             .map_err(|error| format!("could not connect to Boomux: {error}"))?
             .ok_or_else(|| "Boomux is not running".to_string())?;
+        Self::attach_with_client(client, shell, rows, cols, pixel_width, pixel_height)
+    }
+
+    fn attach_with_client(
+        client: Client,
+        shell: ShellChoice,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<Self, String> {
         let profile = terminal_profile(rows, cols, pixel_width, pixel_height);
         let attachment = attach_shell(&client, &shell, profile.clone(), true)?;
         let shared = Arc::new(SharedTerminal::new(profile));
@@ -419,6 +432,7 @@ impl TerminalSession {
         Ok(Self {
             shell_id: shell.id,
             shell_name: shell.name,
+            setup_workspace_cleanup: None,
             shared,
             // Attachment already established this geometry. Avoid an unchanged
             // first-render resize canceling the reader's temporary redraw size.
@@ -432,10 +446,6 @@ impl TerminalSession {
 
     pub fn set_theme(&self, theme: TerminalTheme) -> Result<(), String> {
         self.shared.set_theme(theme)
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.shared.closed.load(Ordering::Acquire)
     }
 
     pub fn status_message(&self) -> Option<String> {
@@ -609,6 +619,39 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
     let snapshot = client
         .snapshot()
         .map_err(|error| format!("could not read Boomux workspaces: {error}"))?;
+    Ok(overview_from_snapshot(snapshot))
+}
+
+pub fn discover_overview_and_nodes() -> (
+    Result<BoomuxOverview, String>,
+    Result<Vec<crate::nodes::NodeView>, String>,
+) {
+    let combined = client::connect_if_running()
+        .map_err(|error| format!("could not connect to Boomux: {error}"))
+        .and_then(|client| client.ok_or_else(|| "Boomux is not running".into()))
+        .and_then(|client| {
+            client
+                .combined_node_snapshot(None)
+                .map_err(|error| format!("could not read Boomux Nodes: {error}"))
+        });
+    match combined {
+        Ok(combined) => {
+            let nodes = crate::nodes::project(&combined);
+            let overview = combined
+                .nodes
+                .into_iter()
+                .find(|node| node.local)
+                .and_then(|node| node.local_snapshot)
+                .map(overview_from_snapshot)
+                .ok_or_else(|| "Boomux omitted the local Node snapshot".into());
+            (overview, Ok(nodes))
+        }
+        // Federation availability must not stop local discovery.
+        Err(error) => (discover_overview(), Err(error)),
+    }
+}
+
+fn overview_from_snapshot(snapshot: boomux::protocol::Snapshot) -> BoomuxOverview {
     let focused_shell_id = snapshot
         .focused_terminal
         .as_ref()
@@ -683,11 +726,11 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
     }
     distinguish_agent_rows(&mut agents);
     agents.sort_by_key(|agent| std::cmp::Reverse(agent.updated_at_ms));
-    Ok(BoomuxOverview {
+    BoomuxOverview {
         workspaces,
         agents,
         focused_shell_id,
-    })
+    }
 }
 
 // Labels are presentation only; actions retain the exact Agent and Shell IDs.
@@ -760,6 +803,7 @@ fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
         cwd: shell.cwd,
         status: shell.status,
         run_id: shell.run.map(|run| run.id),
+        desktop_setup: shell.command.len() == 2 && shell.command[1] == "__desktop-setup",
     }
 }
 
@@ -812,13 +856,44 @@ pub fn create_shell_in_workspace(workspace_id: &str) -> Result<ShellChoice, Stri
         .map_err(|error| format!("could not create Boomux shell: {error}"))
 }
 
-/// Create a local Workspace with its first pending login Shell. Boomux owns
-/// both resources; the returned Shell can be attached immediately.
-pub fn create_workspace_with_shell(setup: bool) -> Result<ShellChoice, String> {
+/// Explicit local terminal flows using the matching Boomux executable.
+#[derive(Clone, Debug)]
+pub enum WorkspaceLaunch {
+    Shell,
+    Setup,
+    AddNode,
+    ReauthenticateNode(String),
+    Dashboard,
+}
+
+impl WorkspaceLaunch {
+    fn command(&self) -> Option<(&'static str, Vec<String>)> {
+        match self {
+            Self::Shell => None,
+            Self::Setup => Some(("Set up agents", vec!["__desktop-setup".into()])),
+            Self::AddNode => Some(("Add remote Node", vec!["__guided-node-add".into()])),
+            Self::ReauthenticateNode(id) => Some((
+                "Sign in to Node",
+                vec!["__guided-node-reauthenticate".into(), id.clone()],
+            )),
+            Self::Dashboard => Some(("Boomux dashboard", vec![])),
+        }
+    }
+}
+
+/// Create a local Workspace and its first pending Shell; Boomux owns both.
+pub fn create_workspace_with_shell(
+    launch: WorkspaceLaunch,
+) -> Result<(ShellChoice, Option<SetupWorkspaceCleanup>), String> {
     let Some(client) = client::connect_if_running()
         .map_err(|error| format!("could not connect to Boomux: {error}"))?
     else {
         return Err("Boomux is not running".into());
+    };
+    let setup_node = if matches!(launch, WorkspaceLaunch::Setup) {
+        Some(client.node_identity().map_err(|error| error.to_string())?)
+    } else {
+        None
     };
     let snapshot = client
         .snapshot()
@@ -835,7 +910,7 @@ pub fn create_workspace_with_shell(setup: bool) -> Result<ShellChoice, String> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("could not determine the new workspace directory: {error}"))?;
     let mut spec = ShellSpec::login(shell_name, cwd.clone());
-    if setup {
+    if let Some((label, arguments)) = launch.command() {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let bundled = executable
             .parent()
@@ -854,19 +929,96 @@ pub fn create_workspace_with_shell(setup: bool) -> Result<ShellChoice, String> {
             cli.to_str()
                 .ok_or("The setup executable path must be valid UTF-8")?
                 .to_owned(),
-            "setup".into(),
         ];
-        spec.name = "Set up agents".into();
+        spec.command.extend(arguments);
+        spec.name = label.into();
     }
     let workspace = client
         .create_workspace_with_default_cwd(workspace_name, Some(cwd.clone()), vec![spec])
         .map_err(|error| format!("could not create Boomux workspace: {error}"))?;
+    let cleanup = setup_node
+        .and_then(|node_id| SetupWorkspaceCleanup::from_creation(&launch, node_id, &workspace));
     workspace
         .shells
         .into_iter()
         .next()
-        .map(shell_choice)
+        .map(|shell| (shell_choice(shell), cleanup))
         .ok_or_else(|| "Boomux created the workspace without its initial shell".to_string())
+}
+
+/// Ephemeral proof from this setup launch's successful CreateWorkspace response.
+/// Discovery and reattachment never reconstruct cleanup ownership from a name or command.
+pub struct SetupWorkspaceCleanup {
+    node_id: String,
+    workspace_id: String,
+    empty_revision: u64,
+}
+
+impl SetupWorkspaceCleanup {
+    fn from_creation(
+        launch: &WorkspaceLaunch,
+        node_id: String,
+        workspace: &WorkspaceSnapshot,
+    ) -> Option<Self> {
+        if !matches!(launch, WorkspaceLaunch::Setup)
+            || workspace.shells.len() != 1
+            || !workspace.launchers.is_empty()
+            || !workspace.agents.is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            node_id,
+            workspace_id: workspace.id.clone(),
+            // Removing the sole setup Shell is the only allowed intervening mutation.
+            empty_revision: workspace.revision.checked_add(1)?,
+        })
+    }
+
+    fn close_request(&self, node_id: &str, workspace: &WorkspaceSnapshot) -> Option<Request> {
+        (node_id == self.node_id
+            && workspace.id == self.workspace_id
+            && workspace.revision == self.empty_revision
+            && workspace.shells.is_empty()
+            && workspace.launchers.is_empty()
+            && workspace.agents.is_empty())
+        .then(|| Request::GuardedCloseWorkspace {
+            workspace_id: self.workspace_id.clone(),
+            expected_revision: self.empty_revision,
+        })
+    }
+
+    fn cleanup(&self, client: &Client) -> Result<(), String> {
+        let node_id = client.node_identity().map_err(|error| error.to_string())?;
+        if node_id != self.node_id {
+            return Ok(());
+        }
+        // RouteNodeOperation addresses registered remote Nodes, not this local owner.
+        let workspace = match client.get_workspace(&self.workspace_id) {
+            Ok(workspace) => workspace,
+            Err(client::ClientError::Remote(error)) if error.code == Some(ErrorCode::NotFound) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let Some(request) = self.close_request(&node_id, &workspace) else {
+            return Ok(());
+        };
+        // No unguarded fallback or retry against a newer revision after a race.
+        match client.request(request).map_err(|error| error.to_string())? {
+            Response::Ok => Ok(()),
+            response => Err(format!(
+                "unexpected Workspace cleanup response: {response:?}"
+            )),
+        }
+    }
+}
+
+pub fn cleanup_setup_workspace(cleanup: SetupWorkspaceCleanup) -> Result<(), String> {
+    let client = client::connect_if_running()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Boomux is not running".to_string())?;
+    cleanup.cleanup(&client)
 }
 
 pub fn rename_workspace(workspace_id: &str, name: &str) -> Result<(), String> {
@@ -1437,62 +1589,8 @@ fn start_emulator(
                 return;
             }
 
-            while let Ok(command) = receiver.recv() {
-                match apply_emulator_command(&mut core, &worker_shared, command) {
-                    Ok(true) => {}
-                    Ok(false) => return,
-                    Err(error) => {
-                        worker_shared.close(error);
-                        return;
-                    }
-                }
-
-                let mut stopped = false;
-                while let Ok(command) = receiver.try_recv() {
-                    match apply_emulator_command(&mut core, &worker_shared, command) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            stopped = true;
-                            break;
-                        }
-                        Err(error) => {
-                            worker_shared.close(error);
-                            return;
-                        }
-                    }
-                }
-                if stopped {
-                    return;
-                }
-                // A full queue could not accept the wake-up marker, but it did
-                // keep the latest requested row. Apply that row once after the
-                // lossless command queue has been drained.
-                if worker_shared
-                    .pending_scroll_wakeup
-                    .swap(false, Ordering::AcqRel)
-                {
-                    let row = worker_shared.pending_scroll_row.load(Ordering::Acquire) as usize;
-                    if let Err(error) =
-                        core.apply(EmulatorCommand::Scroll(ScrollViewport::Row(row)))
-                    {
-                        worker_shared.close(error);
-                        return;
-                    }
-                }
-                if let Some(theme) = worker_shared.pending_theme.lock().unwrap().take()
-                    && let Err(error) = configure_terminal(&mut core.terminal, theme)
-                {
-                    worker_shared.close(error);
-                    return;
-                }
-                if core.terminal.mode(Mode::SYNC_OUTPUT).unwrap_or(false) {
-                    continue;
-                }
-                if let Err(error) = publish_screen(&mut core, &worker_shared) {
-                    worker_shared.close(error);
-                    return;
-                }
-            }
+            run_emulator(&mut core, &worker_shared, receiver);
+            worker_shared.updates.close();
         })
         .map_err(|error| format!("could not start Ghostty terminal worker: {error}"))?;
 
@@ -1501,6 +1599,72 @@ fn start_emulator(
         .map_err(|_| "Ghostty terminal worker stopped during startup".to_string())??;
     shared.install_emulator(sender);
     Ok(())
+}
+
+fn run_emulator(
+    core: &mut EmulatorCore,
+    worker_shared: &SharedTerminal,
+    receiver: mpsc::Receiver<EmulatorCommand>,
+) {
+    while let Ok(command) = receiver.recv() {
+        match apply_emulator_command(core, worker_shared, command) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                worker_shared.close(error);
+                return;
+            }
+        }
+
+        let mut stopped = false;
+        while let Ok(command) = receiver.try_recv() {
+            match apply_emulator_command(core, worker_shared, command) {
+                Ok(true) => {}
+                Ok(false) => {
+                    stopped = true;
+                    break;
+                }
+                Err(error) => {
+                    worker_shared.close(error);
+                    return;
+                }
+            }
+        }
+        if stopped {
+            break;
+        }
+        // A full queue could not accept the wake-up marker, but it did
+        // keep the latest requested row. Apply that row once after the
+        // lossless command queue has been drained.
+        if worker_shared
+            .pending_scroll_wakeup
+            .swap(false, Ordering::AcqRel)
+        {
+            let row = worker_shared.pending_scroll_row.load(Ordering::Acquire) as usize;
+            if let Err(error) = core.apply(EmulatorCommand::Scroll(ScrollViewport::Row(row))) {
+                worker_shared.close(error);
+                return;
+            }
+        }
+        if let Some(theme) = worker_shared.pending_theme.lock().unwrap().take()
+            && let Err(error) = configure_terminal(&mut core.terminal, theme)
+        {
+            worker_shared.close(error);
+            return;
+        }
+        if core.terminal.mode(Mode::SYNC_OUTPUT).unwrap_or(false) {
+            continue;
+        }
+        if let Err(error) = publish_screen(core, worker_shared) {
+            worker_shared.close(error);
+            return;
+        }
+    }
+    // Stop may share a batch with final output, or end synchronized output.
+    // Preserve those bytes in the detached pane before releasing the core.
+    if let Err(error) = publish_screen(core, worker_shared) {
+        worker_shared.close(error);
+    }
 }
 
 fn publish_screen(core: &mut EmulatorCore, shared: &SharedTerminal) -> Result<(), String> {
@@ -1962,6 +2126,381 @@ fn indexed_color_with_palette(index: u8, ansi: &[u32; 16]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires the matching CLI in BOOMUX_TEST_CLI; runs only an isolated fixture daemon"]
+    fn setup_workspace_real_lifecycle_cleans_only_unused_creation() {
+        use boomux::protocol::{Request, ShellSpec};
+        use std::os::unix::fs::DirBuilderExt;
+        use std::process::{Command, Stdio};
+
+        struct Fixture {
+            root: std::path::PathBuf,
+            child: std::process::Child,
+            client: boomux::client::Client,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.client.shutdown();
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let executable = std::env::var_os("BOOMUX_TEST_CLI")
+            .expect("set BOOMUX_TEST_CLI to this worktree's built CLI");
+        let root =
+            std::env::temp_dir().join(format!("desktop-setup-lifecycle-{}", fastrand::u64(..)));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let child = Command::new(executable)
+            .args(["daemon", "run"])
+            .env_clear()
+            .env("HOME", &root)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/sh")
+            .env("XDG_RUNTIME_DIR", &root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let fixture = Fixture {
+            client: boomux::client::Client::from_socket_path(root.join("boomux/daemon.sock")),
+            root,
+            child,
+        };
+        let wait = |condition: &mut dyn FnMut() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "isolated lifecycle timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait(&mut || fixture.client.ping().is_ok());
+        for (reuse, race) in [(false, false), (true, false), (false, true)] {
+            let mut spec = ShellSpec::login("fixture-setup", fixture.root.clone());
+            // A harmless waiting process exercises the same PTY/start/close path, without setup/install.
+            spec.command = vec![
+                "/usr/bin/env".into(),
+                "-i".into(),
+                format!("HOME={}", fixture.root.display()),
+                format!("XDG_RUNTIME_DIR={}", fixture.root.display()),
+                format!("XDG_CONFIG_HOME={}", fixture.root.join("config").display()),
+                format!("XDG_STATE_HOME={}", fixture.root.join("state").display()),
+                "PATH=/usr/bin:/bin".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf fixture-ready; read answer".into(),
+            ];
+            let created = fixture
+                .client
+                .create_workspace(format!("fixture-{reuse}-{race}"), vec![spec])
+                .unwrap();
+            let receipt = super::SetupWorkspaceCleanup::from_creation(
+                &super::WorkspaceLaunch::Setup,
+                fixture.client.node_identity().unwrap(),
+                &created,
+            )
+            .unwrap();
+            let mut shell = super::shell_choice(created.shells[0].clone());
+            shell.desktop_setup = true;
+            let mut session = super::TerminalSession::attach_with_client(
+                fixture.client.clone(),
+                shell.clone(),
+                24,
+                80,
+                800,
+                480,
+            )
+            .unwrap();
+            session.setup_workspace_cleanup = Some(receipt);
+            wait(&mut || {
+                fixture
+                    .client
+                    .read_shell(&shell.id, 1024)
+                    .is_ok_and(|bytes| bytes.windows(13).any(|bytes| bytes == b"fixture-ready"))
+            });
+            let started = fixture.client.get_workspace(&created.id).unwrap();
+            assert_eq!(
+                started.revision, created.revision,
+                "PTY startup must not be mistaken for user reuse"
+            );
+            if reuse {
+                let user_shell = fixture
+                    .client
+                    .create_shell(
+                        &created.id,
+                        ShellSpec::login("user-work", fixture.root.clone()),
+                    )
+                    .unwrap();
+                fixture.client.close_shell(&user_shell.id).unwrap();
+            }
+            let running = fixture.client.get_shell(&shell.id).unwrap();
+            fixture
+                .client
+                .request(Request::GuardedCloseShell {
+                    shell_id: shell.id.clone(),
+                    expected_revision: running.revision,
+                })
+                .unwrap();
+            wait(&mut || session.update_events().is_closed());
+            let overview = super::overview_from_snapshot(fixture.client.snapshot().unwrap());
+            assert!(crate::setup_pane_was_removed(&shell, true, &overview));
+            let empty = fixture.client.get_workspace(&created.id).unwrap();
+            assert!(empty.shells.is_empty());
+            eprintln!(
+                "setup lifecycle reuse={reuse}: created={}, started={}, removed={}",
+                created.revision, started.revision, empty.revision
+            );
+            assert_eq!(empty.revision, created.revision + if reuse { 3 } else { 1 });
+            let cleanup = session.setup_workspace_cleanup.take().unwrap();
+            if race {
+                let stale = cleanup
+                    .close_request(&fixture.client.node_identity().unwrap(), &empty)
+                    .unwrap();
+                let user_shell = fixture
+                    .client
+                    .create_shell(
+                        &created.id,
+                        ShellSpec::login("concurrent-user-work", fixture.root.clone()),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(fixture.client.request(stale), Err(boomux::client::ClientError::Remote(error)) if error.code == Some(boomux::protocol::ErrorCode::RevisionAhead))
+                );
+                assert!(fixture.client.get_shell(&user_shell.id).is_ok());
+            }
+            cleanup.cleanup(&fixture.client).unwrap();
+            match fixture.client.get_workspace(&created.id) {
+                Ok(workspace) if reuse || race => assert_eq!(workspace.id, created.id),
+                Err(boomux::client::ClientError::Remote(error)) if !reuse && !race => {
+                    assert_eq!(error.code, Some(boomux::protocol::ErrorCode::NotFound));
+                }
+                result => {
+                    panic!("unexpected cleanup result (reuse={reuse}, race={race}): {result:?}")
+                }
+            }
+        }
+    }
+
+    fn setup_workspace_creation() -> boomux::protocol::WorkspaceSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "id": "created-workspace", "name": "same-name-as-another-workspace", "revision": 1,
+            "shells": [{"id": "setup-shell", "workspace_id": "created-workspace",
+                "name": "Set up agents", "cwd": "/tmp", "status": "pending",
+                "command": ["/build/boomux", "__desktop-setup"]}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn setup_workspace_cleanup_requires_creation_identity_and_only_its_shell_removal() {
+        let created = setup_workspace_creation();
+        let cleanup = super::SetupWorkspaceCleanup::from_creation(
+            &super::WorkspaceLaunch::Setup,
+            "owner".into(),
+            &created,
+        )
+        .unwrap();
+        for launch in [
+            super::WorkspaceLaunch::Shell,
+            super::WorkspaceLaunch::Dashboard,
+            super::WorkspaceLaunch::AddNode,
+        ] {
+            assert!(
+                super::SetupWorkspaceCleanup::from_creation(&launch, "owner".into(), &created)
+                    .is_none()
+            );
+        }
+        assert!(cleanup.close_request("owner", &created).is_none());
+        let mut empty = created.clone();
+        empty.shells.clear();
+        empty.revision += 1;
+        assert_eq!(
+            cleanup.close_request("owner", &empty),
+            Some(boomux::protocol::Request::GuardedCloseWorkspace {
+                workspace_id: created.id.clone(),
+                expected_revision: 2,
+            })
+        );
+        assert!(cleanup.close_request("different-node", &empty).is_none());
+        empty.id = "existing-workspace-with-the-same-name".into();
+        assert!(cleanup.close_request("owner", &empty).is_none());
+        empty.id = created.id.clone();
+        // Rename/default edits, or adding then removing user work, invalidate ownership.
+        for revision in [0, 1, 3, 4, u64::MAX] {
+            empty.revision = revision;
+            assert!(cleanup.close_request("owner", &empty).is_none());
+        }
+        // An empty/reused snapshot cannot be a successful setup creation receipt.
+        assert!(
+            super::SetupWorkspaceCleanup::from_creation(
+                &super::WorkspaceLaunch::Setup,
+                "owner".into(),
+                &empty
+            )
+            .is_none()
+        );
+        let mut overflow = created;
+        overflow.revision = u64::MAX;
+        assert!(
+            super::SetupWorkspaceCleanup::from_creation(
+                &super::WorkspaceLaunch::Setup,
+                "owner".into(),
+                &overflow
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn setup_workspace_cleanup_preserves_shells_launchers_and_agent_history() {
+        let mut workspace = setup_workspace_creation();
+        let cleanup = super::SetupWorkspaceCleanup::from_creation(
+            &super::WorkspaceLaunch::Setup,
+            "owner".into(),
+            &workspace,
+        )
+        .unwrap();
+        workspace.revision = 2;
+        assert!(cleanup.close_request("owner", &workspace).is_none());
+        workspace.shells.clear();
+        workspace.launchers.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "user-launcher", "workspace_id": workspace.id, "name": "user work",
+                "command": ["user-command"], "cwd": "/tmp"
+            }))
+            .unwrap(),
+        );
+        assert!(cleanup.close_request("owner", &workspace).is_none());
+        workspace.launchers.clear();
+        workspace.agents.push(serde_json::from_value(serde_json::json!({
+            "id": "user-agent", "workspace_id": workspace.id, "shell_id": "old-shell",
+            "run_id": "old-run", "name": "history", "integration": "test",
+            "started_at_ms": 1, "ended_at_ms": 2,
+            "observation": {"revision": 1, "state": "done", "authority": "lifecycle_integration",
+                "evidence": "test", "confidence": 100, "observed_at_ms": 2}
+        })).unwrap());
+        assert!(cleanup.close_request("owner", &workspace).is_none());
+    }
+
+    #[test]
+    fn setup_workspace_cleanup_sends_guarded_close_once_and_never_retries_a_race() {
+        use boomux::protocol::{self, Envelope, ErrorCode, Request, Response};
+        use std::os::unix::net::UnixListener;
+
+        for race in [false, true] {
+            let directory =
+                std::env::temp_dir().join(format!("desktop-setup-cleanup-{}", fastrand::u64(..)));
+            std::fs::create_dir(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let mut workspace = setup_workspace_creation();
+            let cleanup = super::SetupWorkspaceCleanup::from_creation(
+                &super::WorkspaceLaunch::Setup,
+                "owner".into(),
+                &workspace,
+            )
+            .unwrap();
+            workspace.shells.clear();
+            workspace.revision = 2;
+            let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let exchanges = [
+                    (
+                        Request::GetNodeIdentity,
+                        Response::NodeIdentity {
+                            node_id: "owner".into(),
+                        },
+                    ),
+                    (
+                        Request::GetWorkspace {
+                            workspace_id: workspace.id.clone(),
+                        },
+                        Response::Workspace { workspace },
+                    ),
+                    (
+                        Request::GuardedCloseWorkspace {
+                            workspace_id: "created-workspace".into(),
+                            expected_revision: 2,
+                        },
+                        if race {
+                            Response::Error {
+                                code: Some(ErrorCode::RevisionAhead),
+                                message: "user added work after inspection".into(),
+                            }
+                        } else {
+                            Response::Ok
+                        },
+                    ),
+                ];
+                for (expected, response) in exchanges {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                    assert_eq!(request.message, expected);
+                    protocol::write_message(
+                        &mut stream,
+                        &Envelope::with_version(request.version, response),
+                    )
+                    .unwrap();
+                }
+                finished_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                listener.set_nonblocking(true).unwrap();
+                assert!(
+                    listener.accept().is_err(),
+                    "cleanup must not retry with an unguarded or updated request"
+                );
+            });
+            let result = cleanup.cleanup(&boomux::client::Client::from_socket_path(socket));
+            finished_sender.send(()).unwrap();
+            assert_eq!(result.is_err(), race);
+            if let Err(error) = result {
+                assert!(error.contains("user added work"), "{error}");
+            }
+            server.join().unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn setup_launch_uses_the_dedicated_cleanup_entry_point() {
+        assert_eq!(
+            super::WorkspaceLaunch::Setup.command().unwrap().1,
+            ["__desktop-setup"]
+        );
+    }
+
+    #[test]
+    fn node_launches_preserve_exact_arguments_and_do_not_request_upgrades() {
+        use super::WorkspaceLaunch;
+        assert!(WorkspaceLaunch::Shell.command().is_none());
+        assert_eq!(
+            WorkspaceLaunch::AddNode.command().unwrap().1,
+            ["__guided-node-add"]
+        );
+        assert!(WorkspaceLaunch::Dashboard.command().unwrap().1.is_empty());
+        let id = "node with spaces; $(touch should-not-exist)";
+        assert_eq!(
+            WorkspaceLaunch::ReauthenticateNode(id.into())
+                .command()
+                .unwrap()
+                .1,
+            ["__guided-node-reauthenticate", id]
+        );
+    }
+
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -1972,12 +2511,13 @@ mod tests {
     use libghostty_vt::terminal::Mode;
 
     use super::{
-        AgentChoice, EmulatorCommand, EmulatorCore, SharedTerminal, agent_is_visible, blank_screen,
-        configure_terminal, distinguish_agent_rows, encode_key, encode_mouse_wheel, encode_paste,
-        image_bgra, indexed_color, resynchronize_terminal_size, spawn_reader, terminal_profile,
+        AgentChoice, EMULATOR_QUEUE_CAPACITY, EmulatorCommand, EmulatorCore, SharedTerminal,
+        agent_is_visible, blank_screen, configure_terminal, distinguish_agent_rows, encode_key,
+        encode_mouse_wheel, encode_paste, image_bgra, indexed_color, resynchronize_terminal_size,
+        run_emulator, spawn_reader, start_emulator, terminal_profile,
     };
     use crate::theme::TerminalTheme;
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
 
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
         Keystroke {
@@ -2658,6 +3198,69 @@ mod tests {
             panic!("expected a keyboard enhancement response");
         };
         assert_eq!(bytes, b"\x1b[?0u");
+    }
+
+    #[test]
+    fn terminal_updates_remain_open_until_the_final_screen_is_published() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(6, 80, 800, 120)));
+        start_emulator(&shared, 6, 80, 800, 120).unwrap();
+        let screen = shared.screen.lock().unwrap();
+        while shared.update_events.try_recv().is_ok() {}
+        shared.process(b"Setup completed successfully.".to_vec());
+        shared.close("detached");
+
+        // Hold back screen publication to reproduce the UI observing closure first.
+        assert!(shared.closed.load(Ordering::Acquire));
+        assert!(shared.update_events.try_recv().is_ok());
+        assert!(!shared.update_events.is_closed());
+        drop(screen);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !shared.update_events.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(shared.update_events.try_recv().is_ok());
+        let screen = shared.screen.lock().unwrap();
+        let text: String = screen.cells.iter().map(|cell| cell.text.as_str()).collect();
+        assert!(text.contains("Setup completed successfully."), "{text}");
+    }
+
+    #[test]
+    fn detached_pane_retains_final_output_and_wakes_the_view() {
+        for queued_output in [true, false] {
+            for receipt in [
+                "Setup completed successfully.",
+                "Setup finished with failures.",
+            ] {
+                let shared = Arc::new(SharedTerminal::new(terminal_profile(6, 80, 800, 120)));
+                let mut core = EmulatorCore::new(&shared, 6, 80, 800, 120).unwrap();
+                let (sender, receiver) = mpsc::sync_channel(EMULATOR_QUEUE_CAPACITY);
+                shared.install_emulator(sender);
+                let output = format!("\x1b[?2026h{receipt}\r\nPress Ctrl+W to close this pane.");
+                if queued_output {
+                    shared.process(output.into_bytes());
+                } else {
+                    // A prior synchronized batch has not published its screen yet.
+                    core.apply(EmulatorCommand::Output(output.into_bytes()))
+                        .unwrap();
+                }
+                shared.close("detached");
+                while shared.update_events.try_recv().is_ok() {}
+
+                run_emulator(&mut core, &shared, receiver);
+
+                let screen = shared.screen.lock().unwrap();
+                let text: String = screen.cells.iter().map(|cell| cell.text.as_str()).collect();
+                assert!(text.contains(receipt), "{text}");
+                assert!(text.contains("Press Ctrl+W to close this pane."), "{text}");
+                assert_eq!(*shared.status.lock().unwrap(), "detached");
+                assert!(shared.update_events.try_recv().is_ok());
+            }
+        }
     }
 
     #[test]

@@ -23,6 +23,12 @@ tests, `CONTEXT.md`, architecture documentation, and accepted ADRs.
 
 ## Product
 
+- [x] Add compact native Node status and entry points for guided SSH setup and
+  reauthentication, reusing Boomux's terminal flows.
+- Present remote Shells and Agents with exact Node-qualified identities and
+  coordinated Workspace membership in the native canvas.
+- Preserve remote panes across connection loss with exact-run recovery and
+  actionable authentication/identity failures.
 - Extend persisted Desktop preferences to window geometry and pane arrangement restoration.
 - Reach feature parity with the essential `omarchy-boomux` Workspace and Agent
   workflows before considering replacement of that client.
