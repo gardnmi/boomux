@@ -6,8 +6,9 @@ release stage.
 
 | Stage | Validation |
 | --- | --- |
-| Code PR | Formatting, Clippy, Rust unit/CLI/serial native tests, integration fixtures, dependency policy, release packaging on both architectures, Arch compatibility; benchmark smoke when relevant |
-| Code merge to main | Same checks on the actual merged commit; main also saves dependency caches |
+| Backend/shared-code PR | Formatting, backend and Desktop Clippy/tests, integration fixtures, dependency policy, release packaging on both architectures, Arch compatibility; benchmark smoke when relevant |
+| Desktop-only Rust PR | Formatting, Desktop Clippy/tests, and optimized Desktop build; omit unchanged backend tests, integrations, dependency audit, CLI packaging, and backend benchmarks |
+| Code merge to main | Same component selection on the actual merged commit; main also saves dependency caches |
 | Release Please proposal generation | No builds or test suites; runs after successful main push CI |
 | Version-only release PR | Reuse successful base main CI; build and smoke test both release architectures, validate packaging scripts, and check Arch compatibility |
 | Version-only release merge | Same selection, with artifacts built for the exact new main commit |
@@ -22,14 +23,14 @@ binary and used by update/packaging behavior.
 
 ## Conservative Selection
 
-`.github/scripts/classify-ci.py` produces independent decisions for ordinary
-validation, packaging, and benchmark smoke. A failed diff, missing Git base,
+`.github/scripts/classify-ci.py` produces independent decisions for backend
+validation, Desktop validation, packaging, and backend benchmark smoke. A failed diff, missing Git base,
 unavailable CI evidence, or malformed release metadata requires full validation.
 The workflow also defaults to full work if classification fails. Manual CI runs
 have no diff base and run all checks. Merge-group events are supported.
 
-Documentation-only skips apply to Markdown under `docs/` and the explicitly
-listed root guidance/changelog files. The packaged `README.md`, embedded
+Documentation-only skips apply to Markdown under `docs/`, `desktop/AGENTS.md`,
+and the explicitly listed root guidance/changelog files. The packaged `README.md`, embedded
 `THIRD_PARTY_NOTICES.md`, and `.agents/skills/boomux/SKILL.md` are executable or
 packaging inputs and cannot use the documentation skip.
 
@@ -51,7 +52,27 @@ page of 100 jobs from the selected successful run. Missing
 or inaccessible evidence causes validation to run. Source or dependency changes
 mixed into a release PR always receive full checks.
 
-Rust source, test, benchmark, Cargo/toolchain/build, and `.github/` changes retain
+After excluding guidance, a change consisting entirely of `.rs` files under
+`desktop/src/` selects Desktop validation only. Deletions still select Desktop;
+renames use both old and new paths, so moving backend code cannot skip backend
+validation. Desktop formatting and a release build remain checked even when the
+backend and bundle jobs are omitted. Full runs build the optimized Desktop in
+the bundle job instead of building it twice. Backend/shared changes keep Desktop
+checks because Desktop depends on the root crate.
+
+Cargo manifests, the shared lockfile, toolchains, vendored code, workflow changes,
+and unknown inputs never take the Desktop-only path. Packaged documentation and
+installer/assets still require packaging coverage. A source-only change does not
+rebuild the unchanged packaging machinery or CLI architectures; release version
+changes always build both CLI architectures and the complete bundle.
+
+A partial Desktop-only success is not complete release-validation evidence.
+Version-only releases following such a base conservatively run the full suites;
+component evidence inheritance is not implemented. This preserves the existing
+rule that release reuse requires real, successful steps for every required
+component, rather than a green job that only reports a skip.
+
+Backend Rust source, test, benchmark, Cargo/toolchain/build, and `.github/` changes retain
 optimized benchmark smoke. Packaging and JavaScript-only changes still receive
 ordinary validation but omit the optimized benchmarks. Clippy's
 `--all-targets --all-features` already checks the benchmark targets, so CI does
@@ -97,8 +118,9 @@ python3 -m unittest discover -s .github/scripts -p 'test_ci_*.py'
 They exercise actual Git diffs, version-only changes with/without CI proof,
 embedded Markdown, dependency changes, failure fallbacks, and artifact source
 and digest mismatches. The classifier job runs these fixtures on every event.
-Run actionlint for workflow expressions, plus the repository validation set in
-`AGENTS.md` before opening a PR.
+Run actionlint for workflow expressions, plus the applicable local validation in
+`AGENTS.md` before opening a PR. CI/workflow-only changes require the full hosted
+pipeline before merging, without redundantly running unchanged Rust suites locally.
 
 Before this change, main CI run `33948018935` took 6m45s: Rust took 6m34s,
 benchmark smoke 6m22s, and x86-64/ARM packaging 2m10s/1m45s. Release run

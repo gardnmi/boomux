@@ -25,8 +25,21 @@ module map, then read its colocated tests and the relevant contract document.
 
 ## Validation
 
-Run the complete validation set below. CI selection and reuse rules are in
-`docs/ci.md`; Clippy already checks every benchmark target:
+Select local validation by changed inputs, matching `docs/ci.md`:
+
+| Change | Local validation before a PR |
+| --- | --- |
+| Unpackaged Markdown/guidance only | Review links and claims; `git diff --check` |
+| Desktop Rust only, optionally with guidance | Formatting, Desktop Clippy/tests, and Desktop release build below |
+| CI/workflow or packaging scripts without Rust/dependency changes | Relevant Python/Bun/shell fixtures and shell syntax; actionlint for workflow changes |
+| Backend Rust, shared dependencies, Cargo/toolchain, or vendored code | Complete root and Desktop validation below |
+
+CI configuration changes still select the full hosted pipeline. Require its
+selected checks to pass before merging; script-only work does not require a
+second local run of unchanged Rust suites. Unknown or mixed code inputs use the
+complete set. Clippy already checks every benchmark target.
+
+The complete root validation set is:
 
 ```console
 cargo fmt --all -- --check
@@ -42,7 +55,7 @@ bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.t
 
 The workspace also contains `desktop/`; read `desktop/AGENTS.md` for GUI changes.
 Core commands above select the default root package and require no Zig or display
-SDK. Before a workspace PR also run:
+SDK. For backend/shared-code validation also run:
 
 ```console
 cargo clippy -p boomux-desktop --all-targets --all-features --locked -- -D warnings
@@ -60,8 +73,8 @@ Desktop requires Zig 0.15.2 and the graphics dependencies listed in
 `.github/workflows/desktop-build.yml`. Bundle changes also require X11 and
 Wayland smoke tests described in `docs/desktop/releases.md`.
 
-Run the narrowest relevant tests while iterating, then run the complete set
-before opening a PR. Native backend tests are intentionally serial because they
+Run the narrowest relevant tests while iterating, then the applicable set above
+before opening a PR. Require all selected CI checks before merging. Native backend tests are intentionally serial because they
 exercise process, socket, PTY, and daemon lifecycle behavior.
 
 ### Testing By Change Type

@@ -13,19 +13,21 @@ in the backend. GPUI rendering and input live in `desktop/`.
 
 ## Validation
 
-Run the same checks as CI:
+For Desktop Rust-only changes, run:
 
 ```console
 cargo fmt --all -- --check
 cargo clippy -p boomux-desktop --all-targets --all-features --locked -- -D warnings
 cargo test -p boomux-desktop --locked -- --test-threads=1
 cargo build -p boomux-desktop --release --locked
-cargo deny check
 ```
 
 Building `libghostty-vt` requires Zig 0.15.2 on `PATH`. Run the narrowest
-relevant test while iterating, then the complete validation set before opening
-a PR.
+relevant test while iterating, then the Desktop set above before opening a PR.
+Run `cargo deny check` and the complete root/desktop suite for dependency,
+Cargo/toolchain, backend, or vendored changes, as specified by root `AGENTS.md`.
+For docs-only or packaging/workflow-script changes, use the root validation
+matrix. All selected CI checks must pass before merging.
 
 ### Testing By Change Type
 
