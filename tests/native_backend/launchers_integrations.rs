@@ -150,7 +150,9 @@ fn guided_setup_discovers_and_installs_one_selected_harness() {
         while !output.contains(prompt) {
             let bytes = output_receiver
                 .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                .unwrap_or_else(|error| panic!("waiting for {prompt:?}: {error}; output: {output:?}"));
+                .unwrap_or_else(|error| {
+                    panic!("waiting for {prompt:?}: {error}; output: {output:?}")
+                });
             output.push_str(&String::from_utf8_lossy(&bytes));
         }
         writer.write_all(answer.as_bytes()).unwrap();
