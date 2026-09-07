@@ -45,6 +45,8 @@ badge’s single cancelable exit task; it does not delay restoring input.
 - `src/terminal.rs`: Boomux discovery/attachment adapter, per-pane terminal
   worker, Ghostty VT state, scrollback, key/paste encoding, and Kitty graphics
   extraction.
+- `src/nodes.rs`: read-only Node identity, health, and resource-count presentation
+  from the daemon's combined snapshot.
 - `src/boomux_settings.rs`: active-layer settings editor and bounded CLI bridge;
   Boomux retains configuration validation and commit authority.
 - `src/settings.rs`: bounded preference loading, validation, and atomic background
@@ -118,6 +120,39 @@ Workspace ordering is client-owned presentation state keyed by exact Workspace
 identity. Overview refreshes retain the current order, newly discovered
 Workspaces append, and drag or keyboard reordering never mutates Boomux's
 Workspace authority.
+
+## Remote Node Entry Points
+
+The sidebar overflow menu opens a bounded, scrollable Nodes popover. Once remote
+Nodes are registered, the existing sidebar subtitle shows a compact Node count
+and connection summary. Selection uses stable Node IDs, including when aliases
+or routes happen to match. Details show observed health, last observation,
+helper version when available, and owner-local Workspace/Shell counts. Cached
+counts are explicitly labelled; disconnect does not establish process exit.
+
+The existing window-owned overview worker reads one combined snapshot per
+refresh for both local resources and Node summaries. It falls back to local
+discovery if federation is unavailable. A failed refresh retains prior Node
+summaries but removes their connected presentation. Observation timestamp changes
+do not alone repaint a closed popover. There is no additional SSH worker,
+registration store, or discovery loop in Desktop. Snapshot and registration
+bounds remain daemon-owned; the client retains only the latest summary per Node.
+
+Add Node and reauthentication open the matching Boomux CLI's existing guided
+flow in a local daemon-owned Shell, using exact argument vectors. Reauthentication
+passes the stable Node ID and leaves route/identity verification to Boomux.
+SSH credentials, browser challenges, host verification, installation consent,
+and protocol compatibility remain owned by that interactive flow. These Shells
+and their Workspaces follow the existing setup-terminal lifecycle and remain
+visible after the command exits until explicitly removed. An Open Boomux
+dashboard action provides access to the existing TUI's Nodes tab.
+
+This first native entry point does not yet put remote Shells in the Desktop
+canvas. Local Shell/Agent projection and attachment retain their current scope.
+Node-qualified remote pane identities, coordinated Workspace presentation, and
+connection-loss recovery are the next implementation stages. The popover has its
+own input context, closes on Escape or outside click, and blocks terminal input
+while open; releases for keys sent before opening still reach their original pane.
 
 ## Dependency Boundary
 

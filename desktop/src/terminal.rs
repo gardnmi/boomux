@@ -609,6 +609,39 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
     let snapshot = client
         .snapshot()
         .map_err(|error| format!("could not read Boomux workspaces: {error}"))?;
+    Ok(overview_from_snapshot(snapshot))
+}
+
+pub fn discover_overview_and_nodes() -> (
+    Result<BoomuxOverview, String>,
+    Result<Vec<crate::nodes::NodeView>, String>,
+) {
+    let combined = client::connect_if_running()
+        .map_err(|error| format!("could not connect to Boomux: {error}"))
+        .and_then(|client| client.ok_or_else(|| "Boomux is not running".into()))
+        .and_then(|client| {
+            client
+                .combined_node_snapshot(None)
+                .map_err(|error| format!("could not read Boomux Nodes: {error}"))
+        });
+    match combined {
+        Ok(combined) => {
+            let nodes = crate::nodes::project(&combined);
+            let overview = combined
+                .nodes
+                .into_iter()
+                .find(|node| node.local)
+                .and_then(|node| node.local_snapshot)
+                .map(overview_from_snapshot)
+                .ok_or_else(|| "Boomux omitted the local Node snapshot".into());
+            (overview, Ok(nodes))
+        }
+        // Federation availability must not stop local discovery.
+        Err(error) => (discover_overview(), Err(error)),
+    }
+}
+
+fn overview_from_snapshot(snapshot: boomux::protocol::Snapshot) -> BoomuxOverview {
     let focused_shell_id = snapshot
         .focused_terminal
         .as_ref()
@@ -683,11 +716,11 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
     }
     distinguish_agent_rows(&mut agents);
     agents.sort_by_key(|agent| std::cmp::Reverse(agent.updated_at_ms));
-    Ok(BoomuxOverview {
+    BoomuxOverview {
         workspaces,
         agents,
         focused_shell_id,
-    })
+    }
 }
 
 // Labels are presentation only; actions retain the exact Agent and Shell IDs.
@@ -812,9 +845,33 @@ pub fn create_shell_in_workspace(workspace_id: &str) -> Result<ShellChoice, Stri
         .map_err(|error| format!("could not create Boomux shell: {error}"))
 }
 
-/// Create a local Workspace with its first pending login Shell. Boomux owns
-/// both resources; the returned Shell can be attached immediately.
-pub fn create_workspace_with_shell(setup: bool) -> Result<ShellChoice, String> {
+/// Explicit local terminal flows using the matching Boomux executable.
+#[derive(Clone, Debug)]
+pub enum WorkspaceLaunch {
+    Shell,
+    Setup,
+    AddNode,
+    ReauthenticateNode(String),
+    Dashboard,
+}
+
+impl WorkspaceLaunch {
+    fn command(&self) -> Option<(&'static str, Vec<String>)> {
+        match self {
+            Self::Shell => None,
+            Self::Setup => Some(("Set up agents", vec!["setup".into()])),
+            Self::AddNode => Some(("Add remote Node", vec!["__guided-node-add".into()])),
+            Self::ReauthenticateNode(id) => Some((
+                "Sign in to Node",
+                vec!["__guided-node-reauthenticate".into(), id.clone()],
+            )),
+            Self::Dashboard => Some(("Boomux dashboard", vec![])),
+        }
+    }
+}
+
+/// Create a local Workspace and its first pending Shell; Boomux owns both.
+pub fn create_workspace_with_shell(launch: WorkspaceLaunch) -> Result<ShellChoice, String> {
     let Some(client) = client::connect_if_running()
         .map_err(|error| format!("could not connect to Boomux: {error}"))?
     else {
@@ -835,7 +892,7 @@ pub fn create_workspace_with_shell(setup: bool) -> Result<ShellChoice, String> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("could not determine the new workspace directory: {error}"))?;
     let mut spec = ShellSpec::login(shell_name, cwd.clone());
-    if setup {
+    if let Some((label, arguments)) = launch.command() {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let bundled = executable
             .parent()
@@ -854,9 +911,9 @@ pub fn create_workspace_with_shell(setup: bool) -> Result<ShellChoice, String> {
             cli.to_str()
                 .ok_or("The setup executable path must be valid UTF-8")?
                 .to_owned(),
-            "setup".into(),
         ];
-        spec.name = "Set up agents".into();
+        spec.command.extend(arguments);
+        spec.name = label.into();
     }
     let workspace = client
         .create_workspace_with_default_cwd(workspace_name, Some(cwd.clone()), vec![spec])
@@ -1962,6 +2019,25 @@ fn indexed_color_with_palette(index: u8, ansi: &[u32; 16]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn node_launches_preserve_exact_arguments_and_do_not_request_upgrades() {
+        use super::WorkspaceLaunch;
+        assert!(WorkspaceLaunch::Shell.command().is_none());
+        assert_eq!(
+            WorkspaceLaunch::AddNode.command().unwrap().1,
+            ["__guided-node-add"]
+        );
+        assert!(WorkspaceLaunch::Dashboard.command().unwrap().1.is_empty());
+        let id = "node with spaces; $(touch should-not-exist)";
+        assert_eq!(
+            WorkspaceLaunch::ReauthenticateNode(id.into())
+                .command()
+                .unwrap()
+                .1,
+            ["__guided-node-reauthenticate", id]
+        );
+    }
+
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
     use std::time::Duration;

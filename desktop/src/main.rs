@@ -3,6 +3,7 @@ mod bundle_update;
 mod generated_names;
 mod layout;
 mod layout_badge;
+mod nodes;
 mod runtime;
 mod settings;
 mod terminal;
@@ -1282,6 +1283,10 @@ struct Workspace {
     minimized_tab_scroll_handle: ScrollHandle,
     sidebar_menu: Option<SidebarMenu>,
     sidebar_header_menu_open: bool,
+    nodes_open: bool,
+    node_views: Vec<nodes::NodeView>,
+    nodes_error: Option<String>,
+    selected_node: Option<String>,
     resource_dialog: Option<ResourceDialog>,
     sidebar_visible: bool,
     drawer_animation_from: Option<f32>,
@@ -1450,6 +1455,10 @@ impl Workspace {
             minimized_tab_scroll_handle,
             sidebar_menu: None,
             sidebar_header_menu_open: false,
+            nodes_open: false,
+            node_views: Vec::new(),
+            nodes_error: None,
+            selected_node: None,
             resource_dialog: None,
             sidebar_visible: saved.sidebar_visible,
             drawer_animation_from: None,
@@ -2285,6 +2294,7 @@ impl Workspace {
     ) {
         let previous_width = self.sidebar_width();
         self.sidebar_visible = !self.sidebar_visible;
+        self.nodes_open = false;
         self.save_settings();
         self.drawer_animation_generation = self.drawer_animation_generation.wrapping_add(1);
         self.drawer_animation_from = Some(previous_width);
@@ -4108,6 +4118,49 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.nodes_open {
+            let modifiers = event.keystroke.modifiers;
+            if modifiers.control
+                || modifiers.alt
+                || modifiers.platform
+                || modifiers.function
+                || (event.is_held && !matches!(event.keystroke.key.as_str(), "up" | "down"))
+            {
+                cx.stop_propagation();
+                return;
+            }
+            match event.keystroke.key.as_str() {
+                "escape" => self.nodes_open = false,
+                "up" | "down" => {
+                    let len = self.node_views.len();
+                    if len > 0 {
+                        let current = self
+                            .selected_node
+                            .as_ref()
+                            .and_then(|id| self.node_views.iter().position(|node| &node.id == id));
+                        let index = match (current, event.keystroke.key.as_str()) {
+                            (Some(index), "up") => (index + len - 1) % len,
+                            (Some(index), _) => (index + 1) % len,
+                            (None, "up") => len - 1,
+                            _ => 0,
+                        };
+                        self.selected_node = Some(self.node_views[index].id.clone());
+                    }
+                }
+                "a" => self.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx),
+                "d" => self.launch_node_action(terminal::WorkspaceLaunch::Dashboard, window, cx),
+                "r" => {
+                    if let Some(node) = self.node_views.iter().find(|node| Some(&node.id) == self.selected_node.as_ref()
+                        && !node.local && node.health == boomux::protocol::NodeProjectionHealthCode::AuthenticationRequired) {
+                        self.launch_node_action(terminal::WorkspaceLaunch::ReauthenticateNode(node.id.clone()), window, cx);
+                    }
+                }
+                _ => {}
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if self.settings_restart_confirm {
             if event.keystroke.key == "escape" {
                 self.settings_restart_confirm = false;
@@ -4431,16 +4484,16 @@ impl Workspace {
     }
 
     fn create_and_attach_new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.create_workspace_terminal(false, window, cx);
+        self.create_workspace_terminal(terminal::WorkspaceLaunch::Shell, window, cx);
     }
 
     fn create_and_attach_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.create_workspace_terminal(true, window, cx);
+        self.create_workspace_terminal(terminal::WorkspaceLaunch::Setup, window, cx);
     }
 
     fn create_workspace_terminal(
         &mut self,
-        setup: bool,
+        launch: terminal::WorkspaceLaunch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4463,7 +4516,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let shell = terminal::create_workspace_with_shell(setup)?;
+                    let shell = terminal::create_workspace_with_shell(launch)?;
                     let session = match TerminalSession::attach(
                         shell.clone(),
                         size.0,
@@ -4520,10 +4573,42 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let result = cx
-                    .background_spawn(async { terminal::discover_overview() })
+                    .background_spawn(async { terminal::discover_overview_and_nodes() })
                     .await;
                 let keep_watching = this
                     .update(cx, |this, cx| {
+                        let (result, nodes) = result;
+                        let (node_views, nodes_error) = match nodes {
+                            Ok(nodes) => (nodes, None),
+                            Err(error) => {
+                                let mut retained = this.node_views.clone();
+                                for node in &mut retained {
+                                    node.current = false;
+                                }
+                                (retained, Some(error))
+                            }
+                        };
+                        if this.node_views != node_views || this.nodes_error != nodes_error {
+                            let visible_change = this.nodes_open
+                                || this.nodes_error != nodes_error
+                                || this.node_views.len() != node_views.len()
+                                || this.node_views.iter().zip(&node_views).any(
+                                    |(before, after)| {
+                                        before.id != after.id
+                                            || before.connected() != after.connected()
+                                    },
+                                );
+                            this.node_views = node_views;
+                            this.nodes_error = nodes_error;
+                            if this.selected_node.as_ref().is_some_and(|id| {
+                                !this.node_views.iter().any(|node| &node.id == id)
+                            }) {
+                                this.selected_node = None;
+                            }
+                            if visible_change {
+                                cx.notify();
+                            }
+                        }
                         if let Ok(mut overview) = result {
                             reconcile_workspace_order(&mut this.workspace_order, &mut overview);
                             if overview != this.boomux_overview || this.boomux_error.is_some() {
@@ -5074,6 +5159,121 @@ impl Workspace {
         }
     }
 
+    fn open_nodes(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_header_menu_open = false;
+        self.sidebar_menu = None;
+        self.nodes_open = true;
+        self.selected_node = self
+            .selected_node
+            .take()
+            .or_else(|| self.node_views.first().map(|node| node.id.clone()));
+        cx.notify();
+    }
+
+    fn launch_node_action(
+        &mut self,
+        launch: terminal::WorkspaceLaunch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.nodes_open = false;
+        if self.layout_mode {
+            self.leave_layout_mode(cx);
+        }
+        self.create_workspace_terminal(launch, window, cx);
+    }
+
+    fn nodes_panel(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.nodes_open {
+            return None;
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u64);
+        let selected = self
+            .selected_node
+            .as_ref()
+            .and_then(|id| self.node_views.iter().find(|node| &node.id == id));
+        let rows = self
+            .node_views
+            .iter()
+            .map(|node| {
+                let id = node.id.clone();
+                div()
+                    .id(SharedString::from(format!("node-row-{}", node.id)))
+                    .px_2()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(if self.selected_node.as_ref() == Some(&node.id) {
+                        0x313244
+                    } else {
+                        0x1e1e2e
+                    }))
+                    .hover(|row| row.bg(rgb(0x313244)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.selected_node = Some(id.clone());
+                        cx.notify();
+                    }))
+                    .child(div().text_sm().child(node.label.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(if node.connected() { 0xa6e3a1 } else { 0xf9e2af }))
+                            .child(node.status()),
+                    )
+            })
+            .collect::<Vec<_>>();
+        Some(div().id("nodes-backdrop").absolute().occlude().size_full().top_0().left_0()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.nodes_open = false;
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(div().id("nodes-panel").absolute().occlude()
+            .top(px(54.0)).left(px(10.0)).w(px(280.0)).max_h(relative(0.85)).overflow_y_scroll()
+            .p_3().flex().flex_col().gap_2().rounded_lg().border_1()
+            .border_color(rgb(0x45475a)).bg(rgb(0x1e1e2e)).shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().flex().items_center().justify_between()
+                .child(div().font_weight(gpui::FontWeight::BOLD).child("Nodes"))
+                .child(Self::settings_option("close-nodes", "Close", false)
+                    .on_click(cx.listener(|this, _, _, cx| { this.nodes_open = false; cx.notify(); }))))
+            .when_some(self.nodes_error.clone(), |panel, error| panel.child(div().text_xs().text_color(rgb(0xf9e2af)).child(error)))
+            .child(div().id("node-list").max_h(px(180.0)).overflow_y_scroll().children(rows))
+            .when_some(selected, |panel, node| {
+                panel.child(div().flex().flex_col().gap_2().text_xs()
+                    .when_some(node.route.clone(), |detail, route| detail.child(div().child(route)))
+                    .child(format!("{} Workspaces · {} Shells{}", node.workspace_count, node.shell_count,
+                        if node.connected() { "" } else { " · cached" }))
+                    .child(node.last_seen(now_ms))
+                    .when_some(node.version.clone(), |detail, version| detail.child(format!("Boomux {version}")))
+                    .child(node.guidance())
+                    .when(!node.local && node.health == boomux::protocol::NodeProjectionHealthCode::AuthenticationRequired, |detail| {
+                        let id = node.id.clone();
+                        detail.child(Self::settings_option("reauthenticate-node", "Sign in…", false)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.launch_node_action(terminal::WorkspaceLaunch::ReauthenticateNode(id.clone()), window, cx);
+                            })))
+                    }))
+            })
+            .child(div().h(px(1.0)).bg(rgb(0x45475a)))
+            .child(Self::settings_option("add-remote-node", "Add remote Node…", false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
+                })))
+            .child(Self::settings_option("manage-nodes", "Open Boomux dashboard", false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.launch_node_action(terminal::WorkspaceLaunch::Dashboard, window, cx);
+                })))
+            .child(div().text_xs().text_color(rgb(0xa6adc8))
+                .child("Setup and sign-in open a terminal. Manage remote work in the dashboard’s Nodes tab."))
+            .child(div().text_xs().text_color(rgb(0x7f849c)).child("↑/↓ select · A add · R sign in · D dashboard · Esc close")))
+            .into_any_element())
+    }
+
     fn sidebar_header_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         self.sidebar_header_menu_open.then(|| {
             div()
@@ -5108,6 +5308,14 @@ impl Workspace {
                         }))
                         .child(div().min_w_0().flex_1().child("Settings"))
                         .child(div().flex_none().text_color(rgb(0x7f849c)).child("⚙")),
+                )
+                .child(
+                    Self::settings_option("header-menu-nodes", "Nodes…", false).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_nodes(cx);
+                        }),
+                    ),
                 )
                 .child(
                     div()
@@ -5576,12 +5784,43 @@ impl Workspace {
                                     .child(
                                         div().font_weight(gpui::FontWeight::BOLD).child("BOOMUX"),
                                     )
-                                    .child(div().text_xs().text_color(rgb(0x89b4fa)).child(
-                                        format!(
-                                            "active · {} workspaces",
-                                            self.boomux_overview.workspaces.len()
-                                        ),
-                                    )),
+                                    .child(
+                                        div()
+                                            .id("sidebar-node-status")
+                                            .text_xs()
+                                            .text_color(rgb(0x89b4fa))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.open_nodes(cx);
+                                            }))
+                                            .child(
+                                                if self.node_views.iter().any(|node| !node.local) {
+                                                    let unavailable = self
+                                                        .node_views
+                                                        .iter()
+                                                        .filter(|node| !node.connected())
+                                                        .count();
+                                                    if unavailable == 0 {
+                                                        format!(
+                                                            "{} Nodes · connected",
+                                                            self.node_views.len()
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "{} Nodes · {} unavailable",
+                                                            self.node_views.len(),
+                                                            unavailable
+                                                        )
+                                                    }
+                                                } else {
+                                                    format!(
+                                                        "active · {} workspaces",
+                                                        self.boomux_overview.workspaces.len()
+                                                    )
+                                                },
+                                            ),
+                                    ),
                             ),
                     )
                     .child(
@@ -8365,6 +8604,7 @@ impl Render for Workspace {
             .child(terminal_area)
             .into_any_element();
         let sidebar_menu = self.sidebar_menu_overlay(cx);
+        let nodes_panel = self.nodes_panel(cx);
         let resource_dialog = self.resource_dialog_overlay(cx);
         let settings_restart = self.settings_restart_overlay(cx);
         let help = self.help_overlay(cx);
@@ -8373,7 +8613,10 @@ impl Render for Workspace {
             .id("workspace")
             .track_focus(&self.focus_handle)
             .key_context(
-                if self.boomux_setting_input.is_some() || self.settings_restart_confirm {
+                if self.nodes_open
+                    || self.boomux_setting_input.is_some()
+                    || self.settings_restart_confirm
+                {
                     "BoomuxSettingsInput"
                 } else {
                     workspace_key_context(self.help_open, self.navigation_region, self.layout_mode)
@@ -8450,6 +8693,7 @@ impl Render for Workspace {
             .text_color(rgb(0xcdd6f4))
             .child(content)
             .when_some(sidebar_menu, |element, menu| element.child(menu))
+            .when_some(nodes_panel, |element, panel| element.child(panel))
             .when_some(resource_dialog, |element, dialog| element.child(dialog))
             .when_some(settings_restart, |element, dialog| element.child(dialog))
             .when_some(help, |element, help| element.child(help))
