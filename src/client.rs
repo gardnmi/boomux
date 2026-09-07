@@ -1176,6 +1176,22 @@ impl Client {
         self.restart_request(Request::Restart)
     }
 
+    pub fn restart_with_executable(
+        &self,
+        executable: PathBuf,
+        notifications: NotificationDeliveryConfig,
+    ) -> Result<()> {
+        if !self.supports(protocol::ProtocolFeature::RestartExecutable)? {
+            return Err(unsupported_version(
+                "this daemon predates executable handoff (protocol 52); upgrade it with its owning installation method before retrying",
+            ));
+        }
+        self.restart_request(Request::RestartWithExecutable {
+            executable,
+            notifications,
+        })
+    }
+
     pub fn restart_with_notification_config(
         &self,
         notifications: NotificationDeliveryConfig,
@@ -2478,13 +2494,55 @@ mod tests {
     }
 
     #[test]
+    fn executable_restart_refuses_an_old_peer_before_sending_a_mutation() {
+        let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for version in [52, 51] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.version, version);
+                assert_eq!(request.message, Request::Ping);
+                let response = if version == 52 {
+                    Response::Error {
+                        message: "protocol 52 unsupported".into(),
+                        code: Some(ErrorCode::UnsupportedVersion),
+                    }
+                } else {
+                    Response::Pong
+                };
+                protocol::write_message(&mut stream, &Envelope::with_version(51, response))
+                    .unwrap();
+            }
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let client = Client::from_socket_path(socket);
+        let error = client
+            .restart_with_executable(
+                "/opt/boomux/new/bin/boomux".into(),
+                NotificationDeliveryConfig::default(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("owning installation method"));
+        let listener = server.join().unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn protocol_forty_six_daemon_is_rejected_without_downgrade() {
         let directory = env::temp_dir().join(format!("boomux-client-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            for expected in [51, 50, 49, 48, 47] {
+            for expected in (protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION).rev() {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
                 assert_eq!(request.version, expected);

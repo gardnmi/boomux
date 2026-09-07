@@ -1,6 +1,7 @@
 """Exercise the real installer and launcher using local release fixtures."""
 
 import hashlib
+import fcntl
 import io
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import shutil
 import time
 import tarfile
 import tempfile
+import termios
 import unittest
 
 
@@ -27,8 +29,10 @@ class InstallerTests(unittest.TestCase):
         self.releases.mkdir()
         self.install = self.root / "installed"
         self.bin = self.root / "bin"
+        (self.root / "home").mkdir(mode=0o700)
         self.env = dict(
             os.environ,
+            HOME=str(self.root / "home"),
             PATH=f"{self.mock}:/usr/bin:/bin",
             BOOMUX_DESKTOP_INSTALL_DIR=str(self.install),
             BOOMUX_DESKTOP_BIN_DIR=str(self.bin),
@@ -36,6 +40,8 @@ class InstallerTests(unittest.TestCase):
             BOOMUX_DESKTOP_VERSION="",
             TRACE=str(self.root / "trace"),
             XDG_DATA_HOME=str(self.root / "data"),
+            MOCK_GLIBC="glibc 2.39",
+            MOCK_MISSING_LIBRARY="",
             MOCK_OS="Linux",
             MOCK_ARCH="x86_64",
         )
@@ -50,6 +56,7 @@ else:
     version, name = url.rsplit('/', 2)[-2:]
     shutil.copyfile(pathlib.Path(os.environ['FIXTURES']) / version / name, args[args.index('-o') + 1])
 ''')
+        self.executable("getconf", '#!/bin/sh\nprintf "%s\\n" "$MOCK_GLIBC"\n')
         self.fixture("v0.1.0")
 
     def executable(self, name, content):
@@ -63,8 +70,9 @@ else:
         archive = directory / ASSET
         files = {
             "bin/boomux-desktop": (ROOT / "packaging/boomux-desktop").read_bytes(),
-            "bin/boomux": b'#!/bin/sh\nprintf "boomux:%s\\n" "$*" >> "$TRACE"\n',
-            "libexec/boomux-desktop": f'#!/bin/sh\nprintf "desktop:{version}:%s\\n" "$*" >> "$TRACE"\ncommand -v boomux >> "$TRACE"\n'.encode(),
+            "bin/boomux": f'#!/bin/sh\n[ "$1" != --version ] || {{ echo "boomux {version[1:]}"; exit; }}\nprintf "boomux:%s\\n" "$*" >> "$TRACE"\n'.encode(),
+            "libexec/boomux-desktop": f'#!/bin/sh\n[ "$1" != --version ] || {{ echo "boomux-desktop {version[1:]}"; exit; }}\nif [ "$1" = --check-runtime ]; then [ -z "$MOCK_MISSING_LIBRARY" ] || {{ echo "Missing graphics libraries: $MOCK_MISSING_LIBRARY" >&2; exit 1; }}; exit 0; fi\nprintf "desktop:{version}:%s\\n" "$*" >> "$TRACE"\ncommand -v boomux >> "$TRACE"\n'.encode(),
+            "THIRD_PARTY_NOTICES.md": b"fixture notices",
             "LICENSE": b"fixture",
             "LICENSE.boomux": b"fixture",
             "release.txt": version.encode(),
@@ -81,9 +89,9 @@ else:
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         (directory / (ASSET + ".sha256")).write_text(f"{digest}  {ASSET}\n")
 
-    def run_installer(self, success=True):
+    def run_installer(self, success=True, args=()):
         # Match curl | sh, including a script read from stdin.
-        result = subprocess.run(["sh"], input=(ROOT / "install.sh").read_text(),
+        result = subprocess.run(["sh", "-s", "--", *args], input=(ROOT / "install.sh").read_text(),
                                 env=self.env, capture_output=True, text=True)
         self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
         return result
@@ -167,6 +175,72 @@ else:
         desktop.write_text("existing desktop")
         self.run_installer(success=False)
         self.assertEqual(desktop.read_text(), "existing desktop")
+
+    def test_prepare_preserves_active_release_until_restart(self):
+        self.run_installer()
+        previous = (self.install / "current").resolve()
+        self.fixture("v0.2.0")
+        self.env["BOOMUX_DESKTOP_VERSION"] = "v0.2.0"
+        self.run_installer(args=("--prepare",))
+        self.assertEqual((self.install / "current").resolve(), previous)
+        self.assertNotEqual((self.install / "pending").resolve(), previous)
+        self.assertTrue((self.install / "pending/THIRD_PARTY_NOTICES.md").is_file())
+        self.assertFalse(Path(self.env["TRACE"]).exists())
+
+    def test_runtime_failure_preserves_active_release(self):
+        self.run_installer()
+        previous = (self.install / "current").resolve()
+        self.fixture("v0.2.0")
+        self.env["BOOMUX_DESKTOP_VERSION"] = "v0.2.0"
+        self.env["MOCK_MISSING_LIBRARY"] = "libvulkan.so.1"
+        result = self.run_installer(success=False)
+        self.assertIn("libvulkan.so.1", result.stderr)
+        self.assertEqual((self.install / "current").resolve(), previous)
+        self.assertFalse((self.install / "pending").exists())
+
+    def test_old_glibc_is_rejected_before_downloading_or_creating_paths(self):
+        for glibc in ["glibc 2.38", "musl 1.2.5", ""]:
+            self.env["MOCK_GLIBC"] = glibc
+            result = self.run_installer(success=False)
+            self.assertIn("glibc 2.39", result.stderr)
+            self.assertFalse(self.install.exists())
+
+    def test_unified_installer_routes_desktop_without_installing_cli_separately(self):
+        installer = self.root / "unified.sh"
+        subprocess.run(["bash", ROOT.parent / "packaging/render-installer.sh", "v0.1.0", installer], check=True)
+        result = subprocess.run(["sh", installer, "--desktop"], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.bin / "boomux").resolve(), (self.install / "current/bin/boomux").resolve())
+
+    def test_unified_installer_requires_a_mode_without_a_terminal(self):
+        installer = self.root / "unified.sh"
+        subprocess.run(["bash", ROOT.parent / "packaging/render-installer.sh", "v0.1.0", installer], check=True)
+        for arguments in [[], ["--desktop", "--cli"], ["--unexpected"]]:
+            result = subprocess.run(["sh", installer, *arguments], env=self.env,
+                                    start_new_session=True, stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+            self.assertFalse(self.install.exists())
+
+    def test_unified_installer_defaults_to_desktop_on_an_interactive_terminal(self):
+        installer = self.root / "unified.sh"
+        subprocess.run(["bash", ROOT.parent / "packaging/render-installer.sh", "v0.1.0", installer], check=True)
+        master, slave = os.openpty()
+        def controlling_terminal():
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+        child = subprocess.Popen(["sh", installer], env=self.env, stdin=slave,
+                                 stdout=slave, stderr=slave, preexec_fn=controlling_terminal)
+        os.close(slave)
+        try:
+            os.write(master, b"\n")
+            self.assertEqual(child.wait(timeout=10), 0)
+            self.assertTrue((self.bin / "boomux-desktop").is_symlink())
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+            os.close(master)
 
     def test_unsupported_platform_and_invalid_version(self):
         for key, value in [("MOCK_OS", "Darwin"), ("MOCK_ARCH", "aarch64"),

@@ -14,11 +14,15 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh
 ```
 
-The installer supports only `--no-setup`. Unknown arguments fail before network
-or filesystem mutation. It never invokes privilege escalation or a package
+The installer accepts `--desktop` or `--cli`, and `--no-setup` for the CLI setup
+handoff. Without a choice it prompts on the controlling terminal, defaulting to
+Desktop. Noninteractive callers must select a mode explicitly. Unknown or
+conflicting arguments fail before network or filesystem mutation. Desktop
+installation is embedded from `desktop/install.sh` at release rendering time, so
+selection does not execute another remotely downloaded script. It never invokes privilege escalation or a package
 manager.
 
-## Platform And Destination
+## CLI Platform And Destination
 
 The installer accepts only x86_64 and aarch64 GNU/Linux release targets. `HOME`
 must be absolute. `HOME`, `~/.local`, and `~/.local/bin` must be real,
@@ -26,10 +30,9 @@ current-user-owned directories that are not group/world-writable; missing local
 directories are created owner-only. The sole destination is
 `~/.local/bin/boomux`.
 
-Platform acceptance is separate from desktop support. Current Omarchy is the
-supported desktop environment, and the official x86_64 binary is smoke-tested
-on the repository's pinned Arch Linux compatibility baseline. Other Linux
-desktop environments and the aarch64 binary are best-effort.
+The CLI is smoke-tested on the pinned Arch Linux compatibility baseline.
+External-terminal opens require `xdg-terminal-exec`; guided setup and Desktop
+embedded terminals do not. Omarchy integration is optional and manually installed.
 
 An existing file or symbolic link at that destination is never replaced, even
 if it appears while the installer is running. The operator must use `boomux
@@ -66,3 +69,15 @@ absolute setup command instead.
 Setup failure does not remove the verified Boomux installation. The installer
 reports that installation succeeded, reports setup as incomplete, prints the
 exact retry command, and exits nonzero.
+
+## Desktop Installation And Updates
+
+The Desktop choice includes the matching CLI executable and an application-menu
+launcher. It requires Linux x86_64 with glibc 2.39+ and checks fixed graphics
+libraries and both executable versions before switching the active bundle.
+Neither platform mode invokes package managers or privilege escalation.
+
+The app welcome card offers optional agent setup inside an embedded terminal.
+No installer or guided setup action installs Omarchy, modifies Hyprland bindings,
+or enables its Workspace layer. See [Desktop releases](desktop/releases.md) for
+versioned paths, update preparation, restart/rollback, and uninstall ownership.

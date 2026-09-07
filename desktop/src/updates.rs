@@ -27,6 +27,8 @@ pub struct Check {
     pub desktop: Option<Notice>,
     pub boomux: Option<Notice>,
     pub unavailable: bool,
+    pub installable: bool,
+    pub prepared: Option<crate::bundle_update::Prepared>,
 }
 
 pub fn valid_dismissal(text: &str) -> bool {
@@ -142,7 +144,17 @@ pub fn check() -> Check {
                 .as_deref()
                 .and_then(|raw| serde_json::from_slice::<Value>(raw).ok())
                 .is_none_or(|value| !value["data"]["latest"].is_string()));
+    let installation = crate::bundle_update::Installation::discover();
+    let prepared = installation.as_ref().and_then(|installation| {
+        installation
+            .pending()
+            .ok()
+            .flatten()
+            .or_else(|| installation.finish_installation().ok().flatten())
+    });
     Check {
+        installable: installation.is_some(),
+        prepared,
         desktop,
         boomux,
         unavailable,

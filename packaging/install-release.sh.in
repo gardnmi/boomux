@@ -3,25 +3,11 @@
 # SPDX-License-Identifier: 0BSD
 set -eu
 
-tag='@TAG@'
-repository='https://github.com/gardnmi/boomux'
-run_setup=true
-
-usage() {
-  printf 'Usage: boomux-installer.sh [--no-setup]\n'
+install_desktop() {
+@DESKTOP_INSTALLER@
 }
 
-if [ "$#" -gt 1 ]; then
-  usage >&2
-  exit 64
-fi
-case ${1-} in
-  '') ;;
-  --no-setup) run_setup=false ;;
-  -h|--help) usage; exit 0 ;;
-  *) usage >&2; exit 64 ;;
-esac
-
+install_cli() {
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
   Linux:aarch64) target=aarch64-unknown-linux-gnu ;;
@@ -167,3 +153,49 @@ if [ -r /dev/tty ] && [ -w /dev/tty ]; then
 else
   next_step
 fi
+
+}
+
+choose_install() {
+    tag='@TAG@'
+    repository='https://github.com/gardnmi/boomux'
+    run_setup=true
+    choice=
+    for argument do
+        case "$argument" in
+            --desktop|--cli)
+                [ -z "$choice" ] || { printf 'Choose either --desktop or --cli.\n' >&2; exit 64; }
+                choice=${argument#--} ;;
+            --no-setup) run_setup=false ;;
+            -h|--help)
+                printf 'Usage: boomux-installer.sh [--desktop | --cli] [--no-setup]\n'
+                printf 'Desktop includes Boomux. Without a choice, an interactive terminal is required.\n'
+                exit 0 ;;
+            *) printf 'Unknown installer argument: %s\n' "$argument" >&2; exit 64 ;;
+        esac
+    done
+    if [ -z "$choice" ]; then
+        if (exec </dev/tty) 2>/dev/null; then
+            printf '\nInstall Boomux:\n  1) Desktop (Boomux included)\n  2) CLI only\nChoose [1/2, default 1]: ' >/dev/tty
+            IFS= read -r answer </dev/tty || exit 1
+            case "$answer" in
+                ''|1) choice=desktop ;;
+                2) choice=cli ;;
+                *) printf 'Expected 1 or 2.\n' >&2; exit 64 ;;
+            esac
+        else
+            printf 'Choose --desktop or --cli when installing without an interactive terminal.\n' >&2
+            exit 64
+        fi
+    fi
+    if [ "$choice" = desktop ]; then
+        BOOMUX_DESKTOP_VERSION=$tag
+        export BOOMUX_DESKTOP_VERSION
+        install_desktop
+    else
+        install_cli
+    fi
+}
+
+# Execute only after the complete script has arrived when piped into sh.
+choose_install "$@"

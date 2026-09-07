@@ -1,11 +1,11 @@
 # Boomux
 
-**Persistent Workspaces for native terminal windows.**
+**Persistent terminal Workspaces, with a native desktop app.**
 
-Boomux keeps terminal processes running after native terminal windows close. It
-groups durable Shells into coordinated Workspaces that can span multiple Nodes
-while continuing to use Ghostty, Alacritty, or another XDG terminal as ordinary
-native windows.
+Boomux keeps terminal processes running after windows close. Use Boomux Desktop
+for an integrated tiling terminal, or the CLI with Ghostty, Alacritty, and other
+external terminals. Durable Shells belong to coordinated Workspaces that can
+span multiple Nodes.
 
 <p align="center">
   <img src="assets/boomux-workspace-desktop.png" width="100%" alt="Boomux persistent side pane beside an active tiled Workspace">
@@ -18,41 +18,26 @@ native windows.
 
 ## Quick Start
 
-After [installing Boomux](#install-and-update), run the guided setup:
+After [installing Boomux](#install-and-update), open **Boomux Desktop** from the
+application menu or run `boomux-desktop`. Boomux is included and starts when
+needed. Choose **Set up agents** in the welcome card to connect supported coding
+agents, or **Start using Boomux** to skip it. Setup remains available in the menu.
+It opens in an embedded terminal, previews configuration changes, and asks before
+each agent integration or Agent Skill installation. Existing modified files are
+preserved unless you explicitly approve replacement.
 
-```console
-boomux setup
-```
+CLI users can run `boomux setup` for the same agent setup and daemon verification,
+then `boomux` for the terminal dashboard. Setup does not require an external
+terminal resolver, install Omarchy plugins, or change Hyprland settings.
 
-On Omarchy, the recommended core experience installs and enables the
-[Boomux plugin](https://github.com/gardnmi/omarchy-boomux), enables coordinated
-Workspace presentation in Hyprland, and optionally installs managed keybindings.
-Setup asks before each optional installation or configuration change and
-restarts Omarchy Shell after plugin changes.
-The plugin adds a Boomux icon to the bar and provides a persistent side pane for
-Workspaces, Shells, Agents, and Nodes.
+### Optional Omarchy Plugin
 
-- Click the bar icon to open or close the pane.
-- With the managed bindings, `Super+B` toggles the pane and `Super+A` toggles
-  keyboard focus.
-- Use `+` to create a generated coordinated Workspace, local placement, and first
-  Shell at `$HOME` without opening a terminal.
-- Use the project-folder button to do the same at a configured project path,
-  using the project name.
-
-`boomux setup` inspects the machine before making changes and detects supported
-Agent harnesses. After successful initial inspection, it starts the local daemon
-during verification and prints a readiness receipt; recorded failures include
-exact recovery commands. The recommended Omarchy plugin and Workspace layer
-default to yes; integrations, keybindings, replacements, and modified assets
-default to no. Reruns skip current assets and preserve modified or user-owned
-content unless replacement is explicitly confirmed.
-
-Omarchy's graphical environment must be able to resolve `boomux`; official
-release installations use `~/.local/bin`. See the
-[plugin README](https://github.com/gardnmi/omarchy-boomux#readme) for its complete
-controls and safety behavior. For CLI-only creation, continue to
-[Workspace Creation](#workspace-creation).
+For the separate Omarchy bar icon and persistent side pane, install
+[omarchy-boomux](https://github.com/gardnmi/omarchy-boomux#readme) manually using
+that project's instructions. It provides its own Workspaces, Shells, Agents, and
+Nodes interface. Its README covers installation, keybindings, and optional
+Hyprland Workspace presentation. It is not part of the Boomux installer or setup.
+Existing plugin installations and user keybindings are left intact by setup.
 
 ## Native Desktop
 
@@ -76,21 +61,30 @@ For local development run `python3 desktop/scripts/run-dev.py` from this reposit
 
 ### Requirements
 
-- Current Omarchy is the supported desktop environment. Official x86_64 release
-  binaries are compatibility-tested on a pinned Arch Linux baseline selected for
-  Omarchy. Official binaries are also built for aarch64 GNU/Linux; other Linux
-  desktop environments are best-effort when the requirements below are present.
-- An absolute `XDG_RUNTIME_DIR`.
-- `xdg-terminal-exec` and an available terminal desktop entry.
+- Desktop: Linux x86_64, glibc **2.39 or newer**, a Wayland or X11 session, and
+  Vulkan support. Ubuntu 24.04+ and current Arch are the initial runtime baseline;
+  older glibc distributions and musl/Alpine are not supported by this bundle.
+- Desktop runtime libraries on Ubuntu/Debian: `libfontconfig1`,
+  `libwayland-client0`, `libx11-6`, `libxcb1`, `libxcb-shape0`, `libxcb-xfixes0`,
+  `libxkbcommon0`, `libxkbcommon-x11-0`, and `libvulkan1`, plus your GPU's Vulkan
+  driver (such as `mesa-vulkan-drivers` for supported Mesa GPUs).
+- Arch equivalents: `fontconfig`, `wayland`, `libx11`, `libxcb`, `libxkbcommon`,
+  `libxkbcommon-x11`, `vulkan-icd-loader`, and your GPU's Vulkan driver.
+- CLI packages: Linux x86_64 or ARM64. Native external-terminal opens additionally
+  need `xdg-terminal-exec` and a terminal desktop entry. Those are not required for
+  Desktop's embedded terminals or guided agent setup.
+- An absolute `XDG_RUNTIME_DIR` for the daemon.
 
-Git is optional for core session persistence; without it, repository metadata is
-empty. `boomux doctor` currently reports missing Git as a failed dependency
-check. The optional desktop Workspace layer additionally requires an active
-Hyprland session and compatible `hyprctl`. Outside Hyprland, ordinary Boomux
-terminal opens remain native windows.
+The installer diagnoses unsupported glibc and missing graphics libraries before
+activating Desktop. It does not install system packages or use sudo. Rust and Zig
+are only needed when building from source. Run the installed bundle's
+`libexec/boomux-desktop --check-runtime` to repeat the graphics-library check.
+Graphics-driver and display startup are validated separately by X11/Wayland smoke
+tests; library availability alone cannot guarantee every GPU works.
 
-The guided installer requires `curl`, `id`, `install`, `ln`, `mkdir`, `mktemp`,
-`rm`, `sha256sum`, `stat`, `tar`, and `uname`.
+Git is optional for persistence. `boomux doctor` retains CLI/external-terminal
+checks, including Git. Optional Hyprland Workspace presentation additionally
+requires a compatible active Hyprland session and `hyprctl`.
 
 ### Latest Release
 
@@ -99,12 +93,21 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh
 ```
 
-The release-pinned installer verifies the published archive checksum, installs
-to `~/.local/bin/boomux`, and offers to run `boomux setup` immediately. It
-refuses to replace an existing installation; use that installation's update
-mechanism instead. Pass `--no-setup` with `sh -s -- --no-setup` when a
-noninteractive installation should print the next command without opening the
-wizard. See the [installation contract](docs/install.md) for exact guarantees.
+After the first combined release, this command asks whether to install
+**Desktop (Boomux included)** or **CLI only**, with Desktop selected by default.
+Both choices download a release-pinned, checksum-verified package.
+
+For an explicit choice, append `sh -s -- --desktop` or `sh -s -- --cli` in place
+of `sh`. A noninteractive install requires an explicit choice. CLI automation can
+use `sh -s -- --cli --no-setup` to skip the interactive setup handoff. Desktop
+setup happens on first launch, not inside the installer.
+CLI mode offers to run `boomux setup` immediately after installation.
+
+Desktop installs a versioned bundle, an application-menu entry, and command links
+under `~/.local/bin`. An existing independent CLI installation is preserved.
+CLI-only installation refuses to overwrite existing files; use their owning
+updater. If `~/.local/bin` is absent from PATH, add it to your shell configuration.
+See the [installation contract](docs/install.md) for exact guarantees.
 
 To inspect and install the release manually, use GitHub CLI (`gh`):
 
@@ -124,6 +127,23 @@ install -Dm755 "boomux-$version-$target/boomux" ~/.local/bin/boomux
 ```
 
 ### Update
+
+Desktop offers **Update**, **View release**, and **Dismiss** for newer releases.
+**Update** downloads and verifies the complete bundle in the background. Once
+ready, choose **Restart now** or **Later**. Restart uses Boomux's graceful daemon
+handoff, opens the updated window, and then closes the old window; running
+terminals survive. Failed window startup restores the previous bundle and asks
+Boomux to recover its previous daemon executable. Errors stay visible for retry.
+Prepared updates survive app restarts; **Check for updates** revisits a dismissed
+notice. There are no automatic downloads or restarts.
+
+Rerunning the Desktop installer also updates the bundle. A running daemon is left
+alone; when the new app opens, it offers to finish the daemon handoff. A separate
+CLI install keeps its own update ownership. Desktop never replaces it.
+Daemons installed before this release need a one-time upgrade through their
+existing installation method before Desktop can take over updates. For an eligible
+standalone release installation, use `boomux update`. Desktop leaves live terminals
+running if that prerequisite is not met. See the [older-install migration steps](docs/desktop/releases.md#distribution-and-installation).
 
 Eligible official release installations at `~/.local/bin/boomux` have an
 explicit guided updater:
@@ -432,8 +452,8 @@ persist_terminal_history = false
 ```
 
 The Hyprland Workspace layer, desktop and sound notifications, and terminal
-history persistence are disabled by default. `boomux setup` offers to enable the
-Workspace layer as part of its recommended Omarchy experience. Notification,
+history persistence are disabled by default. Enable the Workspace layer manually
+only when using Hyprland presentation. Notification,
 recovery, and Claude Remote Control settings are sampled at daemon start and
 require `boomux daemon restart`; terminal, dashboard, project, and desktop
 presentation settings do not.

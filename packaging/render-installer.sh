@@ -15,6 +15,10 @@ fi
 
 rendered=$(<"$template")
 rendered=${rendered//@TAG@/$tag}
+desktop_source=$(<"${script_dir}/../desktop/install.sh")
+# Literal string replacement: shell parameter replacement interprets '&' on
+# newer Bash versions, so assemble the two halves without replacement syntax.
+rendered="${rendered%%@DESKTOP_INSTALLER@*}${desktop_source}${rendered#*@DESKTOP_INSTALLER@}"
 temporary="${output}.tmp.$$"
 trap 'rm -f "$temporary"' EXIT
 printf '%s\n' "$rendered" > "$temporary"

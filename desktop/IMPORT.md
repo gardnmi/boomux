@@ -21,7 +21,7 @@ Ghostty target and `baseline-v1` cache keys. The vendored Ghostty files match th
 final source exactly; `vendor/libghostty-vt-sys/PATCH.md` records upstream provenance.
 
 The migration started from Boomux `0fd34c8` and now includes main at
-`526df3f8f303b7673c62b53494cb861ac0ffae17`, including the Codex lifecycle fix.
+`2734e8b` (release 1.9.8), including the Codex lifecycle fix.
 Desktop shares Boomux's version, lockfile, CI, and release, while remaining a
 presentation client of the daemon.
 
@@ -33,3 +33,8 @@ must both validate this change. Desktop enables serde_json insertion ordering
 through GPUI, so backend tests must not assume sorted JSON object iteration.
 The combined cargo-deny policy retains Desktop's existing ISC, CC0, and MPL
 allowances; duplicate versions remain warnings as in both original repositories.
+
+Post-import work in the migration PR adds unified installation, embedded agent
+setup, runtime diagnostics, and user-driven Desktop updates. These are new
+Boomux changes, not omitted source PRs; see
+[ADR 0016](../docs/adr/0016-unified-installation-and-user-driven-desktop-updates.md).

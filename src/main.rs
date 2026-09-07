@@ -1221,7 +1221,11 @@ enum DaemonCommands {
     /// Report whether the daemon is accepting requests
     Status,
     /// Replace the daemon without changing pending workspace state
-    Restart,
+    Restart {
+        /// Hand off to this executable (requires daemon protocol 52+)
+        #[arg(long)]
+        executable: Option<PathBuf>,
+    },
     /// Stop the daemon and its managed shells
     Stop,
 }
@@ -1556,7 +1560,7 @@ impl Cli {
                     DaemonCommands::Run
                     | DaemonCommands::ReceiveHandoff { .. }
                     | DaemonCommands::Start
-                    | DaemonCommands::Restart
+                    | DaemonCommands::Restart { .. }
                     | DaemonCommands::Stop,
             }) => CommandKey::Daemon,
             Some(Commands::Ui) | None => CommandKey::Ui,
@@ -3273,12 +3277,32 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
                 client.socket_path().display()
             );
         }
-        DaemonCommands::Restart => {
+        DaemonCommands::Restart { executable } => {
             let client = running_client.as_ref().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "Boomux daemon is stopped")
             })?;
-            client
-                .restart_with_notification_config(config::load_notification_settings()?.into())?;
+            let notifications = config::load_notification_settings()?.into();
+            if let Some(executable) = executable {
+                client.restart_with_executable(executable.clone(), notifications)?;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if daemon_process_identity(client)
+                        .and_then(|identity| identity.executable)
+                        .is_some_and(|actual| Path::new(&actual) == executable)
+                    {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other(
+                            "replacement daemon executable could not be verified",
+                        )
+                        .into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            } else {
+                client.restart_with_notification_config(notifications)?;
+            }
             println!("Restarted Boomux daemon");
         }
         DaemonCommands::Stop => {
@@ -15523,7 +15547,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 51);
+        assert_eq!(protocol::PROTOCOL_VERSION, 52);
     }
 
     #[test]

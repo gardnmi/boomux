@@ -814,7 +814,7 @@ pub fn create_shell_in_workspace(workspace_id: &str) -> Result<ShellChoice, Stri
 
 /// Create a local Workspace with its first pending login Shell. Boomux owns
 /// both resources; the returned Shell can be attached immediately.
-pub fn create_workspace_with_shell() -> Result<ShellChoice, String> {
+pub fn create_workspace_with_shell(setup: bool) -> Result<ShellChoice, String> {
     let Some(client) = client::connect_if_running()
         .map_err(|error| format!("could not connect to Boomux: {error}"))?
     else {
@@ -834,12 +834,32 @@ pub fn create_workspace_with_shell() -> Result<ShellChoice, String> {
         .ok_or_else(|| "Boomux shell names are exhausted".to_string())?;
     let cwd = std::env::current_dir()
         .map_err(|error| format!("could not determine the new workspace directory: {error}"))?;
+    let mut spec = ShellSpec::login(shell_name, cwd.clone());
+    if setup {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let bundled = executable
+            .parent()
+            .and_then(|path| path.parent())
+            .map(|path| path.join("bin/boomux"))
+            .filter(|path| path.is_file());
+        let cli = bundled
+            .or_else(|| {
+                executable
+                    .parent()
+                    .map(|path| path.join("boomux"))
+                    .filter(|path| path.is_file())
+            })
+            .ok_or_else(|| "Cannot find the matching Boomux executable for setup".to_string())?;
+        spec.command = vec![
+            cli.to_str()
+                .ok_or("The setup executable path must be valid UTF-8")?
+                .to_owned(),
+            "setup".into(),
+        ];
+        spec.name = "Set up agents".into();
+    }
     let workspace = client
-        .create_workspace_with_default_cwd(
-            workspace_name,
-            Some(cwd.clone()),
-            vec![ShellSpec::login(shell_name, cwd)],
-        )
+        .create_workspace_with_default_cwd(workspace_name, Some(cwd.clone()), vec![spec])
         .map_err(|error| format!("could not create Boomux workspace: {error}"))?;
     workspace
         .shells

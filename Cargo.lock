@@ -835,6 +835,7 @@ dependencies = [
  "gpui-ce",
  "gpui_ce_platform",
  "image",
+ "libc",
  "libghostty-vt",
  "notify",
  "semver",

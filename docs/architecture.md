@@ -37,7 +37,7 @@
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
 | `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
-| `src/setup.rs` | Interactive local setup orchestration, Omarchy plugin discovery and lifecycle operations, and ownership-bounded Hyprland binding installation |
+| `src/setup.rs` | Interactive agent setup and daemon verification; existing Omarchy plugin update/removal and legacy binding cleanup |
 | `src/update.rs` | Local release discovery, installation classification, interactive self-update authorization, atomic executable replacement, and daemon handoff verification |
 | `src/uninstall.rs` | Interactive release uninstall orchestration, owned-asset cleanup, bounded purge validation, and process shutdown ordering |
 | `src/claude_hooks.rs`, `src/codex_hooks.rs`, `src/kiro_hooks.rs` | Bounded Claude Code, Codex, and Kiro hook decoding and lifecycle reduction |
@@ -256,6 +256,13 @@ event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
 default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
 unchanged because owner Workspaces already persist `default_cwd`.
+Protocol 52 adds `restart_executable` and `RestartWithExecutable` for graceful
+handoff to an explicit release path. The daemon pins a validated ELF inode before
+quiescence and executes it through a close-on-exec descriptor, preserving H8
+rollback and ShellRun identity. Clients reject this new mutation on older peers;
+ordinary restart keeps its existing executable selection. State schema and H8
+remain unchanged. See [`live-pty-handoff.md`](live-pty-handoff.md).
+
 Public Agent Session projection was retired after protocol 51. Current binaries
 do not advertise Session capabilities or JSON commands, the native dashboard has
 no Sessions view, and local or routed list, inspect, resolve, display-name, hide,
@@ -677,9 +684,8 @@ projection transitions.
 
 Baseline launching requires no emulator-specific adapter or compositor window
 ID. The local desktop layer defaults to `disabled`; an explicit
-`desktop.workspace_layer = "hyprland-special"` enables it. On Omarchy,
-`boomux setup` recommends the companion plugin and offers this configuration as
-separate default-yes consent. When enabled, the local
+`desktop.workspace_layer = "hyprland-special"` enables it. Enable this manually when using the optional Omarchy plugin;
+guided setup does not change compositor configuration. When enabled, the local
 client decorates initial titles for coordinated Workspace opens, desktop-layer
 presentation, and coordinated create-and-open with exact Node and Shell
 identity. Direct Shell, dashboard Shell/item, path, and Session opens retain
@@ -1069,47 +1075,29 @@ reporting, and `integration uninstall` safely removes one or all managed assets.
 
 The human-only top-level `boomux setup` command composes these existing local
 primitives without adding protocol or durable setup state. It requires terminal
-input and output, prints its active configuration path, and completes read-only
-terminal, daemon, harness, and Omarchy inspection before presenting a concise
-machine-specific plan. A missing `xdg-terminal-exec` is a blocker before any
-mutation. Harness and modified-asset prompts remain default-no. Setup starts or
-confirms the local daemon only during final verification, then reinspects current
-assets and prints a readiness receipt, exact restart guidance, and one primary
-next action. The in-memory receipt retains current, changed, skipped, warning,
-and failed outcomes; failures include a step-specific recovery command, while
-reinspection reports any earlier committed desktop state. The optional Agent
-Skill remains a separate owned asset.
+input/output, including an embedded Desktop terminal. It prints the active
+configuration path, discovers agent harnesses, previews agent and skill changes,
+and retains default-no consent for installations and replacements. It does not
+require `xdg-terminal-exec`, invoke Omarchy, install plugins, or alter Hyprland
+configuration or keybindings. Existing integrations and modified assets retain
+the same ownership and concurrency checks. Final verification starts or confirms
+the daemon and prints a receipt with exact reload/recovery guidance.
 
-On an Omarchy installation, setup executes only bounded exact-argument `omarchy`
-commands. Plugin inventory comes from `omarchy plugin list --json`; installation
-uses the fixed `gardnmi/omarchy-boomux` HTTPS repository and Omarchy retains
-plugin lifecycle ownership. A Cargo-private executable without a corresponding
-`~/.local/bin/boomux` is rejected before desktop mutation because it may be
-absent from the graphical session's `PATH`. After installing or enabling the
-plugin, setup runs bounded `omarchy restart shell` so the running shell loads it,
-then rechecks that the fixed plugin identity is enabled. Current enabled plugins
-and current or compatible user-managed keybindings produce no rerun prompt.
-The plugin is presented as the recommended core Omarchy experience rather than
-an incidental integration. Once it is enabled, setup separately offers to enable
-the default-off Hyprland Workspace layer by updating only
-`desktop.workspace_layer` in the active configuration layer through the same
-owner validation, baseline revalidation, and atomic commit boundary as
-`boomux config edit`. The fixed plugin and Workspace-layer prompts are visibly
-recommended and default to yes; declining either preserves the current state.
+Desktop presents first-run setup as **Set up agents** or **Start using Boomux**.
+The selected setup runs as an explicit command in a new daemon-owned Shell in a
+new Workspace. The CLI owns discovery, confirmation, writes, and verification;
+Desktop only opens the terminal and saves dismissal of its welcome card.
+**Set up agents** remains available in the menu after skipping or completing it.
+The optional Omarchy companion installation is documented in the README.
+
 After a guided local Boomux update commits, the updater revalidates an installed
 companion plugin, delegates its update to the fixed exact-argument Omarchy CLI,
 and restarts Omarchy Shell when the plugin is enabled. Omarchy remains the plugin
 lifecycle owner, and plugin failure cannot roll back the committed executable.
-Boomux never edits `/usr/share/omarchy`. The full
-desktop binding profile is one marked block in the current user's
-`~/.config/hypr/bindings.lua`. Setup reports conflicts before consent, preserves
-all bytes outside that block, rejects symlinked, special, non-owned, oversized,
-or malformed targets, revalidates the inspected baseline, preserves mode, and
-atomically replaces and synchronizes the file. An active Hyprland session is
-reloaded and checked with `hyprctl configerrors`; otherwise the bindings take
-effect at the next session. The complete historical user-managed Boomux profile
-is recognized by its exact panel, focus-release, desktop, Shell-create, and
-focused-close actions and remains user-owned without adding a managed block.
+Boomux never edits `/usr/share/omarchy`. Historical managed binding blocks remain
+recognized for uninstall: cleanup preserves bytes outside the exact unchanged
+block and retains ownership, size, symlink, and concurrent-change checks. Guided
+setup no longer creates or repairs these blocks.
 Local uninstall removes an unchanged managed binding block and, when detected in
 a bounded rechecked inventory, removes the exact Omarchy plugin through the
 Omarchy CLI after the overall uninstall confirmation.

@@ -120,3 +120,14 @@ comparison does not attribute application memory to the wrong component.
 
 Automated workload fixtures and stable numeric regression thresholds are the
 next performance-scaffolding milestone.
+
+## Installation Worker Lifecycle
+
+At most one download or restart transaction runs per Desktop window, additionally
+serialized across processes by the installation lock. Each subprocess output
+stream retains at most 64 KiB; oversized output kills the process group. Download
+execution is capped at 30 minutes, daemon handoff at 45 seconds, and replacement
+window startup at 30 seconds. Downloads cap the compressed bundle at 512 MiB and
+checksum at 4 KiB. The installer owns retained version directories, which remain
+available for rollback and are removed with the documented uninstall procedure.
+No installation work runs in rendering or once per terminal pane.

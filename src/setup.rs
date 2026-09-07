@@ -23,43 +23,9 @@ const PLUGIN_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_COMMAND_OUTPUT: u64 = 1024 * 1024;
 const MAX_BINDINGS_BYTES: u64 = 1024 * 1024;
 const OMARCHY_PLUGIN_ID: &str = "io.github.gardnmi.boomux";
-const OMARCHY_PLUGIN_URL: &str = "https://github.com/gardnmi/omarchy-boomux.git";
 const BINDINGS_BEGIN: &str = "-- BEGIN BOOMUX MANAGED KEYBINDINGS";
 const BINDINGS_END: &str = "-- END BOOMUX MANAGED KEYBINDINGS";
-const BINDING_KEYS: &[&str] = &[
-    "SUPER + B",
-    "SUPER + A",
-    "SUPER + LEFT",
-    "SUPER + RIGHT",
-    "SUPER + UP",
-    "SUPER + DOWN",
-    "SUPER + TAB",
-    "SUPER + SHIFT + TAB",
-    "SUPER + RETURN",
-    "SUPER + O",
-    "SUPER + ALT + B",
-    "SUPER + ALT + R",
-    "SUPER + CTRL + RETURN",
-    "SUPER + CTRL + W",
-];
-const COMPATIBLE_BINDING_SNIPPETS: &[&[u8]] = &[
-    b"omarchy-shell io.github.gardnmi.boomux toggle",
-    b"omarchy-shell io.github.gardnmi.boomux focus",
-    b"omarchy-shell io.github.gardnmi.boomux releaseFocus",
-    b"o.bind(\"SUPER + LEFT\", \"Focus on left window\"",
-    b"o.bind(\"SUPER + RIGHT\", \"Focus on right window\"",
-    b"o.bind(\"SUPER + UP\", \"Focus on above window\"",
-    b"o.bind(\"SUPER + DOWN\", \"Focus on below window\"",
-    b"\"boomux desktop next\"",
-    b"\"boomux desktop previous\"",
-    b"\"boomux desktop terminal\"",
-    b"\"boomux desktop pop\"",
-    b"\"boomux desktop return\"",
-    b"\"boomux desktop gather\"",
-    b"\"boomux shell create --open\"",
-    b"\"boomux close --focused\"",
-];
-
+// Historical profile retained to recognize and safely remove existing owned bindings.
 const MANAGED_BINDINGS: &str = r#"-- BEGIN BOOMUX MANAGED KEYBINDINGS
 hl.unbind("SUPER + B")
 hl.unbind("SUPER + A")
@@ -126,15 +92,6 @@ struct BindingsPlan {
     baseline: Option<Vec<u8>>,
     content: Vec<u8>,
     mode: u32,
-    changed: bool,
-    modified: bool,
-    compatible_unmanaged: bool,
-}
-
-struct SetupReadiness {
-    complete: bool,
-    plugin_enabled: bool,
-    keybindings_ready: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -183,36 +140,6 @@ enum ApplyOutcome {
     Changed,
     Skipped,
 }
-
-#[derive(Default)]
-struct DesktopSetupOutcomes {
-    plugin: Option<ApplyOutcome>,
-    workspace_layer: Option<ApplyOutcome>,
-    keybindings: Option<ApplyOutcome>,
-}
-
-struct DesktopSetupPlan {
-    workspace_enabled: bool,
-    bindings_ready: bool,
-    bindings_path: PathBuf,
-    conflicts: Vec<String>,
-}
-
-#[derive(Debug)]
-struct DesktopPartialFailure {
-    message: String,
-    committed_message: &'static str,
-    failure_label: &'static str,
-    recovery: &'static str,
-}
-
-impl std::fmt::Display for DesktopPartialFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl Error for DesktopPartialFailure {}
 
 fn colors_enabled() -> bool {
     io::stdout().is_terminal()
@@ -277,20 +204,6 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
     );
 
     section("Inspecting System");
-    let Some(terminal_resolver) = executable_on_path("xdg-terminal-exec") else {
-        status("xx", "31", "Terminal resolver", "not found on PATH");
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "xdg-terminal-exec is required; install it and rerun `boomux setup`",
-        )
-        .into());
-    };
-    status(
-        "ok",
-        "32",
-        "Terminal resolver",
-        terminal_resolver.display().to_string(),
-    );
     let daemon_was_running = client::connect().is_ok();
     status(
         if daemon_was_running { "ok" } else { "--" },
@@ -302,21 +215,6 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
             "will start during verification"
         },
     );
-
-    let omarchy_plan = if let Some(omarchy) = executable_on_path("omarchy") {
-        let version = run_command(&omarchy, &["version"], COMMAND_TIMEOUT)?;
-        ensure_omarchy_can_resolve_boomux()?;
-        status(
-            "ok",
-            "32",
-            "Desktop",
-            String::from_utf8_lossy(&version.stdout).trim(),
-        );
-        Some(omarchy_plugins(&omarchy)?)
-    } else {
-        status("--", "2", "Desktop", "Omarchy not detected");
-        None
-    };
 
     let environment = integration_management::Environment::from_process();
     let statuses = IntegrationId::all()
@@ -355,83 +253,7 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-    let (desktop_plan, desktop_plan_error) = if omarchy_plan.is_some() {
-        let omarchy = executable_on_path("omarchy")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "omarchy disappeared"))?;
-        match inspect_omarchy_desktop_plan(&omarchy) {
-            Ok(plan) => (Some(plan), None),
-            Err(error) => (None, Some(error.to_string())),
-        }
-    } else {
-        (None, None)
-    };
-
     section("Setup Plan");
-    if let Some(plugins) = omarchy_plan.as_deref() {
-        let plugin = plugins.iter().find(|plugin| plugin.id == OMARCHY_PLUGIN_ID);
-        status(
-            if plugin.is_some_and(|plugin| plugin.enabled) {
-                "ok"
-            } else {
-                "->"
-            },
-            if plugin.is_some_and(|plugin| plugin.enabled) {
-                "32"
-            } else {
-                "36"
-            },
-            "Companion pane",
-            match plugin {
-                Some(plugin) if plugin.enabled => "plugin enabled",
-                Some(_) => "enable recommended plugin",
-                None => "install and enable recommended plugin",
-            },
-        );
-        detail(format!("source: {OMARCHY_PLUGIN_URL}"));
-        let workspace_enabled = desktop_plan
-            .as_ref()
-            .is_some_and(|plan| plan.workspace_enabled);
-        status(
-            if workspace_enabled { "ok" } else { "->" },
-            if workspace_enabled { "32" } else { "36" },
-            "Workspace layer",
-            if workspace_enabled {
-                "enabled"
-            } else {
-                "enable recommended Hyprland presentation"
-            },
-        );
-        detail(format!(
-            "config: {}",
-            crate::config::active_path()?.display()
-        ));
-        let bindings_ready = desktop_plan
-            .as_ref()
-            .is_some_and(|plan| plan.bindings_ready);
-        status(
-            if bindings_ready { "ok" } else { "--" },
-            if bindings_ready { "32" } else { "2" },
-            "Keybindings",
-            if bindings_ready {
-                "current compatible profile"
-            } else {
-                "optional; install only with confirmation"
-            },
-        );
-        if let Some(desktop_plan) = desktop_plan.as_ref() {
-            detail(format!("path: {}", desktop_plan.bindings_path.display()));
-            for conflict in &desktop_plan.conflicts {
-                detail(format!("conflict: {conflict}"));
-            }
-        } else {
-            detail(format!(
-                "desktop plan unavailable: {}",
-                desktop_plan_error.as_deref().unwrap_or("unknown error")
-            ));
-        }
-    } else {
-        status("--", "2", "Companion pane", "Omarchy not detected");
-    }
     for (integration_id, integration) in &statuses {
         if integration.host.state == HostState::Missing {
             continue;
@@ -481,24 +303,6 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         "Verification",
         "start or confirm the local daemon",
     );
-    detail("Recommended Omarchy choices default to yes.");
-    detail("Modified assets, replacements, and optional keybindings default to no.");
-
-    let skip_desktop = if let Some(error) = desktop_plan_error.as_deref() {
-        status("!!", "33", "Desktop blocker", error);
-        detail("No desktop change will be attempted unless inspection succeeds.");
-        if confirm_recommended("Skip unavailable optional desktop setup and continue?")? {
-            true
-        } else {
-            return Err(io::Error::other(format!(
-                "desktop setup inspection failed: {error}; fix it and rerun `boomux setup`"
-            ))
-            .into());
-        }
-    } else {
-        false
-    };
-
     section("Agent Harnesses");
     if detected == 0 {
         status("--", "2", "Harnesses", "none found on PATH");
@@ -641,79 +445,6 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let desktop_result = if skip_desktop {
-        if omarchy_plan.as_deref().is_some_and(|plugins| {
-            plugins
-                .iter()
-                .any(|plugin| plugin.id == OMARCHY_PLUGIN_ID && plugin.enabled)
-        }) {
-            outcomes.push(SetupOutcome::new(
-                SetupOutcomeKind::Warning,
-                "Omarchy plugin",
-                "enabled; later desktop verification skipped",
-            ));
-        }
-        outcomes.push(SetupOutcome::new(
-            SetupOutcomeKind::Skipped,
-            "Omarchy desktop",
-            "skipped because read-only inspection failed",
-        ));
-        Ok(DesktopSetupOutcomes::default())
-    } else {
-        setup_omarchy()
-    };
-    match desktop_result {
-        Ok(desktop) => {
-            if let Some(outcome) = desktop.plugin {
-                outcomes.push(apply_outcome(
-                    "Omarchy plugin",
-                    outcome,
-                    "enabled",
-                    "installed and loaded",
-                    "skipped",
-                ));
-            }
-            if let Some(outcome) = desktop.workspace_layer {
-                outcomes.push(apply_outcome(
-                    "Workspace layer",
-                    outcome,
-                    "enabled",
-                    "enabled",
-                    "skipped",
-                ));
-            }
-            if let Some(outcome) = desktop.keybindings {
-                outcomes.push(apply_outcome(
-                    "Keybindings",
-                    outcome,
-                    "current compatible profile",
-                    "installed",
-                    "skipped",
-                ));
-            }
-        }
-        Err(error) => {
-            if let Some(partial) = error.downcast_ref::<DesktopPartialFailure>() {
-                outcomes.push(SetupOutcome::new(
-                    SetupOutcomeKind::Changed,
-                    "Omarchy plugin",
-                    partial.committed_message,
-                ));
-                outcomes.push(SetupOutcome::failed(
-                    partial.failure_label,
-                    partial,
-                    partial.recovery,
-                ));
-            } else {
-                outcomes.push(SetupOutcome::failed(
-                    "Omarchy desktop",
-                    error,
-                    "run `omarchy plugin list --json`, then `boomux setup`",
-                ));
-            }
-        }
-    }
-
     section("Verification");
     let daemon_ready = match client::connect_or_start() {
         Ok(_) => {
@@ -758,7 +489,6 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         detected,
         &changed_harnesses,
         daemon_ready,
-        skip_desktop,
         &mut outcomes,
     );
 
@@ -768,18 +498,9 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         .count();
     if failures == 0 {
         section("Next");
-        if recommended_ready.plugin_enabled {
-            if recommended_ready.keybindings_ready {
-                detail("Press Super+B to open Boomux, then press + to create a Workspace.");
-            } else {
-                detail("Open Boomux from the Omarchy bar, then press + to create a Workspace.");
-            }
-            detail("If the pane is not visible yet, run `omarchy restart shell` once.");
-        } else {
-            detail("Run `boomux` to open the dashboard and create your first Workspace.");
-        }
+        detail("Open Boomux Desktop from the application menu, or run `boomux` for the dashboard.");
         detail("Run `boomux doctor` at any time to check system health.");
-        if !recommended_ready.complete {
+        if !recommended_ready {
             detail("Run `boomux setup` again to finish skipped recommended steps.");
         }
         return Ok(());
@@ -826,9 +547,8 @@ fn render_setup_receipt(
     detected: usize,
     changed_harnesses: &[&str],
     daemon_ready: bool,
-    skip_desktop: bool,
     outcomes: &mut Vec<SetupOutcome>,
-) -> SetupReadiness {
+) -> bool {
     let installed_integrations = IntegrationId::all()
         .map(|integration| integration_management::inspect(integration, environment, None))
         .filter(|integration| {
@@ -885,141 +605,10 @@ fn render_setup_receipt(
             }
         }
     };
-    let mut plugin_enabled = false;
-    let mut workspace_layer_enabled = false;
-    let mut keybindings_ready = false;
-    let omarchy = executable_on_path("omarchy");
-    if skip_desktop {
-        plugin_enabled = outcomes.iter().any(|outcome| {
-            outcome.label == "Omarchy plugin"
-                && matches!(
-                    outcome.kind,
-                    SetupOutcomeKind::Current
-                        | SetupOutcomeKind::Changed
-                        | SetupOutcomeKind::Warning
-                )
-        });
-    } else if let Some(omarchy) = omarchy.as_deref() {
-        plugin_enabled = match omarchy_plugins(omarchy) {
-            Ok(plugins) => plugins
-                .iter()
-                .any(|plugin| plugin.id == OMARCHY_PLUGIN_ID && plugin.enabled),
-            Err(error) => {
-                outcomes.push(SetupOutcome::failed(
-                    "Omarchy plugin verification",
-                    error,
-                    "run `omarchy plugin list --json`, then `boomux setup`",
-                ));
-                false
-            }
-        };
-        let desktop_failed = outcomes.iter().any(|outcome| {
-            outcome.kind == SetupOutcomeKind::Failed && outcome.label == "Omarchy desktop"
-        });
-        if plugin_enabled
-            && !outcomes
-                .iter()
-                .any(|outcome| outcome.label == "Omarchy plugin")
-        {
-            outcomes.push(SetupOutcome::new(
-                if desktop_failed {
-                    SetupOutcomeKind::Warning
-                } else {
-                    SetupOutcomeKind::Current
-                },
-                "Omarchy plugin",
-                if desktop_failed {
-                    "enabled before a later desktop step failed"
-                } else {
-                    "installed and enabled"
-                },
-            ));
-        }
-        if plugin_enabled {
-            workspace_layer_enabled = match crate::config::load() {
-                Ok(config) => {
-                    config.desktop.workspace_layer
-                        == crate::config::DesktopWorkspaceLayer::HyprlandSpecial
-                }
-                Err(error) => {
-                    outcomes.push(SetupOutcome::failed(
-                        "Workspace layer verification",
-                        error,
-                        "run `boomux config validate`, then `boomux setup`",
-                    ));
-                    false
-                }
-            };
-            if workspace_layer_enabled
-                && !outcomes
-                    .iter()
-                    .any(|outcome| outcome.label == "Workspace layer")
-            {
-                outcomes.push(SetupOutcome::new(
-                    if desktop_failed {
-                        SetupOutcomeKind::Warning
-                    } else {
-                        SetupOutcomeKind::Current
-                    },
-                    "Workspace layer",
-                    if desktop_failed {
-                        "enabled before a later desktop step failed"
-                    } else {
-                        "enabled"
-                    },
-                ));
-            }
-            let keybindings = match bindings_plan() {
-                Ok(plan) => Some(plan),
-                Err(error) => {
-                    outcomes.push(SetupOutcome::failed(
-                        "Keybindings verification",
-                        error,
-                        "`boomux setup`",
-                    ));
-                    None
-                }
-            };
-            keybindings_ready = keybindings.as_ref().is_some_and(|plan| !plan.changed);
-            let compatible_unmanaged = keybindings
-                .as_ref()
-                .is_some_and(|plan| plan.compatible_unmanaged);
-            if keybindings_ready
-                && !outcomes
-                    .iter()
-                    .any(|outcome| outcome.label == "Keybindings")
-            {
-                outcomes.push(SetupOutcome::new(
-                    if desktop_failed {
-                        SetupOutcomeKind::Warning
-                    } else {
-                        SetupOutcomeKind::Current
-                    },
-                    "Keybindings",
-                    if desktop_failed {
-                        "compatible state preserved after a later failure"
-                    } else if compatible_unmanaged {
-                        "compatible user-managed profile"
-                    } else {
-                        "managed profile ready"
-                    },
-                ));
-            }
-        }
-    } else {
-        outcomes.push(SetupOutcome::new(
-            SetupOutcomeKind::Skipped,
-            "Omarchy desktop",
-            "not detected",
-        ));
-    }
-
-    let desktop_ready =
-        skip_desktop || omarchy.is_none() || plugin_enabled && workspace_layer_enabled;
     let failed = outcomes
         .iter()
         .any(|outcome| outcome.kind == SetupOutcomeKind::Failed);
-    let complete = daemon_ready && !failed && integrations_ready && skill_ready && desktop_ready;
+    let complete = daemon_ready && !failed && integrations_ready && skill_ready;
 
     println!(
         "\n{}",
@@ -1057,11 +646,7 @@ fn render_setup_receipt(
         },
     );
 
-    SetupReadiness {
-        complete,
-        plugin_enabled,
-        keybindings_ready,
-    }
+    complete
 }
 
 fn setup_agent_skill() -> Result<ApplyOutcome, Box<dyn Error>> {
@@ -1104,363 +689,13 @@ fn required_home() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "HOME must be absolute"))
 }
 
-fn setup_omarchy() -> Result<DesktopSetupOutcomes, Box<dyn Error>> {
-    section("Desktop Integration");
-    let Some(omarchy) = executable_on_path("omarchy") else {
-        status("--", "2", "Omarchy", "not detected");
-        detail("Desktop plugin and keybindings were skipped.");
-        return Ok(DesktopSetupOutcomes::default());
-    };
-    let version = run_command(&omarchy, &["version"], COMMAND_TIMEOUT)?;
-    status(
-        "ok",
-        "32",
-        "Omarchy",
-        String::from_utf8_lossy(&version.stdout).trim(),
-    );
-    ensure_omarchy_can_resolve_boomux()?;
-    let hyprland_active =
-        env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|value| !value.is_empty());
-    status(
-        if hyprland_active { "ok" } else { "--" },
-        if hyprland_active { "32" } else { "2" },
-        "Hyprland session",
-        if hyprland_active {
-            "active"
-        } else {
-            "not active"
-        },
-    );
-
-    let plugins = omarchy_plugins(&omarchy)?;
-    let (plugin_enabled, plugin_changed, plugin_outcome) = match plugins
-        .iter()
-        .find(|plugin| plugin.id == OMARCHY_PLUGIN_ID)
-    {
-        Some(plugin) if plugin.enabled => {
-            status(
-                "ok",
-                "32",
-                "omarchy-boomux",
-                "recommended core experience installed and enabled",
-            );
-            detail("Enabled in the Omarchy plugin inventory; no change is needed.");
-            (true, false, ApplyOutcome::Current)
-        }
-        Some(_) => {
-            status(
-                "!!",
-                "33",
-                "omarchy-boomux",
-                "recommended core experience is disabled",
-            );
-            detail("Enabling the plugin also restarts Omarchy Shell so it is loaded.");
-            if confirm_recommended("Enable and load the recommended omarchy-boomux plugin?")? {
-                preflight_omarchy_desktop(&omarchy)?;
-                run_command(
-                    &omarchy,
-                    &["plugin", "enable", OMARCHY_PLUGIN_ID],
-                    COMMAND_TIMEOUT,
-                )?;
-                status("ok", "32", "omarchy-boomux", "enabled");
-                (true, true, ApplyOutcome::Changed)
-            } else {
-                (false, false, ApplyOutcome::Skipped)
-            }
-        }
-        None => {
-            status(
-                "->",
-                "36",
-                "omarchy-boomux",
-                "recommended core Omarchy experience",
-            );
-            detail("Keep Workspaces, Shells, Agents, and Nodes available in a persistent pane.");
-            detail("Plugins run as unsandboxed code inside the Omarchy shell.");
-            detail(format!("Source: {OMARCHY_PLUGIN_URL}"));
-            detail("Installation also restarts Omarchy Shell so the plugin is loaded.");
-            if confirm_recommended(
-                "Install, enable, and load the recommended omarchy-boomux plugin?",
-            )? {
-                preflight_omarchy_desktop(&omarchy)?;
-                run_command(
-                    &omarchy,
-                    &["plugin", "add", OMARCHY_PLUGIN_URL, "--enable", "--yes"],
-                    PLUGIN_INSTALL_TIMEOUT,
-                )?;
-                status("ok", "32", "omarchy-boomux", "installed and enabled");
-                (true, true, ApplyOutcome::Changed)
-            } else {
-                (false, false, ApplyOutcome::Skipped)
-            }
-        }
-    };
-    if plugin_changed {
-        run_command(&omarchy, &["restart", "shell"], PLUGIN_INSTALL_TIMEOUT).map_err(|error| {
-            Box::new(DesktopPartialFailure {
-                message: format!("plugin is enabled, but Omarchy Shell did not restart: {error}"),
-                committed_message: "enabled before shell reload failed",
-                failure_label: "Omarchy Shell reload",
-                recovery: "`omarchy restart shell`",
-            }) as Box<dyn Error>
-        })?;
-        status("ok", "32", "Omarchy Shell", "restarted with plugin loaded");
-        let plugins = omarchy_plugins(&omarchy).map_err(|error| {
-            Box::new(DesktopPartialFailure {
-                message: format!(
-                    "plugin was enabled and the shell restarted, but inventory verification failed: {error}"
-                ),
-                committed_message: "enabled and shell reloaded before verification failed",
-                failure_label: "Omarchy plugin verification",
-                recovery: "run `omarchy plugin list --json`, then `omarchy restart shell` if the plugin is not visible",
-            }) as Box<dyn Error>
-        })?;
-        if !plugins
-            .iter()
-            .any(|plugin| plugin.id == OMARCHY_PLUGIN_ID && plugin.enabled)
-        {
-            return Err(Box::new(DesktopPartialFailure {
-                message: "Omarchy did not report the companion plugin as enabled after the change"
-                    .into(),
-                committed_message: "enabled and shell reloaded before verification failed",
-                failure_label: "Omarchy plugin verification",
-                recovery: "run `omarchy plugin list --json`, then `omarchy restart shell`",
-            }));
-        }
-    }
-    if !plugin_enabled {
-        status("--", "2", "Keybindings", "skipped; plugin is not enabled");
-        return Ok(DesktopSetupOutcomes {
-            plugin: Some(plugin_outcome),
-            workspace_layer: None,
-            keybindings: None,
-        });
-    }
-
-    let workspace_layer = setup_hyprland_workspace_layer()?;
-
-    let plan = bindings_plan()?;
-    if !plan.changed {
-        if plan.compatible_unmanaged {
-            status("ok", "32", "Keybindings", "compatible user-managed profile");
-            detail("Existing bindings work and remain user-owned unless you reinstall them.");
-
-            let inventory = run_command(
-                &omarchy,
-                &["menu", "keybindings", "--print"],
-                COMMAND_TIMEOUT,
-            )?;
-            let inventory = String::from_utf8_lossy(&inventory.stdout);
-            let conflicts = binding_conflicts(&inventory);
-            if !conflicts.is_empty() {
-                status(
-                    "!!",
-                    "33",
-                    "Reinstall impact",
-                    "these existing bindings would be overridden",
-                );
-                for conflict in conflicts {
-                    detail(conflict);
-                }
-            }
-        } else {
-            status("ok", "32", "Keybindings", "current managed profile");
-        }
-
-        detail("No changes are needed.");
-        return Ok(DesktopSetupOutcomes {
-            plugin: Some(plugin_outcome),
-            workspace_layer: Some(workspace_layer),
-            keybindings: Some(ApplyOutcome::Current),
-        });
-    } else {
-        let inventory = run_command(
-            &omarchy,
-            &["menu", "keybindings", "--print"],
-            COMMAND_TIMEOUT,
-        )?;
-        let inventory = String::from_utf8_lossy(&inventory.stdout);
-        let conflicts = binding_conflicts(&inventory);
-        if plan.modified {
-            status("!!", "33", "Keybindings", "managed profile modified");
-        } else if conflicts.is_empty() {
-            status("->", "36", "Keybindings", "full profile not installed");
-        } else {
-            status("!!", "33", "Keybindings", "conflicts require replacement");
-            for conflict in conflicts {
-                detail(conflict);
-            }
-        }
-        let prompt = if plan.modified {
-            "Replace the modified Boomux keybinding profile?"
-        } else {
-            "Install the full Boomux keybinding profile?"
-        };
-        if !confirm(prompt)? {
-            status("--", "2", "Keybindings", "skipped");
-            return Ok(DesktopSetupOutcomes {
-                plugin: Some(plugin_outcome),
-                workspace_layer: Some(workspace_layer),
-                keybindings: Some(ApplyOutcome::Skipped),
-            });
-        }
-    }
-    commit_bindings(&plan)?;
-    status("ok", "32", "Keybindings", "installed");
-    detail(plan.path.display().to_string());
-
-    let hyprctl = hyprland_active
-        .then(|| executable_on_path("hyprctl"))
-        .flatten();
-    let validation = if hyprland_active {
-        hyprctl.as_deref().map_or_else(
-            || {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "HYPRLAND_INSTANCE_SIGNATURE is set but hyprctl is unavailable",
-                ))
-            },
-            validate_hyprland_config,
-        )
-    } else {
-        detail("Hyprland is not active; bindings will load at the next session.");
-        Ok(())
-    };
-    if let Err(error) = validation {
-        rollback_bindings(&plan).map_err(|rollback| {
-            io::Error::other(format!(
-                "{error}; additionally failed to restore prior keybindings: {rollback}"
-            ))
-        })?;
-        if let Some(hyprctl) = hyprctl.as_deref() {
-            validate_hyprland_config(hyprctl).map_err(|rollback| {
-                io::Error::other(format!(
-                    "{error}; prior keybindings were restored but Hyprland failed to reload them: {rollback}"
-                ))
-            })?;
-        }
-        return Err(error.into());
-    }
-    if hyprland_active {
-        status("ok", "32", "Hyprland config", "reloaded without errors");
-    }
-    Ok(DesktopSetupOutcomes {
-        plugin: Some(plugin_outcome),
-        workspace_layer: Some(workspace_layer),
-        keybindings: Some(ApplyOutcome::Changed),
-    })
-}
-
-fn setup_hyprland_workspace_layer() -> Result<ApplyOutcome, Box<dyn Error>> {
-    if crate::config::load()?.desktop.workspace_layer
-        == crate::config::DesktopWorkspaceLayer::HyprlandSpecial
-    {
-        status("ok", "32", "Workspace layer", "enabled");
-        return Ok(ApplyOutcome::Current);
-    }
-
-    status(
-        "->",
-        "36",
-        "Workspace layer",
-        "recommended for the core Omarchy experience",
-    );
-    detail("Present coordinated Boomux Workspaces as named Hyprland special Workspaces.");
-    if !confirm_recommended("Enable the recommended Hyprland Workspace layer?")? {
-        status("--", "2", "Workspace layer", "kept disabled");
-        return Ok(ApplyOutcome::Skipped);
-    }
-
-    let path = crate::config::enable_hyprland_workspace_layer()?;
-    status("ok", "32", "Workspace layer", "enabled");
-    detail(format!("config: {}", path.display()));
-    Ok(ApplyOutcome::Changed)
-}
-
-fn preflight_omarchy_desktop(omarchy: &Path) -> Result<(), Box<dyn Error>> {
-    inspect_omarchy_desktop_plan(omarchy).map(|_| ())
-}
-
-fn inspect_omarchy_desktop_plan(omarchy: &Path) -> Result<DesktopSetupPlan, Box<dyn Error>> {
-    let workspace_enabled = crate::config::load()?.desktop.workspace_layer
-        == crate::config::DesktopWorkspaceLayer::HyprlandSpecial;
-    let bindings = bindings_plan()?;
-    let conflicts = if bindings.changed || bindings.compatible_unmanaged {
-        let inventory = run_command(
-            omarchy,
-            &["menu", "keybindings", "--print"],
-            COMMAND_TIMEOUT,
-        )?;
-        binding_conflicts(&String::from_utf8_lossy(&inventory.stdout))
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    if bindings.changed && env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-        executable_on_path("hyprctl").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "HYPRLAND_INSTANCE_SIGNATURE is set but hyprctl is unavailable",
-            )
-        })?;
-    }
-    Ok(DesktopSetupPlan {
-        workspace_enabled,
-        bindings_ready: !bindings.changed,
-        bindings_path: bindings.path,
-        conflicts,
-    })
-}
-
-fn ensure_omarchy_can_resolve_boomux() -> io::Result<()> {
-    let home = required_home()?;
-    let cargo_home = env::var_os("CARGO_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".cargo"));
-    let executable = env::current_exe()?;
-    let desktop_executable = home.join(".local/bin/boomux");
-    if executable.starts_with(cargo_home.join("bin")) && !is_executable_file(&desktop_executable) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "{} is available to this shell but Omarchy may not include {} in its graphical PATH; install the official Boomux release at {} before configuring desktop integration",
-                executable.display(),
-                cargo_home.join("bin").display(),
-                desktop_executable.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
 fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-fn validate_hyprland_config(hyprctl: &Path) -> io::Result<()> {
-    run_command(hyprctl, &["reload"], COMMAND_TIMEOUT)?;
-    let errors = run_command(hyprctl, &["configerrors"], COMMAND_TIMEOUT)?;
-    let errors = String::from_utf8_lossy(&errors.stdout);
-    if errors.trim().is_empty() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Hyprland reported configuration errors:\n{}", errors.trim()),
-        ))
-    }
-}
-
 fn confirm(prompt: &str) -> io::Result<bool> {
     confirm_with_default(prompt, false)
-}
-
-fn confirm_recommended(prompt: &str) -> io::Result<bool> {
-    confirm_with_default(prompt, true)
 }
 
 fn confirm_with_default(prompt: &str, default_yes: bool) -> io::Result<bool> {
@@ -1646,35 +881,6 @@ fn terminate_process_group(child: &mut std::process::Child, process_group: i32) 
     let _ = child.wait();
 }
 
-fn bindings_plan() -> Result<BindingsPlan, Box<dyn Error>> {
-    let path = bindings_directory()?.join("bindings.lua");
-    let (baseline, mode) = read_owned_bindings(&path)?;
-    let source = baseline.as_deref().unwrap_or_default();
-    let range = managed_block_range(source)?;
-    let compatible_unmanaged = range.is_none() && compatible_unmanaged_profile(source);
-    let modified = range
-        .as_ref()
-        .is_some_and(|range| &source[range.clone()] != MANAGED_BINDINGS.as_bytes());
-    let content = render_bindings(source)?;
-    if content.len() > MAX_BINDINGS_BYTES as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bindings file would exceed 1 MiB after setup",
-        )
-        .into());
-    }
-    let changed = !compatible_unmanaged && baseline.as_deref() != Some(content.as_slice());
-    Ok(BindingsPlan {
-        path,
-        baseline,
-        content,
-        mode,
-        changed,
-        modified,
-        compatible_unmanaged,
-    })
-}
-
 pub(crate) fn managed_bindings_status() -> io::Result<(PathBuf, Option<bool>)> {
     let path = bindings_directory()?.join("bindings.lua");
     let (baseline, _) = read_owned_bindings(&path)?;
@@ -1713,9 +919,6 @@ pub(crate) fn remove_managed_bindings() -> io::Result<bool> {
         baseline: Some(baseline),
         content,
         mode,
-        changed: true,
-        modified: false,
-        compatible_unmanaged: false,
     };
     commit_bindings(&plan)?;
     Ok(true)
@@ -1774,29 +977,6 @@ fn read_owned_bindings(path: &Path) -> io::Result<(Option<Vec<u8>>, u32)> {
     Ok((Some(bytes), metadata.permissions().mode() & 0o7777))
 }
 
-fn render_bindings(source: &[u8]) -> io::Result<Vec<u8>> {
-    match managed_block_range(source)? {
-        None => {
-            let mut content = source.to_vec();
-            if !content.is_empty() && !content.ends_with(b"\n") {
-                content.push(b'\n');
-            }
-            if !content.is_empty() {
-                content.push(b'\n');
-            }
-            content.extend_from_slice(MANAGED_BINDINGS.as_bytes());
-            Ok(content)
-        }
-        Some(range) => {
-            let mut content = Vec::with_capacity(source.len() + MANAGED_BINDINGS.len());
-            content.extend_from_slice(&source[..range.start]);
-            content.extend_from_slice(MANAGED_BINDINGS.as_bytes());
-            content.extend_from_slice(&source[range.end..]);
-            Ok(content)
-        }
-    }
-}
-
 fn managed_block_range(source: &[u8]) -> io::Result<Option<Range<usize>>> {
     let begins = find_all(source, BINDINGS_BEGIN.as_bytes());
     let ends = find_all(source, BINDINGS_END.as_bytes());
@@ -1819,34 +999,6 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         .windows(needle.len())
         .enumerate()
         .filter_map(|(index, window)| (window == needle).then_some(index))
-        .collect()
-}
-
-fn compatible_unmanaged_profile(source: &[u8]) -> bool {
-    COMPATIBLE_BINDING_SNIPPETS.iter().all(|snippet| {
-        source
-            .windows(snippet.len())
-            .any(|window| window == *snippet)
-    })
-}
-
-fn binding_conflicts(inventory: &str) -> Vec<&str> {
-    inventory
-        .lines()
-        .filter(|line| {
-            let binding = line.split('→').next().unwrap_or(line).trim();
-            let binding = normalized_binding(binding);
-            BINDING_KEYS
-                .iter()
-                .any(|key| normalized_binding(key) == binding)
-        })
-        .collect()
-}
-
-fn normalized_binding(binding: &str) -> String {
-    binding
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace() && *character != '+')
         .collect()
 }
 
@@ -1892,39 +1044,6 @@ fn require_bindings_baseline(plan: &BindingsPlan, current: &Option<Vec<u8>>) -> 
     }
 }
 
-fn rollback_bindings(plan: &BindingsPlan) -> io::Result<()> {
-    let (current, _) = read_owned_bindings(&plan.path)?;
-    if current.as_deref() != Some(plan.content.as_slice()) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{} changed before rollback", plan.path.display()),
-        ));
-    }
-    match &plan.baseline {
-        Some(baseline) => {
-            let rollback = BindingsPlan {
-                path: plan.path.clone(),
-                baseline: current,
-                content: baseline.clone(),
-                mode: plan.mode,
-                changed: true,
-                modified: false,
-                compatible_unmanaged: false,
-            };
-            commit_bindings(&rollback)
-        }
-        None => {
-            fs::remove_file(&plan.path)?;
-            fs::File::open(
-                plan.path
-                    .parent()
-                    .ok_or_else(|| io::Error::other("bindings path has no parent"))?,
-            )?
-            .sync_all()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
@@ -1955,80 +1074,18 @@ mod tests {
     }
 
     #[test]
-    fn managed_bindings_append_replace_and_reject_bad_markers() {
-        let original = b"-- user binding\no.bind(\"SUPER + Q\", \"User\", \"true\")\n";
-        let installed = render_bindings(original).unwrap();
-        assert!(installed.starts_with(original));
-        assert!(
-            installed
-                .windows(b"boomux desktop gather".len())
-                .any(|window| window == b"boomux desktop gather")
-        );
-        assert_eq!(render_bindings(&installed).unwrap(), installed);
-
-        let modified = String::from_utf8(installed.clone())
-            .unwrap()
-            .replace("Toggle Boomux panel", "Custom panel")
-            .into_bytes();
-        let repaired = render_bindings(&modified).unwrap();
-        assert_eq!(repaired, installed);
-        assert!(render_bindings(BINDINGS_BEGIN.as_bytes()).is_err());
-        assert!(
-            render_bindings(format!("{BINDINGS_BEGIN}\n{BINDINGS_END}\n{BINDINGS_END}").as_bytes())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn managed_bindings_preserve_non_utf8_user_bytes() {
-        let original = b"-- user\n\xff\xfe\n";
-        let installed = render_bindings(original).unwrap();
-        assert!(installed.starts_with(original));
-        let range = managed_block_range(&installed).unwrap().unwrap();
-        let mut removed = installed;
-        removed.drain(range);
-        assert_eq!(removed, b"-- user\n\xff\xfe\n\n");
-    }
-
-    #[test]
-    fn conflict_inventory_selects_only_managed_keys() {
-        let inventory =
-            "SUPER + B        → Browser\nSUPER + Q        → User\nSUPER CTRL + W   → Close\n";
-        assert_eq!(
-            binding_conflicts(inventory),
-            vec!["SUPER + B        → Browser", "SUPER CTRL + W   → Close"]
-        );
-    }
-
-    #[test]
-    fn complete_unmanaged_profile_is_compatible_but_partial_profile_is_not() {
-        let complete = COMPATIBLE_BINDING_SNIPPETS
-            .iter()
-            .flat_map(|snippet| snippet.iter().copied().chain(*b"\n"))
-            .collect::<Vec<_>>();
-        assert!(compatible_unmanaged_profile(&complete));
-
-        let partial =
-            &complete[..complete.len() - COMPATIBLE_BINDING_SNIPPETS.last().unwrap().len()];
-        assert!(!compatible_unmanaged_profile(partial));
-    }
-
-    #[test]
     fn bindings_commit_preserves_mode_and_rejects_concurrent_changes() {
         let directory = TestDirectory::new();
         let path = directory.0.join("bindings.lua");
         let baseline = b"-- user\n".to_vec();
         fs::write(&path, &baseline).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-        let content = render_bindings(b"-- user\n").unwrap();
+        let content = b"-- remaining user bindings\n".to_vec();
         let plan = BindingsPlan {
             path: path.clone(),
             baseline: Some(baseline),
             content: content.clone(),
             mode: 0o640,
-            changed: true,
-            modified: false,
-            compatible_unmanaged: false,
         };
         commit_bindings(&plan).unwrap();
         assert_eq!(fs::read(&path).unwrap(), content);
@@ -2048,39 +1105,6 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(&path).unwrap(), b"user changed it");
-    }
-
-    #[test]
-    fn bindings_rollback_restores_existing_and_missing_baselines() {
-        let directory = TestDirectory::new();
-        let existing = directory.0.join("existing.lua");
-        fs::write(&existing, b"before").unwrap();
-        let existing_plan = BindingsPlan {
-            path: existing.clone(),
-            baseline: Some(b"before".to_vec()),
-            content: b"after".to_vec(),
-            mode: 0o640,
-            changed: true,
-            modified: false,
-            compatible_unmanaged: false,
-        };
-        commit_bindings(&existing_plan).unwrap();
-        rollback_bindings(&existing_plan).unwrap();
-        assert_eq!(fs::read(&existing).unwrap(), b"before");
-
-        let missing = directory.0.join("missing.lua");
-        let missing_plan = BindingsPlan {
-            path: missing.clone(),
-            baseline: None,
-            content: b"created".to_vec(),
-            mode: 0o600,
-            changed: true,
-            modified: false,
-            compatible_unmanaged: false,
-        };
-        commit_bindings(&missing_plan).unwrap();
-        rollback_bindings(&missing_plan).unwrap();
-        assert!(!missing.exists());
     }
 
     #[test]

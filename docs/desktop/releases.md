@@ -8,7 +8,10 @@ bundle for x86_64 GNU/Linux. The Desktop archive contains `bin/boomux`, the
 licenses/notices, and `release.txt`. The CLI executable is byte-identical to the
 standalone x86_64 archive from the same source SHA and version.
 
-After the first unified release is published:
+After the first unified release is published, `boomux-installer.sh` offers
+Desktop (including Boomux) or CLI only. Its `--desktop`/`--cli` options support
+explicit selection; noninteractive calls require one. The direct Desktop route
+remains supported:
 
 ```sh
 curl -fsSL https://github.com/gardnmi/boomux/releases/latest/download/boomux-desktop-installer.sh | sh
@@ -23,8 +26,50 @@ and the atomic `current` link. Commands are linked under `~/.local/bin`; existin
 independent CLI installations are preserved. XDG directories and absolute
 `BOOMUX_DESKTOP_INSTALL_DIR` / `BOOMUX_DESKTOP_BIN_DIR` overrides remain supported.
 No updater independently replaces bundle-owned Boomux, including through its
-optional CLI symlink. Rerunning the installer updates the whole bundle without
-restarting a running daemon or overwriting running executable files.
+optional CLI symlink. An independent CLI installation keeps its own update
+ownership. The Desktop installer checks glibc 2.39+, both executable versions,
+and fixed graphics libraries with `--check-runtime` before activating a release.
+Missing libraries produce distro package guidance; it never invokes sudo or a
+package manager. The archive and checksum downloads have explicit byte limits.
+
+The app's **Update** action executes its embedded installer with `--prepare` on a
+bounded worker. This downloads and verifies the complete bundle and atomically
+records a `pending` release link without changing `current` or restarting any
+process. **Restart now** acquires the same install lock, revalidates owned release
+paths and the current/pending selection, calls the candidate CLI's graceful
+`daemon restart --executable <candidate>/bin/boomux`, verifies the daemon is
+running that executable, switches `current`, and opens the candidate Desktop. It waits
+up to 30 seconds for GPUI window creation before closing the old app. A failed
+window start switches back and requests graceful daemon recovery with the old
+CLI; recovery failures are surfaced. It never uses `daemon stop`.
+
+**Later** dismisses the prepared version while retaining its files. Preparation
+survives Desktop restarts; manual **Check for updates** revisits the notice. Only
+installer-owned versioned bundles offer in-app installation. File ownership,
+non-writable-by-others mode, exact version/digest directory names, and release
+containment are checked; concurrent installer activity or a changed `current`
+blocks restart. Child-process time and output are bounded. GUI and backend
+lifecycle operations run off GPUI's foreground thread.
+
+Rerunning the ordinary installer switches `current` without restarting a daemon
+or overwriting running executable files. On opening the newly installed app, a
+daemon running from another executable produces a **Restart now**/**Later**
+reminder to finish installation. Closing the old app alone does not restart its
+daemon. In-app restart opens the replacement window only after daemon handoff.
+
+Executable handoff requires a running daemon with protocol 52 or newer. Older
+daemons need a one-time upgrade through their owning installation method before
+Desktop can complete the switch (for an eligible standalone release install,
+`boomux update`). The compatibility error leaves the existing daemon and live
+Shells running; Desktop does not silently overwrite a separate CLI or cold-stop
+its sessions. Fresh combined installs include this support.
+
+For a pre-protocol-52 Desktop bundle or a development daemon that cannot update
+its existing executable in place, install the new bundle first, then finish all
+running work. Close Desktop, run `boomux daemon stop` from the old installation,
+and open the newly installed Desktop. **Stop terminates every managed process**;
+this is a user-scheduled one-time migration, never an automatic updater fallback.
+The new app starts its bundled daemon, enabling subsequent graceful updates.
 
 The old repository is retained until cutover. Existing development builds should
 rerun the canonical installer after the first unified release; their old update
