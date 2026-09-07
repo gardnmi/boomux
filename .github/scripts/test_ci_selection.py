@@ -57,6 +57,52 @@ class SelectionTests(unittest.TestCase):
         self.write("docs/architecture.md", "updated")
         self.assertEqual(self.classify(), dict.fromkeys(selection.FULL, False))
 
+    def test_desktop_source_and_guidance_select_only_desktop(self):
+        self.write("desktop/src/terminal.rs", "changed")
+        self.write("docs/desktop/architecture.md", "updated")
+        self.write("desktop/AGENTS.md", "updated")
+        self.assertEqual(self.classify(), {
+            "run_code": False, "run_desktop": True,
+            "run_package": False, "run_benchmarks": False,
+        })
+
+    def test_desktop_guidance_alone_skips_executable_checks(self):
+        self.write("desktop/AGENTS.md", "updated")
+        self.assertEqual(self.classify(), dict.fromkeys(selection.FULL, False))
+
+    def test_desktop_source_with_shared_inputs_requires_full_validation(self):
+        for path in ["src/client.rs", "Cargo.toml", "Cargo.lock", "desktop/Cargo.toml",
+                     "vendor/libghostty-vt-sys/build.rs", ".github/workflows/ci.yml"]:
+            with self.subTest(path=path):
+                self.write("desktop/src/main.rs", "changed")
+                self.write(path, "changed")
+                self.assertEqual(self.classify(), selection.FULL)
+                self.git("reset", "--hard", self.base)
+
+    def test_renaming_core_source_into_desktop_cannot_skip_core(self):
+        Path("desktop/src").mkdir(parents=True)
+        self.git("mv", "src/lib.rs", "desktop/src/lib.rs")
+        self.assertEqual(self.classify(), selection.FULL)
+
+    def test_deleted_desktop_source_still_requires_desktop_checks(self):
+        self.write("desktop/src/terminal.rs", "initial")
+        self.base = self.commit()
+        Path("desktop/src/terminal.rs").unlink()
+        result = self.classify()
+        self.assertTrue(result["run_desktop"])
+        self.assertFalse(result["run_code"])
+
+    def test_packaged_desktop_inputs_do_not_take_the_source_only_path(self):
+        for path in ["desktop/install.sh", "desktop/README.md", "desktop/packaging/boomux-desktop",
+                     "desktop/src/unknown.data", "desktop/scripts/package-release.py"]:
+            with self.subTest(path=path):
+                self.write(path, "changed")
+                result = self.classify()
+                self.assertTrue(result["run_package"])
+                self.assertTrue(result["run_code"])
+                self.assertTrue(result["run_desktop"])
+                self.git("reset", "--hard", self.base)
+
     def test_embedded_and_packaged_markdown_cannot_skip(self):
         for path in ["README.md", "THIRD_PARTY_NOTICES.md", ".agents/skills/boomux/SKILL.md"]:
             with self.subTest(path=path):
@@ -83,7 +129,7 @@ class SelectionTests(unittest.TestCase):
         seen = []
         result = self.classify(lambda sha: seen.append(sha) or True)
         self.assertEqual(seen, [self.base])
-        self.assertEqual(result, {"run_code": False, "run_package": True, "run_benchmarks": False})
+        self.assertEqual(result, {"run_code": False, "run_desktop": False, "run_package": True, "run_benchmarks": False})
 
     def test_version_only_without_proof_runs_full_validation(self):
         self.write_version("1.2.4")
@@ -100,6 +146,17 @@ class SelectionTests(unittest.TestCase):
         jobs = {"jobs": [{"name": "Rust", "conclusion": "success", "steps": [
             {"name": name, "conclusion": "success"} for name in
             ["Run Clippy", "Run Rust unit tests", "Run configuration CLI tests", "Run native backend tests"]]}]}
+        with patch.dict(os.environ, GITHUB_REPOSITORY="owner/repo", DEFAULT_BRANCH="main"), patch.object(
+            selection.subprocess, "check_output", side_effect=[json.dumps({"workflow_runs": [valid]}).encode(), json.dumps(jobs).encode()]):
+            self.assertFalse(selection.validated_base(self.base))
+
+    def test_desktop_only_ci_cannot_justify_workspace_reuse(self):
+        valid = {"id": 123, "head_sha": self.base, "event": "push", "conclusion": "success",
+                 "head_branch": "main", "head_repository": {"full_name": "owner/repo"}}
+        jobs = {"jobs": [{"name": "Rust", "conclusion": "success", "steps": [
+            {"name": "Skip code checks when covered or not required", "conclusion": "success"}]},
+            {"name": "Desktop Rust", "conclusion": "success", "steps": [
+                {"name": name, "conclusion": "success"} for name in ["Run Desktop Clippy", "Run Desktop tests"]]}]}
         with patch.dict(os.environ, GITHUB_REPOSITORY="owner/repo", DEFAULT_BRANCH="main"), patch.object(
             selection.subprocess, "check_output", side_effect=[json.dumps({"workflow_runs": [valid]}).encode(), json.dumps(jobs).encode()]):
             self.assertFalse(selection.validated_base(self.base))
@@ -134,7 +191,7 @@ class SelectionTests(unittest.TestCase):
     def test_packaging_and_js_changes_skip_benchmark_smoke(self):
         for path in ["packaging/test-installer.sh", "integrations/pi/boomux.js"]:
             self.write(path, "changed")
-        self.assertEqual(self.classify(), {"run_code": True, "run_package": True, "run_benchmarks": False})
+        self.assertEqual(self.classify(), {"run_code": True, "run_desktop": True, "run_package": True, "run_benchmarks": False})
 
     def test_rust_and_workflow_changes_keep_benchmarks(self):
         self.write(".github/workflows/ci.yml", "changed")

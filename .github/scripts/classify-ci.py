@@ -9,7 +9,12 @@ import tomllib
 DOCS = {"AGENTS.md", "CONTEXT.md", "DEVELOPMENT.md", "BENCHMARKING.md",
         "CHANGELOG.md", "SECURITY.md"}
 RELEASE_FILES = {"desktop/Cargo.toml", "Cargo.toml", "Cargo.lock", ".release-please-manifest.json", "CHANGELOG.md"}
-FULL = {"run_code": True, "run_package": True, "run_benchmarks": True}
+FULL = {"run_code": True, "run_desktop": True, "run_package": True, "run_benchmarks": True}
+
+
+def documentation(path):
+    return (path in DOCS or path == "desktop/AGENTS.md"
+            or (path.startswith("docs/") and path.endswith(".md")))
 
 
 def git(*args):
@@ -87,18 +92,22 @@ def classify(base, head, proof=validated_base):
         if not re.fullmatch(r"[0-9a-f]{40}", base) or base == "0" * 40:
             return FULL.copy(), "No usable comparison base; full validation."
         paths = set(git("diff", "--name-only", "--no-renames", "-z", base, head).decode().rstrip("\0").split("\0")) - {""}
-        if all(path in DOCS or (path.startswith("docs/") and path.endswith(".md")) for path in paths):
+        if all(documentation(path) for path in paths):
             return dict.fromkeys(FULL, False), "Documentation-only change; no executable or packaged inputs changed."
         if release_only(base, head, paths):
             if proof(base):
-                return {"run_code": False, "run_package": True, "run_benchmarks": False}, f"Version-only release; reuse successful push CI for {base}. Build and smoke test the new version."
+                return {"run_code": False, "run_desktop": False, "run_package": True, "run_benchmarks": False}, f"Version-only release; reuse successful push CI for {base}. Build and smoke test the new version."
             return FULL.copy(), "Version-only change has no successful base push CI; full validation."
+        executable_paths = {path for path in paths if not documentation(path)}
+        if executable_paths and all(path.startswith("desktop/src/") and path.endswith(".rs")
+                                    for path in executable_paths):
+            return {"run_code": False, "run_desktop": True, "run_package": False, "run_benchmarks": False}, "Desktop-only Rust change; validate and build Desktop. Backend, dependencies, and packaging inputs are unchanged."
         # Rust/core/build/CI changes retain benchmark smoke. Packaging and JS-only
         # changes still receive ordinary validation without optimized benchmarks.
         benchmarks = any(path.startswith(("src/", "benches/", "tests/", "desktop/src/", "vendor/", ".cargo/", ".github/"))
                          or path in {"Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain", "rust-toolchain.toml"}
                          for path in paths)
-        return {"run_code": True, "run_package": True, "run_benchmarks": benchmarks}, "Validate changed executable or packaging inputs."
+        return {"run_code": True, "run_desktop": True, "run_package": True, "run_benchmarks": benchmarks}, "Validate changed executable or packaging inputs."
     except (subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError) as error:
         return FULL.copy(), f"Classification unavailable ({type(error).__name__}); full validation."
 

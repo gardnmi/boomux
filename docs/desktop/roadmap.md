@@ -5,8 +5,8 @@ tests, `CONTEXT.md`, architecture documentation, and accepted ADRs.
 
 ## Repository Readiness
 
-- Validate the Linux release bundle on supported distributions and publish the
-  first stable release after the Wayland/X11 smoke tests in `docs/releases.md`.
+- [x] Publish the unified Linux release bundle with Wayland/X11 smoke coverage
+  (v1.10.0). Continue compatibility validation using `releases.md`.
 - Replace the temporary application icon with final artwork and refine Omarchy integration.
 - Consider focused client/protocol crates within the workspace when justified
   by dependency or build measurements.

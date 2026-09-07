@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       run_code: ${{ steps.classify.outputs.run_code }}
+      run_desktop: ${{ steps.classify.outputs.run_desktop }}
       run_package: ${{ steps.classify.outputs.run_package }}
       run_benchmarks: ${{ steps.classify.outputs.run_benchmarks }}
     steps:
@@ -368,7 +369,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_code == 'false' && 'false' || 'true' }}
+      RUN_CODE: ${{ needs.changes.result == 'success' && needs.changes.outputs.run_desktop == 'false' && 'false' || 'true' }}
       RUSTUP_TOOLCHAIN: stable
     steps:
       - name: Skip Desktop checks when covered or not required
@@ -382,7 +383,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes libfontconfig-dev libwayland-dev libx11-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev
-          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: env.RUN_CODE == 'true'
         with:
@@ -392,14 +393,20 @@ jobs:
         with:
           key: desktop-checks-ubuntu-24.04-zig-0.15.2-baseline-v1
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Check Desktop formatting
+        if: env.RUN_CODE == 'true'
+        run: cargo fmt --all -- --check
       - name: Run Desktop Clippy
         if: env.RUN_CODE == 'true'
         run: cargo clippy -p boomux-desktop --all-targets --all-features --locked -- -D warnings
       - name: Run Desktop tests
         if: env.RUN_CODE == 'true'
         run: cargo test -p boomux-desktop --locked -- --test-threads=1
+      - name: Build Desktop when no bundle is selected
+        if: ${{ env.RUN_CODE == 'true' && needs.changes.outputs.run_package == 'false' }}
+        run: cargo build -p boomux-desktop --release --locked
       - name: Validate Desktop packaging fixtures
-        if: env.RUN_CODE == 'true'
+        if: ${{ env.RUN_CODE == 'true' && needs.changes.outputs.run_package != 'false' }}
         run: |
           sh -n desktop/install.sh desktop/packaging/boomux-desktop desktop/scripts/package-release.sh
           python3 desktop/scripts/test-installer.py

@@ -8,7 +8,7 @@ bundle for x86_64 GNU/Linux. The Desktop archive contains `bin/boomux`, the
 licenses/notices, and `release.txt`. The CLI executable is byte-identical to the
 standalone x86_64 archive from the same source SHA and version.
 
-After the first unified release is published, `boomux-installer.sh` offers
+Since v1.10.0, `boomux-installer.sh` offers
 Desktop (including Boomux) or CLI only. Its `--desktop`/`--cli` options support
 explicit selection; noninteractive calls require one. The direct Desktop route
 remains supported:
@@ -71,11 +71,12 @@ and open the newly installed Desktop. **Stop terminates every managed process**;
 this is a user-scheduled one-time migration, never an automatic updater fallback.
 The new app starts its bundled daemon, enabling subsequent graceful updates.
 
-The old repository is retained until cutover. Existing development builds should
-rerun the canonical installer after the first unified release; their old update
-endpoint cannot be changed by moving source. Install paths and preferences need
-no data migration. Old-repository installer forwarding and archival happen only
-after the new release route has been verified.
+The old `gardnmi/boomux-desktop` repository is archived. Its historical source
+remains readable and its `install.sh` URL forwards to the canonical release
+installer. Development and issue tracking live in `gardnmi/boomux`.
+Existing source builds need a one-time installation of the official bundle to
+use in-app updates. Moving source alone cannot update an already-running binary.
+Install paths and preferences need no data migration.
 
 ## Build and publish
 
@@ -133,6 +134,43 @@ The Wayland path exercises the actual launcher, settings transactions, and
 bundle-owned CLI update refusal. Both binaries are part of the test contract.
 
 See [shared CI](ci.md) for support limits and artifact reuse.
+
+### Next published-release update check
+
+The first unified bundle is v1.10.0. Installing that bundle and handing off an
+existing daemon establishes migration evidence; it does not establish the
+complete in-app update flow between two published unified releases. Perform
+the following check when a newer stable release with Desktop assets is available.
+Record the date, both versions, release URLs, display backend, and each result
+in the release verification record.
+
+1. Start from an official v1.10.0 or newer bundle. Record the resolved `current`
+   link, Desktop executable, and bundled CLI's `--json daemon status`. Keep a
+   Shell running a recognizable command and record its exact Shell/ShellRun
+   identities and process PID for comparison after handoff.
+2. Use **Check for updates**, then **Update**. Verify that the advertised version
+   matches the published release and that preparation creates `pending` while
+   `current`, the running daemon, and the command remain unchanged.
+3. Choose **Later**, close and reopen Desktop, then use **Check for updates**.
+   Verify that the prepared release is still available and the same ShellRun
+   remains attached. Closing Desktop must not stop the daemon or command.
+4. Choose **Restart now**. Verify that the replacement window renders before the
+   old window exits, `current` selects the candidate, `pending` is cleared, and
+   the daemon status identifies the candidate's bundled CLI executable. Verify
+   the new Desktop version, unchanged ShellRun and command PID, continued output,
+   and working terminal input. Check that no stale update notice remains.
+
+Use the configured install root when inspecting links; the default is
+`~/.local/share/boomux-desktop`. Retain identity receipts privately rather than
+publishing user terminal contents or local process details.
+
+Failure injection belongs in isolated fixtures. `desktop/scripts/test-installer.py`
+covers preparation without activation, bad downloads, runtime rejection, and
+concurrent installs. The `bundle_update::tests` module covers persisted
+preparation, handoff ordering, failed-window rollback and retry, failed daemon
+handoff, and changed installation state. These fixtures run in CI; they do not
+replace the published-release GUI check above. Do not corrupt the live bundle
+or stop an active daemon to exercise rollback.
 
 ## Desktop Integration And Preferences
 
