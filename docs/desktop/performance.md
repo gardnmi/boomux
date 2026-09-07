@@ -67,6 +67,10 @@ must also track the number and byte size of live image generations.
 - GPU image generations are retained only while referenced by the current screen
   and are dropped explicitly afterward.
 - Overview refresh and Boomux requests stay off the render path.
+- Settings replaces the covered sidebar body rather than rebuilding its hidden
+  Workspace, Shell, Agent, integration-prompt, and update-notice elements on every scroll
+  render. Closing Settings reads the current overview directly, with no stale
+  cached projection. Collapsed Workspaces do not construct hidden Shell rows.
 - Terminal output is coalesced before publishing a new screen snapshot.
 - Each pane has a capacity-one terminal-update mailbox. Idle panes do not poll,
   and output bursts wake GPUI once to consume the newest immutable snapshot.
@@ -94,6 +98,17 @@ must also track the number and byte size of live image generations.
 
 Any new queue, cache, history, retry, image store, or task must document its
 bound and cleanup owner.
+
+## Settings Row Preparation Fixture
+
+`settings_scroll_eliminates_hidden_sidebar_row_preparation` compares the old
+unconditional sidebar clone/row preparation with the Settings visibility gate,
+using the same synthetic overview and debug test binary. On 2026-09-07, 60
+iterations over 100 Workspaces, 2,000 Shells, and 2,000 Agents visited 246,000
+rows before and zero afterward (322.961 ms versus 0.023 ms on this machine).
+These are row-preparation timings, not GUI frame times or a GPU/RSS measurement.
+The deterministic regression asserts eliminated work and fresh data on closing
+Settings, not a timing threshold.
 
 ## Comparison Protocol
 

@@ -11,12 +11,229 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::{
+    layout::{Constraint, Layout},
+    style::{Modifier, Style},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
 use boomux::client;
+use boomux::protocol::{Request, Response, ShellSnapshot, ShellStatus};
 
-use crate::integration_management::{self, AssetState, HostState, InstallAction, IntegrationId};
+use crate::integration_management::{self, AssetState, HostState, IntegrationId};
+
+struct HarnessChoice {
+    integration: IntegrationId,
+    host: HostState,
+    asset: AssetState,
+    path: Option<String>,
+    selected: bool,
+}
+
+impl HarnessChoice {
+    fn enabled(&self) -> bool {
+        self.host == HostState::Available && self.asset != AssetState::Unavailable
+    }
+
+    fn description(&self) -> &'static str {
+        match (self.host, self.asset) {
+            (HostState::Missing, _) => "host not found (unavailable)",
+            (HostState::ProbeFailed | HostState::NotChecked, _) => {
+                "host not verified (unavailable)"
+            }
+            (_, AssetState::Unavailable) => "integration inspection failed (unavailable)",
+            (_, AssetState::Current) => "integration current; keep existing files",
+            (_, AssetState::Missing) => "install Boomux integration",
+            (_, AssetState::Modified) => "REPLACE MODIFIED integration files",
+        }
+    }
+}
+
+struct HarnessChecklist {
+    choices: Vec<HarnessChoice>,
+    cursor: ListState,
+    confirmed: bool,
+}
+
+impl HarnessChecklist {
+    fn new(statuses: &[(IntegrationId, integration_management::IntegrationStatus)]) -> Self {
+        let choices = statuses
+            .iter()
+            .map(|(integration, status)| HarnessChoice {
+                integration: *integration,
+                host: status.host.state,
+                asset: status.asset.state,
+                path: status.asset.path.clone(),
+                selected: status.host.state == HostState::Available
+                    && status.asset.state == AssetState::Current,
+            })
+            .collect::<Vec<_>>();
+        let focused = choices
+            .iter()
+            .position(HarnessChoice::enabled)
+            .or_else(|| (!choices.is_empty()).then_some(0));
+        Self {
+            choices,
+            cursor: ListState::default().with_selected(focused),
+            confirmed: false,
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        if key.kind == KeyEventKind::Release {
+            return Ok(false);
+        }
+        if key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c' | 'd')))
+        {
+            self.confirmed = false;
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "harness selection cancelled; no integrations changed",
+            ));
+        }
+        if !key.modifiers.is_empty() {
+            return Ok(false);
+        }
+        match key.code {
+            KeyCode::Enter => {
+                self.confirmed = true;
+                return Ok(true);
+            }
+            KeyCode::Up | KeyCode::Down if !self.choices.is_empty() => {
+                let count = self.choices.len();
+                let current = self.cursor.selected().unwrap_or(0);
+                self.cursor.select(Some(if key.code == KeyCode::Up {
+                    (current + count - 1) % count
+                } else {
+                    (current + 1) % count
+                }));
+            }
+            KeyCode::Char(' ') if key.kind == KeyEventKind::Press => {
+                if let Some(choice) = self
+                    .cursor
+                    .selected()
+                    .and_then(|index| self.choices.get_mut(index))
+                    && choice.enabled()
+                {
+                    choice.selected = !choice.selected;
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn install_with<T>(&self, index: usize, install: impl FnOnce(bool) -> T) -> Option<T> {
+        let choice = self.choices.get(index)?;
+        (self.confirmed
+            && choice.selected
+            && choice.enabled()
+            && matches!(choice.asset, AssetState::Missing | AssetState::Modified))
+        .then(|| install(choice.asset == AssetState::Modified))
+    }
+
+    fn render(&mut self, frame: &mut ratatui::Frame) -> bool {
+        let area = frame.area();
+        if area.width < 40 || area.height < 10 {
+            frame.render_widget(
+                Paragraph::new("Resize to at least 40x10. Esc cancels.").wrap(Wrap { trim: false }),
+                area,
+            );
+            return false;
+        }
+        let compact = area.height < 14;
+        let [heading, list, details, controls] = Layout::vertical([
+            Constraint::Length(if compact { 1 } else { 3 }),
+            Constraint::Min(1),
+            Constraint::Length(if compact { 2 } else { 4 }),
+            Constraint::Length(3),
+        ])
+        .areas(area);
+        frame.render_widget(
+            Paragraph::new(
+                "AI harness integrations\nSelect Boomux integrations, not harness applications.",
+            ),
+            heading,
+        );
+        let items = self
+            .choices
+            .iter()
+            .map(|choice| {
+                ListItem::new(format!(
+                    "[{}] {} - {}",
+                    if choice.selected {
+                        "x"
+                    } else if choice.enabled() {
+                        " "
+                    } else {
+                        "-"
+                    },
+                    choice.integration.spec().display_name,
+                    choice.description()
+                ))
+                .style(if choice.enabled() {
+                    Style::default()
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                })
+            })
+            .collect::<Vec<_>>();
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_symbol("> ")
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+            list,
+            &mut self.cursor,
+        );
+        if let Some(choice) = self
+            .cursor
+            .selected()
+            .and_then(|index| self.choices.get(index))
+        {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{}\nPath: {}\nUnchecked integrations are never removed.",
+                    choice.description(),
+                    choice.path.as_deref().unwrap_or("unavailable")
+                ))
+                .wrap(Wrap { trim: false }),
+                details,
+            );
+        }
+        frame.render_widget(Paragraph::new("Up/Down move | Space toggle\nEnter apply | Esc cancel\nChecked replacements overwrite files.")
+            .wrap(Wrap { trim: false }), controls);
+        true
+    }
+
+    fn choose(&mut self) -> io::Result<()> {
+        let mut terminal = ratatui::try_init().inspect_err(|_| {
+            let _ = ratatui::try_restore();
+        })?;
+        let result: io::Result<()> = (|| {
+            loop {
+                let mut usable = false;
+                terminal.draw(|frame| usable = self.render(frame))?;
+                if let Event::Key(key) = event::read()?
+                    && (usable
+                        || key.code == KeyCode::Esc
+                        || key.modifiers.contains(KeyModifiers::CONTROL))
+                    && self.key(key)?
+                {
+                    return Ok(());
+                }
+            }
+        })();
+        // Restore canonical input and the original screen before any install or Y/n prompt.
+        let restored = ratatui::try_restore();
+        result?;
+        restored
+    }
+}
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PLUGIN_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -173,6 +390,103 @@ fn detail(value: impl AsRef<str>) {
     println!("       {}", paint("2", value));
 }
 
+pub(crate) fn desktop_setup() -> Result<(), Box<dyn Error>> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(io::Error::other("Desktop setup requires an interactive terminal").into());
+    }
+    let shell_id = env::var("BOOMUX_SHELL_ID")?;
+    let run_id = env::var("BOOMUX_RUN_ID")?;
+    let executable = env::current_exe()?;
+    let client = client::connect()?;
+    desktop_setup_close_request(
+        &client.get_shell(&shell_id)?,
+        &shell_id,
+        &run_id,
+        &executable,
+    )?;
+
+    let result = guided_setup();
+    finish_desktop_setup(
+        result,
+        &mut io::stdin().lock(),
+        &mut io::stdout().lock(),
+        || {
+            let shell = client.get_shell(&shell_id)?;
+            let request = desktop_setup_close_request(&shell, &shell_id, &run_id, &executable)?;
+            match client.request(request)? {
+                Response::Ok => Ok(()),
+                response => Err(io::Error::other(format!(
+                    "unexpected cleanup response: {response:?}"
+                ))
+                .into()),
+            }
+        },
+    )
+}
+
+fn desktop_setup_close_request(
+    shell: &ShellSnapshot,
+    shell_id: &str,
+    run_id: &str,
+    executable: &Path,
+) -> io::Result<Request> {
+    if shell.id != shell_id
+        || run_id.is_empty()
+        || shell.status != ShellStatus::Running
+        || !shell
+            .run
+            .as_ref()
+            .is_some_and(|run| run.id == run_id && run.ended_at_ms.is_none())
+        || shell.command.len() != 2
+        || Path::new(&shell.command[0]) != executable
+        || shell.command[1] != "__desktop-setup"
+    {
+        return Err(io::Error::other(
+            "refusing cleanup outside the exact dedicated Desktop setup Shell/run",
+        ));
+    }
+    Ok(Request::GuardedCloseShell {
+        shell_id: shell.id.clone(),
+        expected_revision: shell.revision,
+    })
+}
+
+fn finish_desktop_setup(
+    result: Result<(), Box<dyn Error>>,
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+    mut close: impl FnMut() -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    if let Err(error) = &result {
+        writeln!(output, "\nSetup completed with failures: {error}")?;
+    }
+    loop {
+        write!(output, "\nExit and remove this setup Shell? [Y/n] ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        io::BufRead::read_line(&mut (&mut *input).take(64), &mut answer)?;
+        if !answer.ends_with('\n') {
+            return Err(io::Error::other(
+                "confirmation input closed or exceeded its limit; setup Shell retained",
+            )
+            .into());
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => {
+                writeln!(output, "Removing this setup Shell...")?;
+                output.flush()?;
+                close()?;
+                return result;
+            }
+            "n" | "no" => writeln!(
+                output,
+                "Setup Shell retained. Review the output; answer Y when ready to remove it."
+            )?,
+            _ => writeln!(output, "Please answer Y or n.")?,
+        }
+    }
+}
+
 pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::new(
@@ -230,20 +544,6 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         .filter(|(_, status)| status.host.state != HostState::Missing)
         .count();
 
-    for (integration, integration_status) in &statuses {
-        if integration_status.host.state != HostState::Missing
-            && matches!(
-                integration_status.asset.state,
-                AssetState::Missing | AssetState::Modified
-            )
-        {
-            integration_management::plan_install(
-                *integration,
-                &environment,
-                integration_status.asset.state == AssetState::Modified,
-            )?;
-        }
-    }
     let skill_before = if detected > 0 {
         let skill = required_home()?.join(".agents/skills/boomux/SKILL.md");
         Some(integration_management::regular_file_matches(
@@ -261,7 +561,7 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         let (marker, color, plan) = match integration.asset.state {
             AssetState::Current => ("ok", "32", "integration current"),
             AssetState::Missing => ("->", "36", "install integration"),
-            AssetState::Modified => ("!!", "33", "replace only with confirmation"),
+            AssetState::Modified => ("!!", "33", "replace only if checked in the checklist"),
             AssetState::Unavailable => ("xx", "31", "inspection must be repaired"),
         };
         status(marker, color, integration.display_name, plan);
@@ -272,8 +572,11 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
             AssetState::Missing | AssetState::Modified
         ) {
             let force = integration.asset.state == AssetState::Modified;
-            let plan = integration_management::plan_install(*integration_id, &environment, force)?;
-            detail(format!("path: {}", plan.path));
+            if let Ok(plan) =
+                integration_management::plan_install(*integration_id, &environment, force)
+            {
+                detail(format!("path: {}", plan.path));
+            }
         }
     }
     if detected == 0 {
@@ -307,9 +610,13 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
     if detected == 0 {
         status("--", "2", "Harnesses", "none found on PATH");
     }
+    let mut checklist = HarnessChecklist::new(&statuses);
+    if detected > 0 {
+        checklist.choose()?;
+    }
     let mut outcomes = Vec::new();
     let mut changed_harnesses = Vec::new();
-    for (integration, integration_status) in statuses {
+    for (index, (integration, integration_status)) in statuses.into_iter().enumerate() {
         if integration_status.host.state == HostState::Missing {
             continue;
         }
@@ -361,53 +668,29 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
             ));
             continue;
         }
-        let force = integration_status.asset.state == AssetState::Modified;
-        let plan = match integration_management::plan_install(integration, &environment, force) {
-            Ok(plan) => plan,
-            Err(error) => {
-                outcomes.push(SetupOutcome::failed(
-                    integration_status.display_name,
-                    error,
-                    format!(
-                        "`boomux integration status {} --json`",
-                        integration.spec().key
-                    ),
-                ));
-                continue;
-            }
-        };
-        let (action, prompt) = match plan.action {
-            InstallAction::Install => (
-                "Install",
-                format!(
-                    "Install the {} integration?",
-                    integration_status.display_name
-                ),
-            ),
-            InstallAction::Replace => (
-                "Replace modified",
-                format!(
-                    "Replace the modified {} integration?",
-                    integration_status.display_name
-                ),
-            ),
-            InstallAction::Unchanged => continue,
-        };
-        detail(format!("Plan: {action} asset at {}", plan.path));
-        if confirm(&prompt)? {
-            match integration_management::install(integration, &environment, force) {
+        if let Some(result) = checklist.install_with(index, |force| {
+            integration_management::plan_install(integration, &environment, force)?;
+            integration_management::install(integration, &environment, force)
+        }) {
+            match result {
                 Ok(result) => {
-                    status(
-                        "ok",
-                        "32",
-                        integration_status.display_name,
-                        "integration installed",
-                    );
+                    let changed =
+                        result.result != integration_management::InstallOutcome::Unchanged;
+                    let message = if changed {
+                        "integration installed"
+                    } else {
+                        "integration current"
+                    };
+                    status("ok", "32", integration_status.display_name, message);
                     detail(format!("path: {}", result.path));
                     outcomes.push(SetupOutcome::new(
-                        SetupOutcomeKind::Changed,
+                        if changed {
+                            SetupOutcomeKind::Changed
+                        } else {
+                            SetupOutcomeKind::Current
+                        },
                         integration_status.display_name,
-                        "integration installed",
+                        message,
                     ));
                     if result.restart_required {
                         changed_harnesses.push(integration_status.display_name);
@@ -484,9 +767,15 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    let selected_integrations = checklist
+        .choices
+        .iter()
+        .filter(|choice| choice.selected && choice.enabled())
+        .map(|choice| choice.integration)
+        .collect::<Vec<_>>();
     let recommended_ready = render_setup_receipt(
         &environment,
-        detected,
+        &selected_integrations,
         &changed_harnesses,
         daemon_ready,
         &mut outcomes,
@@ -503,6 +792,7 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
         if !recommended_ready {
             detail("Run `boomux setup` again to finish skipped recommended steps.");
         }
+        print!("{}", setup_completion(recommended_ready, false));
         return Ok(());
     }
     for failure in outcomes
@@ -519,12 +809,23 @@ pub(crate) fn guided_setup() -> Result<(), Box<dyn Error>> {
             eprintln!("       Recovery: {recovery}");
         }
     }
+    print!("{}", setup_completion(false, true));
     Err(io::Error::other(format!(
         "setup completed with {} failure{}",
         failures,
         if failures == 1 { "" } else { "s" }
     ))
     .into())
+}
+
+fn setup_completion(ready: bool, failed: bool) -> &'static str {
+    if failed {
+        "\nSetup finished with failures. Review the errors and recovery steps above.\n"
+    } else if ready {
+        "\nSetup completed successfully.\n"
+    } else {
+        "\nSetup finished; recommended steps remain. Review the receipt above.\n"
+    }
 }
 
 fn apply_outcome(
@@ -544,27 +845,30 @@ fn apply_outcome(
 
 fn render_setup_receipt(
     environment: &integration_management::Environment,
-    detected: usize,
+    selected_integrations: &[IntegrationId],
     changed_harnesses: &[&str],
     daemon_ready: bool,
     outcomes: &mut Vec<SetupOutcome>,
 ) -> bool {
-    let installed_integrations = IntegrationId::all()
+    let selected_count = selected_integrations.len();
+    let installed_integrations = selected_integrations
+        .iter()
+        .copied()
         .map(|integration| integration_management::inspect(integration, environment, None))
         .filter(|integration| {
             integration.host.state == HostState::Available
                 && integration.asset.state == AssetState::Current
         })
         .count();
-    let integrations_ready =
-        detected == 0 || installed_integrations == detected && changed_harnesses.is_empty();
-    if detected == 0 {
+    let integrations_ready = selected_count == 0
+        || installed_integrations == selected_count && changed_harnesses.is_empty();
+    if selected_count == 0 {
         outcomes.push(SetupOutcome::new(
             SetupOutcomeKind::Skipped,
             "Agent lifecycle",
-            "no harnesses detected",
+            "no integrations selected",
         ));
-    } else if installed_integrations != detected
+    } else if installed_integrations != selected_count
         && changed_harnesses.is_empty()
         && !outcomes
             .iter()
@@ -573,7 +877,7 @@ fn render_setup_receipt(
         outcomes.push(SetupOutcome::new(
             SetupOutcomeKind::Warning,
             "Agent lifecycle",
-            format!("{installed_integrations} of {detected} integrations verified"),
+            format!("{installed_integrations} of {selected_count} selected integrations verified"),
         ));
     }
     if !changed_harnesses.is_empty() {
@@ -584,7 +888,7 @@ fn render_setup_receipt(
         ));
     }
 
-    let skill_ready = if detected == 0 {
+    let skill_ready = if selected_count == 0 {
         true
     } else {
         match required_home()
@@ -1053,6 +1357,239 @@ mod tests {
 
     use super::*;
 
+    fn harness_checklist(states: &[(HostState, AssetState)]) -> HarnessChecklist {
+        let statuses = IntegrationId::all()
+            .zip(states)
+            .map(|(id, &(host, asset))| {
+                (
+                    id,
+                    integration_management::IntegrationStatus {
+                        name: id.spec().key,
+                        display_name: id.spec().display_name,
+                        package: id.installation().package,
+                        validated_version: id.installation().validated_version,
+                        host: integration_management::HostStatus {
+                            state: host,
+                            executable: None,
+                            version: None,
+                            compatibility: "test",
+                            error: None,
+                        },
+                        asset: integration_management::AssetStatus {
+                            state: asset,
+                            path: Some("/config/integration".into()),
+                            error: None,
+                        },
+                        runtime: integration_management::RuntimeStatus {
+                            state: integration_management::RuntimeState::NotObservable,
+                            running_processes: 0,
+                            tracked_processes: 0,
+                            untracked_processes: 0,
+                        },
+                        recommended_action: integration_management::RecommendedAction::None,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        HarnessChecklist::new(&statuses)
+    }
+
+    #[test]
+    fn harness_checklist_defaults_and_apply_require_explicit_selection() {
+        let mut checklist = harness_checklist(&[
+            (HostState::Available, AssetState::Missing),
+            (HostState::Available, AssetState::Current),
+            (HostState::Available, AssetState::Modified),
+            (HostState::Missing, AssetState::Missing),
+            (HostState::Available, AssetState::Unavailable),
+        ]);
+        assert_eq!(
+            checklist
+                .choices
+                .iter()
+                .map(|choice| choice.selected)
+                .collect::<Vec<_>>(),
+            [false, true, false, false, false]
+        );
+        for key in [
+            KeyCode::Up,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ] {
+            assert!(
+                !checklist
+                    .key(KeyEvent::new(key, KeyModifiers::NONE))
+                    .unwrap()
+            );
+        }
+        assert!(
+            checklist
+                .install_with(0, |_| panic!("must wait for Enter"))
+                .is_none()
+        );
+        assert!(
+            checklist
+                .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap()
+        );
+        let mut calls = Vec::new();
+        for index in 0..checklist.choices.len() {
+            checklist.install_with(index, |force| calls.push((index, force)));
+        }
+        assert_eq!(calls, [(0, false), (2, true)]);
+        assert_eq!(
+            checklist
+                .install_with(0, |_| Err::<(), _>("install failed"))
+                .unwrap()
+                .unwrap_err(),
+            "install failed"
+        );
+    }
+
+    #[test]
+    fn harness_checklist_enter_alone_does_not_install_or_replace() {
+        let mut checklist = harness_checklist(&[
+            (HostState::Available, AssetState::Missing),
+            (HostState::Available, AssetState::Current),
+            (HostState::Available, AssetState::Modified),
+        ]);
+        checklist
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        for index in 0..checklist.choices.len() {
+            assert!(
+                checklist
+                    .install_with(index, |_| panic!(
+                        "new and replacement installs must be opted into"
+                    ))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn harness_checklist_disabled_rows_and_cancel_never_install() {
+        for host in [
+            HostState::Missing,
+            HostState::ProbeFailed,
+            HostState::NotChecked,
+        ] {
+            let mut checklist = harness_checklist(&[(host, AssetState::Missing)]);
+            checklist
+                .key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .unwrap();
+            checklist
+                .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            assert!(
+                checklist
+                    .install_with(0, |_| panic!("disabled host"))
+                    .is_none()
+            );
+        }
+        for cancel in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ] {
+            let mut checklist = harness_checklist(&[(HostState::Available, AssetState::Missing)]);
+            checklist
+                .key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .unwrap();
+            assert_eq!(
+                checklist.key(cancel).unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
+            assert!(
+                checklist
+                    .install_with(0, |_| panic!("cancelled selection"))
+                    .is_none()
+            );
+        }
+        let mut empty = harness_checklist(&[]);
+        assert!(
+            !empty
+                .key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                .unwrap()
+        );
+        assert!(
+            empty
+                .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap()
+        );
+        assert!(
+            empty
+                .install_with(0, |_| panic!("empty selection"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn harness_checklist_ignores_modified_release_and_repeat_toggles() {
+        let mut checklist = harness_checklist(&[(HostState::Available, AssetState::Missing)]);
+        for key in [
+            KeyEvent::new_with_kind(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Repeat),
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+        ] {
+            assert!(!checklist.key(key).unwrap());
+        }
+        assert!(!checklist.choices[0].selected);
+        assert!(!checklist.confirmed);
+    }
+
+    #[test]
+    fn harness_checklist_renders_controls_replacement_consent_and_small_terminal_guidance() {
+        for (width, height) in [(80, 24), (40, 10), (20, 5)] {
+            let mut checklist = harness_checklist(&[(HostState::Available, AssetState::Modified)]);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let mut usable = false;
+            terminal
+                .draw(|frame| usable = checklist.render(frame))
+                .unwrap();
+            let text = (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(usable, width >= 40 && height >= 10);
+            if usable {
+                assert!(text.contains("[ ]"), "{text}");
+                assert!(text.contains("REPLACE MODIFIED"), "{text}");
+                assert!(text.contains("Space toggle"), "{text}");
+                assert!(text.contains("Enter apply"), "{text}");
+                assert!(
+                    text.contains("Checked replacements overwrite files."),
+                    "{text}"
+                );
+            } else {
+                assert!(text.contains("Resize to at least"), "{text}");
+            }
+        }
+        let mut checklist = harness_checklist(&[(HostState::Available, AssetState::Missing); 5]);
+        checklist.cursor.select(Some(4));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                assert!(checklist.render(frame));
+            })
+            .unwrap();
+        assert!(
+            checklist.cursor.offset() > 0,
+            "compact list must scroll to the focused harness"
+        );
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -1160,6 +1697,114 @@ mod tests {
         assert!(read_confirmation(&mut io::Cursor::new(b"\n"), true).unwrap());
         let error = read_confirmation(&mut io::Cursor::new([]), true).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn desktop_setup_confirmation_requires_yes_and_keeps_failures_distinct() {
+        for answer in ["\n", "y\n", "YES\n", "n\ny\n", "invalid\ny\n"] {
+            let mut closed = 0;
+            let mut output = Vec::new();
+            finish_desktop_setup(Ok(()), &mut io::Cursor::new(answer), &mut output, || {
+                closed += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(closed, 1);
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("Exit and remove this setup Shell? [Y/n]"));
+            if answer.starts_with("n\n") {
+                assert!(output.contains("Setup Shell retained."));
+            }
+        }
+        for answer in ["", "y", "n\n", "invalid\n"] {
+            let mut output = Vec::new();
+            assert!(
+                finish_desktop_setup(Ok(()), &mut io::Cursor::new(answer), &mut output, || {
+                    panic!("input without confirmation must not remove a Shell")
+                })
+                .is_err()
+            );
+        }
+        let mut output = Vec::new();
+        let error = finish_desktop_setup(
+            Err(io::Error::other("integration failed").into()),
+            &mut io::Cursor::new("\n"),
+            &mut output,
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "integration failed");
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Setup completed with failures: integration failed"));
+        assert!(!output.contains("successfully"));
+
+        let error =
+            finish_desktop_setup(Ok(()), &mut io::Cursor::new("y\n"), &mut Vec::new(), || {
+                Err(io::Error::other("Shell revision changed").into())
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Shell revision changed");
+        assert!(
+            finish_desktop_setup(
+                Ok(()),
+                &mut io::Cursor::new(format!("{}\n", "y".repeat(64))),
+                &mut Vec::new(),
+                || panic!("oversized confirmation must not remove a Shell"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_setup_cleanup_rejects_other_commands_runs_and_shells() {
+        let mut shell: ShellSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "setup-shell", "revision": 7, "workspace_id": "workspace",
+            "name": "Set up agents", "cwd": "/tmp", "status": "running",
+            "command": ["/bin/boomux", "__desktop-setup"],
+            "run": {"id": "setup-run", "generation": 1, "started_at_ms": 1,
+                "ended_at_ms": null, "exit_reason": null, "output_revision": 0,
+                "environment_has_run_id": true}
+        }))
+        .unwrap();
+        let request = |shell: &ShellSnapshot| {
+            desktop_setup_close_request(shell, "setup-shell", "setup-run", Path::new("/bin/boomux"))
+        };
+        assert_eq!(
+            request(&shell).unwrap(),
+            Request::GuardedCloseShell {
+                shell_id: "setup-shell".into(),
+                expected_revision: 7,
+            }
+        );
+        shell.command[1] = "setup".into();
+        assert!(request(&shell).is_err());
+        shell.command = vec![];
+        assert!(request(&shell).is_err());
+        shell.command = vec!["/other/boomux".into(), "__desktop-setup".into()];
+        assert!(request(&shell).is_err());
+        shell.command[0] = "/bin/boomux".into();
+        shell.run.as_mut().unwrap().id = "replacement-run".into();
+        assert!(request(&shell).is_err());
+        shell.run.as_mut().unwrap().id = "setup-run".into();
+        shell.id = "unrelated-shell".into();
+        assert!(request(&shell).is_err());
+        shell.id = "setup-shell".into();
+        shell.status = ShellStatus::Exited { code: Some(0) };
+        assert!(request(&shell).is_err());
+    }
+
+    #[test]
+    fn setup_completion_distinguishes_success_remaining_steps_and_failures() {
+        for (ready, failed, expected) in [
+            (true, false, "Setup completed successfully."),
+            (false, false, "Setup finished; recommended steps remain."),
+            (false, true, "Setup finished with failures."),
+            (true, true, "Setup finished with failures."),
+        ] {
+            let message = setup_completion(ready, failed);
+            assert!(message.contains(expected), "{message}");
+            assert_eq!(message.contains("successfully"), ready && !failed);
+        }
     }
 
     #[test]

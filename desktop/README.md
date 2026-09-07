@@ -49,11 +49,30 @@ are preserved. See
 [release packaging](../docs/desktop/releases.md) for version selection, install locations,
 release preparation, uninstall instructions, and the required platform smoke tests.
 
-On first launch, **Set up agents** opens the interactive Boomux agent setup in an
-embedded terminal. It asks before installing integrations or replacing modified
-agent settings. **Start using Boomux** skips setup; the header menu can reopen it
-later. Setup does not install the optional Omarchy plugin, change Hyprland, or
-require an external terminal emulator.
+Desktop checks for supported AI harnesses on this computer in the background at
+startup. Detected harnesses with missing integrations get an **Install
+integration** prompt in the sidebar. Differing integrations get **Review update**:
+Boomux cannot distinguish an older integration from a customized one, so replacing
+it requires an explicit **Replace integration** confirmation. Nothing is installed
+by discovery, and harnesses that are absent or already current produce no prompt.
+**Not now** dismisses a suggestion for this window. Recheck after installing a
+harness through **Settings → AI integrations → Check installed harnesses**.
+Successful installation explains how to reload the affected harness.
+
+The header menu contains **Nodes**, updates, and keyboard shortcuts. The gear
+opens Settings. **Settings → AI integrations → Manual setup** remains available
+for the guided terminal checklist: **Up/Down** to choose, **Space** to toggle,
+**Enter** to apply, and **Esc** to cancel. See the
+[checklist controls and defaults](../docs/install.md#harness-checklist).
+Setup does not install the optional Omarchy plugin, change Hyprland, or require
+an external terminal emulator.
+After the completion receipt, **Exit and remove this setup Shell? [Y/n]** defaults
+to yes. Enter or `y` removes the dedicated setup Shell and its pane; `n` keeps
+the output available and prompts again. Setup failures remain labelled as failures.
+Its newly created Workspace is also removed if it is still empty and untouched
+apart from that Shell removal. User resources, edits, or uncertain ownership keep
+the Workspace. Reattached setup panes without the original creation receipt also
+retain it. Ordinary CLI `boomux setup` never removes its Shell or Workspace.
 
 Desktop appearance and behavior preferences save automatically to
 `~/.config/boomux-desktop/settings.toml` (`XDG_CONFIG_HOME` is respected).

@@ -75,6 +75,10 @@ immutable screen snapshot. A bounded one-event mailbox wakes GPUI only when a
 new snapshot or terminal status exists; bursts collapse into one wakeup because
 the consumer always reads the newest snapshot. Synchronized-output mode delays
 publication until the terminal frame is complete.
+When an attachment ends, the worker publishes its final decoded screen before
+stopping, including output batched with the stop command. Detachment itself does
+not establish command success. The UI watches until the worker closes its update
+stream after final publication, rather than stopping at transport closure.
 
 Omarchy theme loading follows the same boundary. A native filesystem watcher
 observes `~/.local/state/omarchy/current`, because Omarchy replaces its `theme`
@@ -93,6 +97,10 @@ Images are explicitly dropped when their generation disappears or their pane
 closes. Each pane also owns one shaped-text paint cache keyed by the exact screen
 snapshot and selection. Layout-only animation frames reuse that cache, while a
 new snapshot or selection invalidates it.
+
+Settings replaces the sidebar resource list while open, so scrolling its controls
+does not build or lay out the covered Workspace, Shell, and Agent rows. The
+sidebar scroll handle remains window-owned and restores its offset on close.
 
 The default presentation draws the binary tile layout and floating layer. The
 optional tabbed-minimization presentation keeps every open pane in that canvas.
@@ -214,20 +222,70 @@ query the installed CLI's public `--json update status` command.
 
 Each process has a 20-second deadline and at most 128 KiB retained output; curl
 also has a 15-second limit. Closing the window cancels its scheduler; in-flight
-work completes within its bounds without retaining the window. Dismissals are
-saved per version and reset by an explicit manual check. Existing settings keys
-remain compatible. No update check installs software or restarts the daemon. Explicit Update and
-Restart actions use the transaction below.
+work completes within its bounds without retaining the window. Release-notice
+dismissals are saved per version and reset by an explicit manual check. Existing settings keys
+remain compatible. Completed manual-check results and update errors have a
+Dismiss control; active checks and installation progress remain visible until
+they finish. No update check installs software or restarts the daemon. Explicit
+Update and Restart actions use the transaction below.
 
 `runtime.rs` provides a display-independent `--check-runtime` mode for fixed
 system graphics libraries. The installer first checks its glibc baseline, then
 both executable versions and this runtime check before committing any active
 release change. GPU/driver/display startup remains a separate smoke-test concern.
 
-The welcome card and menu launch `boomux setup` with an exact argument vector in
-a new daemon-owned Shell. The CLI keeps agent-integration authority and prompts;
-Desktop only presents its terminal. `onboarding_complete` is a persisted UI
-preference, not a record that integrations are installed or ready.
+`harness_integrations.rs` checks the matching CLI's `integration status --json`
+once at startup and on an explicit Settings recheck. Only supported, successfully
+probed local harnesses with missing or differing integration assets produce a
+sidebar suggestion. `current` assets remain quiet; `modified` assets require
+review because status cannot distinguish an older bundled asset from user edits.
+An Install action runs `integration install`; a separate Replace confirmation
+allows `--force` for the reviewed integration. The CLI retains all installation,
+ownership, and configuration authority. No installation or harness restart runs
+as a side effect of discovery. Successful installation displays the integration's
+reload instructions. Not now dismisses per window; a manual recheck clears those
+bounded dismissals. Settings also exposes status and discovery failures.
+
+One operation per window runs off GPUI, with a 35-second timeout, a one-second
+kill grace, and at most 128 KiB retained output. Only bundled integration keys can
+become actions. Process argument vectors are exact, JSON envelopes are validated,
+and no polling loop, per-pane task, host transcript, or credential cache is added.
+
+Settings' Manual setup action launches the private `boomux __desktop-setup`
+entry point with an exact argument vector in a new daemon-owned Shell. It runs
+the same guided setup as `boomux setup`. The CLI keeps agent-integration authority
+and prompts; its Ratatui checklist uses the existing Crossterm input path,
+restores canonical input before applying selections, and never treats deselection
+as uninstall. The legacy `onboarding_complete` preference remains readable but
+no longer gates discovery or a generic first-run card.
+Setup prints an explicit completion message distinguishing success, remaining
+recommended steps, and failures, followed by `Exit and remove this setup Shell?
+[Y/n]`. Enter or yes revalidates the exact Shell/run and stored private command,
+then requests revision-guarded Shell removal. No keeps the process and output
+available and prompts again. EOF or interruption does not authorize removal.
+Desktop removes the pane only after output ends and a successful local overview
+confirms that Shell is absent. The successful setup creation response also gives
+that attachment an ephemeral cleanup receipt containing the owning Node, exact
+Workspace ID, and expected revision after removal of its sole setup Shell.
+The existing overview worker consumes it once, off the UI thread, verifies the
+local Node identity, and uses local `GetWorkspace` and `GuardedCloseWorkspace`
+requests. `RouteNodeOperation` is only for registered remote Nodes and must not
+be used to address the local owner. Cleanup requires no Shells, launchers, or
+Agent history and exactly one revision increment since creation. Edits and adding then removing user resources
+therefore preserve even a currently empty Workspace; a mutation racing the final
+close is rejected by the owner. There is no unguarded fallback or retry with a
+newer revision. Unrelated and reused Workspaces are never selected by name.
+Discovery, reattachment, and reopening Desktop do not reconstruct this ownership
+receipt; without it the Workspace is retained. A setup attachment failure also
+retains its resources rather than invoking unguarded Workspace removal.
+Ordinary `boomux setup` does not prompt for Shell removal or remove its caller's
+Shell. Cleanup does not turn a failed setup into a successful one.
+
+The ignored `setup_workspace_real_lifecycle_cleans_only_unused_creation` test
+requires `BOOMUX_TEST_CLI` pointing to the matching built CLI. It starts a private
+fixture daemon and harmless waiting commands, exercises real PTY start, Shell
+removal, Desktop output closure and snapshots, then tests unused, reused, and
+racing Workspace cleanup without running integration installation.
 
 `bundle_update.rs` owns the local Desktop installation transaction, not PTY or
 daemon authority. Release checks report eligibility and a prepared update on the

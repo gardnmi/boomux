@@ -78,6 +78,11 @@ fn guided_setup_works_without_external_terminal_or_omarchy() {
     let mut output = String::new();
     std::io::Read::read_to_string(reader.as_mut(), &mut output).unwrap();
     assert!(output.contains("BOOMUX IS READY"), "{output}");
+    assert!(output.contains("Setup completed successfully."), "{output}");
+    assert!(
+        !output.contains("Exit and remove this setup Shell?"),
+        "{output}"
+    );
     assert!(!output.contains("xdg-terminal-exec"), "{output}");
     stop_setup_daemon(Path::new(env!("CARGO_BIN_EXE_boomux")), &root, &runtime);
     fs::remove_dir_all(root).unwrap();
@@ -125,11 +130,40 @@ fn guided_setup_discovers_and_installs_one_selected_harness() {
     drop(pty.slave);
     let mut reader = pty.master.try_clone_reader().unwrap();
     let mut writer = pty.master.take_writer().unwrap();
-    writer.write_all(b"yes\nno\n").unwrap();
+    let (output_sender, output_receiver) = std::sync::mpsc::sync_channel(64);
+    let reader_thread = std::thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        while let Ok(count) = std::io::Read::read(reader.as_mut(), &mut buffer) {
+            if count == 0 || output_sender.send(buffer[..count].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut output = String::new();
+    // Do not type the later line-mode answer into Crossterm's event buffer.
+    for (prompt, answer) in [
+        ("Space toggle", " \r"),
+        ("Install the Boomux Agent Skill?", "no\n"),
+    ] {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !output.contains(prompt) {
+            let bytes = output_receiver
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            output.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        writer.write_all(answer.as_bytes()).unwrap();
+    }
     drop(writer);
     assert!(child.wait().unwrap().success());
-    let mut output = String::new();
-    std::io::Read::read_to_string(reader.as_mut(), &mut output).unwrap();
+    for bytes in output_receiver {
+        output.push_str(&String::from_utf8_lossy(&bytes));
+    }
+    reader_thread.join().unwrap();
+    assert!(
+        !output.contains("Install the OpenCode integration?"),
+        "{output}"
+    );
     assert!(output.contains("OpenCode"));
     assert!(output.contains("Daemon"));
     assert!(output.contains("started"));
@@ -161,6 +195,14 @@ fn guided_setup_discovers_and_installs_one_selected_harness() {
         "{plan}"
     );
     assert!(output.contains("integration installed"));
+    assert!(
+        output.contains("Setup finished; recommended steps remain."),
+        "{output}"
+    );
+    assert!(
+        !output.contains("Setup completed successfully."),
+        "{output}"
+    );
     assert!(!output.contains("Omarchy"));
     assert!(!root.join("omarchy-called").exists());
     assert!(!root.join(".config/hypr").exists());

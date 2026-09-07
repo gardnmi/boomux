@@ -70,6 +70,29 @@ Setup failure does not remove the verified Boomux installation. The installer
 reports that installation succeeded, reports setup as incomplete, prints the
 exact retry command, and exits nonzero.
 
+### Harness Checklist
+
+Guided setup presents a keyboard checklist of supported AI harness integrations.
+Use **Up/Down** to move, **Space** to check or uncheck, and **Enter** to apply the
+selection. **Esc**, **Ctrl+C**, or **Ctrl+D** cancels before integration changes.
+The checklist scrolls with the selection and redraws on resize; terminals smaller
+than 40 columns by 10 rows must be enlarged before confirming.
+
+Available, current integrations start checked and need no installation. Missing
+and modified integrations start unchecked, retaining setup's opt-in policy.
+Checking a **REPLACE MODIFIED** entry explicitly authorizes replacement of that
+integration's files. Missing or unverified harness hosts and unreadable integration
+targets are disabled. Setup installs Boomux integrations, not the harness
+applications themselves. Unchecking an entry never removes existing files.
+
+Selected integrations install without individual yes/no prompts. The receipt
+verifies the selected integrations rather than treating deselected
+harnesses as missing requirements. Inspection or installation failures and
+required harness restarts remain visible.
+The separate Agent Skill keeps its own confirmation, and Desktop's final **[Y/n]** prompt still
+controls removal of the dedicated setup Shell. Automation continues to use the
+integration CLI commands; guided setup still requires an interactive terminal.
+
 ## Desktop Installation And Updates
 
 The Desktop choice includes the matching CLI executable and an application-menu
