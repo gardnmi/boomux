@@ -46,7 +46,7 @@ It shares Boomux's version and release, with both executables included in the
 Desktop download. CLI-only installation and remote Nodes retain their existing
 lightweight packages.
 
-After the first unified release publishes the Desktop assets, install with:
+Install the official Desktop bundle, available since v1.10.0:
 
 ```sh
 curl -fsSL https://github.com/gardnmi/boomux/releases/latest/download/boomux-desktop-installer.sh | sh

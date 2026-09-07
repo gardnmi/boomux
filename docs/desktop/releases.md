@@ -8,7 +8,7 @@ bundle for x86_64 GNU/Linux. The Desktop archive contains `bin/boomux`, the
 licenses/notices, and `release.txt`. The CLI executable is byte-identical to the
 standalone x86_64 archive from the same source SHA and version.
 
-After the first unified release is published, `boomux-installer.sh` offers
+Since v1.10.0, `boomux-installer.sh` offers
 Desktop (including Boomux) or CLI only. Its `--desktop`/`--cli` options support
 explicit selection; noninteractive calls require one. The direct Desktop route
 remains supported:
@@ -71,11 +71,12 @@ and open the newly installed Desktop. **Stop terminates every managed process**;
 this is a user-scheduled one-time migration, never an automatic updater fallback.
 The new app starts its bundled daemon, enabling subsequent graceful updates.
 
-The old repository is retained until cutover. Existing development builds should
-rerun the canonical installer after the first unified release; their old update
-endpoint cannot be changed by moving source. Install paths and preferences need
-no data migration. Old-repository installer forwarding and archival happen only
-after the new release route has been verified.
+The old `gardnmi/boomux-desktop` repository is archived. Its historical source
+remains readable and its `install.sh` URL forwards to the canonical release
+installer. Development and issue tracking live in `gardnmi/boomux`.
+Existing source builds need a one-time installation of the official bundle to
+use in-app updates. Moving source alone cannot update an already-running binary.
+Install paths and preferences need no data migration.
 
 ## Build and publish
 

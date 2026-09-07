@@ -3,7 +3,8 @@
 Status: historical design and analysis, 2026-09-06. The workspace implementation
 follows [ADR 0015](../adr/0015-consolidate-native-desktop-workspace.md). The
 source snapshots and feasibility results below describe the pre-migration state.
-Repository cutover and archival remain separate post-release actions.
+Repository cutover and archival completed after v1.10.0 was published and the
+new installation route was verified; the original plan below remains historical.
 The [final handoff inventory](handoff.md) records the source snapshot actually imported.
 
 ## Recommendation

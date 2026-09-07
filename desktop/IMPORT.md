@@ -38,3 +38,9 @@ Post-import work in the migration PR adds unified installation, embedded agent
 setup, runtime diagnostics, and user-driven Desktop updates. These are new
 Boomux changes, not omitted source PRs; see
 [ADR 0016](../docs/adr/0016-unified-installation-and-user-driven-desktop-updates.md).
+
+Repository cutover completed after v1.10.0: the old repository is archived and
+its installer forwards to Boomux. Packaging, layout-key routing, and Shift+Enter
+issues were closed against the shipped implementation. The remaining Workspace
+default-directory request was transferred to
+[Boomux #372](https://github.com/gardnmi/boomux/issues/372).

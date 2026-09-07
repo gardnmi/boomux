@@ -3,9 +3,8 @@
 A fast native tiling terminal workspace for [Boomux](https://github.com/gardnmi/boomux), built with GPUI and Ghostty's terminal core.
 
 > [!WARNING]
-> Boomux Desktop is experimental. It currently proves the terminal, graphics,
-> input, and tiling architecture; it is not yet packaged as a stable desktop
-> application.
+> Boomux Desktop is experimental. Official Linux release bundles are available;
+> the desktop interface and supported feature set are still evolving.
 
 The prototype uses [GPUI Community Edition](https://gpui-ce.github.io/) and `libghostty-vt`, pinned to released crate versions for reproducible builds. Boomux remains the shell backend: it owns the PTY lifecycle, persistence, reconstruction, and transport, while libghostty interprets those bytes and maintains the reflowing terminal grid rendered by GPUI.
 
@@ -20,9 +19,8 @@ shared terminal. Select the conversation inside the host application.
 ## Install release builds
 
 The Linux installer installs Boomux Desktop and its matching Boomux executable
-together, without sudo or a local Rust/Zig toolchain. Release publishing is not
-live yet; this command becomes usable after the installer is merged and the
-first stable release bundle is published:
+together, without sudo or a local Rust/Zig toolchain. Unified releases have been
+available since v1.10.0:
 
 ```sh
 curl -fsSL https://github.com/gardnmi/boomux/releases/latest/download/boomux-desktop-installer.sh | sh
