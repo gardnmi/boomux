@@ -140,16 +140,17 @@ fn guided_setup_discovers_and_installs_one_selected_harness() {
         }
     });
     let mut output = String::new();
+    // Ratatui may position each word separately, so match one complete word.
     // Do not type the later line-mode answer into Crossterm's event buffer.
     for (prompt, answer) in [
-        ("Space toggle", " \r"),
+        ("toggle", " \r"),
         ("Install the Boomux Agent Skill?", "no\n"),
     ] {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !output.contains(prompt) {
             let bytes = output_receiver
                 .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                .unwrap();
+                .unwrap_or_else(|error| panic!("waiting for {prompt:?}: {error}; output: {output:?}"));
             output.push_str(&String::from_utf8_lossy(&bytes));
         }
         writer.write_all(answer.as_bytes()).unwrap();
