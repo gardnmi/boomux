@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.10.0](https://github.com/gardnmi/boomux/compare/v1.9.8...v1.10.0) (2026-09-07)
+
+
+### Features
+
+* consolidate native desktop into the boomux workspace ([#367](https://github.com/gardnmi/boomux/issues/367)) ([544fdc8](https://github.com/gardnmi/boomux/commit/544fdc8c797504c41f7f02df971f3373bf13c177))
+* unify installation and desktop updates ([#370](https://github.com/gardnmi/boomux/issues/370)) ([4904f5a](https://github.com/gardnmi/boomux/commit/4904f5ac18c9e1403d201624b1e2f219231be44e))
+
+
+### Bug Fixes
+
+* **desktop:** refresh running terminals after attachment ([#371](https://github.com/gardnmi/boomux/issues/371)) ([d7bcaca](https://github.com/gardnmi/boomux/commit/d7bcaca35f67e131176308a95c8d2c71feebfbad))
+
 ## [1.9.8](https://github.com/gardnmi/boomux/compare/v1.9.7...v1.9.8) (2026-09-06)
 
 
