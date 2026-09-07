@@ -27,17 +27,17 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
       TARGET: x86_64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source-ref }}
           persist-credentials: false
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ inputs.cli-artifact }}
           path: incoming-cli
       - name: Reuse validated Desktop candidate
         if: inputs.reuse-run-id != ''
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: boomux-desktop-linux-x86_64
           path: dist
@@ -62,7 +62,7 @@ jobs:
         if: inputs.reuse-run-id == ''
         with:
           version: 0.15.2
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: inputs.reuse-run-id == ''
         with:
           key: desktop-release-ubuntu-24.04-zig-0.15.2-baseline-v1
@@ -76,7 +76,7 @@ jobs:
           sh desktop/scripts/package-release.sh "incoming-cli/boomux-${tag}-${TARGET}.tar.gz"
           python3 .github/scripts/ci-release-source.py record dist "$(git rev-parse HEAD)" "$tag" "$TARGET" desktop
       - name: Upload Desktop candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: boomux-desktop-linux-x86_64
           path: |
