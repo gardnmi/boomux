@@ -62,6 +62,12 @@ pressure propagates back through the Boomux socket to the PTY producer; arbitrar
 terminal bytes are never discarded because doing so could corrupt escape or
 Kitty graphics sequences.
 
+After initial attachment and daemon reconnect, the reader requests one redraw
+by briefly changing the PTY width and restoring the latest pane dimensions after
+100 ms. Repeating identical dimensions may not notify a running TUI. The bounded
+settle delay stays on the reader thread; concurrent pane resizing updates the
+restored dimensions, and incoming terminal bytes remain subject to backpressure.
+
 The worker coalesces queued commands before publishing a reference-counted,
 immutable screen snapshot. A bounded one-event mailbox wakes GPUI only when a
 new snapshot or terminal status exists; bursts collapse into one wakeup because
