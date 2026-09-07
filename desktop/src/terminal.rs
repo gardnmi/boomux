@@ -420,10 +420,9 @@ impl TerminalSession {
             shell_id: shell.id,
             shell_name: shell.name,
             shared,
-            // Force one normal resize from the first GPUI render pass. The
-            // attachment profile already established this size; repeating it
-            // here avoids blocking startup on the old two-step resize nudge.
-            last_size: Mutex::new((0, 0)),
+            // Attachment already established this geometry. Avoid an unchanged
+            // first-render resize canceling the reader's temporary redraw size.
+            last_size: Mutex::new((rows, cols)),
         })
     }
 
@@ -1574,11 +1573,19 @@ fn spawn_reader(
     expected_run_id: Option<String>,
     mut stream: std::os::unix::net::UnixStream,
     shared: Arc<SharedTerminal>,
-) {
+) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("boomux-desktop-terminal".into())
         .spawn(move || {
+            let mut refresh_attachment = true;
             loop {
+                if refresh_attachment {
+                    if let Err(error) = resynchronize_terminal_size(&shared, thread::sleep) {
+                        shared.close(format!("could not restore terminal size: {error}"));
+                        return;
+                    }
+                    refresh_attachment = false;
+                }
                 match AttachFrame::read_from(&mut stream) {
                     Ok(AttachFrame::Output(bytes)) => shared.process(bytes),
                     Ok(AttachFrame::Resize {
@@ -1597,22 +1604,12 @@ fn spawn_reader(
                         match reconnect(&client, &shell_id, expected_run_id.as_deref(), &profile) {
                             Ok(attachment) => {
                                 stream = attachment.stream;
-                                if let Err(error) = resynchronize_terminal_size(
-                                    &mut stream,
-                                    profile.rows,
-                                    profile.cols,
-                                    profile.pixel_width,
-                                    profile.pixel_height,
-                                ) {
-                                    shared
-                                        .close(format!("could not restore terminal size: {error}"));
-                                    return;
-                                }
                                 if let Err(error) = shared.install_writer(&stream) {
                                     shared.close(error);
                                     return;
                                 }
                                 shared.process(attachment.reconstruction);
+                                refresh_attachment = true;
                                 shared.set_status("attached");
                             }
                             Err(error) => {
@@ -1640,40 +1637,39 @@ fn spawn_reader(
                 }
             }
         })
-        .expect("spawn Boomux terminal reader");
+        .expect("spawn Boomux terminal reader")
 }
 
 fn resynchronize_terminal_size(
-    stream: &mut std::os::unix::net::UnixStream,
-    rows: u16,
-    cols: u16,
-    pixel_width: u16,
-    pixel_height: u16,
+    shared: &SharedTerminal,
+    settle: impl FnOnce(Duration),
 ) -> Result<(), String> {
-    let (nudged_rows, nudged_cols) = if rows > 1 {
-        (rows - 1, cols)
-    } else if cols > 1 {
-        (rows, cols - 1)
-    } else {
-        return Ok(());
-    };
-    AttachFrame::Resize {
-        rows: nudged_rows,
-        cols: nudged_cols,
-        pixel_width,
-        pixel_height,
+    // An unchanged TIOCSWINSZ need not notify the foreground application.
+    // Change the width once so TUIs can reflow their transcript after attaching
+    // to a running Shell. Keep the delay on the existing socket reader thread.
+    {
+        let profile = shared.profile.lock().unwrap();
+        shared.send(AttachFrame::Resize {
+            rows: profile.rows,
+            cols: if profile.cols > 1 {
+                profile.cols - 1
+            } else {
+                2
+            },
+            pixel_width: profile.pixel_width,
+            pixel_height: profile.pixel_height,
+        })?;
     }
-    .write_to(stream)
-    .map_err(|error| format!("could not nudge terminal size: {error}"))?;
-    thread::sleep(RESIZE_SETTLE);
-    AttachFrame::Resize {
-        rows,
-        cols,
-        pixel_width,
-        pixel_height,
-    }
-    .write_to(stream)
-    .map_err(|error| format!("could not synchronize terminal size: {error}"))
+    settle(RESIZE_SETTLE);
+    // A pane may resize while the application redraws. Restore the latest
+    // geometry, serialized with profile updates and other attachment writes.
+    let profile = shared.profile.lock().unwrap();
+    shared.send(AttachFrame::Resize {
+        rows: profile.rows,
+        cols: profile.cols,
+        pixel_width: profile.pixel_width,
+        pixel_height: profile.pixel_height,
+    })
 }
 
 fn reconnect(
@@ -1948,7 +1944,6 @@ fn indexed_color_with_palette(index: u8, ansi: &[u32; 16]) -> u32 {
 mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
-    use std::thread;
     use std::time::Duration;
 
     use boomux::protocol::{AgentState, AttachFrame};
@@ -1959,7 +1954,7 @@ mod tests {
     use super::{
         AgentChoice, EmulatorCommand, EmulatorCore, SharedTerminal, agent_is_visible, blank_screen,
         configure_terminal, distinguish_agent_rows, encode_key, encode_mouse_wheel, encode_paste,
-        image_bgra, indexed_color, resynchronize_terminal_size, terminal_profile,
+        image_bgra, indexed_color, resynchronize_terminal_size, spawn_reader, terminal_profile,
     };
     use crate::theme::TerminalTheme;
     use std::sync::Arc;
@@ -2704,30 +2699,179 @@ mod tests {
     }
 
     #[test]
-    fn attachment_resize_is_nudged_then_restored() {
-        let (mut client, mut daemon) = UnixStream::pair().unwrap();
-        let receiver = thread::spawn(move || {
-            assert_eq!(
+    fn initial_attachment_requests_redraw_without_a_window_resize() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(22, 70, 588, 374)));
+        shared.install_writer(&client).unwrap();
+        let reader = spawn_reader(
+            boomux::client::Client::from_socket_path("/unused-desktop-test.sock".into()),
+            "shell-test".into(),
+            Some("run-test".into()),
+            client,
+            Arc::clone(&shared),
+        );
+        assert_eq!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 22,
+                cols: 69,
+                pixel_width: 588,
+                pixel_height: 374
+            }
+        );
+        assert_eq!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 22,
+                cols: 70,
+                pixel_width: 588,
+                pixel_height: 374
+            }
+        );
+        AttachFrame::Detached.write_to(&mut daemon).unwrap();
+        reader.join().unwrap();
+        assert!(shared.closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn reconnected_attachment_refreshes_the_exact_run_and_preserves_output_order() {
+        use boomux::protocol::{self, Envelope, Request, Response};
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc;
+
+        let directory = std::env::temp_dir().join(format!("desktop-redraw-{}", fastrand::u64(..)));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let profile = terminal_profile(22, 70, 588, 374);
+        let shared = Arc::new(SharedTerminal::new(profile.clone()));
+        let (commands, received) = mpsc::sync_channel(8);
+        shared.install_emulator(commands);
+        shared.install_writer(&client).unwrap();
+        let reader = spawn_reader(
+            boomux::client::Client::from_socket_path(socket),
+            "shell-test".into(),
+            Some("run-test".into()),
+            client,
+            Arc::clone(&shared),
+        );
+        for _ in 0..2 {
+            assert!(matches!(
                 AttachFrame::read_from(&mut daemon).unwrap(),
-                AttachFrame::Resize {
-                    rows: 21,
-                    cols: 70,
-                    pixel_width: 588,
-                    pixel_height: 374,
-                }
-            );
+                AttachFrame::Resize { .. }
+            ));
+        }
+        AttachFrame::Reconnect.write_to(&mut daemon).unwrap();
+        assert_eq!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::ReconnectAck
+        );
+        let (mut reattached, _) = listener.accept().unwrap();
+        reattached
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let request: Envelope<Request> = protocol::read_message(&mut reattached).unwrap();
+        assert!(matches!(request.message, Request::Attach {
+            shell_id, expected_run_id: Some(run_id), takeover: false, restart_exited: false,
+            profile: requested_profile, ..
+        } if shell_id == "shell-test" && run_id == "run-test" && requested_profile == profile));
+        protocol::write_message(
+            &mut reattached,
+            &Envelope::with_version(
+                request.version,
+                Response::Attached {
+                    token: "test-token".into(),
+                    reconstruction: b"reconstructed".to_vec(),
+                    warning: None,
+                    profile: None,
+                },
+            ),
+        )
+        .unwrap();
+        AttachFrame::Output(b"live".to_vec())
+            .write_to(&mut reattached)
+            .unwrap();
+        for cols in [69, 70] {
             assert_eq!(
-                AttachFrame::read_from(&mut daemon).unwrap(),
+                AttachFrame::read_from(&mut reattached).unwrap(),
                 AttachFrame::Resize {
                     rows: 22,
-                    cols: 70,
+                    cols,
                     pixel_width: 588,
                     pixel_height: 374,
                 }
             );
-        });
+        }
+        for expected in [b"reconstructed".as_slice(), b"live".as_slice()] {
+            assert!(
+                matches!(received.recv_timeout(Duration::from_secs(2)).unwrap(),
+                EmulatorCommand::Output(bytes) if bytes == expected)
+            );
+        }
+        AttachFrame::Detached.write_to(&mut reattached).unwrap();
+        reader.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
-        resynchronize_terminal_size(&mut client, 22, 70, 588, 374).unwrap();
-        receiver.join().unwrap();
+    #[test]
+    fn attachment_redraw_restores_geometry_changed_during_settle() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        let shared = SharedTerminal::new(terminal_profile(22, 70, 588, 374));
+        shared.install_writer(&client).unwrap();
+        resynchronize_terminal_size(&shared, |_| {
+            *shared.profile.lock().unwrap() = terminal_profile(30, 100, 900, 600);
+        })
+        .unwrap();
+        assert_eq!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 22,
+                cols: 69,
+                pixel_width: 588,
+                pixel_height: 374
+            }
+        );
+        assert_eq!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 30,
+                cols: 100,
+                pixel_width: 900,
+                pixel_height: 600
+            }
+        );
+    }
+
+    #[test]
+    fn attachment_redraw_handles_a_single_cell_terminal() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        let shared = SharedTerminal::new(terminal_profile(1, 1, 8, 16));
+        shared.install_writer(&client).unwrap();
+        resynchronize_terminal_size(&shared, |_| {}).unwrap();
+        assert_eq!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 1,
+                cols: 2,
+                pixel_width: 8,
+                pixel_height: 16
+            }
+        );
+        assert_eq!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 1,
+                cols: 1,
+                pixel_width: 8,
+                pixel_height: 16
+            }
+        );
     }
 }
