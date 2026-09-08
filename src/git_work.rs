@@ -345,15 +345,14 @@ fn inspect(
                 "--format=%(refname:short)",
                 "refs/heads/",
             ],
-        ) {
-            if let Some(row) = roots.get_mut(&root) {
-                row.branches = branches
-                    .lines()
-                    .take(MAX_LINKS - branch_count)
-                    .map(|s| s.chars().take(256).collect())
-                    .collect();
-                branch_count += row.branches.len();
-            }
+        ) && let Some(row) = roots.get_mut(&root)
+        {
+            row.branches = branches
+                .lines()
+                .take(MAX_LINKS - branch_count)
+                .map(|s| s.chars().take(256).collect())
+                .collect();
+            branch_count += row.branches.len();
         }
     }
     for row in roots.values_mut() {
