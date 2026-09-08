@@ -1889,7 +1889,7 @@ mod tests {
                 .contains(".terminal-shell { position: relative; width: 100%; height: 100%; }")
         );
         assert!(TERMINAL_JS.contains("scrollToBottom"));
-        assert!(SERVICE_WORKER.contains("boomux-agent-watch-v40"));
+        assert!(SERVICE_WORKER.contains("boomux-agent-watch-v41"));
     }
 
     #[test]
