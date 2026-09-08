@@ -143,6 +143,9 @@ The prototype uses Ctrl on Linux so its input reaches the app while it is runnin
 | `Ctrl + Space` | Enter or leave Layout mode; press twice quickly to send Ctrl+Space to the terminal |
 | `Ctrl + left drag` | Lift, move, and re-tile a tiled pane |
 | `Ctrl + right drag` | Resize a tiled split or floating pane in both axes |
+| `Left drag on a pane edge` | Resize a floating pane or the adjoining tiled divider |
+| `Left drag on a pane corner` | Resize both axes; tiled corners require two adjoining dividers |
+| `Left drag on the sidebar’s right edge` | Resize the sidebar; width is saved |
 | Layout: `Arrow keys` | Focus a spatially adjacent pane (`H/K/L` also focus left/up/right) |
 | Layout: `Tab` or `Shift + Tab` | Cycle focus through panes forward or backward |
 | Layout: `Shift + Arrow keys` or `Shift + H/J/K/L` | Slide-swap a tiled pane, or move a floating pane |
@@ -301,3 +304,7 @@ Boomux owns server-side scale across Shells and attached clients. Boomux Desktop
 owns the incremental cost of each visible terminal pane, decoded image, and
 frame. See [docs/performance.md](../docs/desktop/performance.md) for the measurement model
 and [docs/architecture.md](../docs/desktop/architecture.md) for the ownership boundary.
+
+## Git overview
+
+Open **Git · Branches and worktrees** in the sidebar, or use Layout mode (`Ctrl+Space`, then `G`). The resizable panel connects worktrees to their Shells and Agents and shows local changes, upstream comparisons, and GitHub PR/check status. See [Git panel](../docs/desktop/git-panel.md) for refresh behavior and status semantics.

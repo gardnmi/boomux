@@ -133,7 +133,7 @@ impl Drop for Cache {
 
 // Drain a nonblocking pipe in this worker, with one absolute deadline covering
 // both process exit and EOF. A descendant keeping stdout open cannot wedge it.
-fn command_output(
+pub(crate) fn command_output(
     command: &mut Command,
     timeout: Duration,
     limit: usize,

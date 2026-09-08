@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """Build and open Desktop against this worktree's isolated development daemon."""
 
+import argparse
 import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__, add_help=False)
+    parser.add_argument("--release", action="store_true")
+    options, desktop_args = parser.parse_known_args()
     root = Path(__file__).resolve().parents[2]
-    subprocess.run(["cargo", "build", "--locked", "-p", "boomux", "-p", "boomux-desktop", "--target-dir", str(root / "target")],
+    subprocess.run(["cargo", "build", "--locked", "-p", "boomux", "-p", "boomux-desktop", "--target-dir", str(root / "target"), *(["--release"] if options.release else [])],
                    cwd=root, check=True)
-    target = root / "target/debug"
+    target = root / "target" / ("release" if options.release else "debug")
     env = {key: value for key, value in os.environ.items() if not key.startswith("BOOMUX_")}
     display = env.get("WAYLAND_DISPLAY")
     if display and not Path(display).is_absolute() and env.get("XDG_RUNTIME_DIR"):
         env["WAYLAND_DISPLAY"] = str(Path(env["XDG_RUNTIME_DIR"]) / display)
+    # Keep the user's existing GitHub CLI authentication available to read-only
+    # PR inspection while Boomux's runtime/configuration remain isolated.
+    env.setdefault("GH_CONFIG_DIR", str(Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "gh"))
     for name in ["RUNTIME_DIR", "CONFIG_HOME", "STATE_HOME", "DATA_HOME", "CACHE_HOME"]:
         path = root / "target/desktop-dev" / name.lower()
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -33,7 +39,7 @@ def main():
     action = ["restart", "--executable", str(cli)] if state == "running" else ["start"]
     subprocess.run([cli, "daemon", *action], env=env, check=True, timeout=30)
     executable = str(target / "boomux-desktop")
-    os.execve(executable, [executable, *sys.argv[1:]], env)
+    os.execve(executable, [executable, *desktop_args], env)
 
 
 if __name__ == "__main__":

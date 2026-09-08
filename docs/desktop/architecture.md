@@ -45,6 +45,8 @@ badge’s single cancelable exit task; it does not delay restoring input.
 - `src/terminal.rs`: Boomux discovery/attachment adapter, per-pane terminal
   worker, Ghostty VT state, scrollback, key/paste encoding, and Kitty graphics
   extraction.
+- `src/git_panel.rs`: demand-driven Node Git overview, filtering, resizable panel,
+  and exact local Shell navigation; see [Git panel](git-panel.md).
 - `src/nodes.rs`: read-only Node identity, health, and resource-count presentation
   from the daemon's combined snapshot.
 - `src/boomux_settings.rs`: active-layer settings editor and bounded CLI bridge;
@@ -299,3 +301,21 @@ remain visible and retryable. The update worker serializes operations, bounds
 process lifetime/output, and never starts per-pane tasks. Existing independent
 CLI binaries remain outside its install ownership. A daemon from a different
 executable gets a finish-installation reminder after launching a new bundle.
+
+## Edge Resizing
+
+The sidebar exposes a five-pixel right-edge handle. Its preferred width is bounded
+to 280–600 logical pixels and stored in Desktop preferences when dragging ends;
+older preference files retain the 300-pixel default. The displayed width also
+reserves terminal canvas space on narrow windows. Sidebar content, Settings,
+menus, and terminal pointer coordinates use the same effective width.
+
+Pane edge handles reuse the existing pointer-drag lifecycle. Floating left/top
+resizes preserve the opposite edge, while right/bottom resizes preserve the
+origin; all respect canvas bounds and minimum sizes. Tiled handles exist only
+where a split borders the selected edge. Direction-aware tree traversal selects
+that divider and converts root-relative movement into its local split span.
+Twelve-pixel corner targets paint above side handles and resize both axes with
+diagonal cursors. Tiled corner targets require adjoining dividers on both axes.
+Maximized and transitioning panes omit edge handles. Terminal body selection
+and Ctrl-drag behavior retain their existing input paths.
