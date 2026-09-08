@@ -16,7 +16,7 @@ pub(crate) struct AgentStateCounts {
 }
 
 impl AgentStateCounts {
-    fn add(&mut self, state: AgentState) {
+    pub(crate) fn add(&mut self, state: AgentState) {
         match state {
             AgentState::Unknown => self.unknown += 1,
             AgentState::Working => self.working += 1,

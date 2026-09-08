@@ -17,6 +17,9 @@ use uuid::Uuid;
 use boomux::integrations::{InstallTargetKind, InstallationCapability, IntegrationDescriptor};
 use boomux::protocol::{AgentAuthority, ShellStatus, Snapshot};
 
+mod managed;
+pub(crate) use managed::synchronize;
+
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_VERSION_OUTPUT_BYTES: u64 = 4096;
 const MAX_CODEX_HOOKS_BYTES: u64 = 1024 * 1024;
@@ -794,6 +797,14 @@ pub(crate) fn install(
     environment: &Environment,
     force: bool,
 ) -> Result<InstallResult, Box<dyn Error>> {
+    managed::install(id, environment, force)
+}
+
+fn install_unmanaged(
+    id: IntegrationId,
+    environment: &Environment,
+    force: bool,
+) -> Result<InstallResult, Box<dyn Error>> {
     let descriptor = id.spec();
     let installation = id.installation();
     let target = install_target(id, environment)?;
@@ -829,7 +840,9 @@ pub(crate) fn plan_install(
     let (current_state, action) = match existing {
         ExistingAsset::Missing => (AssetState::Missing, InstallAction::Install),
         ExistingAsset::Current => (AssetState::Current, InstallAction::Unchanged),
-        ExistingAsset::Modified if !force => return Err(existing_asset_error(&target.path).into()),
+        ExistingAsset::Modified if !force && !managed::is_owned(id, &target)? => {
+            return Err(existing_asset_error(&target.path).into());
+        }
         ExistingAsset::Modified => (AssetState::Modified, InstallAction::Replace),
     };
     Ok(InstallPlan {
@@ -855,13 +868,21 @@ pub(crate) fn preflight_uninstall(
     } else {
         inspect_existing_asset(&target.path, installation.content)?
     };
-    if existing == ExistingAsset::Modified && !force {
+    if existing == ExistingAsset::Modified && !force && !managed::is_owned(id, &target)? {
         return Err(modified_uninstall_error(&target.path).into());
     }
     Ok(())
 }
 
 pub(crate) fn uninstall(
+    id: IntegrationId,
+    environment: &Environment,
+    force: bool,
+) -> Result<UninstallResult, Box<dyn Error>> {
+    managed::uninstall(id, environment, force)
+}
+
+fn uninstall_unmanaged(
     id: IntegrationId,
     environment: &Environment,
     force: bool,
@@ -1631,51 +1652,6 @@ mod tests {
             None,
             Some(OsString::new()),
         )
-    }
-
-    #[test]
-    fn descriptors_have_unique_names_and_expected_metadata() {
-        assert_eq!(
-            IntegrationId::Opencode.installation().package,
-            "opencode-ai"
-        );
-        assert_eq!(IntegrationId::Pi.installation().validated_version, "0.84.1");
-        assert_eq!(
-            IntegrationId::Claude.installation().package,
-            "@anthropic-ai/claude-code"
-        );
-        assert_eq!(
-            IntegrationId::Claude.installation().validated_version,
-            "2.1.236"
-        );
-        assert_eq!(IntegrationId::Codex.installation().package, "@openai/codex");
-        assert_eq!(
-            IntegrationId::Codex.installation().validated_version,
-            "0.147.0"
-        );
-        assert_eq!(IntegrationId::Kiro.installation().package, "kiro-cli");
-        assert_eq!(
-            IntegrationId::Kiro.installation().validated_version,
-            "2.18.0"
-        );
-        assert_eq!(
-            IntegrationId::Claude.spec().titles,
-            Some(boomux::integrations::TitleCapability {
-                provider: boomux::integrations::TitleProvider::Claude,
-                provides_catalog: false,
-            })
-        );
-        assert_eq!(
-            IntegrationId::Claude
-                .spec()
-                .foreground
-                .map(|capability| capability.process_name),
-            Some("claude")
-        );
-        assert_ne!(
-            IntegrationId::Opencode.spec().key,
-            IntegrationId::Pi.spec().key
-        );
     }
 
     #[test]

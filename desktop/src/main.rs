@@ -1,8 +1,7 @@
 mod boomux_settings;
 mod bundle_update;
-mod generated_names;
+use boomux::generated_names;
 mod git_panel;
-mod harness_integrations;
 mod layout;
 mod layout_badge;
 mod nodes;
@@ -66,6 +65,11 @@ impl Render for HeaderTooltip {
     }
 }
 
+// Keep the collapsed edge reachable while retaining the normal readable width.
+fn sidebar_drag_target(pointer_x: f32) -> Option<f32> {
+    (pointer_x > 48.0).then(|| pointer_x.clamp(280.0, 600.0))
+}
+
 fn sidebar_header_button(
     id: &'static str,
     label: &'static str,
@@ -89,45 +93,6 @@ fn sidebar_header_button(
         .text_color(rgb(0xa6adc8))
         .hover(|button| button.bg(rgb(0x313244)))
         .child(glyph)
-}
-
-fn git_branch_icon(active: bool) -> Div {
-    let color = rgb(if active { 0xcba6f7 } else { 0xa6adc8 });
-    div()
-        .relative()
-        .size(px(18.0))
-        .child(
-            div()
-                .absolute()
-                .left(px(3.0))
-                .top(px(4.0))
-                .w(px(2.0))
-                .h(px(11.0))
-                .bg(color),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(px(4.0))
-                .top(px(4.0))
-                .w(px(10.0))
-                .h(px(7.0))
-                .border_b_2()
-                .border_r_2()
-                .rounded_br(px(4.0))
-                .border_color(color),
-        )
-        .children([(1.0, 0.0), (1.0, 12.0), (10.0, 0.0)].map(|(x, y)| {
-            div()
-                .absolute()
-                .left(px(x))
-                .top(px(y))
-                .size(px(6.0))
-                .rounded_full()
-                .border_2()
-                .border_color(color)
-                .bg(rgb(0x181825))
-        }))
 }
 
 fn sidebar_menu_row(id: &'static str) -> Stateful<Div> {
@@ -297,14 +262,21 @@ const KEY_TOGGLE_SIDEBAR: &str = "f6";
 const KEY_NEW_PANE: &str = "secondary-enter";
 const KEY_DETACH_PANE: &str = "secondary-w";
 const KEY_REMOVE_SHELL: &str = "secondary-shift-w";
-const KEY_TOGGLE_LAYOUT_MODE: &str = "ctrl-space";
+fn layout_leader_starts_press(is_repeat: bool, already_pressed: bool) -> bool {
+    !is_repeat && !already_pressed
+}
+const LAYOUT_HOLD_THRESHOLD: Duration = Duration::from_millis(250);
+const LAYOUT_RELEASE_SETTLE: Duration = Duration::from_millis(50);
+fn layout_leader_release_exits(entered_on_press: bool, elapsed: Duration) -> bool {
+    entered_on_press && elapsed >= LAYOUT_HOLD_THRESHOLD
+}
 const LAYOUT_LEADER_PASSTHROUGH_WINDOW: Duration = Duration::from_millis(500);
 
 const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     ShortcutSpec {
         section: ShortcutSection::Navigation,
         keys: "Layout: G",
-        description: "Toggle Git branches and worktrees panel",
+        description: "Select Git branches and worktrees tab",
     },
     ShortcutSpec {
         section: ShortcutSection::General,
@@ -319,7 +291,7 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     ShortcutSpec {
         section: ShortcutSection::Navigation,
         keys: "Ctrl + Space",
-        description: "Enter/leave Layout mode; press twice to pass through",
+        description: "Tap to toggle Layout; hold for temporary Layout; double-tap to pass through",
     },
     ShortcutSpec {
         section: ShortcutSection::Navigation,
@@ -1448,6 +1420,8 @@ struct Workspace {
     sidebar_focus_pointer: Option<(f32, f32)>,
     sidebar_item: Option<SidebarItem>,
     sidebar_scroll_handle: ScrollHandle,
+    sidebar_agent_scroll_handle: ScrollHandle,
+    sidebar_agent_scroll_anchor: ScrollAnchor,
     sidebar_scroll_anchor: ScrollAnchor,
     minimized_tab_scroll_handle: ScrollHandle,
     sidebar_menu: Option<SidebarMenu>,
@@ -1461,6 +1435,7 @@ struct Workspace {
     sidebar_preferred_width: f32,
     sidebar_viewport_width: f32,
     sidebar_resizing: bool,
+    sidebar_drag_width: Option<f32>,
     drawer_animation_from: Option<f32>,
     drawer_animation_generation: u64,
     pane_headings_visible: bool,
@@ -1481,7 +1456,6 @@ struct Workspace {
     update_busy: bool,
     prepared_update: Option<bundle_update::Prepared>,
     onboarding_complete: bool,
-    harness_integrations: harness_integrations::Model,
     updates_status: Option<String>,
     update_task: Option<gpui::Task<()>>,
     dismissed_desktop_update: String,
@@ -1499,6 +1473,10 @@ struct Workspace {
     help_scroll_handle: ScrollHandle,
     layout_mode: bool,
     layout_mode_entered_at: Option<Instant>,
+    layout_leader_pressed_at: Option<Instant>,
+    layout_leader_entered: bool,
+    layout_leader_release_task: Option<gpui::Task<()>>,
+    layout_suppressed_keys: HashSet<String>,
     layout_badge_generation: u64,
     layout_badge_exiting: bool,
     layout_badge_cleanup: Option<gpui::Task<()>>,
@@ -1593,6 +1571,9 @@ impl Workspace {
             .unwrap_or_default();
         let sidebar_scroll_handle = ScrollHandle::new();
         let sidebar_scroll_anchor = ScrollAnchor::for_handle(sidebar_scroll_handle.clone());
+        let sidebar_agent_scroll_handle = ScrollHandle::new();
+        let sidebar_agent_scroll_anchor =
+            ScrollAnchor::for_handle(sidebar_agent_scroll_handle.clone());
         let minimized_tab_scroll_handle = ScrollHandle::new();
         let help_scroll_handle = ScrollHandle::new();
         let mut workspace = Self {
@@ -1625,6 +1606,8 @@ impl Workspace {
             sidebar_focus_pointer: None,
             sidebar_item: None,
             sidebar_scroll_handle,
+            sidebar_agent_scroll_handle,
+            sidebar_agent_scroll_anchor,
             sidebar_scroll_anchor,
             minimized_tab_scroll_handle,
             sidebar_menu: None,
@@ -1638,6 +1621,7 @@ impl Workspace {
             sidebar_preferred_width: saved.sidebar_width,
             sidebar_viewport_width: f32::from(window.viewport_size().width),
             sidebar_resizing: false,
+            sidebar_drag_width: None,
             drawer_animation_from: None,
             drawer_animation_generation: 0,
             pane_headings_visible: saved.pane_headings_visible,
@@ -1658,7 +1642,6 @@ impl Workspace {
             update_busy: false,
             prepared_update: None,
             onboarding_complete: saved.onboarding_complete,
-            harness_integrations: harness_integrations::Model::default(),
             updates_status: None,
             update_task: None,
             dismissed_desktop_update: saved.dismissed_desktop_update,
@@ -1676,6 +1659,10 @@ impl Workspace {
             help_scroll_handle,
             layout_mode: false,
             layout_mode_entered_at: None,
+            layout_leader_pressed_at: None,
+            layout_leader_entered: false,
+            layout_leader_release_task: None,
+            layout_suppressed_keys: HashSet::new(),
             layout_badge_generation: 0,
             layout_badge_exiting: false,
             layout_badge_cleanup: None,
@@ -1720,9 +1707,22 @@ impl Workspace {
             .detach();
         }
         workspace.watch_updates(cx);
-        workspace.check_harness_integrations(false, cx);
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.layout_leader_release_task = None;
+                if this.layout_leader_pressed_at.take().is_some() && this.layout_leader_entered {
+                    this.leave_layout_mode(cx);
+                }
+                this.layout_leader_entered = false;
+                this.layout_suppressed_keys.clear();
+            }
+        })
+        .detach();
         workspace.watch_omarchy_theme(cx);
         workspace.watch_boomux_overview(window, cx);
+        if saved.sidebar_git_tab {
+            workspace.select_git_tab(true, cx);
+        }
         workspace
     }
 
@@ -1731,6 +1731,7 @@ impl Workspace {
             let _ = writer.force_send(settings::Settings {
                 onboarding_complete: self.onboarding_complete,
                 sidebar_visible: self.sidebar_visible,
+                sidebar_git_tab: self.git_panel.open,
                 sidebar_width: self.sidebar_preferred_width,
                 pane_headings_visible: self.pane_headings_visible,
                 pane_corner_style: self.pane_corner_style,
@@ -1857,247 +1858,6 @@ impl Workspace {
         })
         .detach();
         cx.notify();
-    }
-
-    fn check_harness_integrations(&mut self, manual: bool, cx: &mut Context<Self>) {
-        if self.harness_integrations.busy {
-            return;
-        }
-        self.harness_integrations.busy = true;
-        self.harness_integrations.error = None;
-        self.harness_integrations.confirm_replace = None;
-        if manual {
-            self.harness_integrations.dismissed.clear();
-        }
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async { harness_integrations::check() })
-                .await;
-            this.update(cx, |this, cx| {
-                this.harness_integrations.busy = false;
-                match result {
-                    Ok(report) => {
-                        this.harness_integrations.report = report;
-                        this.harness_integrations.checked = true;
-                    }
-                    Err(error) => this.harness_integrations.error = Some(error),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
-    }
-
-    fn install_harness_integration(
-        &mut self,
-        suggestion: harness_integrations::Suggestion,
-        cx: &mut Context<Self>,
-    ) {
-        if self.harness_integrations.busy {
-            return;
-        }
-        let name = suggestion.descriptor.key;
-        let replace_confirmed = self.harness_integrations.confirm_replace == Some(name);
-        if suggestion.need == harness_integrations::Need::Review && !replace_confirmed {
-            self.harness_integrations.confirm_replace = Some(name);
-            cx.notify();
-            return;
-        }
-        self.harness_integrations.busy = true;
-        self.harness_integrations.installing = Some(name);
-        self.harness_integrations.message = None;
-        self.harness_integrations.error = None;
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    harness_integrations::install(suggestion, replace_confirmed)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                let model = &mut this.harness_integrations;
-                model.busy = false;
-                model.installing = None;
-                model.confirm_replace = None;
-                match result {
-                    Ok(()) => {
-                        model
-                            .report
-                            .suggestions
-                            .retain(|item| item.descriptor.key != name);
-                        model.message = Some(format!(
-                            "{} integration is ready. {}.",
-                            suggestion.descriptor.display_name,
-                            suggestion
-                                .descriptor
-                                .installation
-                                .expect("installable descriptor")
-                                .reload_message
-                        ));
-                    }
-                    Err(error) => model.error = Some(error),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
-    }
-
-    fn harness_integration_notices(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        let model = &self.harness_integrations;
-        let mut rows = Vec::new();
-        for (kind, message) in [
-            ("result", model.message.as_ref()),
-            ("error", model.error.as_ref()),
-        ] {
-            if let Some(message) = message {
-                rows.push(
-                    div()
-                        .mb_3()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(div().text_xs().child(message.clone()))
-                        .child(
-                            Self::settings_option(
-                                SharedString::from(format!("dismiss-integration-message-{kind}")),
-                                "Dismiss",
-                                false,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    if kind == "result" {
-                                        this.harness_integrations.message = None;
-                                    } else {
-                                        this.harness_integrations.error = None;
-                                    }
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
-        for &suggestion in &model.report.suggestions {
-            let name = suggestion.descriptor.key;
-            if model.dismissed.contains(name) {
-                continue;
-            }
-            let confirm = model.confirm_replace == Some(name);
-            let replacing = suggestion.need == harness_integrations::Need::Review;
-            let description = if confirm {
-                "Replace the existing Boomux integration with this version? This may replace customizations to the Boomux integration."
-            } else if replacing {
-                "Its Boomux integration differs from this version. It may be older or customized."
-            } else {
-                "Enable its Boomux integration to show agent status and notifications."
-            };
-            let label = if model.installing == Some(name) {
-                "Installing…"
-            } else if confirm {
-                "Replace integration"
-            } else if replacing {
-                "Review update"
-            } else {
-                "Install integration"
-            };
-            rows.push(
-                div()
-                    .mb_3()
-                    .p_3()
-                    .border_1()
-                    .border_color(rgb(0x45475a))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(format!("{} detected", suggestion.descriptor.display_name)),
-                    )
-                    .child(div().text_xs().text_color(rgb(0xa6adc8)).child(description))
-                    .child(
-                        Self::settings_control(
-                            SharedString::from(format!("install-integration-{name}")),
-                            label,
-                            true,
-                            !model.busy,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.install_harness_integration(suggestion, cx)
-                        })),
-                    )
-                    .child(
-                        Self::settings_control(
-                            SharedString::from(format!("dismiss-integration-{name}")),
-                            if confirm { "Cancel" } else { "Not now" },
-                            false,
-                            !model.busy,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.harness_integrations.busy {
-                                return;
-                            }
-                            if this.harness_integrations.confirm_replace == Some(name) {
-                                this.harness_integrations.confirm_replace = None;
-                            } else {
-                                this.harness_integrations.dismissed.insert(name);
-                            }
-                            cx.notify();
-                        })),
-                    )
-                    .into_any_element(),
-            );
-        }
-        rows
-    }
-
-    fn harness_integration_settings(&self, cx: &mut Context<Self>) -> Div {
-        let model = &self.harness_integrations;
-        let summary = if model.busy && model.installing.is_none() {
-            "Checking installed harnesses…".into()
-        } else if !model.checked {
-            "Check this computer for supported AI harnesses.".into()
-        } else if model.report.unavailable > 0 {
-            format!(
-                "{} detected; {} checks unavailable.",
-                model.report.detected, model.report.unavailable
-            )
-        } else if model.report.detected == 0 {
-            "No supported AI harnesses detected on this computer.".into()
-        } else if model.report.suggestions.is_empty() {
-            "Detected harness integrations are up to date.".into()
-        } else {
-            format!("{} detected on this computer.", model.report.detected)
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(div().text_xs().text_color(rgb(0xa6adc8)).child(summary))
-            .child(
-                Self::settings_control(
-                    "check-harness-integrations",
-                    "Check installed harnesses",
-                    false,
-                    !model.busy,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.check_harness_integrations(true, cx))),
-            )
-            .children(self.harness_integration_notices(cx))
-            .child(
-                Self::settings_control("manual-harness-setup", "Manual setup", false, !model.busy)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if !this.harness_integrations.busy {
-                            this.close_settings(cx);
-                            this.create_and_attach_setup(window, cx);
-                        }
-                    })),
-            )
     }
 
     fn update_notices(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -2427,6 +2187,7 @@ impl Workspace {
         visible_sidebar_items(&self.boomux_overview, &self.expanded_workspaces)
             .into_iter()
             .filter(|item| sidebar_item_visible_in_layout(self.pane_layout_mode, item))
+            .filter(|item| !self.git_panel.open || !matches!(item, SidebarItem::Agent { .. }))
             .collect()
     }
 
@@ -2577,7 +2338,11 @@ impl Workspace {
     }
 
     fn reveal_sidebar_item(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar_scroll_anchor.scroll_to(window, cx);
+        if matches!(self.sidebar_item, Some(SidebarItem::Agent { .. })) {
+            self.sidebar_agent_scroll_anchor.scroll_to(window, cx);
+        } else {
+            self.sidebar_scroll_anchor.scroll_to(window, cx);
+        }
     }
 
     fn enter_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2632,6 +2397,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // OS key repeat must not turn one held leader into repeated toggles.
+        if self.layout_leader_pressed_at.is_some() {
+            self.layout_leader_release_task = None;
+            cx.stop_propagation();
+            return;
+        }
+        self.layout_leader_pressed_at = Some(Instant::now());
+        self.layout_leader_entered = !self.layout_mode;
         if self.layout_mode {
             let pass_through = self
                 .layout_mode_entered_at
@@ -2665,6 +2438,23 @@ impl Workspace {
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn release_layout_leader(&mut self, cx: &mut Context<Self>) {
+        let elapsed = self
+            .layout_leader_pressed_at
+            .map(|pressed| pressed.elapsed());
+        self.release_layout_leader_at(elapsed, cx);
+    }
+
+    fn release_layout_leader_at(&mut self, elapsed: Option<Duration>, cx: &mut Context<Self>) {
+        if elapsed
+            .is_some_and(|elapsed| layout_leader_release_exits(self.layout_leader_entered, elapsed))
+            && self.layout_mode
+        {
+            self.leave_layout_mode(cx);
+        }
+        self.layout_leader_entered = false;
     }
 
     fn leave_layout_mode(&mut self, cx: &mut Context<Self>) {
@@ -3517,9 +3307,16 @@ impl Workspace {
         }
     }
 
+    // The drawer clips this layout during collapse; text keeps its readable width.
+    fn sidebar_content_width(&self) -> f32 {
+        self.sidebar_preferred_width
+            .min((self.sidebar_viewport_width - 240.0).max(0.0))
+    }
+
     fn sidebar_width(&self) -> f32 {
-        if self.sidebar_visible && !(self.git_panel.open && self.git_panel.compact) {
-            self.sidebar_preferred_width
+        if self.sidebar_visible {
+            self.sidebar_drag_width
+                .unwrap_or(self.sidebar_preferred_width)
                 .min((self.sidebar_viewport_width - 240.0).max(0.0))
         } else {
             0.0
@@ -3534,8 +3331,7 @@ impl Workspace {
             0.0
         };
         (
-            (f32::from(viewport.width) - self.sidebar_width() - self.git_panel_width(window))
-                .max(0.0),
+            (f32::from(viewport.width) - self.sidebar_width()).max(0.0),
             (f32::from(viewport.height) - tab_bar_height).max(0.0),
         )
     }
@@ -4101,10 +3897,22 @@ impl Workspace {
     ) {
         if self.sidebar_resizing {
             if event.pressed_button == Some(MouseButton::Left) {
-                self.sidebar_preferred_width = f32::from(event.position.x).clamp(280.0, 600.0);
+                self.sidebar_drag_width = Some(f32::from(event.position.x).clamp(0.0, 600.0));
+                if let Some(width) = sidebar_drag_target(f32::from(event.position.x)) {
+                    self.sidebar_visible = true;
+                    self.sidebar_preferred_width = width;
+                } else {
+                    self.sidebar_visible = false;
+                    self.sidebar_menu = None;
+                    self.sidebar_header_menu_open = false;
+                    self.git_panel.search_focused = false;
+                    self.nodes_open = false;
+                    if self.navigation_region == NavigationRegion::Sidebar {
+                        self.leave_sidebar(cx);
+                    }
+                }
             } else {
-                self.sidebar_resizing = false;
-                self.save_settings();
+                self.finish_sidebar_resize();
             }
             cx.notify();
             cx.stop_propagation();
@@ -4112,9 +3920,11 @@ impl Workspace {
         }
         if self.git_panel.resizing {
             if event.pressed_button == Some(MouseButton::Left) {
-                self.git_panel.width = Some(
-                    (f32::from(window.viewport_size().width) - f32::from(event.position.x))
-                        .clamp(280.0, 900.0),
+                self.git_panel.height = Some(
+                    (f32::from(window.viewport_size().height) - f32::from(event.position.y)).clamp(
+                        120.0,
+                        (f32::from(window.viewport_size().height) - 180.0).max(120.0),
+                    ),
                 );
             } else {
                 self.git_panel.resizing = false;
@@ -4231,6 +4041,19 @@ impl Workspace {
         cx.notify();
     }
 
+    fn finish_sidebar_resize(&mut self) {
+        let previous_width = self.sidebar_width();
+        self.sidebar_resizing = false;
+        self.sidebar_drag_width = None;
+        if self.motion_speed.duration().is_some()
+            && (previous_width - self.sidebar_width()).abs() > 1.0
+        {
+            self.drawer_animation_generation = self.drawer_animation_generation.wrapping_add(1);
+            self.drawer_animation_from = Some(previous_width);
+        }
+        self.save_settings();
+    }
+
     fn end_pointer_interaction(
         &mut self,
         event: &MouseUpEvent,
@@ -4238,8 +4061,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if self.sidebar_resizing {
-            self.sidebar_resizing = false;
-            self.save_settings();
+            self.finish_sidebar_resize();
             cx.notify();
             cx.stop_propagation();
             return;
@@ -4612,6 +4434,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.key == "space" && self.layout_leader_pressed_at.is_some() {
+            self.layout_leader_release_task = None;
+            cx.stop_propagation();
+            return;
+        }
+        if self.layout_mode {
+            self.layout_suppressed_keys
+                .insert(event.keystroke.key.clone());
+        } else if event.is_held && self.layout_suppressed_keys.contains(&event.keystroke.key) {
+            cx.stop_propagation();
+            return;
+        } else if !event.is_held {
+            self.layout_suppressed_keys.remove(&event.keystroke.key);
+        }
         if self.git_panel.search_focused {
             match event.keystroke.key.as_str() {
                 "escape" | "enter" => self.git_panel.search_focused = false,
@@ -4716,6 +4552,20 @@ impl Workspace {
             cx.notify();
             return;
         }
+        let modifiers = event.keystroke.modifiers;
+        if event.keystroke.key == "space"
+            && modifiers.control
+            && !modifiers.alt
+            && !modifiers.shift
+            && !modifiers.platform
+            && !modifiers.function
+        {
+            if layout_leader_starts_press(event.is_held, self.layout_leader_pressed_at.is_some()) {
+                self.toggle_layout_mode(&ToggleLayoutMode, window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.navigation_region == NavigationRegion::Sidebar {
             self.sidebar_key_down(event, window, cx);
             return;
@@ -4792,7 +4642,29 @@ impl Workspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.key == "space" && self.layout_leader_pressed_at.is_some() {
+            let elapsed = self
+                .layout_leader_pressed_at
+                .map(|pressed| pressed.elapsed());
+            // Some Wayland input paths repeat as fresh release/press pairs.
+            // Keep one gesture alive until a release survives the repeat gap.
+            self.layout_leader_release_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(LAYOUT_RELEASE_SETTLE).await;
+                this.update(cx, |this, cx| {
+                    this.release_layout_leader_at(elapsed, cx);
+                    this.layout_leader_pressed_at = None;
+                    this.layout_leader_release_task = None;
+                })
+                .ok();
+            }));
+            cx.stop_propagation();
+            return;
+        }
+        let suppressed = self.layout_suppressed_keys.remove(&event.keystroke.key);
         let Some(pane_id) = self.terminal_pressed_keys.remove(&event.keystroke.key) else {
+            if suppressed {
+                cx.stop_propagation();
+            }
             return;
         };
         let sent = self
@@ -5002,10 +4874,6 @@ impl Workspace {
 
     fn create_and_attach_new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.create_workspace_terminal(terminal::WorkspaceLaunch::Shell, window, cx);
-    }
-
-    fn create_and_attach_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.create_workspace_terminal(terminal::WorkspaceLaunch::Setup, window, cx);
     }
 
     fn create_workspace_terminal(
@@ -5935,13 +5803,11 @@ impl Workspace {
         })
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> Div {
+    fn sidebar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let header_menu = self.sidebar_header_menu(cx);
         let settings_panel = self.settings_overlay(cx);
-        let (workspaces, agents) = sidebar_render_sources(
-            &self.boomux_overview,
-            self.settings_open || self.git_panel.compact,
-        );
+        let (workspaces, agents) =
+            sidebar_render_sources(&self.boomux_overview, self.settings_open);
         let focused_shell_id = self
             .terminals
             .get(&self.focused)
@@ -6261,7 +6127,7 @@ impl Workspace {
 
         div()
             .relative()
-            .w(px(self.sidebar_width()))
+            .w(px(self.sidebar_content_width()))
             .h_full()
             .flex_none()
             .flex()
@@ -6375,21 +6241,6 @@ impl Workspace {
                             )
                             .child(
                                 sidebar_header_button(
-                                    "toggle-git-panel",
-                                    "Git branches and worktrees · Ctrl+Space, G",
-                                    "",
-                                    self.git_panel.open,
-                                )
-                                .child(git_branch_icon(self.git_panel.open))
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_git_panel(cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                sidebar_header_button(
                                     "open-settings",
                                     "Settings",
                                     "⚙",
@@ -6430,7 +6281,6 @@ impl Workspace {
                         .min_h_0()
                         .overflow_y_scroll()
                         .p_3()
-                        .children(self.harness_integration_notices(cx))
                         .children(self.update_notices(cx))
                         .child(
                             div()
@@ -6455,26 +6305,112 @@ impl Workspace {
                                 .w_full()
                                 .on_drag_move(cx.listener(Self::drag_workspace))
                                 .children(workspace_rows),
-                        )
-                        .child(div().mt_4().mb_3().h(px(1.0)).w_full().bg(rgb(0x313244)))
+                        ),
+                )
+            })
+            .when(!self.settings_open, |sidebar| {
+                let available = (f32::from(window.viewport_size().height) - 180.0).max(0.0);
+                let height = self
+                    .git_panel
+                    .height
+                    .unwrap_or(f32::from(window.viewport_size().height) * 0.45)
+                    .min(available);
+                let attention = agents
+                    .iter()
+                    .filter(|agent| agent.state == AgentState::Blocked)
+                    .count();
+                sidebar.child(
+                    div()
+                        .h(px(height))
+                        .min_h_0()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
                         .child(
                             div()
-                                .mb_2()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(0x7f849c))
-                                .child("AGENTS"),
+                                .id("sidebar-activity-resize")
+                                .h(px(5.0))
+                                .flex_none()
+                                .cursor(gpui::CursorStyle::ResizeUpDown)
+                                .border_t_1()
+                                .border_color(rgb(0x313244))
+                                .hover(|divider| divider.bg(rgb(0x45475a)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.git_panel.resizing = true;
+                                        cx.stop_propagation();
+                                    }),
+                                ),
                         )
-                        .when(agent_rows.is_empty(), |element| {
-                            element.child(
+                        .child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                .gap_3()
+                                .px_3()
+                                .py_1()
+                                .items_center()
+                                .children([false, true].map(|git| {
+                                    div()
+                                        .id(if git {
+                                            "sidebar-git-tab"
+                                        } else {
+                                            "sidebar-agents-tab"
+                                        })
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .pb_1()
+                                        .border_b_2()
+                                        .border_color(rgb(if self.git_panel.open == git {
+                                            0x89b4fa
+                                        } else {
+                                            0x181825
+                                        }))
+                                        .text_color(rgb(if self.git_panel.open == git {
+                                            0xcdd6f4
+                                        } else {
+                                            0x7f849c
+                                        }))
+                                        .child(if git {
+                                            "Git".to_owned()
+                                        } else if attention > 0 {
+                                            format!("Agents · {attention}")
+                                        } else {
+                                            "Agents".to_owned()
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.select_git_tab(git, cx)
+                                        }))
+                                }))
+                                .child(div().flex_1())
+                                .when(self.git_panel.open, |tabs| {
+                                    tabs.child(self.render_git_controls(cx))
+                                }),
+                        )
+                        .when_some(self.render_git_panel(cx), |section, git| section.child(git))
+                        .when(!self.git_panel.open, |section| {
+                            section.child(
                                 div()
-                                    .py_4()
-                                    .text_sm()
-                                    .text_color(rgb(0x6c7086))
-                                    .child("No active Boomux agents"),
+                                    .id("sidebar-agents-scroll")
+                                    .track_scroll(&self.sidebar_agent_scroll_handle)
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .px_3()
+                                    .pb_3()
+                                    .when(agent_rows.is_empty(), |list| {
+                                        list.child(
+                                            div()
+                                                .py_3()
+                                                .text_sm()
+                                                .text_color(rgb(0x6c7086))
+                                                .child("No active Boomux agents"),
+                                        )
+                                    })
+                                    .children(agent_rows),
                             )
-                        })
-                        .children(agent_rows),
+                        }),
                 )
             })
             .when_some(settings_panel, |element, settings| element.child(settings))
@@ -6636,7 +6572,7 @@ impl Workspace {
             .left_0()
             .top(px(64.0))
             .bottom_0()
-            .w(px(self.sidebar_width()))
+            .w(px(self.sidebar_content_width()))
             .min_h_0()
             .p_4()
             .flex()
@@ -7065,8 +7001,11 @@ impl Workspace {
     fn settings_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         self.settings_open.then(|| {
             let content = div().flex_none().flex().flex_col().gap_4()
-                .child(Self::settings_category("AI integrations"))
-                .child(self.harness_integration_settings(cx))
+                .child(Self::settings_control("manual-setup", "Open advanced setup in terminal", false, true)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_settings(cx);
+                        this.create_workspace_terminal(terminal::WorkspaceLaunch::Setup, window, cx);
+                    })))
                 .child(Self::settings_category("Layout & workspaces"))
                 .when_some(self.settings_error.clone(), |panel, error| panel.child(
                     div().text_xs().text_color(rgb(0xf38ba8)).child(format!("Settings could not be saved or loaded: {error}. Check settings.toml and restart."))
@@ -8183,7 +8122,7 @@ impl Workspace {
             .items_center()
             .gap_2()
             .rounded_md()
-            .anchor_scroll(keyboard_selected.then(|| self.sidebar_scroll_anchor.clone()))
+            .anchor_scroll(keyboard_selected.then(|| self.sidebar_agent_scroll_anchor.clone()))
             .bg(if keyboard_selected {
                 rgb(0x45475a)
             } else if selected {
@@ -9024,8 +8963,6 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sidebar_viewport_width = f32::from(window.viewport_size().width);
-        self.git_panel.compact =
-            self.git_panel.open && f32::from(window.viewport_size().width) < 1000.0;
         let workspace_name = self
             .terminals
             .get(&self.focused)
@@ -9274,7 +9211,7 @@ impl Render for Workspace {
             .relative()
             .h_full()
             .w(px(target_drawer_width))
-            .child(self.sidebar(cx))
+            .child(self.sidebar(window, cx))
             .when(target_drawer_width > 0.0, |sidebar| {
                 sidebar.child(
                     div()
@@ -9332,13 +9269,43 @@ impl Render for Workspace {
                 .into_any_element()
         };
 
-        let git_panel = self.render_git_panel(window, cx);
         let content = div()
+            .relative()
             .size_full()
             .flex()
             .child(drawer)
             .child(terminal_area)
-            .when_some(git_panel, |element, panel| element.child(panel))
+            .when(!self.sidebar_visible, |content| {
+                content.child(
+                    div()
+                        .id("sidebar-reopen-handle")
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(6.0))
+                        .occlude()
+                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                        .hover(|handle| handle.bg(rgb(0x89b4fa)))
+                        .tooltip(|_, cx| {
+                            cx.new(|_| HeaderTooltip("Drag right to open sidebar"))
+                                .into()
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.sidebar_resizing = true;
+                                this.drawer_animation_from = None;
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(Self::on_pointer_move))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(Self::end_pointer_interaction),
+                        ),
+                )
+            })
             .into_any_element();
         let sidebar_menu = self.sidebar_menu_overlay(cx);
         let nodes_panel = self.nodes_panel(cx);
@@ -9408,6 +9375,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::exit_layout_mode))
             .on_key_down(cx.listener(Self::terminal_key_down))
             .on_key_up(cx.listener(Self::terminal_key_up))
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                    if !event.modifiers.control {
+                        this.release_layout_leader(cx);
+                    }
+                },
+            ))
             .on_mouse_move(cx.listener(Self::on_pointer_move))
             .on_mouse_up(
                 MouseButton::Left,
@@ -9815,6 +9789,57 @@ fn main() {
     gpui_platform::application().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("BoomuxSettingsInput")),
+            // Layout commands remain available while Control is held with the leader.
+            KeyBinding::new("ctrl-h", FocusLeft, Some("Layout")),
+            KeyBinding::new("ctrl-l", FocusRight, Some("Layout")),
+            KeyBinding::new("ctrl-k", FocusUp, Some("Layout")),
+            KeyBinding::new("ctrl-j", ToggleSplit, Some("Layout")),
+            KeyBinding::new("ctrl-left", FocusLeft, Some("Layout")),
+            KeyBinding::new("ctrl-right", FocusRight, Some("Layout")),
+            KeyBinding::new("ctrl-up", FocusUp, Some("Layout")),
+            KeyBinding::new("ctrl-down", FocusDown, Some("Layout")),
+            KeyBinding::new("ctrl-shift-h", MoveLeft, Some("Layout")),
+            KeyBinding::new("ctrl-shift-l", MoveRight, Some("Layout")),
+            KeyBinding::new("ctrl-shift-k", MoveUp, Some("Layout")),
+            KeyBinding::new("ctrl-shift-j", MoveDown, Some("Layout")),
+            KeyBinding::new("ctrl-shift-left", MoveLeft, Some("Layout")),
+            KeyBinding::new("ctrl-shift-right", MoveRight, Some("Layout")),
+            KeyBinding::new("ctrl-shift-up", MoveUp, Some("Layout")),
+            KeyBinding::new("ctrl-shift-down", MoveDown, Some("Layout")),
+            KeyBinding::new("ctrl-alt-h", ResizeSmallLeft, Some("Layout")),
+            KeyBinding::new("ctrl-alt-l", ResizeSmallRight, Some("Layout")),
+            KeyBinding::new("ctrl-alt-k", ResizeSmallUp, Some("Layout")),
+            KeyBinding::new("ctrl-alt-j", ResizeSmallDown, Some("Layout")),
+            KeyBinding::new("ctrl-alt-left", ResizeLeft, Some("Layout")),
+            KeyBinding::new("ctrl-alt-right", ResizeRight, Some("Layout")),
+            KeyBinding::new("ctrl-alt-up", ResizeUp, Some("Layout")),
+            KeyBinding::new("ctrl-alt-down", ResizeDown, Some("Layout")),
+            KeyBinding::new("ctrl-alt-shift-h", ResizeLargeLeft, Some("Layout")),
+            KeyBinding::new("ctrl-alt-shift-l", ResizeLargeRight, Some("Layout")),
+            KeyBinding::new("ctrl-alt-shift-k", ResizeLargeUp, Some("Layout")),
+            KeyBinding::new("ctrl-alt-shift-j", ResizeLargeDown, Some("Layout")),
+            KeyBinding::new("ctrl-alt-shift-left", AlignFloatingLeft, Some("Layout")),
+            KeyBinding::new("ctrl-alt-shift-right", AlignFloatingRight, Some("Layout")),
+            KeyBinding::new("ctrl-alt-shift-up", AlignFloatingUp, Some("Layout")),
+            KeyBinding::new("ctrl-alt-shift-down", AlignFloatingDown, Some("Layout")),
+            KeyBinding::new("ctrl-s", ToggleSplit, Some("Layout")),
+            KeyBinding::new("ctrl-e", EqualizeSplit, Some("Layout")),
+            KeyBinding::new("ctrl-r", SwapSplit, Some("Layout")),
+            KeyBinding::new("ctrl-c", CenterFloating, Some("Layout")),
+            KeyBinding::new("ctrl-tab", CyclePaneNext, Some("Layout")),
+            KeyBinding::new("ctrl-shift-tab", CyclePanePrevious, Some("Layout")),
+            KeyBinding::new("ctrl-pagedown", CycleWorkspaceNext, Some("Layout")),
+            KeyBinding::new("ctrl-pageup", CycleWorkspacePrevious, Some("Layout")),
+            KeyBinding::new("ctrl-o", ToggleFloating, Some("Layout")),
+            KeyBinding::new("ctrl-f", ToggleFullscreen, Some("Layout")),
+            KeyBinding::new("ctrl-b", ToggleSidebarDrawer, Some("Layout")),
+            KeyBinding::new("ctrl-escape", ExitLayoutMode, Some("Layout")),
+            KeyBinding::new("ctrl-right", FocusRight, Some("SidebarLayout")),
+            KeyBinding::new("ctrl-l", FocusRight, Some("SidebarLayout")),
+            KeyBinding::new("ctrl-pagedown", CycleWorkspaceNext, Some("SidebarLayout")),
+            KeyBinding::new("ctrl-pageup", CycleWorkspacePrevious, Some("SidebarLayout")),
+            KeyBinding::new("ctrl-g", ToggleGitPanel, Some("Layout")),
+            KeyBinding::new("ctrl-g", ToggleGitPanel, Some("SidebarLayout")),
             KeyBinding::new("shift-insert", PasteClipboard, Some("BoomuxSettingsInput")),
             KeyBinding::new("h", FocusLeft, Some("Layout")),
             KeyBinding::new("l", FocusRight, Some("Layout")),
@@ -9860,14 +9885,6 @@ fn main() {
             KeyBinding::new("f", ToggleFullscreen, Some("Layout")),
             KeyBinding::new("b", ToggleSidebarDrawer, Some("Layout")),
             KeyBinding::new("escape", ExitLayoutMode, Some("Layout")),
-            KeyBinding::new(KEY_TOGGLE_LAYOUT_MODE, ToggleLayoutMode, Some("Terminal")),
-            KeyBinding::new(KEY_TOGGLE_LAYOUT_MODE, ToggleLayoutMode, Some("Layout")),
-            KeyBinding::new(KEY_TOGGLE_LAYOUT_MODE, ToggleLayoutMode, Some("Sidebar")),
-            KeyBinding::new(
-                KEY_TOGGLE_LAYOUT_MODE,
-                ToggleLayoutMode,
-                Some("SidebarLayout"),
-            ),
             KeyBinding::new("right", FocusRight, Some("SidebarLayout")),
             KeyBinding::new("l", FocusRight, Some("SidebarLayout")),
             KeyBinding::new("pagedown", CycleWorkspaceNext, Some("SidebarLayout")),
@@ -9945,6 +9962,54 @@ fn main() {
 #[cfg(test)]
 mod pointer_tests {
     use super::*;
+
+    #[test]
+    fn layout_leader_release_distinguishes_taps_holds_and_toggle_off() {
+        assert!(!layout_leader_release_exits(
+            true,
+            Duration::from_millis(249)
+        ));
+        assert!(layout_leader_release_exits(
+            true,
+            Duration::from_millis(250)
+        ));
+        assert!(layout_leader_release_exits(true, Duration::from_secs(2)));
+        // A press that toggled off, or a chord already released via Control,
+        // must not perform another mode transition when Space is released.
+        assert!(!layout_leader_release_exits(false, Duration::from_secs(2)));
+        for key in ["ctrl-left", "ctrl-tab", "ctrl-alt-shift-left"] {
+            let _ = KeyBinding::new(key, FocusLeft, Some("Layout"));
+        }
+    }
+
+    #[test]
+    fn layout_leader_repeat_never_starts_another_gesture() {
+        assert!(layout_leader_starts_press(false, false));
+        assert!(!layout_leader_starts_press(false, true));
+        for _ in 0..100 {
+            assert!(!layout_leader_starts_press(true, true));
+            // Focus/activation or release processing may clear tracked state.
+            // A repeat is still not a fresh press and must never toggle Layout.
+            assert!(!layout_leader_starts_press(true, false));
+        }
+        assert!(layout_leader_release_exits(true, Duration::from_secs(2)));
+        assert!(layout_leader_starts_press(false, false));
+    }
+
+    #[test]
+    fn sidebar_drag_collapses_at_edge_and_reopens_with_bounded_width() {
+        for x in [-20.0, 0.0, 48.0] {
+            assert_eq!(sidebar_drag_target(x), None);
+        }
+        assert_eq!(sidebar_drag_target(49.0), Some(280.0));
+        assert_eq!(sidebar_drag_target(420.0), Some(420.0));
+        assert_eq!(sidebar_drag_target(900.0), Some(600.0));
+        // A single drag can cross the collapse boundary in either direction.
+        assert_eq!(
+            [320.0, 20.0, 100.0].map(sidebar_drag_target),
+            [Some(320.0), None, Some(280.0)]
+        );
+    }
 
     #[test]
     fn settings_scroll_eliminates_hidden_sidebar_row_preparation() {

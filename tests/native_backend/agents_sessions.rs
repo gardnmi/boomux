@@ -493,7 +493,7 @@ fn retired_session_host_services_do_not_invoke_catalogs() {
             fs::write(
                 &path,
                 format!(
-                    "#!/bin/sh\nprintf x >> \"{}\"\n/bin/sleep 5\nexit 1\n",
+                    "#!/bin/sh\nif [ \"${{1-}}\" = --version ]; then printf '1.0.0\\n'; exit 0; fi\nprintf x >> \"{}\"\n/bin/sleep 5\nexit 1\n",
                     runtime_dir.join("catalog-invoked").display()
                 ),
             )
@@ -1112,7 +1112,7 @@ fn supervised_opencode_resume_attaches_to_warm_shared_runtime_without_cold_start
         let opencode = runtime_bin.join("opencode");
         fs::write(
             &opencode,
-            "#!/bin/sh\ncase \"${1-}\" in\n  serve) exec python3 -c 'import socket,sys,time; s=socket.socket(); s.bind((\"127.0.0.1\", int(sys.argv[5]))); s.listen(); time.sleep(60)' \"$@\" ;;\n  attach) { for arg do printf 'arg:%s\\n' \"$arg\"; done; printf 'generation:%s\\nshell:%s\\nrun:%s\\n' \"$BOOMUX_OPENCODE_SHARED_GENERATION\" \"$BOOMUX_SHELL_ID\" \"$BOOMUX_RUN_ID\"; } > \"$CAPTURE\"; while :; do sleep 60; done ;;\n  *) printf 'standalone:%s\\n' \"$*\" > \"$STANDALONE_CAPTURE\"; while :; do sleep 60; done ;;\nesac\n",
+            "#!/bin/sh\ncase \"${1-}\" in\n  --version) printf '1.0.0\\n'; exit 0 ;;\n  serve) exec python3 -c 'import socket,sys,time; s=socket.socket(); s.bind((\"127.0.0.1\", int(sys.argv[5]))); s.listen(); time.sleep(60)' \"$@\" ;;\n  attach) { for arg do printf 'arg:%s\\n' \"$arg\"; done; printf 'generation:%s\\nshell:%s\\nrun:%s\\n' \"$BOOMUX_OPENCODE_SHARED_GENERATION\" \"$BOOMUX_SHELL_ID\" \"$BOOMUX_RUN_ID\"; } > \"$CAPTURE\"; while :; do sleep 60; done ;;\n  *) printf 'standalone:%s\\n' \"$*\" > \"$STANDALONE_CAPTURE\"; while :; do sleep 60; done ;;\nesac\n",
         )
         .unwrap();
         fs::set_permissions(&opencode, fs::Permissions::from_mode(0o700)).unwrap();

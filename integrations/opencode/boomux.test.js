@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { BoomuxOpenCodePlugin } from "./boomux.js";
+import { createProcessRunner as createTuiProcessRunner } from "./boomux-tui-runner.js";
 
 const {
   COMMAND_TIMEOUT_MS,
@@ -17,6 +18,45 @@ const env = {
   BOOMUX_SHELL_ID: "shell;not-a-command",
   BOOMUX_RUN_ID: "run $(false)",
 };
+
+// Both assets are independently deployed; share contract fixtures, not an
+// import between installed plugin files that may live in different directories.
+for (const [name, makeRunner] of [["lifecycle", createProcessRunner], ["TUI", createTuiProcessRunner]]) {
+  describe(`${name} subprocess cleanup`, () => {
+    test("deadline rejects even when the child never exits or closes its pipes", async () => {
+      const signals = [];
+      let cancelled = 0;
+      const pipe = () => new ReadableStream({ cancel() { cancelled += 1; } });
+      const stdout = pipe();
+      const stderr = pipe();
+      const run = makeRunner({ timeoutMs: 5, spawn: () => ({
+        stdout, stderr, exited: new Promise(() => {}), kill(signal) { signals.push(signal); },
+      }) });
+      await expect(run(["boomux"])).rejects.toThrow("timed out");
+      expect(signals).toEqual(["SIGKILL"]);
+      expect(cancelled).toBe(2);
+      expect(stdout.locked).toBe(false);
+      expect(stderr.locked).toBe(false);
+    });
+
+    test("output overflow terminates the child and cancels its other pipe", async () => {
+      const signals = [];
+      let cancelled = false;
+      const stdout = new ReadableStream({ start(controller) {
+        controller.enqueue(new Uint8Array(64 * 1024 + 1));
+      } });
+      const stderr = new ReadableStream({ cancel() { cancelled = true; } });
+      const run = makeRunner({ spawn: () => ({
+        stdout, stderr, exited: new Promise(() => {}), kill(signal) { signals.push(signal); },
+      }) });
+      await expect(run(["boomux"])).rejects.toThrow("output limit");
+      expect(signals).toEqual(["SIGKILL"]);
+      expect(cancelled).toBe(true);
+      expect(stdout.locked).toBe(false);
+      expect(stderr.locked).toBe(false);
+    });
+  });
+}
 
 function event(type, properties) {
   return { type, properties };

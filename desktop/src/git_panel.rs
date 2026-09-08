@@ -36,20 +36,16 @@ pub(crate) struct NodeOverview {
 #[derive(Default)]
 pub(crate) struct Model {
     pub open: bool,
-    pub compact: bool,
-    pub wide: bool,
-    pub width: Option<f32>,
+    pub height: Option<f32>,
     pub resizing: bool,
     pub search: String,
     pub search_focused: bool,
     pub search_open: bool,
-    pub filters_open: bool,
-    pub current_workspace: bool,
-    pub needs_attention: bool,
     pub busy: bool,
     pub nodes: Vec<NodeOverview>,
     pub expanded: HashSet<(String, PathBuf)>,
     pub task: Option<gpui::Task<()>>,
+    pub scroll_handle: ScrollHandle,
 }
 fn fetch(previous: Vec<NodeOverview>, refresh: bool) -> Vec<NodeOverview> {
     let result = (|| -> Result<Vec<NodeOverview>, String> {
@@ -123,51 +119,107 @@ fn toolbar_button(
         .text_color(rgb(if active { 0xcba6f7 } else { 0xa6adc8 }))
 }
 
-fn status(row: &Worktree) -> String {
+fn local_status(row: &Worktree) -> (String, u32) {
     let Some(status) = &row.status else {
-        return row
-            .error
-            .clone()
-            .unwrap_or_else(|| "Git status unknown".into());
+        return (
+            row.error.clone().unwrap_or_else(|| "Status unknown".into()),
+            0xf9e2af,
+        );
     };
-    let local = if status.conflicts > 0 {
-        format!("{} conflicts", status.conflicts)
+    if status.conflicts > 0 {
+        (format!("{} conflicts", status.conflicts), 0xf38ba8)
     } else if status.staged + status.unstaged + status.untracked == 0 {
-        "Clean".into()
+        ("Clean".into(), 0xa6e3a1)
     } else {
-        [
-            (status.staged, "staged"),
-            (status.unstaged, "unstaged"),
-            (status.untracked, "untracked"),
-        ]
-        .into_iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, label)| format!("{count} {label}"))
-        .collect::<Vec<_>>()
-        .join(" · ")
-    };
-    let push = if status.upstream.is_none() {
-        "No upstream".into()
-    } else if !status.divergence_known {
-        "Upstream comparison unavailable".into()
-    } else if status.ahead == 0 && status.behind == 0 {
-        "Matches upstream".into()
-    } else {
-        format!("{} ahead · {} behind", status.ahead, status.behind)
-    };
-    format!("{local} · {push}")
+        (
+            [
+                (status.staged, "staged"),
+                (status.unstaged, "unstaged"),
+                (status.untracked, "untracked"),
+            ]
+            .into_iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, label)| format!("{count} {label}"))
+            .collect::<Vec<_>>()
+            .join(" · "),
+            0xf9e2af,
+        )
+    }
 }
-fn attention(row: &Worktree) -> bool {
-    row.error.is_some()
-        || row.pr.error.is_some()
-        || row.status.as_ref().is_some_and(|s| {
-            s.conflicts + s.staged + s.unstaged + s.untracked + s.ahead + s.behind > 0
-                || s.upstream.is_none()
-                || !s.divergence_known
-        })
-        || row.agents.iter().any(|a| a.state == AgentState::Blocked)
-        || row.pr.summary.contains("failed")
-        || row.pr.summary.contains("changes requested")
+
+fn upstream_status(row: &Worktree) -> (String, u32) {
+    let Some(status) = &row.status else {
+        return ("Upstream unknown".into(), 0x7f849c);
+    };
+    if status.upstream.is_none() {
+        ("No upstream".into(), 0xf9e2af)
+    } else if !status.divergence_known {
+        ("Upstream unknown".into(), 0xf9e2af)
+    } else if status.ahead == 0 && status.behind == 0 {
+        ("Up to date".into(), 0xa6e3a1)
+    } else {
+        (
+            format!("{} ahead · {} behind", status.ahead, status.behind),
+            0xf9e2af,
+        )
+    }
+}
+
+fn pr_status(row: &Worktree) -> Option<(String, u32)> {
+    if row.pr.error.is_some()
+        || row.pr.summary.is_empty()
+        || matches!(
+            row.pr.summary.as_str(),
+            "No matching PR" | "No branch PR lookup"
+        )
+        || row.pr.summary.starts_with("PR lookup unavailable")
+        || row.pr.summary.starts_with("PR lookup truncated")
+    {
+        return None;
+    }
+    let color = if row.pr.summary.contains("failed") || row.pr.summary.contains("changes requested")
+    {
+        0xf38ba8
+    } else if row.pr.summary.contains("pending") || row.pr.summary.contains("unknown") {
+        0xf9e2af
+    } else {
+        0xa6e3a1
+    };
+    Some((row.pr.summary.clone(), color))
+}
+
+fn status_item(label: String, color: u32) -> Div {
+    div()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .text_xs()
+        .text_color(rgb(0xa6adc8))
+        .child(
+            div()
+                .size(px(6.0))
+                .flex_none()
+                .rounded_full()
+                .bg(rgb(color)),
+        )
+        .child(div().min_w_0().truncate().child(label))
+}
+
+fn detail_row(label: &'static str, value: String) -> Div {
+    div()
+        .flex()
+        .gap_3()
+        .min_w_0()
+        .text_xs()
+        .child(
+            div()
+                .w(px(58.0))
+                .flex_none()
+                .text_color(rgb(0x7f849c))
+                .child(label),
+        )
+        .child(div().min_w_0().text_color(rgb(0xa6adc8)).child(value))
 }
 fn state_label(state: AgentState) -> &'static str {
     match state {
@@ -196,10 +248,25 @@ fn age(timestamp: u64) -> String {
 }
 impl Workspace {
     pub(crate) fn toggle_git_panel(&mut self, cx: &mut Context<Self>) {
-        self.git_panel.open = !self.git_panel.open;
+        self.sidebar_visible = true;
+        self.settings_open = false;
+        self.select_git_tab(true, cx);
+    }
+
+    pub(crate) fn select_git_tab(&mut self, git: bool, cx: &mut Context<Self>) {
+        if self.git_panel.open == git {
+            self.save_settings();
+            cx.notify();
+            return;
+        }
+        self.git_panel.open = git;
+        self.reconcile_sidebar_item();
+        self.save_settings();
         if self.git_panel.open {
+            self.refresh_git_panel(false, cx);
             self.git_panel.task = Some(cx.spawn(async move |this, cx| {
                 loop {
+                    cx.background_executor().timer(Duration::from_secs(3)).await;
                     let proceed = this
                         .update(cx, |this, cx| {
                             if !this.git_panel.open {
@@ -212,7 +279,6 @@ impl Workspace {
                     if !proceed {
                         break;
                     }
-                    cx.background_executor().timer(Duration::from_secs(3)).await;
                 }
             }));
         } else {
@@ -227,6 +293,7 @@ impl Workspace {
             return;
         }
         self.git_panel.busy = true;
+        cx.notify();
         let previous = self.git_panel.nodes.clone();
         cx.spawn(async move |this, cx| {
             let nodes = cx
@@ -242,45 +309,94 @@ impl Workspace {
                             &n.id == node && n.overview.worktrees.iter().any(|r| &r.root == path)
                         })
                     });
-                    cx.notify();
                 }
+                cx.notify();
             })
             .ok();
         })
         .detach();
     }
-    pub(crate) fn git_panel_width(&self, window: &Window) -> f32 {
-        if !self.git_panel.open {
-            return 0.0;
-        }
-        let available =
-            (f32::from(window.viewport_size().width) - self.sidebar_width() - 240.0).max(0.0);
-        available.min(self.git_panel.width.unwrap_or(if self.git_panel.wide {
-            720.0
-        } else {
-            420.0
-        }))
+    pub(crate) fn render_git_controls(&self, cx: &mut Context<Self>) -> Div {
+        let refreshing = self.git_panel.busy
+            || self
+                .git_panel
+                .nodes
+                .iter()
+                .any(|node| node.overview.refreshing);
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                toolbar_button(
+                    "git-search-toggle",
+                    "Search worktrees",
+                    "⌕",
+                    self.git_panel.search_open,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.git_panel.search_open = !this.git_panel.search_open;
+                    this.git_panel.search_focused = this.git_panel.search_open;
+                    if !this.git_panel.search_open {
+                        this.git_panel.search.clear();
+                    }
+                    cx.notify();
+                })),
+            )
+            .child(
+                toolbar_button(
+                    "git-refresh",
+                    if refreshing {
+                        "Refreshing Git status…"
+                    } else {
+                        "Refresh Git status"
+                    },
+                    "↻",
+                    refreshing,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.refresh_git_panel(true, cx))),
+            )
     }
-    pub(crate) fn render_git_panel(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
+
+    pub(crate) fn render_git_panel(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.git_panel.open {
             return None;
         }
-        let workspace = self
-            .terminals
-            .get(&self.focused)
-            .and_then(|p| p.shell.as_ref())
-            .map(|s| s.workspace_id.as_str());
         let mut rows = Vec::new();
         let query = self.git_panel.search.to_lowercase();
-        let refreshing = self
-            .git_panel
-            .nodes
-            .iter()
-            .any(|node| node.overview.refreshing);
+        let refreshing = self.git_panel.busy
+            || self
+                .git_panel
+                .nodes
+                .iter()
+                .any(|node| node.overview.refreshing);
+        let initial_loading = refreshing
+            && self
+                .git_panel
+                .nodes
+                .iter()
+                .all(|node| node.overview.worktrees.is_empty() && node.error.is_none());
+        if initial_loading {
+            rows.push(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .text_color(rgb(0xa6adc8))
+                    .child(div().size_2().rounded_full().bg(rgb(0x89b4fa)))
+                    .child(div().text_sm().child("Loading repositories…"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x7f849c))
+                            .child("Inspecting managed Shells and Agents"),
+                    )
+                    .into_any_element(),
+            );
+        }
         let show_nodes =
             self.git_panel.nodes.len() > 1 || self.git_panel.nodes.iter().any(|node| !node.local);
         for node in &self.git_panel.nodes {
@@ -326,21 +442,6 @@ impl Workspace {
             let mut previous_repository = None;
             let mut repository: Option<Div> = None;
             for row in &node.overview.worktrees {
-                if self.git_panel.current_workspace
-                    && !row
-                        .shells
-                        .iter()
-                        .any(|s| Some(s.workspace_id.as_str()) == workspace)
-                    && !row
-                        .agents
-                        .iter()
-                        .any(|a| Some(a.workspace_id.as_str()) == workspace)
-                {
-                    continue;
-                }
-                if self.git_panel.needs_attention && !attention(row) {
-                    continue;
-                }
                 if !query.is_empty()
                     && !format!(
                         "{} {} {} {}",
@@ -369,16 +470,16 @@ impl Workspace {
                             .flex_col()
                             .min_w_0()
                             .flex_none()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(0x313244))
+                            .gap_1()
                             .overflow_hidden()
                             .child(
                                 div()
                                     .px_3()
-                                    .py_2()
+                                    .pt_1()
+                                    .pb_1()
                                     .text_sm()
-                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xa6adc8))
                                     .child(row.repository.clone()),
                             ),
                     );
@@ -398,9 +499,11 @@ impl Workspace {
                     .min_w_0()
                     .gap_1()
                     .px_3()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(rgb(0x313244))
+                    .py_1()
+                    .ml_3()
+                    .border_l_1()
+                    .border_color(rgb(if expanded { 0x89b4fa } else { 0x313244 }))
+                    .when(expanded, |row| row.bg(rgb(0x1e1e2e)))
                     .child(
                         div()
                             .id(SharedString::from(format!(
@@ -409,12 +512,14 @@ impl Workspace {
                                 row.root.display()
                             )))
                             .cursor_pointer()
+                            .rounded_sm()
+                            .hover(|header| header.bg(rgb(0x29293d)))
                             .flex()
                             .items_center()
                             .gap_2()
                             .min_w_0()
                             .text_sm()
-                            .text_color(rgb(0x89b4fa))
+                            .font_weight(gpui::FontWeight::NORMAL)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.git_panel.expanded.remove(&toggle) {
                                     this.git_panel.expanded.clear();
@@ -422,11 +527,20 @@ impl Workspace {
                                 }
                                 cx.notify();
                             }))
-                            .child(div().flex_1().min_w_0().truncate().child(format!(
-                                "{} {}",
-                                if expanded { "▾" } else { "▸" },
-                                row.branch
-                            )))
+                            .child(
+                                div()
+                                    .w(px(10.0))
+                                    .flex_none()
+                                    .text_color(rgb(0x6c7086))
+                                    .child(if expanded { "▾" } else { "▸" }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(row.branch.clone()),
+                            )
                             .when(!agents.is_empty(), |header| {
                                 header.child(
                                     div().text_xs().flex_none().text_color(rgb(0xa6adc8)).child(
@@ -439,66 +553,53 @@ impl Workspace {
                                 )
                             }),
                     );
-                let pr = if row.pr.summary.is_empty() {
-                    if row.pr.error.is_some() {
-                        "PR unavailable"
-                    } else {
-                        "PR pending"
-                    }
-                } else if row.pr.summary == "No matching PR" {
-                    "No PR"
-                } else {
-                    &row.pr.summary
-                };
-                let summary = format!(
-                    "{} · {}{}{}",
-                    status(row),
-                    pr,
-                    if row.pr.error.is_some() {
-                        " · stale/unavailable"
-                    } else {
-                        ""
-                    },
-                    if row.pr.head.as_ref().is_some_and(|head| head != &row.head) {
-                        " · PR at different commit"
-                    } else {
-                        ""
-                    }
-                );
+                let local = local_status(row);
+                let upstream = upstream_status(row);
+                let pr = pr_status(row);
                 card = card.child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(if attention(row) { 0xf9e2af } else { 0xa6adc8 }))
-                        .child(summary),
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .min_w_0()
+                        .child(status_item(local.0, local.1))
+                        .child(status_item(upstream.0, upstream.1))
+                        .when_some(pr, |statuses, (label, color)| {
+                            statuses.child(status_item(label, color))
+                        }),
                 );
+                if row.pr.error.is_none()
+                    && !row.pr.summary.is_empty()
+                    && row.pr.summary != "No matching PR"
+                    && row.pr.head.as_ref().is_some_and(|head| head != &row.head)
+                {
+                    card = card.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xf9e2af))
+                            .child("PR status is for a different commit"),
+                    );
+                }
                 if expanded {
-                    card = card
-                        .child(
-                            div()
-                                .mt_1()
-                                .text_xs()
-                                .text_color(rgb(0xa6adc8))
-                                .child(row.root.display().to_string()),
-                        )
-                        .child(div().text_xs().text_color(rgb(0xa6adc8)).child(format!(
-                            "{} Shells · {} {}",
-                            row.shells.len(),
-                            agents.len(),
-                            if agents.len() == 1 { "Agent" } else { "Agents" }
-                        )))
-                        .when_some(row.pr.error.clone(), |card, error| {
-                            card.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0xf9e2af))
-                                    .child(format!("PR unavailable / stale: {error}")),
-                            )
-                        });
+                    card = card.child(
+                        div()
+                            .mt_2()
+                            .child(detail_row("Path", row.root.display().to_string())),
+                    );
                     if let Some(commit) = &row.last_commit {
-                        card = card.child(div().text_xs().child(format!("Last commit: {commit}")));
+                        card = card.child(detail_row("Commit", commit.clone()));
                     }
                     if let Some(upstream) = row.status.as_ref().and_then(|s| s.upstream.as_ref()) {
-                        card = card.child(div().text_xs().child(format!("Upstream: {upstream}")));
+                        card = card.child(detail_row("Upstream", upstream.clone()));
+                    }
+                    if !row.shells.is_empty() || !agents.is_empty() {
+                        card = card.child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Linked activity"),
+                        );
                     }
                     for shell in &row.shells {
                         let id = shell.id.clone();
@@ -584,18 +685,17 @@ impl Workspace {
                                 )),
                         );
                     }
-                    if !row.branches.is_empty() {
-                        card =
-                            card.child(div().text_xs().text_color(rgb(0xa6adc8)).child(format!(
-                                "Other local branches: {}",
-                                row.branches.join(", ")
-                            )));
-                    }
-                    card = card.child(div().text_xs().text_color(rgb(0xa6adc8)).child(format!(
-                        "Git: {} · PR: {} · Upstream uses local refs",
-                        age(row.observed_at_ms),
-                        age(row.pr.observed_at_ms)
-                    )));
+                    card = card.child(div().mt_2().text_xs().text_color(rgb(0x7f849c)).child(
+                        format!(
+                            "Updated {} · Local upstream refs{}",
+                            age(row.observed_at_ms),
+                            if pr_status(row).is_some() {
+                                format!(" · PR checked {}", age(row.pr.observed_at_ms))
+                            } else {
+                                String::new()
+                            }
+                        ),
+                    ));
                     let path = row.root.display().to_string();
                     card = card.child(
                         Self::settings_option(
@@ -646,7 +746,7 @@ impl Workspace {
                 div()
                     .text_xs()
                     .text_color(rgb(0xa6adc8))
-                    .child("No worktrees match these filters.")
+                    .child("No worktrees match this search.")
                     .into_any_element(),
             );
         }
@@ -654,118 +754,14 @@ impl Workspace {
             div()
                 .relative()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .w(px(self.git_panel_width(window)))
-                .h_full()
+                .w_full()
+                .flex_1()
+                .min_h_0()
                 .min_w_0()
-                .flex_none()
                 .flex()
                 .flex_col()
-                .border_l_1()
-                .border_color(rgb(0x45475a))
                 .bg(rgb(0x181825))
                 .overflow_hidden()
-                .child(
-                    div()
-                        .id("git-resize")
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(5.0))
-                        .cursor(gpui::CursorStyle::ResizeLeftRight)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.git_panel.resizing = true;
-                                cx.stop_propagation();
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child("Git")
-                                .child(
-                                    div()
-                                        .id("git-refresh-indicator")
-                                        .size(px(6.0))
-                                        .flex_none()
-                                        .rounded_full()
-                                        .bg(rgb(0x89b4fa))
-                                        .opacity(if refreshing { 1.0 } else { 0.0 })
-                                        .tooltip(|_, cx| {
-                                            cx.new(|_| HeaderTooltip("Refreshing Git status"))
-                                                .into()
-                                        }),
-                                ),
-                        )
-                        .child(
-                            toolbar_button(
-                                "git-search-toggle",
-                                "Search worktrees",
-                                "⌕",
-                                self.git_panel.search_open,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.git_panel.search_open = !this.git_panel.search_open;
-                                this.git_panel.search_focused = this.git_panel.search_open;
-                                if !this.git_panel.search_open {
-                                    this.git_panel.search.clear();
-                                }
-                                this.git_panel.filters_open = false;
-                                cx.notify();
-                            })),
-                        )
-                        .child(
-                            toolbar_button(
-                                "git-filter-toggle",
-                                "Filter worktrees",
-                                "≡",
-                                self.git_panel.filters_open
-                                    || self.git_panel.current_workspace
-                                    || self.git_panel.needs_attention,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.git_panel.filters_open = !this.git_panel.filters_open;
-                                this.git_panel.search_focused = false;
-                                cx.notify();
-                            })),
-                        )
-                        .child(
-                            toolbar_button("git-refresh", "Refresh Git status", "↻", false)
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.refresh_git_panel(true, cx)),
-                                ),
-                        )
-                        .child(
-                            toolbar_button(
-                                "git-expand-panel",
-                                "Expand or narrow panel",
-                                "↔",
-                                self.git_panel.wide,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.git_panel.wide = !this.git_panel.wide;
-                                this.git_panel.width = None;
-                                cx.notify();
-                            })),
-                        )
-                        .child(
-                            toolbar_button("git-close", "Close Git panel", "×", false)
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_git_panel(cx))),
-                        ),
-                )
                 .when(self.git_panel.search_open, |panel| {
                     panel.child(
                         div()
@@ -796,6 +792,7 @@ impl Workspace {
                 .child(
                     div()
                         .id("git-panel-scroll")
+                        .track_scroll(&self.git_panel.scroll_handle)
                         .flex_1()
                         .min_h_0()
                         .overflow_y_scroll()
@@ -806,63 +803,6 @@ impl Workspace {
                         .gap_2()
                         .children(rows),
                 )
-                .when(self.git_panel.filters_open, |panel| {
-                    panel.child(
-                        div()
-                            .absolute()
-                            .top(px(42.0))
-                            .right(px(12.0))
-                            .w(px(220.0))
-                            .p_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(0x45475a))
-                            .bg(rgb(0x1e1e2e))
-                            .shadow_lg()
-                            .occlude()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                Self::settings_option(
-                                    "git-workspace-filter",
-                                    if self.git_panel.current_workspace {
-                                        "Current Workspace"
-                                    } else {
-                                        "All Workspaces"
-                                    },
-                                    self.git_panel.current_workspace,
-                                )
-                                .flex_none()
-                                .py_1()
-                                .text_xs()
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.git_panel.current_workspace =
-                                            !this.git_panel.current_workspace;
-                                        cx.notify();
-                                    },
-                                )),
-                            )
-                            .child(
-                                Self::settings_option(
-                                    "git-attention-filter",
-                                    "Needs attention",
-                                    self.git_panel.needs_attention,
-                                )
-                                .flex_none()
-                                .py_1()
-                                .text_xs()
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.git_panel.needs_attention =
-                                            !this.git_panel.needs_attention;
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
-                    )
-                })
                 .into_any_element(),
         )
     }

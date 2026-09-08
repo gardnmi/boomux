@@ -32,7 +32,20 @@ the `Layout` context, where unmodified navigation keys and their Shift/Alt
 variants manipulate panes until `Escape` exits. Layout mode blocks new terminal
 key presses, repeats, paste, and mouse-wheel reports; releases for keys already
 sent still reach their original pane. Double `Ctrl+Space` retains its explicit
-pass-through behavior. Output processing continues while each visible pane
+pass-through behavior. The leader activates Layout immediately; release before
+250 ms latches it, while a longer hold exits on release of Control or Space.
+The leader is handled from raw key events, outside the ordinary action binding
+dispatcher, so auto-repeat is explicitly ignored even after tracked press state
+is cleared. Space release is settled for 50 ms using one cancelable task:
+a fresh press during that interval continues the same gesture. This handles
+input paths that synthesize repeat as release/press pairs without a repeat flag.
+Tap/hold classification uses the release event time, excluding the settling
+delay. Control release ends a hold immediately. Window deactivation cancels the
+pending release and clears an active hold.
+Control-modified Layout bindings support navigation while holding the chord.
+Keys pressed in Layout are prevented from repeating into the terminal after
+release of the leader; releases for previously forwarded keys still reach their
+original pane. Output processing continues while each visible pane
 shows a dimming overlay and animated tile icon. Overlay removal shares the
 badge’s single cancelable exit task; it does not delay restoring input.
 
@@ -45,7 +58,7 @@ badge’s single cancelable exit task; it does not delay restoring input.
 - `src/terminal.rs`: Boomux discovery/attachment adapter, per-pane terminal
   worker, Ghostty VT state, scrollback, key/paste encoding, and Kitty graphics
   extraction.
-- `src/git_panel.rs`: demand-driven Node Git overview, filtering, resizable panel,
+- `src/git_panel.rs`: demand-driven Node Git overview, filtering, lower sidebar tab,
   and exact local Shell navigation; see [Git panel](git-panel.md).
 - `src/nodes.rs`: read-only Node identity, health, and resource-count presentation
   from the daemon's combined snapshot.
@@ -236,24 +249,12 @@ system graphics libraries. The installer first checks its glibc baseline, then
 both executable versions and this runtime check before committing any active
 release change. GPU/driver/display startup remains a separate smoke-test concern.
 
-`harness_integrations.rs` checks the matching CLI's `integration status --json`
-once at startup and on an explicit Settings recheck. Only supported, successfully
-probed local harnesses with missing or differing integration assets produce a
-sidebar suggestion. `current` assets remain quiet; `modified` assets require
-review because status cannot distinguish an older bundled asset from user edits.
-An Install action runs `integration install`; a separate Replace confirmation
-allows `--force` for the reviewed integration. The CLI retains all installation,
-ownership, and configuration authority. No installation or harness restart runs
-as a side effect of discovery. Successful installation displays the integration's
-reload instructions. Not now dismisses per window; a manual recheck clears those
-bounded dismissals. Settings also exposes status and discovery failures.
+Desktop does not probe harness installations or offer integration installation
+and update notices. Core owns automatic setup, managed-asset refresh, ownership
+receipts, and persistent uninstall choices (see the root architecture). There is
+no per-window integration worker or Desktop-owned integration preference.
 
-One operation per window runs off GPUI, with a 35-second timeout, a one-second
-kill grace, and at most 128 KiB retained output. Only bundled integration keys can
-become actions. Process argument vectors are exact, JSON envelopes are validated,
-and no polling loop, per-pane task, host transcript, or credential cache is added.
-
-Settings' Manual setup action launches the private `boomux __desktop-setup`
+Settings' advanced terminal setup action launches the private `boomux __desktop-setup`
 entry point with an exact argument vector in a new daemon-owned Shell. It runs
 the same guided setup as `boomux setup`. The CLI keeps agent-integration authority
 and prompts; its Ratatui checklist uses the existing Crossterm input path,

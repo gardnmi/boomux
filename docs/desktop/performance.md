@@ -68,7 +68,7 @@ must also track the number and byte size of live image generations.
   and are dropped explicitly afterward.
 - Overview refresh and Boomux requests stay off the render path.
 - Settings replaces the covered sidebar body rather than rebuilding its hidden
-  Workspace, Shell, Agent, integration-prompt, and update-notice elements on every scroll
+  Workspace, Shell, Agent, and update-notice elements on every scroll
   render. Closing Settings reads the current overview directly, with no stale
   cached projection. Collapsed Workspaces do not construct hidden Shell rows.
 - Terminal output is coalesced before publishing a new screen snapshot.

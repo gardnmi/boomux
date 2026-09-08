@@ -10,6 +10,72 @@ use uuid::Uuid;
 
 use crate::support::{TestDaemon, wait_until};
 
+#[test]
+fn managed_integrations_install_at_startup_refresh_on_handoff_and_respect_uninstall() {
+    use sha2::{Digest, Sha256};
+    let daemon = TestDaemon::start_with(|command, root| {
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let pi = bin.join("pi");
+        fs::write(&pi, "#!/bin/sh\nprintf 'pi 0.84.1\\n'\n").unwrap();
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).unwrap();
+        command.env("PATH", bin);
+    });
+    let asset = daemon
+        .runtime_dir
+        .join("home/.pi/agent/extensions/boomux.js");
+    let receipt = asset.with_file_name(".boomux.js.boomux-managed.json");
+    wait_until(|| receipt.exists(), "startup did not install integration");
+    let current = fs::read(&asset).unwrap();
+    // Represent a previous, unmodified bundled integration without needing an
+    // old executable. The normal ownership check must authorize its refresh.
+    let old = b"// previous bundled integration\n";
+    fs::write(&asset, old).unwrap();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    state["fingerprint"] = serde_json::Value::from(format!("{:x}", Sha256::digest(old)));
+    fs::write(&receipt, serde_json::to_vec(&state).unwrap()).unwrap();
+    daemon.client.restart().unwrap();
+    wait_until(
+        || fs::read(&asset).ok().as_deref() == Some(current.as_slice()),
+        "handoff did not refresh integration",
+    );
+    wait_until(
+        || {
+            fs::read(&receipt)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|state| {
+                    state["fingerprint"] == format!("{:x}", Sha256::digest(&current))
+                })
+        },
+        "refresh receipt was not saved",
+    );
+    let output = daemon
+        .command()
+        .args(["integration", "uninstall", "pi"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    daemon.client.restart().unwrap();
+    let output = daemon
+        .command()
+        .args(["integration", "sync"])
+        .env("PATH", daemon.runtime_dir.join("bin"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!asset.exists());
+}
+
 fn setup_runtime(root: &Path) -> PathBuf {
     let runtime = root.join("runtime");
     fs::create_dir_all(&runtime).unwrap();

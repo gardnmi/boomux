@@ -198,7 +198,7 @@ jobs:
 
       - name: Run integration tests
         if: env.RUN_CODE == 'true'
-        run: bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
+        run: bun test ./integrations/opencode/boomux.test.js ./integrations/opencode/boomux-tui.test.js ./integrations/pi/boomux.test.js
 
       - name: Test shared release versioning
         if: env.RUN_CODE == 'true'

@@ -1,27 +1,35 @@
 # Git panel
 
 Boomux Desktop's Git panel shows repositories discovered from managed Shells and
-active Agent working-context observations. Open it with the branch icon beside
-Settings in the sidebar header or press
-`Ctrl+Space`, then `G`. It is a resizable sibling of the terminal canvas; opening,
-resizing, filtering, and closing it do not replace terminal entities or mutate
-Shells, Agents, worktrees, branches, or repositories. In windows narrower than
-1000 logical pixels, the ordinary sidebar temporarily yields its space to the
-Git panel so the terminal canvas remains usable. Closing Git restores the sidebar
-according to its existing preference.
+active Agent working-context observations. Select Git in the lower sidebar or
+press `Ctrl+Space`, then `G`; the shortcut reveals the sidebar when hidden.
+Agents and Git share this section below Workspaces.
+Drag the horizontal divider above the tabs to change its height. Workspaces,
+Agents, and Git scroll independently. The selected tab is remembered across
+restarts, and the Agents tab shows a count of blocked Agents even while viewing
+Git. Switching tabs does not replace terminal entities or mutate Shells, Agents,
+worktrees, branches, or repositories. Git occupies no space beside the terminal
+canvas beyond the ordinary sidebar.
 
-Each repository has one shared container per owning Node, with compact worktree
-rows separated by subtle dividers. Rows show the branch, Agent count, local Git
-status, upstream comparison, and GitHub PR/check/review status. Expand a row for
-the full path, Shell navigation, individual Agent associations, the last commit,
-other local branches, observation ages,
-copy-path, and open-PR actions. Untracked directories count as one entry rather
+Each repository has a heading per owning Node, with indented worktree rows and
+a subtle vertical guide. The expanded row has a highlighted guide and background.
+Rows show the branch and Agent count, then
+compact status indicators for the working tree and upstream comparison. GitHub
+PR/check/review state appears only when a matching PR is available; lookup
+failures and branches without PRs add no placeholder status. Healthy state stays
+visually distinct from warnings and errors. Expand a row for the full path,
+Shell navigation, individual Agent associations, the last commit,
+observation ages, copy-path, and open-PR actions. Path, commit, and upstream use
+aligned labels; linked activity is grouped separately. Other local branches
+are not listed. Untracked
+directories count as one entry rather
 than enumerating every file inside them. Search matches repository, branch,
-path, and Workspace name. Filters cover the current Workspace and work needing
-attention. The compact icon toolbar reveals search on demand and opens filters
-in an overlay; active filters highlight their toolbar button. Hiding search
-clears its query. Refresh activity stays in the header without shifting rows.
-Only one worktree row expands at a time.
+path, and Workspace name. Search and refresh controls sit beside the tabs,
+with repositories immediately below. Hiding search clears its query. The refresh
+button highlights during refresh activity without shifting rows.
+Only one worktree row expands at a time. Initial discovery shows an explicit
+loading state with a short description of what is being inspected; it never
+presents an unexplained empty panel.
 
 ## Associations and authority
 
@@ -76,7 +84,7 @@ copied between Nodes or stored in Boomux state.
 
 ## Scheduling and bounds
 
-The client queries only while the panel is open. Socket operations have a
+The client queries only while the Git tab is selected. Socket operations have a
 bounded timeout; remote Nodes are queried through the verified host-service
 route. Unavailable Nodes retain labeled stale presentation. The first 16 Nodes
 are shown with an explicit limit notice when necessary.
@@ -86,7 +94,7 @@ cached overview immediately and coalesce behind a single bounded worker. Local
 inspection starts at five-second intervals and backs off to fifteen seconds
 when semantic results are unchanged. PR observations have a separate sixty-second
 cache. Explicit Refresh refreshes both, subject to a one-second minimum interval.
-Closing the panel stops its polling; no per-Shell timer is created.
+Selecting Agents stops Git polling; no per-Shell timer is created.
 
 A cycle admits at most 512 Shell/Agent associations, 128 worktrees, and 512
 additional branch labels. Git commands have a one-second timeout and a 1 MiB

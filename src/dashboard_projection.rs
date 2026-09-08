@@ -85,14 +85,7 @@ pub(crate) fn project_remote_node(node: &boomux::protocol::CombinedNode) -> Vec<
                 .iter()
                 .filter(|agent| agent.workspace_id == workspace.id)
             {
-                match agent.state {
-                    AgentState::Unknown => agent_state_counts.unknown += 1,
-                    AgentState::Working => agent_state_counts.working += 1,
-                    AgentState::Blocked => agent_state_counts.blocked += 1,
-                    AgentState::Idle => agent_state_counts.idle += 1,
-                    AgentState::Inactive => agent_state_counts.inactive += 1,
-                    AgentState::Done => agent_state_counts.done += 1,
-                }
+                agent_state_counts.add(agent.state);
             }
             let mut items = Vec::new();
             for shell in projection

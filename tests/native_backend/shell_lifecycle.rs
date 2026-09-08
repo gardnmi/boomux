@@ -86,7 +86,7 @@ fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
         fs::write(
             &codex,
             format!(
-                "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_CODEX_RUN_SCOPED-unset}}\" > '{}'\nprintf '%s' \"${{CODEX_HOME-unset}}\" > '{}'\n",
+                "#!/bin/sh\nif [ \"${{1-}}\" = --version ]; then printf '1.0.0\\n'; exit 0; fi\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_CODEX_RUN_SCOPED-unset}}\" > '{}'\nprintf '%s' \"${{CODEX_HOME-unset}}\" > '{}'\n",
                 runtime_dir.join("codex-argv").display(),
                 runtime_dir.join("codex-argv").display(),
                 runtime_dir.join("codex-marker").display(),
@@ -147,7 +147,7 @@ fn bare_kiro_command_selects_v3_without_rewriting_stored_argv() {
         fs::write(
             &kiro,
             format!(
-                "#!/bin/sh\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_LAUNCH_HOLDER-unset}}\" > '{}'\n",
+                "#!/bin/sh\nif [ \"${{1-}}\" = --version ]; then printf '1.0.0\\n'; exit 0; fi\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_KIRO_LAUNCH_HOLDER-unset}}\" > '{}'\n",
                 runtime_dir.join("kiro-argv").display(),
                 runtime_dir.join("kiro-argv").display(),
                 runtime_dir.join("kiro-marker").display(),

@@ -334,23 +334,31 @@ function parseJSON(value) {
   return parsed;
 }
 
-async function readBounded(stream, limit, onOverflow) {
+async function readBounded(stream, limit, readers) {
   if (!stream) return "";
   const reader = stream.getReader();
+  readers.add(reader);
   const decoder = new TextDecoder();
   let size = 0;
   let result = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > limit) {
-      onOverflow();
-      throw new Error("boomux output limit exceeded");
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        throw new Error("boomux output limit exceeded");
+      }
+      result += decoder.decode(value, { stream: true });
     }
-    result += decoder.decode(value, { stream: true });
+    return result + decoder.decode();
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    readers.delete(reader);
+    reader.releaseLock();
   }
-  return result + decoder.decode();
 }
 
 function createProcessRunner(options = {}) {
@@ -370,19 +378,21 @@ function createProcessRunner(options = {}) {
       stderr: "pipe",
       shell: false,
     });
-    let timedOut = false;
-    const kill = () => child.kill?.();
-    const timer = setTimeout(() => {
-      timedOut = true;
-      kill();
-    }, timeoutMs);
+    const readers = new Set();
+    let timer;
+    // Killing alone does not settle exited or inherited output pipes.
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("boomux command timed out")), timeoutMs);
+    });
     try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        readBounded(child.stdout, maxOutput, kill),
-        readBounded(child.stderr, maxOutput, kill),
-        child.exited,
+      const [stdout, stderr, exitCode] = await Promise.race([
+        Promise.all([
+          readBounded(child.stdout, maxOutput, readers),
+          readBounded(child.stderr, maxOutput, readers),
+          child.exited,
+        ]),
+        deadline,
       ]);
-      if (timedOut) throw new Error("boomux command timed out");
       const parsed = parseJSON(stdout.trim() ? stdout : stderr);
       if (exitCode !== 0 || parsed.error) {
         const failure = new Error(
@@ -394,8 +404,15 @@ function createProcessRunner(options = {}) {
         throw failure;
       }
       return parsed;
+    } catch (error) {
+      try { child.kill?.("SIGKILL"); } catch { /* Already exited. */ }
+      throw error;
     } finally {
       clearTimeout(timer);
+      for (const reader of readers) {
+        // Do not wait on a broken pipe's cancellation to settle the command.
+        void reader.cancel().catch(() => {});
+      }
     }
   };
 }
