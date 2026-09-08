@@ -4,6 +4,7 @@ import { createTerminal } from "./terminal.js";
 import { THEMES, applyTheme, savedTheme } from "./themes.js";
 
 const POLL_INTERVAL_MS = 2_000;
+const relativeTimeFormatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 const state = {
   snapshot: null,
   filter: "all",
@@ -84,11 +85,10 @@ function relativeTime(timestamp) {
   if (!Number.isFinite(timestamp)) return "time unknown";
   const deltaSeconds = Math.round((timestamp - Date.now()) / 1_000);
   const absolute = Math.abs(deltaSeconds);
-  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
-  if (absolute < 60) return formatter.format(deltaSeconds, "second");
-  if (absolute < 3_600) return formatter.format(Math.round(deltaSeconds / 60), "minute");
-  if (absolute < 86_400) return formatter.format(Math.round(deltaSeconds / 3_600), "hour");
-  return formatter.format(Math.round(deltaSeconds / 86_400), "day");
+  if (absolute < 60) return relativeTimeFormatter.format(deltaSeconds, "second");
+  if (absolute < 3_600) return relativeTimeFormatter.format(Math.round(deltaSeconds / 60), "minute");
+  if (absolute < 86_400) return relativeTimeFormatter.format(Math.round(deltaSeconds / 3_600), "hour");
+  return relativeTimeFormatter.format(Math.round(deltaSeconds / 86_400), "day");
 }
 
 function isActive(agent) {

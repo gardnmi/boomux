@@ -2,6 +2,11 @@
 
 Status: Accepted, 2026-09-06.
 
+The first-run integration UI below has since been replaced by core automatic
+integration maintenance. See [Managed Integration Assets](../architecture.md#managed-integration-assets)
+for the current policy. Desktop retains only an optional advanced terminal checklist;
+the explicit application-update consent described here is unchanged.
+
 A shared repository and release should provide a clear first installation and
 whole-application update flow. The main installer offers Desktop (with the
 matching Boomux backend) or CLI only. Explicit mode flags serve automation.

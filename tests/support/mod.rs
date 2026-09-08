@@ -99,6 +99,11 @@ impl TestDaemon {
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env("XDG_CONFIG_HOME", runtime_dir.join("config"))
             .env("XDG_STATE_HOME", runtime_dir.join("state"))
+            .env("HOME", runtime_dir.join("home"))
+            .env_remove("CODEX_HOME")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("KIRO_HOME")
             .env("SHELL", "/bin/sh")
             .env("BOOMUX_NATIVE_TEST_HOOKS", "1")
             .stdin(Stdio::null())
@@ -122,6 +127,15 @@ impl TestDaemon {
         command.env("XDG_RUNTIME_DIR", &self.runtime_dir);
         command.env("XDG_CONFIG_HOME", self.runtime_dir.join("config"));
         command.env("XDG_STATE_HOME", self.runtime_dir.join("state"));
+        command.env("HOME", self.runtime_dir.join("home"));
+        for name in [
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "PI_CODING_AGENT_DIR",
+            "KIRO_HOME",
+        ] {
+            command.env_remove(name);
+        }
         command.env("BOOMUX_NATIVE_TEST_HOOKS", "1");
         remove_boomux_shim_environment(&mut command);
         command

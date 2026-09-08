@@ -12,6 +12,7 @@ pub struct Settings {
     pub dismissed_boomux_update: String,
     pub settings_restart_pending: bool,
     pub sidebar_visible: bool,
+    pub sidebar_git_tab: bool,
     pub sidebar_width: f32,
     pub pane_headings_visible: bool,
     pub pane_corner_style: PaneCornerStyle,
@@ -30,6 +31,7 @@ impl Default for Settings {
             dismissed_boomux_update: String::new(),
             settings_restart_pending: false,
             sidebar_visible: true,
+            sidebar_git_tab: false,
             sidebar_width: crate::SIDEBAR_WIDTH,
             pane_headings_visible: true,
             pane_corner_style: PaneCornerStyle::Rounded,
@@ -94,6 +96,7 @@ impl Settings {
                     s.onboarding_complete = value.as_bool().ok_or_else(invalid)?
                 }
                 "sidebar_visible" => s.sidebar_visible = value.as_bool().ok_or_else(invalid)?,
+                "sidebar_git_tab" => s.sidebar_git_tab = value.as_bool().ok_or_else(invalid)?,
                 "pane_headings_visible" => {
                     s.pane_headings_visible = value.as_bool().ok_or_else(invalid)?
                 }
@@ -166,7 +169,7 @@ impl Settings {
         Ok(s)
     }
     fn encode(&self) -> String {
-        format!(
+        let mut encoded = format!(
             "# Boomux Desktop preferences; shared Boomux configuration is separate.\nsidebar_visible = {}\nsidebar_width = {}\npane_headings_visible = {}\npane_corner_style = \"{}\"\npane_gap = {}\nfocus_highlight_strength = {}\nmotion_speed = \"{}\"\nworkspace_pane_mode = \"{}\"\npane_layout_mode = \"{}\"\nconfirm_destructive_actions = {}\nonboarding_complete = {}\nsettings_restart_pending = {}\ndismissed_desktop_update = \"{}\"\ndismissed_boomux_update = \"{}\"\n",
             self.sidebar_visible,
             self.sidebar_width,
@@ -196,7 +199,9 @@ impl Settings {
             self.settings_restart_pending,
             self.dismissed_desktop_update,
             self.dismissed_boomux_update
-        )
+        );
+        encoded.push_str(&format!("sidebar_git_tab = {}\n", self.sidebar_git_tab));
+        encoded
     }
     fn save(&self, path: &Path) -> Result<(), String> {
         let parent = path.parent().ok_or("invalid settings path")?;
@@ -246,6 +251,17 @@ pub fn writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sidebar_git_tab_defaults_and_round_trips() {
+        assert!(!Settings::parse("").unwrap().sidebar_git_tab);
+        let settings = Settings {
+            sidebar_git_tab: true,
+            ..Settings::default()
+        };
+        assert_eq!(Settings::parse(&settings.encode()).unwrap(), settings);
+        assert!(Settings::parse("sidebar_git_tab = 'git'").is_err());
+    }
+
     #[test]
     fn edge_drag_sidebar_width_round_trips_and_rejects_invalid_values() {
         let settings = Settings {

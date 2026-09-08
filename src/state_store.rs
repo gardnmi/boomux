@@ -536,7 +536,18 @@ impl StateStore {
             ));
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        File::open(&self.path)?.read_to_end(&mut bytes)?;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&self.path)?
+            .take(MAX_STATE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_STATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "boomux state file exceeds the size limit",
+            ));
+        }
         let version: StateVersion = serde_json::from_slice(&bytes).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -49,18 +49,15 @@ are preserved. See
 [release packaging](../docs/desktop/releases.md) for version selection, install locations,
 release preparation, uninstall instructions, and the required platform smoke tests.
 
-Desktop checks for supported AI harnesses on this computer in the background at
-startup. Detected harnesses with missing integrations get an **Install
-integration** prompt in the sidebar. Differing integrations get **Review update**:
-Boomux cannot distinguish an older integration from a customized one, so replacing
-it requires an explicit **Replace integration** confirmation. Nothing is installed
-by discovery, and harnesses that are absent or already current produce no prompt.
-**Not now** dismisses a suggestion for this window. Recheck after installing a
-harness through **Settings → AI integrations → Check installed harnesses**.
-Successful installation explains how to reload the affected harness.
+Core installs detected harness integrations in the background when the Boomux
+service starts, including after an update handoff. Unchanged Boomux-managed
+integrations are refreshed to the bundled version automatically. Desktop has no
+harness detection, install prompts, or update prompts. User customizations and
+uninstall choices are preserved. Running harnesses may need a restart; Codex
+still requires its own hook trust approval. See [automatic integration management](../docs/install.md#automatic-integration-management).
 
 The header menu contains **Nodes**, updates, and keyboard shortcuts. The gear
-opens Settings. **Settings → AI integrations → Manual setup** remains available
+opens Settings. **Settings → Open advanced setup in terminal** remains available
 for the guided terminal checklist: **Up/Down** to choose, **Space** to toggle,
 **Enter** to apply, and **Esc** to cancel. See the
 [checklist controls and defaults](../docs/install.md#harness-checklist).
@@ -140,7 +137,7 @@ The prototype uses Ctrl on Linux so its input reaches the app while it is runnin
 | `F1` | Open or close the keyboard-shortcut help menu |
 | `F6` | Move keyboard focus between the sidebar and the active terminal |
 | `F2` | Rename the selected sidebar Workspace/Shell, or the focused terminal's Shell |
-| `Ctrl + Space` | Enter or leave Layout mode; press twice quickly to send Ctrl+Space to the terminal |
+| `Ctrl + Space` | Tap to toggle Layout mode; hold for 250 ms or longer for temporary Layout until Control or Space is released; double-tap to send Ctrl+Space to the terminal |
 | `Ctrl + left drag` | Lift, move, and re-tile a tiled pane |
 | `Ctrl + right drag` | Resize a tiled split or floating pane in both axes |
 | `Left drag on a pane edge` | Resize a floating pane or the adjoining tiled divider |
@@ -193,7 +190,13 @@ The compact Boomux sidebar header keeps Workspace creation visible and places
 Settings, Keyboard Shortcuts, and Hide Sidebar in its overflow menu. Settings
 opens as a scrollable sidebar screen with consistent segmented and stepper
 controls, and can disable removal confirmations. Layout mode's `B` command opens
-the sidebar again after it has been closed.
+the sidebar again after it has been closed. Drag the sidebar's right edge to
+the far left to collapse it. When collapsed, drag right from the window's left
+edge to reopen it. The sidebar follows the pointer below its normal minimum
+width before collapsing at the edge. Its content is clipped at a readable
+layout width rather than reflowing into the narrow opening. Releasing
+before collapse settles back to the minimum readable width, animated when
+motion is enabled. The sidebar retains its preferred width when collapsed.
 
 On Omarchy, Boomux Desktop follows the active system theme automatically. It
 loads the semantic palette and terminal ANSI colors from
@@ -250,6 +253,9 @@ When a Boomux terminal tile is focused, ordinary typing and common control and
 navigation keys—including `Ctrl+C`, `Ctrl+Arrow`, and `Ctrl+H/J/K/L`—are sent
 to the shell. `Ctrl+Space` enters an explicit Layout mode whose persistent
 on-canvas indicator remains visible until `Escape` or `Ctrl+Space` exits it.
+Holding the chord for at least 250 ms instead makes Layout temporary: releasing
+Control or Space exits it. Layout commands also work with Control held, including
+arrows and Tab, and key repeat never repeatedly toggles the mode.
 The indicator's four tiles spring into place, gently pulse while the mode is
 active, and fold together on exit. Focus changes and animated layout actions
 replay the tile assembly. It follows the Motion setting; Instant uses a static
@@ -307,4 +313,4 @@ and [docs/architecture.md](../docs/desktop/architecture.md) for the ownership bo
 
 ## Git overview
 
-Open **Git · Branches and worktrees** in the sidebar, or use Layout mode (`Ctrl+Space`, then `G`). The resizable panel connects worktrees to their Shells and Agents and shows local changes, upstream comparisons, and GitHub PR/check status. See [Git panel](../docs/desktop/git-panel.md) for refresh behavior and status semantics.
+Select **Git** beside **Agents** in the lower sidebar or use Layout mode (`Ctrl+Space`, then `G`). Search and refresh sit beside the tabs. Drag the divider above them to resize the section. The selected tab is remembered, and a blocked-Agent count remains visible on Agents while viewing Git. Git connects worktrees to their Shells and Agents and shows local changes, upstream comparisons, and available GitHub PR/check status. See [Git panel](../docs/desktop/git-panel.md) for refresh behavior and status semantics.

@@ -523,6 +523,19 @@ fn run_daemon(
         registry.persist()?;
     }
     registry.start_node_projection_workers()?;
+    // Only the committed owner reconciles integrations, including after an
+    // executable handoff. One bounded worker; never delays terminal admission.
+    if let Err(error) = thread::Builder::new()
+        .name("integration-maintenance".into())
+        .spawn(|| {
+            let environment = crate::integration_management::Environment::from_process();
+            for error in crate::integration_management::synchronize(&environment) {
+                eprintln!("boomux: integration maintenance: {error}");
+            }
+        })
+    {
+        eprintln!("boomux: could not start integration maintenance: {error}");
+    }
     let shutdown = Arc::new(AtomicBool::new(false));
     let transition = Arc::new(AtomicU8::new(TRANSITION_IDLE));
     let (restart_sender, restart_receiver) = mpsc::channel::<RestartRequest>();

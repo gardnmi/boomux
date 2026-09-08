@@ -107,6 +107,11 @@ CLI's explicit executable path, preserving compatible live Shells. A failed
 handoff aborts the launch rather than falling back to a destructive stop.
 The helper prints the isolated runtime
 path; it does not replace installed binaries or use the ordinary daemon.
+This isolation does not cover harness configuration under the user's `HOME` or
+explicit harness overrides. Core's automatic integration maintenance can update
+those shared integration files. Before testing integration maintenance, use a
+temporary home and harness-specific configuration roots; the focused native
+integration fixture demonstrates this without touching real harness settings.
 See `desktop/AGENTS.md` for additional validation and `docs/desktop/releases.md`
 for packaging and headless GUI smoke tests.
 
@@ -131,6 +136,10 @@ export XDG_CONFIG_HOME="$BOOMUX_DEV_ROOT/config"
 
 Every development command in that shell now uses an isolated daemon socket,
 Node identity, durable state, and configuration:
+
+Harness configuration is separate: the XDG variables above do not redirect
+`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `PI_CODING_AGENT_DIR`, `KIRO_HOME`, or their
+`HOME`-based defaults. Automatic integration maintenance still uses those paths.
 
 ```console
 ./target/debug/boomux workspace create development
@@ -198,9 +207,9 @@ git diff --exit-code -- \
 Run the integration reducers with:
 
 ```console
-bun test integrations/opencode/boomux.test.js \
-  integrations/opencode/boomux-tui.test.js \
-  integrations/pi/boomux.test.js
+bun test ./integrations/opencode/boomux.test.js \
+  ./integrations/opencode/boomux-tui.test.js \
+  ./integrations/pi/boomux.test.js
 ```
 
 ## Performance Benchmarks
@@ -246,7 +255,7 @@ cargo test --test native_backend --locked -- --test-threads=1
 cargo test --test benchmark_harness --features benchmark-internals --locked
 cargo bench --bench core_cpu --bench wire --features benchmark-internals --locked -- --test
 cargo deny check
-bun test integrations/opencode/boomux.test.js integrations/opencode/boomux-tui.test.js integrations/pi/boomux.test.js
+bun test ./integrations/opencode/boomux.test.js ./integrations/opencode/boomux-tui.test.js ./integrations/pi/boomux.test.js
 ```
 
 CI selects work by changed inputs and prior validation, as documented in

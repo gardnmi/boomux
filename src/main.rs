@@ -1151,6 +1151,8 @@ enum KiroCommands {
 
 #[derive(Subcommand)]
 enum IntegrationCommands {
+    /// Install detected integrations and refresh unchanged Boomux-managed assets
+    Sync,
     /// List integrations bundled with this Boomux binary
     List,
     /// Inspect host, asset, and runtime reporting status
@@ -1323,6 +1325,7 @@ command_keys! {
     AttentionAcknowledge => ("attention.acknowledge", Json),
     NotificationTest => ("notification.test", HumanOnly),
     IntegrationList => ("integration.list", Json),
+    IntegrationSync => ("integration.sync", HumanOnly),
     IntegrationStatus => ("integration.status", Json),
     IntegrationInstall => ("integration.install", Json),
     IntegrationUninstall => ("integration.uninstall", Json),
@@ -1512,6 +1515,9 @@ impl Cli {
             Some(Commands::Integration {
                 command: IntegrationCommands::List,
             }) => CommandKey::IntegrationList,
+            Some(Commands::Integration {
+                command: IntegrationCommands::Sync,
+            }) => CommandKey::IntegrationSync,
             Some(Commands::Integration {
                 command: IntegrationCommands::Status { .. },
             }) => CommandKey::IntegrationStatus,
@@ -6095,7 +6101,7 @@ fn generated_workspace_name<'a>(
 
 fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), Box<dyn Error>> {
     let node = match &command {
-        IntegrationCommands::List => None,
+        IntegrationCommands::List | IntegrationCommands::Sync => None,
         IntegrationCommands::Status { node, .. }
         | IntegrationCommands::Install { node, .. }
         | IntegrationCommands::Uninstall { node, .. }
@@ -6108,6 +6114,18 @@ fn integration_command(command: IntegrationCommands, json: bool) -> Result<(), B
         return remote_integration_command(&client, &registration, command, json);
     }
     match command {
+        IntegrationCommands::Sync => {
+            let errors = integration_management::synchronize(
+                &integration_management::Environment::from_process(),
+            );
+            if !errors.is_empty() {
+                return Err(io::Error::other(errors.join("\n")).into());
+            }
+            println!(
+                "Boomux-managed integrations are ready. Restart running harnesses to load changed integrations."
+            );
+            Ok(())
+        }
         IntegrationCommands::List => list_integrations(json),
         IntegrationCommands::Status { integration, .. } => integration_status(integration, json),
         IntegrationCommands::Install {
@@ -6180,7 +6198,7 @@ fn remote_integration_command(
         }
     };
     match command {
-        IntegrationCommands::List => unreachable!(),
+        IntegrationCommands::List | IntegrationCommands::Sync => unreachable!(),
         IntegrationCommands::Status { integration, .. } => {
             let result = client.route_node_host_service(
                 &registration.node_id,
@@ -15076,6 +15094,15 @@ mod tests {
 
     #[test]
     fn parses_unified_integration_management_commands() {
+        let sync = Cli::try_parse_from(["boomux", "integration", "sync"]).unwrap();
+        assert_eq!(sync.command_descriptor().key, "integration.sync");
+        assert!(matches!(
+            sync.command_descriptor().output,
+            OutputMode::HumanOnly
+        ));
+        assert!(
+            Cli::try_parse_from(["boomux", "integration", "sync", "--node", "remote"]).is_err()
+        );
         let list = Cli::try_parse_from(["boomux", "integration", "list"]).unwrap();
         assert!(matches!(
             list.command,

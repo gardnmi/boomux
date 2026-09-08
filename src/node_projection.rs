@@ -701,9 +701,9 @@ fn validate_helper_version(version: &str) -> io::Result<()> {
 }
 
 fn load(path: &Path) -> io::Result<(CacheState, bool)> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.uid() != effective_uid() || metadata.mode() & 0o077 != 0 {
@@ -716,7 +716,10 @@ fn load(path: &Path) -> io::Result<(CacheState, bool)> {
         return Err(invalid("Node cache exceeds the file-size bound"));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)?;
+    file.take(MAX_CACHE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CACHE_BYTES {
+        return Err(invalid("Node cache exceeds the file-size bound"));
+    }
     let version = serde_json::from_slice::<serde_json::Value>(&bytes)
         .map_err(|error| invalid(error.to_string()))?
         .get("version")

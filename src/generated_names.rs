@@ -22,9 +22,9 @@ pub(crate) fn random() -> String {
     from_seed(random_seed(), std::iter::empty()).expect("the generated name catalog is nonempty")
 }
 
-pub(crate) fn random_excluding<'a>(
-    unavailable: impl IntoIterator<Item = &'a str>,
-) -> Option<String> {
+/// Choose a random adjective-noun name, skipping collisions and returning `None`
+/// only when every name in the shared catalog is unavailable.
+pub fn random_excluding<'a>(unavailable: impl IntoIterator<Item = &'a str>) -> Option<String> {
     from_seed(random_seed(), unavailable)
 }
 
@@ -89,10 +89,6 @@ mod tests {
     #[test]
     fn stable_names_repeat_for_the_same_value() {
         assert_eq!(stable("edge-datapipe-support"), "noble-koala");
-        assert_eq!(
-            stable("edge-datapipe-support"),
-            stable("edge-datapipe-support")
-        );
         assert_ne!(stable("edge-datapipe-support"), stable("boomux"));
     }
 

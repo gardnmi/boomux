@@ -70,6 +70,33 @@ Setup failure does not remove the verified Boomux installation. The installer
 reports that installation succeeded, reports setup as incomplete, prints the
 exact retry command, and exits nonzero.
 
+### Automatic Integration Management
+
+The Boomux service makes one background integration-maintenance pass when it
+starts, including after a committed update handoff. It installs missing
+integrations for detected, successfully probed harnesses and updates unchanged
+Boomux-managed integrations to the version bundled with that binary. Desktop
+does not separately detect harnesses or ask users to install/update integrations.
+Already-running harnesses may need restarting to load changed files. Codex's
+own hook trust approval is still required; Boomux does not bypass it.
+
+Use `boomux integration uninstall <name>` to opt out, and
+`boomux integration install <name>` to opt back in. Uninstall choices survive
+service restarts and Boomux updates. Removing a previously managed asset by hand
+also leaves it off. `boomux integration sync` runs maintenance immediately after
+installing a new harness, without restarting the service or existing Shells.
+`integration status` remains read-only. Maintenance failures are logged to the
+service's stderr and can be retried with `integration sync`.
+
+Versioned ownership receipts beside each integration record its installed
+fingerprint, Boomux release, and enabled state. Older binaries do not automatically
+downgrade newer managed assets. Current existing integrations are adopted; older
+unrecognized files and user customizations are preserved rather than guessed to
+be safe to overwrite. Such legacy files require one intentional installation
+with `--force` before future updates can be managed. Codex receipts track only
+Boomux's handlers, so unrelated hooks are preserved. Keep the hidden
+`.boomux-managed.json` receipts to retain ownership and uninstall choices.
+
 ### Harness Checklist
 
 Guided setup presents a keyboard checklist of supported AI harness integrations.

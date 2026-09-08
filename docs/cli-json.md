@@ -415,6 +415,8 @@ Command payloads are:
   Shells, processes, display-name metadata, and lifecycle state are unchanged.
 - `integration.list`: an `integrations` array containing bundled integration
   names, display names, packages, and validated host versions.
+  `integration sync` is human-only and performs core automatic maintenance;
+  it does not add a JSON envelope or daemon protocol request.
 - `integration.status`: an `integrations` array containing independent `host`,
   `asset`, and `runtime` status objects. Status does not start the daemon or
   mutate integration files. It executes each PATH-resolved host's `--version`

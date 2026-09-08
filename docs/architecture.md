@@ -36,7 +36,7 @@
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
-| `src/integration_management.rs` | Integration inventory, status, setup, verification, install, and uninstall workflows |
+| `src/integration_management.rs`, `src/integration_management/managed.rs` | Integration inventory, status, setup, verification, install/uninstall, and owned-asset automatic maintenance |
 | `src/setup.rs` | Interactive agent setup and daemon verification; existing Omarchy plugin update/removal and legacy binding cleanup |
 | `src/update.rs` | Local release discovery, installation classification, interactive self-update authorization, atomic executable replacement, and daemon handoff verification |
 | `src/uninstall.rs` | Interactive release uninstall orchestration, owned-asset cleanup, bounded purge validation, and process shutdown ordering |
@@ -48,6 +48,34 @@
 | `src/projects.rs`, `src/git.rs` | Bounded project discovery and asynchronous Git metadata |
 | `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
 | `src/desktop_notifications.rs` | Bounded fail-open desktop and sound delivery |
+
+## Managed Integration Assets
+
+After cold startup or finalized handoff, the committed daemon owner starts one
+bounded background maintenance pass. It never delays terminal admission, restarts
+harnesses, or polls in steady state. Successfully probed local harnesses receive
+missing assets; existing managed targets are reconciled even if the executable
+is temporarily absent. `integration sync` exposes the same local operation as a
+human-only CLI command. Read-only status/capabilities calls remain non-mutating.
+
+Each resolved asset target has a sibling `.<filename>.boomux-managed.json`
+receipt, schema 1: `enabled`, a three-component `release`, and an optional SHA-256
+`fingerprint`. Older binaries do not automatically downgrade newer receipts. This is a new,
+independent settings format, not daemon registry state; unknown schemas fail
+closed. No environment or credentials are persisted. Explicit installation
+records ownership; uninstall persists opt-out before removal. External removal
+of a managed asset becomes opt-out on the next pass. Current assets without a
+receipt are adopted; unknown/modified legacy assets require explicit replacement.
+Automatic upgrades require an exact prior installed fingerprint. Codex hashes
+only Boomux handler groups and merges replacements into the shared document.
+
+An owner-validated nonblocking per-directory file lock serializes core writers.
+Reads reject symlinks/non-regular or foreign-owned files and are bounded to 1 MiB.
+Updates use temporary files, baseline revalidation, atomic rename, and fsync;
+receipt failure is surfaced, not treated as permission to replace unknown assets.
+Host probes have existing five-second/output limits; there is at most one worker
+and one receipt per bundled integration target. Errors are logged without failing
+daemon startup. Desktop owns no integration discovery worker or update prompts.
 
 ## Invariant Index
 
@@ -390,6 +418,8 @@ requests are sent. Generated names are collision-excluded from the relevant
 snapshot. Generated shell names in existing Workspaces are
 checked against the workspace snapshot and retried on a typed daemon collision;
 the resulting concrete names use the ordinary protocol and durable state fields.
+Desktop uses the same `generated_names` library implementation and catalog;
+it does not maintain a second copy of naming and collision-exclusion rules.
 
 ### Protocol
 
@@ -1093,11 +1123,11 @@ configuration or keybindings. Existing integrations and modified assets retain
 the same ownership and concurrency checks. Final verification starts or confirms
 the daemon and prints a receipt with exact reload/recovery guidance.
 
-Desktop presents first-run setup as **Set up agents** or **Start using Boomux**.
-The selected setup runs as an explicit command in a new daemon-owned Shell in a
-new Workspace. The CLI owns discovery, confirmation, writes, and verification;
-Desktop only opens the terminal and saves dismissal of its welcome card.
-**Set up agents** remains available in the menu after skipping or completing it.
+Core's automatic maintenance handles first installation and managed-asset updates
+at startup/handoff (see [Managed Integration Assets](#managed-integration-assets)).
+Desktop has no first-run integration card or installation/update prompts. Its
+optional **Open advanced setup in terminal** action runs the explicit CLI checklist
+in a new daemon-owned Shell and Workspace; it does not duplicate management policy.
 The optional Omarchy companion installation is documented in the README.
 
 After a guided local Boomux update commits, the updater revalidates an installed
