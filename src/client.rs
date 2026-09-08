@@ -2550,14 +2550,14 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            for version in [52, 51] {
+            for version in (51..=protocol::PROTOCOL_VERSION).rev() {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
                 assert_eq!(request.version, version);
                 assert_eq!(request.message, Request::Ping);
-                let response = if version == 52 {
+                let response = if version > 51 {
                     Response::Error {
-                        message: "protocol 52 unsupported".into(),
+                        message: format!("protocol {version} unsupported"),
                         code: Some(ErrorCode::UnsupportedVersion),
                     }
                 } else {
