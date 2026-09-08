@@ -1023,6 +1023,56 @@ impl Client {
         }
     }
 
+    /// Bounded read-only Git observations. Older Nodes report UnsupportedVersion.
+    pub fn git_overview(
+        &self,
+        node_id: Option<&str>,
+        refresh: bool,
+        timeout: Duration,
+    ) -> Result<crate::git_work::Overview> {
+        let operation = crate::protocol::HostServiceOperation::GitOverview { refresh };
+        let request = match node_id {
+            Some(node_id) => Request::RouteNodeHostService {
+                node_id: node_id.into(),
+                operation,
+            },
+            None => Request::HostService { operation },
+        };
+        let version = self.protocol_version.load(Ordering::Acquire);
+        if !protocol::ProtocolFeature::GitWorkOverview.is_supported_by(version) {
+            return Err(unsupported_version(
+                "Git panel requires a newer Boomux daemon",
+            ));
+        }
+        match self
+            .send_with_version_timeout(request, version, Some(timeout))?
+            .1
+        {
+            Response::HostService {
+                result: crate::protocol::HostServiceResult::GitOverview { overview },
+            } => Ok(overview),
+            response => unexpected(response),
+        }
+    }
+
+    pub fn combined_node_snapshot_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<CombinedNodeSnapshot> {
+        let version = self.protocol_version.load(Ordering::Acquire);
+        match self
+            .send_with_version_timeout(
+                Request::GetCombinedNodeSnapshot { selector: None },
+                version,
+                Some(timeout),
+            )?
+            .1
+        {
+            Response::CombinedNodeSnapshot { snapshot } => Ok(snapshot),
+            response => unexpected(response),
+        }
+    }
+
     pub fn host_service(
         &self,
         operation: crate::protocol::HostServiceOperation,
@@ -2500,14 +2550,14 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
-            for version in [52, 51] {
+            for version in (51..=protocol::PROTOCOL_VERSION).rev() {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
                 assert_eq!(request.version, version);
                 assert_eq!(request.message, Request::Ping);
-                let response = if version == 52 {
+                let response = if version > 51 {
                     Response::Error {
-                        message: "protocol 52 unsupported".into(),
+                        message: format!("protocol {version} unsupported"),
                         code: Some(ErrorCode::UnsupportedVersion),
                     }
                 } else {

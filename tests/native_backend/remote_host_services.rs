@@ -146,6 +146,32 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
             }],
         )
         .unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(owner_projects.join("remote-only"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let local_git = ssh_bin.join("git");
+    fs::write(&local_git, "#!/bin/sh\nexit 77\n").unwrap();
+    fs::set_permissions(&local_git, fs::Permissions::from_mode(0o700)).unwrap();
+    wait_until(
+        || {
+            local
+                .client
+                .git_overview(Some(&owner_id), true, Duration::from_secs(2))
+                .is_ok_and(|overview| {
+                    overview.worktrees.iter().any(|row| {
+                        row.root == owner_projects.join("remote-only")
+                            && row.branch == "main"
+                            && row.status.is_some()
+                    })
+                })
+        },
+        "Git inspection did not execute on the owning Node",
+    );
     let shell_id = session_workspace.shells[0].id.clone();
     let owner_attachment = owner.client.attach(&shell_id, false, profile()).unwrap();
     let run_id = owner.client.get_shell(&shell_id).unwrap().run.unwrap().id;

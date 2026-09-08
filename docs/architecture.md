@@ -44,6 +44,7 @@
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/config.rs` | Layered configuration resolution, bounded validation, and transactional active-layer editing |
 | `src/workspace_selection.rs` | Owner-only local CLI Workspace selection, validation, locking, and atomic persistence |
+| `src/git_work.rs` | Bounded owner-local Git worktree discovery, Shell/Agent associations, disposable status cache, and GitHub PR observations |
 | `src/projects.rs`, `src/git.rs` | Bounded project discovery and asynchronous Git metadata |
 | `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
 | `src/desktop_notifications.rs` | Bounded fail-open desktop and sound delivery |
@@ -256,6 +257,15 @@ event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
 default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
 unchanged because owner Workspaces already persist `default_cwd`.
+Protocol 53 adds `git_work_overview`: a read-only `GitOverview` host-service
+operation and result, available locally and through verified Node routing.
+The owner discovers repositories from managed Shells and observed Agent contexts,
+inspects Git in bounded background work, and returns disposable cached metadata.
+It does not alter durable Shell cwd, Agent authority, Git refs, or persistence.
+Requests require version 53, including the nested routed operation; older clients
+continue to use their existing snapshots without new unsolicited fields.
+See [Desktop Git panel](desktop/git-panel.md) for status and cache semantics.
+
 Protocol 52 adds `restart_executable` and `RestartWithExecutable` for graceful
 handoff to an explicit release path. The daemon pins a validated ELF inode before
 quiescence and executes it through a close-on-exec descriptor, preserving H8

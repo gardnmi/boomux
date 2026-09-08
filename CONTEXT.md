@@ -229,3 +229,17 @@ permanently closing its Shell is a distinct daemon mutation. The **terminal core
 is the pane-owned Ghostty decoder and render state; it does not own the PTY.
 Both executable packages share a repository and release version, but the daemon
 remains usable without the native Desktop application.
+
+## Git Work Overview
+
+A disposable, owner-local observation of Git repositories and worktrees related
+to managed Shells and active Agent working contexts. Repository identity within
+an observation is the owning Node and canonical Git common directory; a worktree
+also retains its root path. These are filesystem observations, not new durable
+Boomux resources or Workspace membership.
+
+A Shell's current managed-process cwd can associate it with a worktree without
+changing its launch cwd. This association is distinct from an Agent Working
+Context supplied by lifecycle integration. Neither Git cleanliness, push status,
+PR state, nor CI results establish Agent completion. Local Git and remote PR
+observations retain separate freshness and failure states.

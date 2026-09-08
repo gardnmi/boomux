@@ -345,6 +345,74 @@ impl Node {
         true
     }
 
+    pub fn has_resize_edge(&self, focused: usize, edge: Direction) -> bool {
+        let Self::Split {
+            axis,
+            first,
+            second,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let in_first = first.contains(focused);
+        if !in_first && !second.contains(focused) {
+            return false;
+        }
+        let child = if in_first { first } else { second };
+        child.has_resize_edge(focused, edge)
+            || (*axis == edge.axis()
+                && in_first == matches!(edge, Direction::Right | Direction::Down))
+    }
+
+    /// Move only the divider bordering the selected edge, never an unrelated
+    /// split on the other side of the pane. Delta is a fraction of root size.
+    pub fn resize_edge_from_pointer(
+        &mut self,
+        focused: usize,
+        edge: Direction,
+        delta: f32,
+    ) -> bool {
+        self.resize_edge_in_span(focused, edge, delta, 1.0)
+    }
+
+    fn resize_edge_in_span(
+        &mut self,
+        focused: usize,
+        edge: Direction,
+        delta: f32,
+        span: f32,
+    ) -> bool {
+        let Self::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return false;
+        };
+        let in_first = first.contains(focused);
+        if !in_first && !second.contains(focused) {
+            return false;
+        }
+        let child_span = if *axis == edge.axis() {
+            span * if in_first { *ratio } else { 1.0 - *ratio }
+        } else {
+            span
+        };
+        let child = if in_first { first } else { second };
+        if child.resize_edge_in_span(focused, edge, delta, child_span) {
+            return true;
+        }
+        if *axis == edge.axis() && in_first == matches!(edge, Direction::Right | Direction::Down) {
+            *ratio = (*ratio + delta / span.max(f32::EPSILON)).clamp(0.2, 0.8);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Moves the nearest matching split divider by a delta expressed as a
     /// fraction of the root layout. The divider follows the pointer regardless
     /// of which side contains the focused pane.
@@ -400,6 +468,42 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_drag_selects_adjacent_divider_and_preserves_outer_edges() {
+        let mut layout = Node::pane(1);
+        layout.split(1, 2, Axis::Horizontal);
+        layout.split(2, 3, Axis::Horizontal);
+        assert!(!layout.has_resize_edge(1, Direction::Left));
+        assert!(!layout.has_resize_edge(3, Direction::Right));
+        assert!(!layout.has_resize_edge(2, Direction::Up));
+        assert!(layout.has_resize_edge(2, Direction::Left));
+        assert!(layout.has_resize_edge(2, Direction::Right));
+        assert!(!layout.resize_edge_from_pointer(1, Direction::Left, 0.1));
+        // Pane 2's left edge belongs to the outer split; its right belongs to the inner.
+        layout.resize_edge_from_pointer(2, Direction::Left, 0.1);
+        let rects = layout.rects();
+        assert!((rects.iter().find(|(id, _)| *id == 1).unwrap().1.width - 0.6).abs() < 0.001);
+        layout.resize_edge_from_pointer(2, Direction::Right, 0.05);
+        let rects = layout.rects();
+        let middle = rects.iter().find(|(id, _)| *id == 2).unwrap().1;
+        assert!((middle.x - 0.6).abs() < 0.001);
+        assert!((middle.width - 0.25).abs() < 0.001);
+        layout.resize_edge_from_pointer(2, Direction::Right, 100.0);
+        assert!(layout.rects().iter().all(|(_, rect)| rect.width > 0.0));
+    }
+
+    #[test]
+    fn edge_drag_moves_vertical_divider_from_either_side() {
+        let mut above = Node::pane(1);
+        above.split(1, 2, Axis::Vertical);
+        let mut below = above.clone();
+        above.resize_edge_from_pointer(1, Direction::Down, 0.1);
+        below.resize_edge_from_pointer(2, Direction::Up, 0.1);
+        assert_eq!(format!("{above:?}"), format!("{below:?}"));
+        assert!(!above.has_resize_edge(1, Direction::Up));
+        assert!(!above.has_resize_edge(2, Direction::Down));
+    }
 
     fn sample() -> Node {
         Node::Split {

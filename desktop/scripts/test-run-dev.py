@@ -14,11 +14,15 @@ CLI = ROOT / "target/debug/boomux"
 
 
 class DevelopmentLaunchTests(unittest.TestCase):
-    def launch(self, state, failure=None):
+    def launch(self, state, failure=None, gh_config=None, release=False):
+        target = ROOT / "target" / ("release" if release else "debug")
+        cli = target / "boomux"
         status = Mock(stdout=json.dumps({"data": {"status": state}}))
-        with patch.dict(os.environ, {
+        with patch("sys.argv", ["run-dev.py", *(["--release"] if release else []), "--example-desktop-flag"]), patch.dict(os.environ, {
             "PATH": "/usr/bin", "XDG_RUNTIME_DIR": "/ordinary/runtime",
             "WAYLAND_DISPLAY": "wayland-1", "BOOMUX_CONFIG": "/ordinary/config",
+            "XDG_CONFIG_HOME": "/ordinary/config-home",
+            **({"GH_CONFIG_DIR": gh_config} if gh_config else {}),
         }, clear=True), patch.object(Path, "mkdir"), \
                 patch("subprocess.run", side_effect=[Mock(), status, failure or Mock()]) as run, \
                 patch("os.execve") as execute:
@@ -29,23 +33,33 @@ class DevelopmentLaunchTests(unittest.TestCase):
             else:
                 DEV["main"]()
                 execute.assert_called_once()
-                self.assertEqual(execute.call_args.args[0], str(ROOT / "target/debug/boomux-desktop"))
+                self.assertEqual(execute.call_args.args[1], [str(target / "boomux-desktop"), "--example-desktop-flag"])
+                self.assertEqual(execute.call_args.args[0], str(target / "boomux-desktop"))
                 self.assertEqual(execute.call_args.args[2], run.call_args.kwargs["env"])
             calls = run.call_args_list
-            self.assertEqual(calls[1].args[0], [CLI, "daemon", "status", "--json"])
+            self.assertEqual("--release" in calls[0].args[0], release)
+            self.assertEqual(calls[1].args[0], [cli, "daemon", "status", "--json"])
             for call in calls[1:]:
                 env = call.kwargs["env"]
                 for name in ["RUNTIME_DIR", "CONFIG_HOME", "STATE_HOME", "DATA_HOME", "CACHE_HOME"]:
                     self.assertEqual(env[f"XDG_{name}"], str(ROOT / "target/desktop-dev" / name.lower()))
+                self.assertEqual(env["GH_CONFIG_DIR"], gh_config or "/ordinary/config-home/gh")
                 self.assertEqual(env["WAYLAND_DISPLAY"], "/ordinary/runtime/wayland-1")
                 self.assertFalse(any(key.startswith("BOOMUX_") for key in env))
-                self.assertEqual(env["PATH"], str(CLI.parent) + os.pathsep + "/usr/bin")
+                self.assertEqual(env["PATH"], str(cli.parent) + os.pathsep + "/usr/bin")
                 self.assertTrue(call.kwargs["check"])
                 self.assertEqual(call.kwargs["timeout"], 30)
             return calls[-1].args[0]
 
     def test_running_daemon_hands_off_to_the_exact_rebuilt_executable(self):
         self.assertEqual(self.launch("running"), [CLI, "daemon", "restart", "--executable", str(CLI)])
+
+    def test_release_handoff_uses_release_binaries_and_the_same_runtime(self):
+        cli = ROOT / "target/release/boomux"
+        self.assertEqual(self.launch("running", release=True), [cli, "daemon", "restart", "--executable", str(cli)])
+
+    def test_explicit_github_config_is_preserved(self):
+        self.launch("stopped", gh_config="/explicit/gh")
 
     def test_absent_daemon_starts_without_an_unnecessary_restart(self):
         self.assertEqual(self.launch("stopped"), [CLI, "daemon", "start"])

@@ -32,3 +32,6 @@ mod shell_name_suggestion;
 mod update;
 #[path = "native_backend/workspace_creation.rs"]
 mod workspace_creation;
+
+#[path = "native_backend/git_work.rs"]
+mod git_work;

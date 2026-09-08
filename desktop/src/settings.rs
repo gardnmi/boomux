@@ -12,6 +12,7 @@ pub struct Settings {
     pub dismissed_boomux_update: String,
     pub settings_restart_pending: bool,
     pub sidebar_visible: bool,
+    pub sidebar_width: f32,
     pub pane_headings_visible: bool,
     pub pane_corner_style: PaneCornerStyle,
     pub pane_gap: f32,
@@ -29,6 +30,7 @@ impl Default for Settings {
             dismissed_boomux_update: String::new(),
             settings_restart_pending: false,
             sidebar_visible: true,
+            sidebar_width: crate::SIDEBAR_WIDTH,
             pane_headings_visible: true,
             pane_corner_style: PaneCornerStyle::Rounded,
             pane_gap: 8.0,
@@ -98,6 +100,16 @@ impl Settings {
                 "confirm_destructive_actions" => {
                     s.confirm_destructive_actions = value.as_bool().ok_or_else(invalid)?
                 }
+                "sidebar_width" => {
+                    let n = value
+                        .as_float()
+                        .or_else(|| value.as_integer().map(|n| n as f64))
+                        .ok_or_else(invalid)?;
+                    if !n.is_finite() || !(280.0..=600.0).contains(&n) {
+                        return Err(invalid());
+                    }
+                    s.sidebar_width = n as f32;
+                }
                 "pane_gap" => {
                     let n = value
                         .as_float()
@@ -155,8 +167,9 @@ impl Settings {
     }
     fn encode(&self) -> String {
         format!(
-            "# Boomux Desktop preferences; shared Boomux configuration is separate.\nsidebar_visible = {}\npane_headings_visible = {}\npane_corner_style = \"{}\"\npane_gap = {}\nfocus_highlight_strength = {}\nmotion_speed = \"{}\"\nworkspace_pane_mode = \"{}\"\npane_layout_mode = \"{}\"\nconfirm_destructive_actions = {}\nonboarding_complete = {}\nsettings_restart_pending = {}\ndismissed_desktop_update = \"{}\"\ndismissed_boomux_update = \"{}\"\n",
+            "# Boomux Desktop preferences; shared Boomux configuration is separate.\nsidebar_visible = {}\nsidebar_width = {}\npane_headings_visible = {}\npane_corner_style = \"{}\"\npane_gap = {}\nfocus_highlight_strength = {}\nmotion_speed = \"{}\"\nworkspace_pane_mode = \"{}\"\npane_layout_mode = \"{}\"\nconfirm_destructive_actions = {}\nonboarding_complete = {}\nsettings_restart_pending = {}\ndismissed_desktop_update = \"{}\"\ndismissed_boomux_update = \"{}\"\n",
             self.sidebar_visible,
+            self.sidebar_width,
             self.pane_headings_visible,
             match self.pane_corner_style {
                 PaneCornerStyle::Rounded => "rounded",
@@ -233,6 +246,22 @@ pub fn writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn edge_drag_sidebar_width_round_trips_and_rejects_invalid_values() {
+        let settings = Settings {
+            sidebar_width: 440.0,
+            ..Settings::default()
+        };
+        assert_eq!(Settings::parse(&settings.encode()).unwrap(), settings);
+        assert_eq!(
+            Settings::parse("").unwrap().sidebar_width,
+            crate::SIDEBAR_WIDTH
+        );
+        for value in ["279", "601", "nan", "inf", "'wide'"] {
+            assert!(Settings::parse(&format!("sidebar_width = {value}")).is_err());
+        }
+    }
+
     #[test]
     fn update_dismissals_round_trip_independently() {
         let settings = Settings {

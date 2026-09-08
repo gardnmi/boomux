@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 52;
+pub const PROTOCOL_VERSION: u32 = 53;
 pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -200,6 +200,7 @@ define_protocol_features! {
     WorkspaceSessionHiding => (51, "Workspace Agent Session hiding", [
         "workspace_session_hiding",
     ]),
+    GitWorkOverview => (53, "Git work overview", ["protocol_53", "git_work_overview"]),
     RestartExecutable => (52, "restart executable", ["protocol_52", "restart_executable"]),
 }
 
@@ -227,6 +228,10 @@ pub enum HostServiceIntegrationAction {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostServiceOperation {
     DiscoverProjects,
+    GitOverview {
+        #[serde(default)]
+        refresh: bool,
+    },
     ResolveDirectory {
         path: PathBuf,
     },
@@ -448,6 +453,9 @@ pub struct HostAgentSessionResumePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostServiceResult {
+    GitOverview {
+        overview: crate::git_work::Overview,
+    },
     Projects {
         discovery: HostProjectDiscovery,
     },
@@ -2189,6 +2197,13 @@ impl Request {
             | Self::GuardedCloseShell { .. }
             | Self::GuardedRestartShell { .. }
             | Self::GuardedRemoveLauncher { .. } => Some(ProtocolFeature::GuardedNodeRouting),
+            Self::HostService {
+                operation: HostServiceOperation::GitOverview { .. },
+            }
+            | Self::RouteNodeHostService {
+                operation: HostServiceOperation::GitOverview { .. },
+                ..
+            } => Some(ProtocolFeature::GitWorkOverview),
             Self::HostService { .. }
             | Self::RouteNodeHostService { .. }
             | Self::ResumeAgentSession { .. }
@@ -2833,9 +2848,36 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_fifty_two_with_forty_seven_floor() {
-        assert_eq!(PROTOCOL_VERSION, 52);
+    fn protocol_version_is_fifty_three_with_forty_seven_floor() {
+        assert_eq!(PROTOCOL_VERSION, 53);
         assert_eq!(MIN_PROTOCOL_VERSION, 47);
+    }
+
+    #[test]
+    fn git_work_overview_requires_protocol_fifty_three_and_round_trips() {
+        for request in [
+            Request::HostService {
+                operation: HostServiceOperation::GitOverview { refresh: false },
+            },
+            Request::RouteNodeHostService {
+                node_id: "remote".into(),
+                operation: HostServiceOperation::GitOverview { refresh: true },
+            },
+        ] {
+            assert_eq!(request.minimum_protocol_version(), 53);
+            assert!(!request.required_feature().unwrap().is_supported_by(52));
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(serde_json::from_value::<Request>(value).unwrap(), request);
+        }
+        let response = Response::HostService {
+            result: HostServiceResult::GitOverview {
+                overview: crate::git_work::Overview::default(),
+            },
+        };
+        assert_eq!(
+            serde_json::from_value::<Response>(serde_json::to_value(&response).unwrap()).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -4453,6 +4495,7 @@ mod tests {
                 ][..],
             ),
             (51, &["workspace_session_hiding"][..]),
+            (53, &["protocol_53", "git_work_overview"][..]),
             (52, &["protocol_52", "restart_executable"][..]),
         ];
 

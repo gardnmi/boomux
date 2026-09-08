@@ -1,6 +1,7 @@
 mod boomux_settings;
 mod bundle_update;
 mod generated_names;
+mod git_panel;
 mod harness_integrations;
 mod layout;
 mod layout_badge;
@@ -90,6 +91,45 @@ fn sidebar_header_button(
         .child(glyph)
 }
 
+fn git_branch_icon(active: bool) -> Div {
+    let color = rgb(if active { 0xcba6f7 } else { 0xa6adc8 });
+    div()
+        .relative()
+        .size(px(18.0))
+        .child(
+            div()
+                .absolute()
+                .left(px(3.0))
+                .top(px(4.0))
+                .w(px(2.0))
+                .h(px(11.0))
+                .bg(color),
+        )
+        .child(
+            div()
+                .absolute()
+                .left(px(4.0))
+                .top(px(4.0))
+                .w(px(10.0))
+                .h(px(7.0))
+                .border_b_2()
+                .border_r_2()
+                .rounded_br(px(4.0))
+                .border_color(color),
+        )
+        .children([(1.0, 0.0), (1.0, 12.0), (10.0, 0.0)].map(|(x, y)| {
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .size(px(6.0))
+                .rounded_full()
+                .border_2()
+                .border_color(color)
+                .bg(rgb(0x181825))
+        }))
+}
+
 fn sidebar_menu_row(id: &'static str) -> Stateful<Div> {
     div()
         .id(id)
@@ -145,6 +185,7 @@ actions!(
         ToggleSidebarDrawer,
         ToggleSidebarFocus,
         ToggleHelp,
+        ToggleGitPanel,
         RenameResource,
         RemoveShell,
         CopySelection,
@@ -260,6 +301,11 @@ const KEY_TOGGLE_LAYOUT_MODE: &str = "ctrl-space";
 const LAYOUT_LEADER_PASSTHROUGH_WINDOW: Duration = Duration::from_millis(500);
 
 const HELP_SHORTCUTS: &[ShortcutSpec] = &[
+    ShortcutSpec {
+        section: ShortcutSection::Navigation,
+        keys: "Layout: G",
+        description: "Toggle Git branches and worktrees panel",
+    },
     ShortcutSpec {
         section: ShortcutSection::General,
         keys: "F1",
@@ -685,6 +731,8 @@ struct WorkspaceTransition {
 enum PointerOperation {
     Move,
     Resize,
+    ResizeEdge(Direction),
+    ResizeCorner(Direction, Direction),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -944,6 +992,45 @@ fn dragged_bounds(
         PointerOperation::Move => {
             bounds.x = (bounds.x + delta.0).clamp(0.0, (panel_size.0 - bounds.width).max(0.0));
             bounds.y = (bounds.y + delta.1).clamp(0.0, (panel_size.1 - bounds.height).max(0.0));
+        }
+        PointerOperation::ResizeCorner(horizontal, vertical) => {
+            bounds = dragged_bounds(
+                bounds,
+                PointerOperation::ResizeEdge(horizontal),
+                delta,
+                panel_size,
+            );
+            bounds = dragged_bounds(
+                bounds,
+                PointerOperation::ResizeEdge(vertical),
+                delta,
+                panel_size,
+            );
+        }
+        PointerOperation::ResizeEdge(edge) => {
+            let right = bounds.x + bounds.width;
+            let bottom = bounds.y + bounds.height;
+            match edge {
+                Direction::Left => {
+                    bounds.x = (bounds.x + delta.0).clamp(0.0, (right - MIN_FLOAT_WIDTH).max(0.0));
+                    bounds.width = right - bounds.x;
+                }
+                Direction::Up => {
+                    bounds.y =
+                        (bounds.y + delta.1).clamp(0.0, (bottom - MIN_FLOAT_HEIGHT).max(0.0));
+                    bounds.height = bottom - bounds.y;
+                }
+                Direction::Right => {
+                    let available = (panel_size.0 - bounds.x).max(0.0);
+                    bounds.width =
+                        (bounds.width + delta.0).clamp(MIN_FLOAT_WIDTH.min(available), available);
+                }
+                Direction::Down => {
+                    let available = (panel_size.1 - bounds.y).max(0.0);
+                    bounds.height =
+                        (bounds.height + delta.1).clamp(MIN_FLOAT_HEIGHT.min(available), available);
+                }
+            }
         }
         PointerOperation::Resize => {
             let available_width = (panel_size.0 - bounds.x).max(0.0);
@@ -1336,6 +1423,7 @@ fn desktop_window_title(workspace_name: Option<&str>) -> String {
 }
 
 struct Workspace {
+    git_panel: git_panel::Model,
     layout: Option<Node>,
     floating: Vec<FloatingPane>,
     pointer_drag: Option<PointerDrag>,
@@ -1370,6 +1458,9 @@ struct Workspace {
     selected_node: Option<String>,
     resource_dialog: Option<ResourceDialog>,
     sidebar_visible: bool,
+    sidebar_preferred_width: f32,
+    sidebar_viewport_width: f32,
+    sidebar_resizing: bool,
     drawer_animation_from: Option<f32>,
     drawer_animation_generation: u64,
     pane_headings_visible: bool,
@@ -1507,6 +1598,7 @@ impl Workspace {
         let mut workspace = Self {
             layout: Some(layout),
             floating: Vec::new(),
+            git_panel: git_panel::Model::default(),
             pointer_drag: None,
             terminal_scrollbar_drag: None,
             layout_animation: None,
@@ -1543,6 +1635,9 @@ impl Workspace {
             selected_node: None,
             resource_dialog: None,
             sidebar_visible: saved.sidebar_visible,
+            sidebar_preferred_width: saved.sidebar_width,
+            sidebar_viewport_width: f32::from(window.viewport_size().width),
+            sidebar_resizing: false,
             drawer_animation_from: None,
             drawer_animation_generation: 0,
             pane_headings_visible: saved.pane_headings_visible,
@@ -1636,6 +1731,7 @@ impl Workspace {
             let _ = writer.force_send(settings::Settings {
                 onboarding_complete: self.onboarding_complete,
                 sidebar_visible: self.sidebar_visible,
+                sidebar_width: self.sidebar_preferred_width,
                 pane_headings_visible: self.pane_headings_visible,
                 pane_corner_style: self.pane_corner_style,
                 pane_gap: self.pane_gap,
@@ -2284,6 +2380,7 @@ impl Workspace {
     }
 
     fn focus_terminal_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.git_panel.search_focused = false;
         if !self.terminals.contains_key(&pane_id) {
             return;
         }
@@ -2630,6 +2727,7 @@ impl Workspace {
     }
 
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         if self.settings_open {
             self.close_settings(cx);
@@ -3353,7 +3451,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pointer_drag.is_some() || self.terminal_scrollbar_drag.is_some() {
+        if self.pointer_drag.is_some()
+            || self.terminal_scrollbar_drag.is_some()
+            || self.sidebar_resizing
+            || self.git_panel.resizing
+        {
             return;
         }
 
@@ -3416,8 +3518,9 @@ impl Workspace {
     }
 
     fn sidebar_width(&self) -> f32 {
-        if self.sidebar_visible {
-            SIDEBAR_WIDTH
+        if self.sidebar_visible && !(self.git_panel.open && self.git_panel.compact) {
+            self.sidebar_preferred_width
+                .min((self.sidebar_viewport_width - 240.0).max(0.0))
         } else {
             0.0
         }
@@ -3431,7 +3534,8 @@ impl Workspace {
             0.0
         };
         (
-            (f32::from(viewport.width) - self.sidebar_width()).max(0.0),
+            (f32::from(viewport.width) - self.sidebar_width() - self.git_panel_width(window))
+                .max(0.0),
             (f32::from(viewport.height) - tab_bar_height).max(0.0),
         )
     }
@@ -3651,6 +3755,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.git_panel.search_focused = false;
         self.floating_animation = None;
         self.focused = id;
         self.raise_floating_pane(id);
@@ -3672,7 +3777,12 @@ impl Workspace {
         event: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
-        if matches!(operation, PointerOperation::Resize) {
+        if matches!(
+            operation,
+            PointerOperation::Resize
+                | PointerOperation::ResizeEdge(_)
+                | PointerOperation::ResizeCorner(_, _)
+        ) {
             self.layout_animation = None;
         }
         let subject = self.pointer_subject(id);
@@ -3707,7 +3817,11 @@ impl Workspace {
             return;
         }
         // Keep the dragged pane focused even while it crosses other panes.
-        if self.pointer_drag.is_some() || self.terminal_scrollbar_drag.is_some() {
+        if self.pointer_drag.is_some()
+            || self.terminal_scrollbar_drag.is_some()
+            || self.sidebar_resizing
+            || self.git_panel.resizing
+        {
             return;
         }
         if self.navigation_region == NavigationRegion::Sidebar
@@ -3985,6 +4099,31 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.sidebar_resizing {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.sidebar_preferred_width = f32::from(event.position.x).clamp(280.0, 600.0);
+            } else {
+                self.sidebar_resizing = false;
+                self.save_settings();
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if self.git_panel.resizing {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.git_panel.width = Some(
+                    (f32::from(window.viewport_size().width) - f32::from(event.position.x))
+                        .clamp(280.0, 900.0),
+                );
+            } else {
+                self.git_panel.resizing = false;
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
         if let Some(drag) = self.terminal_scrollbar_drag.clone() {
             if event.pressed_button != Some(MouseButton::Left) {
                 self.terminal_scrollbar_drag = None;
@@ -4056,6 +4195,29 @@ impl Workspace {
             }
             PointerSubject::Tiled(start_layout) => match drag.operation {
                 PointerOperation::Move => unreachable!("tiled moves are lifted before dragging"),
+                PointerOperation::ResizeCorner(horizontal, vertical) => {
+                    let mut layout = start_layout;
+                    layout.resize_edge_from_pointer(
+                        drag.pane_id,
+                        horizontal,
+                        dx / panel_width.max(1.0),
+                    );
+                    layout.resize_edge_from_pointer(
+                        drag.pane_id,
+                        vertical,
+                        dy / panel_height.max(1.0),
+                    );
+                    self.layout = Some(layout);
+                }
+                PointerOperation::ResizeEdge(edge) => {
+                    let mut layout = start_layout;
+                    let delta = match edge {
+                        Direction::Left | Direction::Right => dx / panel_width.max(1.0),
+                        Direction::Up | Direction::Down => dy / panel_height.max(1.0),
+                    };
+                    layout.resize_edge_from_pointer(drag.pane_id, edge, delta);
+                    self.layout = Some(layout);
+                }
                 PointerOperation::Resize => {
                     self.layout = Some(resized_tiled_layout(
                         start_layout,
@@ -4075,6 +4237,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.sidebar_resizing {
+            self.sidebar_resizing = false;
+            self.save_settings();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if self.git_panel.resizing {
+            self.git_panel.resizing = false;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
         if let Some(drag) = self.terminal_scrollbar_drag.take() {
             if let Some(pane) = self.terminals.get_mut(&drag.pane_id)
                 && !pane.scrollbar_hovered
@@ -4436,6 +4612,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.git_panel.search_focused {
+            match event.keystroke.key.as_str() {
+                "escape" | "enter" => self.git_panel.search_focused = false,
+                "backspace" => {
+                    self.git_panel.search.pop();
+                }
+                _ if !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.alt =>
+                {
+                    if let Some(text) = &event.keystroke.key_char
+                        && self.git_panel.search.len() + text.len() <= 256
+                    {
+                        self.git_panel.search.push_str(text);
+                    }
+                }
+                _ => (),
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
         if self.nodes_open {
             let modifiers = event.keystroke.modifiers;
             if modifiers.control
@@ -5538,6 +5737,7 @@ impl Workspace {
     }
 
     fn open_nodes(&mut self, cx: &mut Context<Self>) {
+        self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
         self.nodes_open = true;
@@ -5738,8 +5938,10 @@ impl Workspace {
     fn sidebar(&self, cx: &mut Context<Self>) -> Div {
         let header_menu = self.sidebar_header_menu(cx);
         let settings_panel = self.settings_overlay(cx);
-        let (workspaces, agents) =
-            sidebar_render_sources(&self.boomux_overview, self.settings_open);
+        let (workspaces, agents) = sidebar_render_sources(
+            &self.boomux_overview,
+            self.settings_open || self.git_panel.compact,
+        );
         let focused_shell_id = self
             .terminals
             .get(&self.focused)
@@ -6059,7 +6261,7 @@ impl Workspace {
 
         div()
             .relative()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width()))
             .h_full()
             .flex_none()
             .flex()
@@ -6168,6 +6370,21 @@ impl Workspace {
                                         cx.stop_propagation();
                                         this.sidebar_header_menu_open = false;
                                         this.create_and_attach_new_workspace(window, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                sidebar_header_button(
+                                    "toggle-git-panel",
+                                    "Git branches and worktrees · Ctrl+Space, G",
+                                    "",
+                                    self.git_panel.open,
+                                )
+                                .child(git_branch_icon(self.git_panel.open))
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_git_panel(cx);
                                     },
                                 )),
                             )
@@ -6283,7 +6500,7 @@ impl Workspace {
                 .id("sidebar-resource-menu")
                 .absolute()
                 .occlude()
-                .left(px(SIDEBAR_WIDTH - 188.0))
+                .left(px((self.sidebar_width() - 188.0).max(0.0)))
                 .top(px(menu.top))
                 .w(px(178.0))
                 .p_1()
@@ -6419,7 +6636,7 @@ impl Workspace {
             .left_0()
             .top(px(64.0))
             .bottom_0()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width()))
             .min_h_0()
             .p_4()
             .flex()
@@ -8175,6 +8392,143 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn pane_resize_handles(&self, id: usize, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        if self.fullscreen == Some(id) || self.workspace_transition.is_some() {
+            return Vec::new();
+        }
+        let floating = self.floating.iter().any(|pane| pane.id == id);
+        let mut handles = [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, edge)| {
+            if !floating
+                && !self
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.has_resize_edge(id, edge))
+            {
+                return None;
+            }
+            let handle = div()
+                .id(SharedString::from(format!("pane-resize-{id}-{index}")))
+                .absolute()
+                .occlude()
+                .hover(|handle| handle.bg(rgb(0x89b4fa)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.begin_pointer_interaction_focus(id, window, cx);
+                        this.start_pointer_drag(id, PointerOperation::ResizeEdge(edge), event, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(Self::on_pointer_move))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(Self::end_pointer_interaction),
+                );
+            Some(
+                match edge {
+                    Direction::Left => handle
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(4.0))
+                        .cursor(gpui::CursorStyle::ResizeLeftRight),
+                    Direction::Right => handle
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(4.0))
+                        .cursor(gpui::CursorStyle::ResizeLeftRight),
+                    Direction::Up => handle
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(4.0))
+                        .cursor(gpui::CursorStyle::ResizeUpDown),
+                    Direction::Down => handle
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(4.0))
+                        .cursor(gpui::CursorStyle::ResizeUpDown),
+                }
+                .into_any_element(),
+            )
+        })
+        .collect::<Vec<_>>();
+        // Paint corner hitboxes after side handles so diagonal dragging wins
+        // where the two side targets meet.
+        for (index, (horizontal, vertical)) in [
+            (Direction::Left, Direction::Up),
+            (Direction::Right, Direction::Up),
+            (Direction::Left, Direction::Down),
+            (Direction::Right, Direction::Down),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if !floating
+                && !self.layout.as_ref().is_some_and(|layout| {
+                    layout.has_resize_edge(id, horizontal) && layout.has_resize_edge(id, vertical)
+                })
+            {
+                continue;
+            }
+            let handle = div()
+                .id(SharedString::from(format!(
+                    "pane-corner-resize-{id}-{index}"
+                )))
+                .absolute()
+                .size(px(12.0))
+                .occlude()
+                .cursor(
+                    if matches!(
+                        (horizontal, vertical),
+                        (Direction::Left, Direction::Up) | (Direction::Right, Direction::Down)
+                    ) {
+                        gpui::CursorStyle::ResizeUpLeftDownRight
+                    } else {
+                        gpui::CursorStyle::ResizeUpRightDownLeft
+                    },
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.begin_pointer_interaction_focus(id, window, cx);
+                        this.start_pointer_drag(
+                            id,
+                            PointerOperation::ResizeCorner(horizontal, vertical),
+                            event,
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_move(cx.listener(Self::on_pointer_move))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(Self::end_pointer_interaction),
+                );
+            let handle = if horizontal == Direction::Left {
+                handle.left_0()
+            } else {
+                handle.right_0()
+            };
+            let handle = if vertical == Direction::Up {
+                handle.top_0()
+            } else {
+                handle.bottom_0()
+            };
+            handles.push(handle.into_any_element());
+        }
+        handles
+    }
+
     fn pane(&self, id: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         self.pane_with_heading(id, self.pane_headings_visible, cx)
     }
@@ -8211,6 +8565,7 @@ impl Workspace {
 
         div()
             .id(("pane", id))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -8462,6 +8817,7 @@ impl Workspace {
                         },
                     ),
             )
+            .children(self.pane_resize_handles(id, cx))
     }
 
     fn minimized_tab_strip(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -8667,6 +9023,9 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sidebar_viewport_width = f32::from(window.viewport_size().width);
+        self.git_panel.compact =
+            self.git_panel.open && f32::from(window.viewport_size().width) < 1000.0;
         let workspace_name = self
             .terminals
             .get(&self.focused)
@@ -8911,7 +9270,39 @@ impl Render for Workspace {
             );
 
         let target_drawer_width = self.sidebar_width();
-        let sidebar = self.sidebar(cx);
+        let sidebar = div()
+            .relative()
+            .h_full()
+            .w(px(target_drawer_width))
+            .child(self.sidebar(cx))
+            .when(target_drawer_width > 0.0, |sidebar| {
+                sidebar.child(
+                    div()
+                        .id("sidebar-resize")
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(5.0))
+                        .occlude()
+                        .cursor(gpui::CursorStyle::ResizeLeftRight)
+                        .hover(|handle| handle.bg(rgb(0x89b4fa)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.sidebar_resizing = true;
+                                this.drawer_animation_from = None;
+                                this.git_panel.search_focused = false;
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(Self::on_pointer_move))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(Self::end_pointer_interaction),
+                        ),
+                )
+            });
         let drawer = if let Some(from) = self.drawer_animation_from {
             let animation_id = SharedString::from(format!(
                 "sidebar-drawer-{}",
@@ -8941,11 +9332,13 @@ impl Render for Workspace {
                 .into_any_element()
         };
 
+        let git_panel = self.render_git_panel(window, cx);
         let content = div()
             .size_full()
             .flex()
             .child(drawer)
             .child(terminal_area)
+            .when_some(git_panel, |element, panel| element.child(panel))
             .into_any_element();
         let sidebar_menu = self.sidebar_menu_overlay(cx);
         let nodes_panel = self.nodes_panel(cx);
@@ -8958,6 +9351,7 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .key_context(
                 if self.nodes_open
+                    || self.git_panel.search_focused
                     || self.boomux_setting_input.is_some()
                     || self.settings_restart_confirm
                 {
@@ -9005,6 +9399,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_sidebar_drawer))
             .on_action(cx.listener(Self::toggle_sidebar_focus))
             .on_action(cx.listener(Self::toggle_help))
+            .on_action(cx.listener(|this, _: &ToggleGitPanel, _, cx| this.toggle_git_panel(cx)))
             .on_action(cx.listener(Self::rename_resource))
             .on_action(cx.listener(Self::remove_shell))
             .on_action(cx.listener(Self::copy_selection))
@@ -9489,6 +9884,8 @@ fn main() {
             KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("Layout")),
             KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("Sidebar")),
             KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("SidebarLayout")),
+            KeyBinding::new("g", ToggleGitPanel, Some("Layout")),
+            KeyBinding::new("g", ToggleGitPanel, Some("SidebarLayout")),
             KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Terminal")),
             KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Layout")),
             KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Sidebar")),
@@ -9669,6 +10066,96 @@ mod pointer_tests {
         }
     }
     use boomux::protocol::{AgentState, ShellStatus};
+
+    #[test]
+    fn corner_drag_resizes_both_axes_and_preserves_opposite_corner() {
+        for (horizontal, vertical, expected) in [
+            (Direction::Left, Direction::Up, (130.0, 140.0, 370.0, 260.0)),
+            (
+                Direction::Right,
+                Direction::Up,
+                (100.0, 140.0, 430.0, 260.0),
+            ),
+            (
+                Direction::Left,
+                Direction::Down,
+                (130.0, 100.0, 370.0, 340.0),
+            ),
+            (
+                Direction::Right,
+                Direction::Down,
+                (100.0, 100.0, 430.0, 340.0),
+            ),
+        ] {
+            let start = FloatingPane {
+                id: 1,
+                x: 100.0,
+                y: 100.0,
+                width: 400.0,
+                height: 300.0,
+            };
+            let result = dragged_bounds(
+                start,
+                PointerOperation::ResizeCorner(horizontal, vertical),
+                (30.0, 40.0),
+                (1000.0, 800.0),
+            );
+            assert_eq!((result.x, result.y, result.width, result.height), expected);
+        }
+    }
+
+    #[test]
+    fn edge_drag_floating_keeps_opposite_edge_fixed_and_bounds_size() {
+        let start = FloatingPane {
+            id: 1,
+            x: 100.0,
+            y: 100.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        let left = dragged_bounds(
+            start.clone(),
+            PointerOperation::ResizeEdge(Direction::Left),
+            (50.0, 20.0),
+            (1000.0, 800.0),
+        );
+        assert_eq!(
+            (left.x, left.width, left.y, left.height),
+            (150.0, 350.0, 100.0, 300.0)
+        );
+        let top = dragged_bounds(
+            start.clone(),
+            PointerOperation::ResizeEdge(Direction::Up),
+            (20.0, 50.0),
+            (1000.0, 800.0),
+        );
+        assert_eq!(
+            (top.y, top.height, top.x, top.width),
+            (150.0, 250.0, 100.0, 400.0)
+        );
+        let minimum = dragged_bounds(
+            start.clone(),
+            PointerOperation::ResizeEdge(Direction::Left),
+            (1000.0, 0.0),
+            (1000.0, 800.0),
+        );
+        assert_eq!(minimum.width, MIN_FLOAT_WIDTH);
+        assert_eq!(minimum.x + minimum.width, 500.0);
+        let right = dragged_bounds(
+            start.clone(),
+            PointerOperation::ResizeEdge(Direction::Right),
+            (1000.0, 0.0),
+            (1000.0, 800.0),
+        );
+        assert_eq!((right.x, right.width), (100.0, 900.0));
+        let bottom = dragged_bounds(
+            start,
+            PointerOperation::ResizeEdge(Direction::Down),
+            (0.0, 1000.0),
+            (1000.0, 800.0),
+        );
+        assert_eq!((bottom.y, bottom.height), (100.0, 700.0));
+    }
 
     fn pane() -> FloatingPane {
         FloatingPane {

@@ -3301,6 +3301,7 @@ struct DaemonService {
     claude_remote_control: ClaudeRemoteControlBindings,
     remote_attachments: RemoteAttachmentManager,
     host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
+    git_work: crate::git_work::Service,
     host_session_catalog: HostSessionCatalogCache,
     workspace_operation_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     mutation_lock: Mutex<()>,
@@ -7313,6 +7314,7 @@ impl Default for DaemonService {
             claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
+            git_work: crate::git_work::Service::default(),
             host_session_catalog: HostSessionCatalogCache::default(),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
@@ -9617,6 +9619,38 @@ impl DaemonService {
         _requester_version: u32,
     ) -> DaemonResult<HostServiceResult> {
         match operation {
+            HostServiceOperation::GitOverview { refresh } => {
+                if let Some(overview) = self.git_work.cached_if_fresh(refresh) {
+                    return Ok(HostServiceResult::GitOverview { overview });
+                }
+                let snapshot = self.snapshot()?;
+                let mut live = HashMap::new();
+                for observed in snapshot.workspaces.iter().flat_map(|w| &w.shells).take(512) {
+                    let Some(expected) = &observed.run else {
+                        continue;
+                    };
+                    let Ok(shell) = self.durable.shell(&observed.id) else {
+                        continue;
+                    };
+                    let lifecycle = lock(&shell.lifecycle)?;
+                    if let ShellLifecycle::Running { run, runtime, .. } = &*lifecycle
+                        && run.snapshot()?.id == expected.id
+                    {
+                        let mut process = lock(&runtime.process)?;
+                        if process.try_wait_code()?.is_none()
+                            && let Some(pid) = process.process_id()
+                            && let Ok(path) = fs::read_link(format!("/proc/{pid}/cwd"))
+                            && path.is_absolute()
+                            && process.try_wait_code()?.is_none()
+                        {
+                            live.insert(observed.id.clone(), path);
+                        }
+                    }
+                }
+                Ok(HostServiceResult::GitOverview {
+                    overview: self.git_work.query(snapshot, live, refresh),
+                })
+            }
             HostServiceOperation::DiscoverProjects => Ok(HostServiceResult::Projects {
                 discovery: host_services::discover_projects().map_err(DaemonError::from)?,
             }),
@@ -13816,6 +13850,7 @@ impl DaemonService {
             claude_remote_control: ClaudeRemoteControlBindings::default(),
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
+            git_work: crate::git_work::Service::default(),
             host_session_catalog: HostSessionCatalogCache::default(),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),

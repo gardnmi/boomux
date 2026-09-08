@@ -93,6 +93,12 @@ cargo check -p boomux-desktop --locked
 cargo test -p boomux-desktop <test-name> --locked -- --test-threads=1
 ```
 
+For a performance comparison, run `python3 desktop/scripts/run-dev.py --release`.
+This builds and launches optimized Desktop and daemon binaries against the same
+isolated development runtime. The first optimized build takes longer; keep the
+default debug build for routine iteration. Close the previous Desktop window
+before comparing the same workload.
+
 The helper builds both executables, sets a matching CLI PATH, and uses XDG
 runtime/config/state directories under `target/desktop-dev/`. Closing the window
 keeps these development sessions alive. After rebuilding, the helper starts an

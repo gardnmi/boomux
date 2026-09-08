@@ -15553,7 +15553,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 52);
+        assert_eq!(protocol::PROTOCOL_VERSION, 53);
     }
 
     #[test]
