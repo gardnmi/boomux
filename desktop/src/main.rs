@@ -1489,6 +1489,7 @@ struct Workspace {
     pane_gap: f32,
     focus_highlight_strength: u8,
     motion_speed: MotionSpeed,
+    layout_overlay_visible: bool,
     workspace_pane_mode: WorkspacePaneMode,
     pane_layout_mode: PaneLayoutMode,
     minimized_shells: HashSet<String>,
@@ -1684,6 +1685,7 @@ impl Workspace {
             pane_gap: saved.pane_gap,
             focus_highlight_strength: saved.focus_highlight_strength,
             motion_speed: saved.motion_speed,
+            layout_overlay_visible: saved.layout_overlay_visible,
             workspace_pane_mode: saved.workspace_pane_mode,
             pane_layout_mode: saved.pane_layout_mode,
             minimized_shells: HashSet::new(),
@@ -1793,6 +1795,7 @@ impl Workspace {
                 pane_gap: self.pane_gap,
                 focus_highlight_strength: self.focus_highlight_strength,
                 motion_speed: self.motion_speed,
+                layout_overlay_visible: self.layout_overlay_visible,
                 workspace_pane_mode: self.workspace_pane_mode,
                 pane_layout_mode: self.pane_layout_mode,
                 confirm_destructive_actions: self.confirm_destructive_actions,
@@ -7887,6 +7890,21 @@ impl Workspace {
                             ),
                     ),
                 )
+                .child(Self::settings_toggle_row(
+                    "Layout overlay",
+                    "Dim terminals and show animated tiles in layout mode.",
+                    Self::settings_switch(
+                        "layout-overlay",
+                        "Layout overlay",
+                        self.layout_overlay_visible,
+                        true,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.layout_overlay_visible = !this.layout_overlay_visible;
+                        this.save_settings();
+                        cx.notify();
+                    })),
+                ))
                 .child(
                     Self::settings_field("Motion", "Speed of pane transitions.").child(
                         div()
@@ -9046,9 +9064,10 @@ impl Workspace {
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::paste_primary))
                     .child(self.boomux_body(id, cx))
                     .when(
-                        self.layout_mode
-                            || (self.layout_badge_exiting
-                                && self.motion_speed.duration().is_some()),
+                        self.layout_overlay_visible
+                            && (self.layout_mode
+                                || (self.layout_badge_exiting
+                                    && self.motion_speed.duration().is_some())),
                         |body| {
                             body.child(layout_badge::render_pane_overlay(
                                 self.theme,

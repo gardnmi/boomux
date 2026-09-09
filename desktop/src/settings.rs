@@ -19,6 +19,7 @@ pub struct Settings {
     pub pane_gap: f32,
     pub focus_highlight_strength: u8,
     pub motion_speed: MotionSpeed,
+    pub layout_overlay_visible: bool,
     pub workspace_pane_mode: WorkspacePaneMode,
     pub pane_layout_mode: PaneLayoutMode,
     pub confirm_destructive_actions: bool,
@@ -38,6 +39,7 @@ impl Default for Settings {
             pane_gap: 8.0,
             focus_highlight_strength: 100,
             motion_speed: MotionSpeed::Smooth,
+            layout_overlay_visible: true,
             workspace_pane_mode: WorkspacePaneMode::Workspace,
             pane_layout_mode: PaneLayoutMode::default(),
             confirm_destructive_actions: true,
@@ -144,6 +146,9 @@ impl Settings {
                         _ => return Err(invalid()),
                     }
                 }
+                "layout_overlay_visible" => {
+                    s.layout_overlay_visible = value.as_bool().ok_or_else(invalid)?
+                }
                 "motion_speed" => {
                     s.motion_speed = match value.as_str() {
                         Some("instant") => MotionSpeed::Instant,
@@ -207,6 +212,10 @@ impl Settings {
             self.dismissed_boomux_update
         );
         encoded.push_str(&format!("sidebar_git_tab = {}\n", self.sidebar_git_tab));
+        encoded.push_str(&format!(
+            "layout_overlay_visible = {}\n",
+            self.layout_overlay_visible
+        ));
         encoded
     }
     fn save(&self, path: &Path) -> Result<(), String> {
@@ -320,10 +329,12 @@ mod tests {
             pane_gap: 0.0,
             motion_speed: MotionSpeed::Instant,
             pane_headings_visible: false,
+            layout_overlay_visible: false,
             ..Settings::default()
         };
         assert_eq!(Settings::parse(&settings.encode()).unwrap(), settings);
         assert_eq!(Settings::parse("").unwrap(), Settings::default());
+        assert!(Settings::parse("").unwrap().layout_overlay_visible);
         assert_eq!(Settings::default().pane_layout_mode, PaneLayoutMode::Tabbed);
         assert_eq!(
             Settings::parse("pane_layout_mode = 'tiled'")
@@ -346,6 +357,7 @@ mod tests {
             "focus_highlight_strength = -1",
             "motion_speed = 'slow'",
             "sidebar_visible = 'true'",
+            "layout_overlay_visible = 'false'",
             "unknown = 3",
             "broken[",
         ] {
