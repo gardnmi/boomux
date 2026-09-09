@@ -123,8 +123,26 @@ pub fn process_cwd(pid: u32) -> io::Result<PathBuf> {
 
 fn process_arguments(pid: u32) -> io::Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
-    let mut bytes = vec![0u8; MAX_PROCESS_ARGS];
-    let mut len = bytes.len();
+    // Darwin rejects buffers larger than ARG_MAX, even when the process has
+    // only a few arguments. Query the required length before allocating.
+    let mut len = 0usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if !(4..=MAX_PROCESS_ARGS).contains(&len) {
+        return Err(io::Error::other("process arguments exceed bound"));
+    }
+    let mut bytes = vec![0u8; len];
     let rc = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
