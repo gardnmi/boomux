@@ -276,6 +276,8 @@ See [checklist details](../docs/install.md#harness-checklist).
 
 Desktop checks for stable releases after startup and every six hours.
 Checks do not download updates or restart anything.
+One **Boomux update available** notice covers Desktop and the CLI; dismissing
+it hides that release for both. Different detected versions share one version line.
 
 1. Choose **Update** to download and verify the complete bundle.
 2. Choose **Restart now** for a graceful handoff, or **Later** to keep working.

@@ -31,6 +31,36 @@ pub struct Check {
     pub prepared: Option<crate::bundle_update::Prepared>,
 }
 
+impl Check {
+    /// One release notice, even when a development install checks both binaries.
+    pub fn release_notice(
+        &self,
+        desktop_dismissed: &str,
+        boomux_dismissed: &str,
+    ) -> Option<&Notice> {
+        if self.prepared.is_some() {
+            return None;
+        }
+        self.boomux
+            .iter()
+            .chain(self.desktop.iter())
+            .max_by_key(|notice| Version::parse(&notice.latest).ok())
+            .filter(|notice| notice.visible(desktop_dismissed) && notice.visible(boomux_dismissed))
+    }
+
+    pub fn version_summary(&self, notice: &Notice) -> String {
+        if let (Some(desktop), Some(boomux)) = (&self.desktop, &self.boomux)
+            && desktop.current != boomux.current
+        {
+            return format!(
+                "Desktop {} · CLI {} → {}",
+                desktop.current, boomux.current, notice.latest
+            );
+        }
+        format!("{} → {}", notice.current, notice.latest)
+    }
+}
+
 pub fn valid_dismissal(text: &str) -> bool {
     text.is_empty() || (text.len() <= 64 && Version::parse(text).is_ok())
 }
@@ -164,6 +194,38 @@ pub fn check() -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn release_notice_unifies_components_and_honors_either_saved_dismissal() {
+        let check = Check {
+            desktop: notice("1.10.0", "v1.11.1", "boomux"),
+            boomux: notice("1.10.0", "v1.11.1", "boomux"),
+            ..Check::default()
+        };
+        let release = check.release_notice("", "").unwrap();
+        assert_eq!(check.version_summary(release), "1.10.0 → 1.11.1");
+        assert!(check.release_notice("1.11.1", "").is_none());
+        assert!(check.release_notice("", "1.11.1").is_none());
+        assert!(check.release_notice("1.11.0", "1.11.0").is_some());
+    }
+
+    #[test]
+    fn release_notice_retains_partial_checks_and_different_component_versions() {
+        let mut check = Check {
+            boomux: notice("1.9.0", "v1.12.0", "boomux"),
+            ..Check::default()
+        };
+        assert_eq!(check.release_notice("", "").unwrap().latest, "1.12.0");
+        check.desktop = notice("1.10.0", "v1.11.1", "boomux");
+        let release = check.release_notice("1.11.1", "").unwrap();
+        assert_eq!(release.latest, "1.12.0");
+        assert_eq!(
+            check.version_summary(release),
+            "Desktop 1.10.0 · CLI 1.9.0 → 1.12.0"
+        );
+        assert!(check.release_notice("", "1.12.0").is_none());
+        check.boomux = None;
+        assert_eq!(check.release_notice("", "").unwrap().latest, "1.11.1");
+    }
     #[test]
     fn only_newer_stable_releases_are_offered() {
         for tag in ["v0.1.0", "v0.0.9", "v0.2.0-beta.1", "bad", "v0.1.0+rebuild"] {
