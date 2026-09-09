@@ -106,7 +106,12 @@ before comparing the same workload.
 The helper builds both executables, sets a matching CLI PATH, and uses Boomux-only
 runtime/config/state directories under `target/desktop-dev/`. It sets
 `BOOMUX_RUNTIME_DIR`, `BOOMUX_CONFIG_HOME`, and `BOOMUX_STATE_HOME` instead of
-changing XDG variables. These override only Boomux's corresponding XDG roots
+changing XDG variables. When a worktree path would exceed the Unix socket path
+limit, the helper uses a
+private `/tmp/boomux-dev-<uid>-<worktree-hash>` runtime directory instead; config
+and state remain under `target/desktop-dev/`. The runtime path is stable for that
+worktree and shared by debug and release launches.
+These override only Boomux's corresponding XDG roots
 (including Desktop settings); terminal applications retain normal configuration,
 plugins, credentials, and desktop runtime services. Closing the window
 keeps these development sessions alive. After rebuilding, the helper starts an

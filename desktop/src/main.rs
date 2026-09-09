@@ -14,7 +14,6 @@ mod updates;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use boomux::protocol::AgentState;
@@ -937,7 +936,6 @@ struct TerminalScrollbarPointerDrag {
 #[derive(Clone)]
 struct TerminalSelectionDrag {
     pane_id: usize,
-    started: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -968,6 +966,34 @@ impl Render for WorkspaceRowDrag {
                     .text_color(rgb(0xcdd6f4))
                     .child(self.workspace_name.clone()),
             )
+    }
+}
+
+impl TerminalSelectionDrag {
+    fn selection(
+        &self,
+        pane_id: usize,
+        anchor: Option<gpui::Point<gpui::Pixels>>,
+        position: gpui::Point<gpui::Pixels>,
+        bounds: Bounds<gpui::Pixels>,
+        screen: &TerminalScreen,
+    ) -> Option<TerminalSelection> {
+        // GPUI dispatches drag moves to every listener of this type, including
+        // other panes. Only the source pane's bounds describe this selection.
+        if pane_id != self.pane_id {
+            return None;
+        }
+        let cell = |position: gpui::Point<gpui::Pixels>| {
+            terminal_cell_from_offset(
+                f32::from(position.x - bounds.left()),
+                f32::from(position.y - bounds.top()),
+                screen,
+            )
+        };
+        Some(TerminalSelection {
+            anchor: cell(anchor?),
+            head: cell(position),
+        })
     }
 }
 
@@ -1322,6 +1348,22 @@ fn terminal_selected_text(screen: &TerminalScreen, selection: TerminalSelection)
         .join("\n")
 }
 
+// Consume a completed gesture once, even when automatic copying is disabled.
+// The source pane remains authoritative if focus changed during the drag.
+fn take_terminal_selection_copy(
+    pending: &mut Option<usize>,
+    panes: &HashMap<usize, TerminalPane>,
+    enabled: bool,
+) -> Option<String> {
+    let pane_id = pending.take()?;
+    if !enabled {
+        return None;
+    }
+    let pane = panes.get(&pane_id)?;
+    let text = terminal_selected_text(pane.screen.as_ref()?, pane.selection?);
+    (!text.is_empty()).then_some(text)
+}
+
 fn drop_placement(layout: &Node, point: (f32, f32)) -> Option<(usize, Axis, bool)> {
     let (id, rect) = layout.rects().into_iter().find(|(_, rect)| {
         point.0 >= rect.x
@@ -1437,6 +1479,9 @@ struct Workspace {
     floating: Vec<FloatingPane>,
     pointer_drag: Option<PointerDrag>,
     terminal_scrollbar_drag: Option<TerminalScrollbarPointerDrag>,
+    terminal_selection_release: Option<usize>,
+    copied_pane: Option<usize>,
+    copied_cleanup: Option<gpui::Task<()>>,
     layout_animation: Option<LayoutAnimation>,
     workspace_order_animation: Option<WorkspaceOrderAnimation>,
     floating_animation: Option<FloatingAnimation>,
@@ -1490,6 +1535,7 @@ struct Workspace {
     focus_highlight_strength: u8,
     motion_speed: MotionSpeed,
     layout_overlay_visible: bool,
+    copy_on_select: bool,
     workspace_pane_mode: WorkspacePaneMode,
     pane_layout_mode: PaneLayoutMode,
     minimized_shells: HashSet<String>,
@@ -1544,6 +1590,7 @@ struct TerminalPane {
     scrollbar_hovered: bool,
     scrollbar_fade_generation: u64,
     selection: Option<TerminalSelection>,
+    selection_anchor_position: Option<gpui::Point<gpui::Pixels>>,
     render_images: HashMap<u64, Arc<RenderImage>>,
     render_image_screen: Option<Arc<TerminalScreen>>,
     paint_cache: Option<Arc<TerminalPaintCache>>,
@@ -1629,6 +1676,9 @@ impl Workspace {
             git_panel: git_panel::Model::default(),
             pointer_drag: None,
             terminal_scrollbar_drag: None,
+            terminal_selection_release: None,
+            copied_pane: None,
+            copied_cleanup: None,
             layout_animation: None,
             workspace_order_animation: None,
             floating_animation: None,
@@ -1686,6 +1736,7 @@ impl Workspace {
             focus_highlight_strength: saved.focus_highlight_strength,
             motion_speed: saved.motion_speed,
             layout_overlay_visible: saved.layout_overlay_visible,
+            copy_on_select: saved.copy_on_select,
             workspace_pane_mode: saved.workspace_pane_mode,
             pane_layout_mode: saved.pane_layout_mode,
             minimized_shells: HashSet::new(),
@@ -1766,6 +1817,7 @@ impl Workspace {
         workspace.watch_updates(cx);
         cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
+                this.terminal_selection_release = None;
                 this.layout_leader_release_task = None;
                 if this.layout_leader_pressed_at.take().is_some() && this.layout_leader_entered {
                     this.leave_layout_mode(cx);
@@ -1796,6 +1848,7 @@ impl Workspace {
                 focus_highlight_strength: self.focus_highlight_strength,
                 motion_speed: self.motion_speed,
                 layout_overlay_visible: self.layout_overlay_visible,
+                copy_on_select: self.copy_on_select,
                 workspace_pane_mode: self.workspace_pane_mode,
                 pane_layout_mode: self.pane_layout_mode,
                 confirm_destructive_actions: self.confirm_destructive_actions,
@@ -3834,8 +3887,26 @@ impl Workspace {
         cx.notify();
     }
 
+    fn begin_terminal_selection(
+        &mut self,
+        pane_id: usize,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.layout_mode || self.pointer_drag.is_some() || event.modifiers.control {
+            return;
+        }
+        if let Some(pane) = self.terminals.get_mut(&pane_id) {
+            self.terminal_selection_release = None;
+            pane.selection_anchor_position = Some(event.position);
+            pane.selection = None;
+            cx.notify();
+        }
+    }
+
     fn drag_terminal_selection(
         &mut self,
+        pane_id: usize,
         event: &DragMoveEvent<TerminalSelectionDrag>,
         _: &mut Window,
         cx: &mut Context<Self>,
@@ -3843,7 +3914,7 @@ impl Workspace {
         // The terminal surface also owns ordinary left-drag selection. Let a
         // compositor drag bubble to the workspace-level pointer handler instead
         // of consuming its mouse moves as selection updates.
-        if self.pointer_drag.is_some() || event.event.modifiers.control {
+        if self.layout_mode || self.pointer_drag.is_some() || event.event.modifiers.control {
             return;
         }
         let drag = event.drag(cx).clone();
@@ -3853,17 +3924,17 @@ impl Workspace {
         let Some(screen) = pane.screen.as_ref() else {
             return;
         };
-        let offset_x = f32::from(event.event.position.x - event.bounds.left());
-        let offset_y = f32::from(event.event.position.y - event.bounds.top());
-        let cell = terminal_cell_from_offset(offset_x, offset_y, screen);
-        if !drag.started.swap(true, Ordering::AcqRel) {
-            pane.selection = Some(TerminalSelection {
-                anchor: cell,
-                head: cell,
-            });
-        } else if let Some(selection) = &mut pane.selection {
-            selection.head = cell;
-        }
+        let Some(selection) = drag.selection(
+            pane_id,
+            pane.selection_anchor_position,
+            event.event.position,
+            event.bounds,
+            screen,
+        ) else {
+            return;
+        };
+        pane.selection = Some(selection);
+        self.terminal_selection_release = Some(drag.pane_id);
         let selected = pane
             .selection
             .map(|selection| terminal_selected_text(screen, selection));
@@ -3871,6 +3942,25 @@ impl Workspace {
             cx.write_to_primary(ClipboardItem::new_string(text));
         }
         cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn copy_terminal_text(&mut self, pane_id: usize, text: String, cx: &mut Context<Self>) {
+        // Feedback belongs only to Desktop-initiated copies. Do not observe the
+        // clipboard or react to harness output: those applications own their UI.
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.copied_pane = Some(pane_id);
+        // Replacing the task cancels the old timeout, keeping rapid copies to a
+        // single indicator and one timer, with no clipboard content retained.
+        self.copied_cleanup = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.copied_pane = None;
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 
@@ -3884,7 +3974,7 @@ impl Workspace {
             return;
         };
         if !text.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.copy_terminal_text(self.focused, text, cx);
             cx.stop_propagation();
         }
     }
@@ -3992,6 +4082,7 @@ impl Workspace {
         if let Some(drag) = self.terminal_scrollbar_drag.clone() {
             if event.pressed_button != Some(MouseButton::Left) {
                 self.terminal_scrollbar_drag = None;
+                self.terminal_selection_release = None;
                 return;
             }
             let offset = scrollbar_offset_from_drag(
@@ -4120,6 +4211,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.button == MouseButton::Left {
+            let source_pane = self.terminal_selection_release;
+            let enabled = self.copy_on_select && !self.layout_mode && self.pointer_drag.is_none();
+            if let Some(text) = take_terminal_selection_copy(
+                &mut self.terminal_selection_release,
+                &self.terminals,
+                enabled,
+            ) && let Some(pane_id) = source_pane
+            {
+                self.copy_terminal_text(pane_id, text, cx);
+            }
+        }
         if self.sidebar_resizing {
             self.finish_sidebar_resize();
             cx.notify();
@@ -5216,6 +5319,7 @@ impl Workspace {
         self.floating.clear();
         self.pointer_drag = None;
         self.terminal_scrollbar_drag = None;
+        self.terminal_selection_release = None;
         self.layout_animation = None;
         self.floating_animation = None;
         self.minimizing_panes.clear();
@@ -5338,6 +5442,7 @@ impl Workspace {
                 self.floating.clear();
                 self.pointer_drag = None;
                 self.terminal_scrollbar_drag = None;
+                self.terminal_selection_release = None;
                 self.layout_animation = None;
                 self.floating_animation = None;
                 self.minimizing_panes.clear();
@@ -8021,6 +8126,17 @@ impl Workspace {
                 .child(layout)
                 .child(Self::settings_category("Appearance"))
                 .child(appearance)
+                .child(Self::settings_category("Clipboard"))
+                .child(Self::settings_group().child(Self::settings_toggle_row(
+                    "Copy on select",
+                    "Copy selected terminal text to the clipboard when you release the mouse.",
+                    Self::settings_switch("copy-on-select", "Copy on select", self.copy_on_select, true)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.copy_on_select = !this.copy_on_select;
+                            this.save_settings();
+                            cx.notify();
+                        })),
+                )))
                 .child(Self::settings_category("Notifications & sounds"))
                 .child(Self::settings_group().children(self.shared_settings_rows(&[0, 1, 2, 3, 4, 5], cx)))
                 .child(Self::settings_category("Recovery & history"))
@@ -9066,21 +9182,35 @@ impl Workspace {
                     .overflow_hidden()
                     .flex_1()
                     .min_h_0()
-                    .on_drag(
-                        TerminalSelectionDrag {
-                            pane_id: id,
-                            started: Arc::new(AtomicBool::new(false)),
-                        },
-                        move |_, _, _, cx| {
-                            cx.new(move |_| TerminalSelectionDrag {
-                                pane_id: id,
-                                started: Arc::new(AtomicBool::new(true)),
-                            })
-                        },
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, _, cx| {
+                            this.begin_terminal_selection(id, event, cx);
+                        }),
                     )
-                    .on_drag_move(cx.listener(Self::drag_terminal_selection))
+                    .on_drag(TerminalSelectionDrag { pane_id: id }, move |_, _, _, cx| {
+                        cx.new(move |_| TerminalSelectionDrag { pane_id: id })
+                    })
+                    .on_drag_move(cx.listener(move |this, event, window, cx| {
+                        this.drag_terminal_selection(id, event, window, cx);
+                    }))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::paste_primary))
                     .child(self.boomux_body(id, cx))
+                    .when(self.copied_pane == Some(id), |body| {
+                        body.child(
+                            div()
+                                .absolute()
+                                .bottom(px(12.0))
+                                .right(px(20.0))
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x313244))
+                                .text_color(rgb(0xa6e3a1))
+                                .text_sm()
+                                .child("Copied"),
+                        )
+                    })
                     .when(
                         self.layout_overlay_visible
                             && (self.layout_mode
@@ -10941,7 +11071,73 @@ mod pointer_tests {
     }
 
     #[test]
-    fn terminal_selection_extracts_rows_in_either_drag_direction() {
+    fn terminal_selection_drag_uses_only_source_pane_bounds_and_mouse_down_anchor() {
+        let screen = TerminalScreen {
+            rows: 24,
+            cols: 80,
+            cells: Vec::new(),
+            scroll_total: 24,
+            scroll_offset: 0,
+            scroll_len: 24,
+            images: Vec::new(),
+            image_placements: Vec::new(),
+        };
+        let bounds = Bounds::new(point(px(600.0), px(100.0)), size(px(700.0), px(430.0)));
+        let position = |row: usize, col: usize| {
+            bounds.origin
+                + point(
+                    px(8.0 + (col as f32 + 0.5) * TERMINAL_CELL_WIDTH),
+                    px(8.0 + (row as f32 + 0.5) * TERMINAL_CELL_HEIGHT),
+                )
+        };
+        let drag = TerminalSelectionDrag { pane_id: 2 };
+        let anchor = Some(position(3, 20));
+        for head in [(3, 30), (3, 10), (2, 40), (5, 10)] {
+            assert_eq!(
+                drag.selection(2, anchor, position(head.0, head.1), bounds, &screen),
+                Some(TerminalSelection {
+                    anchor: (3, 20),
+                    head
+                }),
+            );
+            // A neighboring pane receives the same move with different bounds.
+            // It must neither move the anchor nor consume the source's update.
+            let neighbor = Bounds::new(point(px(0.0), px(0.0)), bounds.size);
+            assert_eq!(
+                drag.selection(1, anchor, position(head.0, head.1), neighbor, &screen),
+                None,
+            );
+        }
+        assert_eq!(
+            drag.selection(2, anchor, point(px(0.0), px(0.0)), bounds, &screen),
+            Some(TerminalSelection {
+                anchor: (3, 20),
+                head: (0, 0)
+            }),
+        );
+        assert_eq!(
+            drag.selection(2, anchor, point(px(2000.0), px(2000.0)), bounds, &screen),
+            Some(TerminalSelection {
+                anchor: (3, 20),
+                head: (23, 79)
+            }),
+        );
+        assert_eq!(
+            drag.selection(2, None, position(3, 30), bounds, &screen),
+            None
+        );
+        // A new gesture uses its own mouse-down position, even before the first
+        // delivered drag move and regardless of the previous selection.
+        assert_eq!(
+            drag.selection(2, Some(position(7, 50)), position(7, 45), bounds, &screen),
+            Some(TerminalSelection {
+                anchor: (7, 50),
+                head: (7, 45)
+            }),
+        );
+    }
+
+    fn selection_test_screen() -> TerminalScreen {
         let cells = "abc efg "
             .chars()
             .map(|character| terminal::TerminalCell {
@@ -10956,7 +11152,7 @@ mod pointer_tests {
                 cursor: false,
             })
             .collect();
-        let screen = TerminalScreen {
+        TerminalScreen {
             rows: 2,
             cols: 4,
             cells,
@@ -10965,12 +11161,71 @@ mod pointer_tests {
             scroll_len: 2,
             images: Vec::new(),
             image_placements: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn terminal_selection_extracts_rows_in_either_drag_direction() {
+        let screen = selection_test_screen();
         let selection = TerminalSelection {
             anchor: (1, 1),
             head: (0, 1),
         };
         assert_eq!(terminal_selected_text(&screen, selection), "bc\nef");
+    }
+
+    #[test]
+    fn terminal_selection_copy_on_release_is_optional_nonempty_and_once_per_gesture() {
+        let mut panes = HashMap::from([(
+            2,
+            TerminalPane {
+                screen: Some(Arc::new(selection_test_screen())),
+                selection: Some(TerminalSelection {
+                    anchor: (0, 1),
+                    head: (1, 1),
+                }),
+                ..TerminalPane::default()
+            },
+        )]);
+        let mut pending = Some(2);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true).as_deref(),
+            Some("bc\nef")
+        );
+        assert_eq!(pending, None);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true),
+            None
+        );
+        pending = Some(2);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, false),
+            None
+        );
+        assert_eq!(pending, None);
+        // Disabling automatic copy preserves the selection for manual copying.
+        assert!(panes[&2].selection.is_some());
+        pending = Some(99);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true),
+            None
+        );
+        assert_eq!(pending, None);
+        panes.get_mut(&2).unwrap().selection = Some(TerminalSelection {
+            anchor: (0, 3),
+            head: (0, 3),
+        });
+        pending = Some(2);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true),
+            None
+        );
+        panes.get_mut(&2).unwrap().selection = None;
+        pending = Some(2);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true),
+            None
+        );
     }
 
     #[test]
