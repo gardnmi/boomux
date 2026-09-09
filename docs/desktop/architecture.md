@@ -1,5 +1,10 @@
 # Architecture
 
+**Jump to:** [Module map](#module-map) · [Threading](#threading-and-backpressure) · [Rendering](#rendering) · [Remotes](#remote-node-entry-points) · [Settings](#shared-boomux-settings)
+
+This is the UI implementation reference. For everyday use, see the
+[Desktop guide](../../desktop/README.md).
+
 ## System Boundary
 
 Boomux Desktop is a presentation client. Boomux remains the source of truth for
@@ -34,6 +39,8 @@ new-Workspace creation retain their existing paths. Reattachment
 to a running Shell retains the exact run already validated by attach, without a
 second owner lookup. Newly started/restarted Shells still resolve their new run.
 
+### Input And Layout Mode
+
 GPUI key contexts separate ordinary terminal input from desktop layout actions.
 The default `Terminal` context reserves only explicit lifecycle, clipboard, and
 mode-entry commands; other keys reach the pane encoder. `Ctrl+Space` activates
@@ -43,6 +50,7 @@ key presses, repeats, paste, and mouse-wheel reports; releases for keys already
 sent still reach their original pane. Double `Ctrl+Space` retains its explicit
 pass-through behavior. The leader activates Layout immediately; release before
 250 ms latches it, while a longer hold exits on release of Control or Space.
+
 The leader is handled from raw key events, outside the ordinary action binding
 dispatcher, so auto-repeat is explicitly ignored even after tracked press state
 is cleared. Space release is settled for 50 ms using one cancelable task:
@@ -51,6 +59,7 @@ input paths that synthesize repeat as release/press pairs without a repeat flag.
 Tap/hold classification uses the release event time, excluding the settling
 delay. Control release ends a hold immediately. Window deactivation cancels the
 pending release and clears an active hold.
+
 Control-modified Layout bindings support navigation while holding the chord.
 Keys pressed in Layout are prevented from repeating into the terminal after
 release of the leader; releases for previously forwarded keys still reach their
@@ -141,6 +150,8 @@ Workspace rows use split-pane icons, semibold names, and distinct header surface
 Shell rows use deeper indentation and regular-weight names. Status indicators
 and activation behavior remain separate from this visual hierarchy.
 
+### Project Discovery
+
 The sidebar `+` opens a local creation menu with New Workspace first, followed by
 projects discovered through the existing bounded `boomux project list --json`
 flow. One background scan runs per opening, without polling or concurrent scans;
@@ -148,12 +159,15 @@ loading, empty, warning, and error states remain visible. Settings exposes
 `projects.roots` and `projects.max_depth` through the validated core config editor,
 with no daemon restart required. Settings and the menu's Add/Manage project folders
 action open a native directory-only picker through GPUI's desktop portal support.
+
 Selections append to the effective roots without replacing existing entries;
 duplicates are skipped and cancel is a no-op. The manual editor remains available,
 including when a desktop file-picker portal is unavailable. Selecting a project creates a new local Workspace named after
 the project (adding a numeric suffix on collision), with its default directory
 and initial login Shell set to the revalidated project path. It does not infer
 membership from an existing Workspace's equal name or launch commands from files.
+
+### Agent Projection
 
 The sidebar is a bounded, read-only Boomux snapshot. Active Agent rows require an
 exact current ShellRun. Historical records appear only through explicit Boomux
@@ -182,6 +196,7 @@ sidebar has keyboard focus, so the selected tab does not consume terminal input.
 Remote-owned Workspaces appear in the main tree with a monitor icon and machine
 status. Desktop keys encode both owner and resource identity, and are decoded
 only at the RPC boundary; encoded keys are never passed as owner-local IDs.
+
 Shell creation, attachment, reconnect, rename, close, and attention acknowledgment
 use the registered owner's existing guarded APIs. Cached directories are not
 invented from local paths. Remote creation resolves the owner's starting directory
@@ -190,6 +205,7 @@ ambiguous mutation failures are surfaced without automatic replay.
 The initial connect flow creates this Workspace after successful registration.
 Open its Shell from the sidebar; creating another Workspace from Remotes also
 attaches its first Shell. Multi-placement coordinator metadata is left unchanged.
+
 The Remotes tab retains sign-in actions and adds an explicitly confirmed
 remote update action. No background installation or upgrade is performed.
 Once remote
@@ -207,6 +223,8 @@ do not alone repaint an inactive Remotes tab. There is no additional SSH worker,
 registration store, or discovery loop in Desktop. Snapshot and registration
 bounds remain daemon-owned; the client retains only the latest summary per Node.
 
+### Guided Remote Actions
+
 Connect, update, uninstall, and reauthentication open the matching Boomux CLI's guided
 flow in a local daemon-owned Shell, using exact argument vectors. Reauthentication
 passes the stable Node ID and leaves route/identity verification to Boomux.
@@ -215,6 +233,7 @@ and protocol compatibility remain owned by that interactive flow. After the
 result acknowledgment, the exact dedicated command Shell/run is removed with a
 revision guard. Desktop removes its temporary Workspace only with ephemeral
 creation proof, the expected post-removal revision, and no remaining resources.
+
 Ordinary Shells invoking the CLI are not cleanup targets. Remotes does not launch
 the separate terminal dashboard. Healthy cards omit generic lifecycle guidance;
 unavailable machines retain their observation age and recovery guidance.
@@ -223,9 +242,12 @@ retaining its interactive consent, identity/revision checks, and confirmed-remov
 registration cleanup. Desktop never substitutes a local forget on failure.
 An independent, inline-confirmed **Forget connection only…** action uses the
 existing local `ForgetNodeRegistration` request with the selected exact Node ID.
+
 It runs off the UI thread, does not require remote availability, and is never
 presented as successful remote uninstall. Concurrent clicks are suppressed;
 normal overview refresh removes the forgotten registration's cached rows.
+
+### Remote Attachment
 
 Remote attachment uses `AttachNode`, preserving the exact owner/run on reconnect
 and leaving environment ownership on that machine. Local attachment continues
@@ -260,16 +282,20 @@ the active file, then the global file, then the workspace Boomux defaults. Daemo
 defaults come from its public library; CLI-only display defaults mirror the
 workspace version and must be reviewed on dependency updates. This is a presentation
 projection, not the running daemon's state. Only edited fields are written.
+
 The comment-preserving active draft and global fallback are each capped at 1 MiB.
 Text entry is limited to 16 KiB. The UI presents one categorized list with
 bordered section groups, label/description rows, compact boolean switches,
 segmented choices, and inset editable fields. These are native GPUI-CE controls
 using the existing theme palette, not a GPUI Kit dependency. Advanced terminal
 setup is placed after the everyday settings.
+
 The Advanced section shows the active core configuration path and opens
 `boomux config edit` in a local terminal using the matching CLI. This preserves
 the core editor's validation and transactional save behavior; it does not edit
 Desktop's separate `boomux-desktop/settings.toml` appearance preferences.
+
+### Configuration Save Transaction
 
 Each completed edit invokes `boomux config edit` with Desktop as its temporary-file editor.
 The helper runs before GPUI initialization, checks the original active-layer
@@ -277,12 +303,14 @@ snapshot against Boomux's working copy, and writes only the working copy.
 Boomux owns validation, ownership checks, inherited-layer conflict checks, and
 atomic replacement of the live file. Temporary request files are private to the
 user and removed after completion. One load/save may be pending per window.
+
 CLI waits and pipe reads run off GPUI; coreutils timeout owns the subprocess
 group, including the helper. Completed daemon-setting edits set one restart reminder. Confirmation appears
 when the panel closes or its restart button is clicked, never while choosing
 settings. A save finishing after the panel closes also offers confirmation.
 The bounded worker invokes only `boomux daemon restart` after confirmation, with
 a 30-second outer timeout. Restart uses Boomux's graceful handoff authority.
+
 A persisted Desktop reminder is cleared only after successful restart; it is
 a UI reminder, not an independent assertion of the daemon's current config. The bundled smoke test exercises creation, save, conflict rejection, and
 owner-side validation failures against the matching Boomux executable.
@@ -324,6 +352,7 @@ and prompts; its Ratatui checklist uses the existing Crossterm input path,
 restores canonical input before applying selections, and never treats deselection
 as uninstall. The legacy `onboarding_complete` preference remains readable but
 no longer gates discovery or a generic first-run card.
+
 Setup prints an explicit completion message distinguishing success, remaining
 recommended steps, and failures, followed by `Exit and remove this setup Shell?
 [Y/n]`. Enter or yes revalidates the exact Shell/run and stored private command,
@@ -333,6 +362,7 @@ Desktop removes the pane only after output ends and a successful local overview
 confirms that Shell is absent. The successful setup creation response also gives
 that attachment an ephemeral cleanup receipt containing the owning Node, exact
 Workspace ID, and expected revision after removal of its sole setup Shell.
+
 The existing overview worker consumes it once, off the UI thread, verifies the
 local Node identity, and uses local `GetWorkspace` and `GuardedCloseWorkspace`
 requests. `RouteNodeOperation` is only for registered remote Nodes and must not
@@ -341,6 +371,7 @@ Agent history and exactly one revision increment since creation. Edits and addin
 therefore preserve even a currently empty Workspace; a mutation racing the final
 close is rejected by the owner. There is no unguarded fallback or retry with a
 newer revision. Unrelated and reused Workspaces are never selected by name.
+
 Discovery, reattachment, and reopening Desktop do not reconstruct this ownership
 receipt; without it the Workspace is retained. A setup attachment failure also
 retains its resources rather than invoking unguarded Workspace removal.

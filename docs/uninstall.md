@@ -1,5 +1,17 @@
 # Uninstall Contract
 
+**Removing Desktop?** Use the [Desktop uninstall instructions](desktop/releases.md#uninstall).
+The commands below govern standalone local and registered remote installations.
+
+| Action | Process impact | Data policy |
+| --- | --- | --- |
+| `boomux uninstall` | Stop the local service and its managed processes | Preserve durable state and configuration |
+| `boomux uninstall --purge` | Same shutdown | Also remove validated standard state/configuration trees |
+| `boomux node uninstall NODE` | Stop managed processes on the verified remote owner | Preserve remote state, configuration, and Agent Skill |
+
+All three require interactive confirmation. See the ownership restrictions below;
+this table does not authorize removal of arbitrary installations.
+
 > **Status: Current contract.** This document governs removal of Boomux-owned
 > local release assets and preserved user data.
 
@@ -20,6 +32,8 @@ capability is `guided_local_uninstall`.
 configuration directories after validating their complete bounded trees. It
 does not remove a `BOOMUX_CONFIG` file outside the standard Boomux configuration
 directory.
+
+### Registered Remote Removal
 
 `boomux node uninstall NODE` is a separate human-only operation for an exact
 registered Node. It authenticates the stored route, verifies the pinned Node ID,
@@ -42,6 +56,8 @@ Package-managed, root-owned, source, development, custom, symlinked, multiply
 linked, changed, and otherwise unprovable executables are refused. Package
 installations must be removed with their owning package manager.
 
+### Remote Installation Eligibility
+
 Registered remote uninstall also accepts source/development copies at that exact
 canonical user-owned path, because remote bootstrap can install the pinned current
 binary. Build distribution is not used as remote ownership evidence. The private
@@ -51,6 +67,8 @@ unchanged executable fingerprint remain required. No installer provenance receip
 is assumed. Local self-update and self-uninstall remain official-release-only.
 Older remote helpers with the release-only check must be updated before removing
 a development copy; the coordinator does not bypass their refusal.
+
+### Integrations And Companion Assets
 
 Unchanged bundled integration assets and the unchanged Boomux Agent Skill are
 removed. Modified or uninspectable assets are preserved and reported; uninstall

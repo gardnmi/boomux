@@ -1,10 +1,20 @@
 # Remote Node Federation
 
+**Using Desktop?** Start with [Remotes in the Desktop guide](../desktop/README.md#remotes).
+This document is the federation contract, including CLI and protocol behavior.
+
+**Jump to:** [Identity](#identity-and-ownership) · [Connect](#connection-and-registration) · [Failures](#reads-mutations-and-failure) · [PTYs](#ptys-and-native-presentation) · [Limits](#bounds-and-non-goals)
+
 > **Status: Current contract.** This document defines the implemented authority,
 > identity, privacy, compatibility, and failure semantics delivered incrementally
 > under [#174](https://github.com/gardnmi/boomux/issues/174) and tracking epic
 > [#173](https://github.com/gardnmi/boomux/issues/173). Current source and
-> compatibility tests remain authoritative for shipped behavior. Protocol 28
+> compatibility tests remain authoritative for shipped behavior.
+
+<details>
+<summary>Protocol and persistence milestones</summary>
+
+> Protocol 28
 > implements stable local Node identity; protocol 29, handshake version 1, and
 > the hidden stdio helper establish the verified same-socket bridge boundary.
 > Protocol 30 and local `boomux node rekey` implement bounded expected-ID rekey
@@ -39,6 +49,8 @@
 > coordinator prepare/attempt/complete recovery. Coordinator Workspace schema 8
 > explicitly migrates schema 7 with empty default-cwd operation ledgers.
 
+</details>
+
 ## Purpose
 
 Remote Node federation lets local Boomux clients present and manage resources
@@ -49,6 +61,8 @@ Omarchy panel should nevertheless behave as native local presentation.
 
 Federation is not shared runtime ownership. Each Node remains a complete Boomux
 authority, and SSH is a replaceable transport between authorities and clients.
+
+### Coordinated Workspaces
 
 The coordinating Node separately owns global Workspace identity, name,
 membership, and operation progress. A placement is always an explicit pair of
@@ -70,6 +84,7 @@ raced an in-flight owner mutation. Completed success is replayed from the
 coordinator's bounded durable outcome ledger even when the request's original
 revision is now stale; no prompt,
 attachment environment, or shell-interpolated command enters coordinator state.
+
 Preparation reserves enough physical store capacity for a conservative upper
 bound of the completed response, evicting oldest outcomes if necessary. A request
 that cannot reserve within 1 MiB fails before any owner mutation. Concurrent
@@ -78,6 +93,7 @@ additional future placement before either new owner dispatch proceeds.
 Changing a placement default cwd uses the same authority boundary but a distinct
 prepared operation. The request fixes the global Workspace ID and revision,
 Node ID, owner Workspace ID and fresh revision, and owner-resolved directory.
+
 Before preparing anything, the coordinator live-verifies that a remote owner
 advertises protocol 49 and `workspace_placement_default_cwd`. The dispatch
 helper repeats that check on the connection used for mutation before durably
@@ -88,9 +104,12 @@ The owner persists first. Coordinator completion accepts only the unchanged
 guarded owner revision or its single updated successor with the exact cwd, then
 updates the placement mirror and, for an update, the global revision. Exact
 replay returns the bounded durable result; a conflicting operation UUID fails.
+
 Definitive owner rejection cancels the exact preparation; timeout, persistence,
 and outcome-unknown responses retain it for exact owner readback.
 Existing resources are unchanged, and no offline write is queued.
+
+### Terminal Dashboard Controls
 
 The dashboard has a dedicated Nodes tab rather than a Node filter. Inspection is
 read-only; `R` opens interactive reauthentication for a selected
@@ -103,6 +122,9 @@ retargets, or changes registration state. Success wakes the selected Node's
 existing batch observer without starting an overlapping worker or changing
 remote authority. Daemon protocol 38 or newer is required for that explicit
 observer wake.
+
+### Prepared Operations And Recovery
+
 Prepared operations are isolated and serialized by operation UUID, so concurrent
 identical handlers return one durable result and cancellation cannot consume an
 in-flight or completed success. Distinct first-placement requests retain their
@@ -111,6 +133,7 @@ prepared request. The completed ledger retains at most the newest 256 successes
 and may retain fewer to preserve the 1 MiB coordinator-store limit; replay is not
 guaranteed after oldest-first eviction. Adoption and linking require a fresh
 identity-pinned protocol-38 combined local snapshot under the admitted route.
+
 That live snapshot must advertise runtime `global_workspaces` eligibility and
 contains the fresh exact owner revision used for commit. Cached projection
 eligibility alone cannot authorize either mutation. The retained internal
@@ -178,6 +201,7 @@ with a different registration value returns `already_exists`; alias changes use
 the revision-conditional rename operation rather than another add. A Node cannot
 register itself as remote. The coordinator allows concurrent channels only when
 they report the same pinned Node and current remote stream.
+
 Simultaneous channels that report one Node ID with divergent stream incarnations
 put the registration into an identity-conflict state and close every live read,
 mutation, attachment, and synchronization channel. Only the previously committed
@@ -215,6 +239,8 @@ destructive changes, integration installation, and remote daemon management
 retain their existing explicit user authorization. Boomux
 never scans SSH configuration and automatically connects to every alias.
 
+### Registration Commands
+
 The implemented registration CLI is `boomux node add ALIAS TARGET`, or guided
 interactive `boomux node add` from the dashboard command palette or Omarchy
 panel. Registration management continues with `node list`,
@@ -229,12 +255,14 @@ changing the registration. Immediately before activation it acquires a bounded
 local maintenance lease, drains admitted operations, and prevents rename,
 retarget, forget, projection, and routed operations until remote commit or
 rollback completes. The lease expires fail-open if the upgrading client dies.
+
 The CLI renews it during a live transaction; local daemon restart and stop are
 busy while it remains active so handoff cannot silently reopen admission.
 Successful remote commit, failure before remote mutation, and a synchronously
 confirmed rollback release it immediately. Only an ambiguous upgrade or a
 rollback whose completion cannot be confirmed leaves it closed until bounded
 expiry so the remote watchdog settles before local routing resumes.
+
 Human-only `node uninstall NODE` uses the same admission-closing maintenance
 lease after explicit process and data-impact confirmation. It requires an
 existing protocol-48 helper at the canonical user install destination, proves a
@@ -246,6 +274,7 @@ the local registration while admission is still closed, then best-effort removes
 its now-inaccessible disposable projection. Any failure retains the registration
 and releases maintenance; Boomux never interprets `node forget` as remote
 uninstall authority.
+
 Add and retarget complete verified bootstrap before submitting a registration
 mutation to the local daemon. The selected helper path is
 connection-local and is rediscovered on every later connection; it is not a
@@ -277,6 +306,7 @@ one endpoint or account can never authorize mutation through another connection.
 The private configuration terminates any trailing `Match` scope inherited from
 the included user configuration before clearing `SendEnv`, so even an included
 file ending in a nonmatching block cannot retain environment forwarding.
+
 Every fixed command that contacts the remote daemon resolves its runtime
 environment on that authenticated host. It never forwards or persists the local
 environment. An existing remote `XDG_RUNTIME_DIR` must be a bounded safe absolute
@@ -286,6 +316,7 @@ directory must be a non-symlink directory owned by that numeric user with mode
 `0700`, and is exported only for that remote command. These rules cover helper
 probes, live federation and host-service channels, provisional proof-bound
 activation, daemon status and restart, and rollback/watchdog daemon restoration.
+
 Missing, malformed, unsupported, or unsafe runtime discovery returns
 `bootstrap_runtime_unavailable` without including the path or raw remote stderr.
 Slave argv also installs a deliberately failing direct-connection fallback, so a
@@ -314,6 +345,7 @@ as `reconnecting`, not `unsupported`. A lock whose recorded watchdog is absent
 or dead is reported separately as `upgrade_recovery_required` instead of being
 misrepresented as active recovery, and registered projection presents it as
 `stale` with the recovery-required error detail.
+
 After authorization, Boomux acquires the remote transaction lock and uploads the
 pinned bytes only to the private transaction `new` path. It validates and marks
 that executable and starts the rollback watchdog without replacing the discovered
@@ -327,6 +359,7 @@ bounded absolute `/proc/<pid>/exe` path after normalizing the kernel's
 ` (deleted)` suffix, and records the socket device and inode. This does not trust
 listener `SO_PEERCRED` retained from an earlier handoff process. Automatic upgrade
 requires that proven process executable to equal the install destination exactly.
+
 Immediately before rename, the provisional binary opens one negotiated daemon
 connection and binds activation to the exact current holder PID, executable,
 protocol, and socket device/inode fingerprint at the activation boundary.
@@ -372,6 +405,7 @@ backup, then rechecks source metadata and compares the complete copy. A failed o
 out-of-space copy leaves the old destination inode untouched. On Linux the
 completed backup and later destination replacement are synced before progress is
 published.
+
 After proof, an idempotent activation command acquires the same claim, validates
 the transaction and destination, copies and verifies the backup, records
 activation intent, and atomically renames `new` over the destination. It never
@@ -381,6 +415,7 @@ executable back to `new`, restores the prior destination, synchronizes both, and
 only then clears activation and backup markers. The transaction is therefore
 again uploaded-only and can be retried exactly; incomplete compensation retains
 its markers for explicit rollback or watchdog recovery.
+
 Consequently Linux exposes the old daemon's executable as the deleted prior
 destination, and graceful restart's installed-path fallback selects the new
 destination rather than the protocol-old backup.
@@ -390,6 +425,7 @@ filesystem, streaming, activation, or watchdog stage emits only a bounded
 non-secret stage marker and deterministic exit code. The client maps that marker
 to actionable `bootstrap_install_failed` detail; arbitrary remote stderr is never
 included in CLI diagnostics.
+
 Post-upload failures similarly name the fixed identity-proof, activation, graceful-restart,
 helper-verification, live-handshake, or protocol-ping stage without exposing raw
 remote output.
@@ -404,6 +440,7 @@ a complete unrenewed 180-second lease and proof that the recorded PID/start owne
 is gone; a zombie is not treated as active, and only the exact recorded owner may
 release a claim. Claim metadata becomes ready only after every field is written;
 an interrupted publication can itself be reclaimed after the same bounded age.
+
 Before commit, master or local-process
 loss therefore lets the watchdog restore it automatically even when a healthy
 transaction spans several lease intervals. ABI/exec failure and every daemon-status, restart, helper,
@@ -413,6 +450,7 @@ Rollback never stops a daemon when the pre-install state was absent; an
 independently started runtime process survives and may require explicit operator
 recovery after filesystem restoration. If a provisional upgrade restarted the daemon,
 rollback atomically renames the complete backup over the provisional destination.
+
 When a daemon existed before activation and provisional helper work could have
 affected it, rollback gracefully restarts through the restored helper regardless
 of later status observations. Rollback is confirmed only after that required
@@ -420,6 +458,7 @@ restart succeeds. A restart failure retains the retryable transaction and leaves
 local maintenance bounded until watchdog recovery can complete. The explicit
 rollback and detached watchdog share the same complete-backup and
 activation-intent markers, so a partial backup is never installed.
+
 An uploaded-only transaction has no activation intent, so explicit rollback or
 watchdog expiry removes only private transaction state and cannot touch the
 destination. Upload and activation acknowledgments are keyed by the caller's
@@ -442,6 +481,7 @@ destination so a retry cannot accept a helper that the watchdog will later roll
 back. Before the atomic marker the watchdog rolls back; after it the watchdog
 cleans up, so transport loss at no commit step can produce a partially finalized
 state.
+
 Every verified-bootstrap result has passed exactly one live protocol ping. A
 previously Ready helper is connected and pinged before the result is returned. An
 installed or upgraded helper is already pinged inside the transaction before
@@ -450,6 +490,7 @@ not ping that returned handoff-era channel again. The remote may close the chann
 immediately after the successful verification ping without invalidating the
 verified handshake identity or a completed commit. A Ready helper that cannot
 answer its one required ping still fails before any registration mutation.
+
 Automatic and ad hoc bootstrap never upload or restart when every discovered
 helper is below protocol 47. Because protocol 47 has no migration from protocol
 46, the remote owner must use its existing pre-47 binary to run `boomux daemon
@@ -457,6 +498,7 @@ stop`, reset the incompatible owner state and removed scheduling configuration,
 then install and start protocol 47 as documented in
 [`local-update.md`](local-update.md). Explicit `node upgrade` likewise returns
 typed `upgrade_required` with that guidance when no compatible helper exists.
+
 When a registered Node already has a compatible helper, explicit `node upgrade`
 may transactionally replace it and restarts any present same-protocol daemon so
 the replacement actually runs; the registered Node ID is checked before
@@ -580,6 +622,7 @@ observation revision, typed category, and bounded typed reason;
 digest claims contain stream UUID, prior and through cursor IDs, and the sorted
 enabled category set. Claims are local presentation state and are removed with
 their registered Node cache.
+
 Schema 3 explicitly migrates schema 2 by retaining its complete cache and
 initializing an empty dismissal set for every Node. Dismissal is accepted only
 for a Shell in a stale or offline cached projection. It persists across restart
@@ -589,6 +632,7 @@ item and attention counts are recomputed from that filtered view. It never
 creates a routed request or owner mutation. Restore clears the selected Node's
 set. A later authoritative projection retains tombstones for Shells still
 present and prunes tombstones for Shells it no longer contains.
+
 Schema 4 explicitly migrates schema 3 by initializing the optional observed
 helper version. Successful authenticated projection commits retain that bounded
 ASCII-graphic version in the same generation as health, capabilities, cursor,
@@ -702,6 +746,7 @@ Workspace revision, and refreshes after completion. The owner keeps the immutabl
 minimal mutation result in a bounded durable receipt, so exact replay does not
 rediscover the Session or consult a host catalog. Receipts contain no projected
 summary, harness title, catalog data, lifecycle state, or occurrences.
+
 Workspace-filtered reads scope the owner
 snapshot before catalog-directory discovery and never enumerate unrelated
 Workspace paths.

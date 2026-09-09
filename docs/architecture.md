@@ -1,5 +1,11 @@
 # Architecture
 
+**Start here:** [Module ownership](#module-ownership) · [Invariants](#invariant-index) · [Runtime semantics](#runtime-semantics) · [Updates](#local-release-updates)
+
+This is the implementation reference. For product usage, see the
+[documentation guide](README.md); for UI internals, see
+[Desktop architecture](desktop/architecture.md).
+
 > **Status: Current reference.** This document describes the implemented
 > architecture. `CONTEXT.md` is authoritative for domain terminology; source and
 > compatibility tests are authoritative for exact protocol and state versions.
@@ -170,6 +176,8 @@ not expose a TCP listener or the local daemon socket. Remote work continues when
 the SSH bridge or local presentation disconnects. The complete accepted contract
 and deferred behavior are in [`remote-nodes.md`](remote-nodes.md).
 
+### Ad Hoc SSH Bootstrap
+
 Public `boomux --remote TARGET` performs ad hoc bootstrap only. It
 discovers and verifies a compatible helper, or interactively installs one before
 opening a daemon-bound stdio channel. The verified-connection boundary performs
@@ -187,6 +195,7 @@ projection worker. Protocol 33 exposes cached projections through the separately
 named combined Node snapshot and dashboard while existing snapshot and list
 operations remain local-only. Protocol 34 adds closed typed exact-Node private
 reads and guarded management; unclassified mutation remains unavailable.
+
 Protocol 35 adds Node-qualified native-terminal attachment and owner-environment
 startup for remote pending and exited Shells.
 Protocol 36 adds closed typed Node host services and owner-executed exact Agent
@@ -199,6 +208,7 @@ Protocol 39 adds Node-qualified focused-terminal presentation to the combined
 Node snapshot and a prompt-free local invalidation event for responsive
 presentation. Focus remains ephemeral and controller-authorized, and is not
 persisted in the reduced remote projection cache.
+
 Protocol 40 lets an owner mark a pending Shell with its interrupted prior run
 only when startup configuration and exact lifecycle state prove one unambiguous
 Agent session can resume. Dashboards present that association as inactive;
@@ -206,6 +216,7 @@ protocol-39 responses remove the marker so old peers cannot display stale Agent
 state as current.
 It also adds coordinator-local dismissal and restore of stale cached Shell
 presentation without routing, queuing, or claiming an owner mutation.
+
 Protocol 41 carries the package version from each authenticated federation
 handshake into the disposable Node projection and combined Node snapshot. The
 Nodes dashboard displays that observed version; protocol-40 responses omit it.
@@ -217,6 +228,7 @@ outcomes. Local daemon restart or stop is rejected until the lease is released
 or expires. An uncommitted remote bootstrap lock projects as reconnecting rather
 than unsupported while watchdog recovery remains active; a lock without its
 exact live watchdog identity projects as stale and requires operator recovery.
+
 Protocol 42 adds the `opencode_shared_runtime_claims` feature. One ephemeral
 Node-local OpenCode server generation is daemon-supervised and shared by native
 clients. Bounded Agent Session Claims map an exact root Session in that generation
@@ -224,6 +236,7 @@ to one exact current ShellRun and ensured Agent Instance while one or more TUI
 holders maintain it. Claims are absent from durable state, snapshots,
 projections, events, and handoff; a surviving TUI reacquires after graceful
 replacement. The runtime process identity and generation do transfer.
+
 Handoff generation 5 accepts generation 4, whose manifest has no shared-runtime
 record.
 Protocol 43 adds `claude_remote_control_bindings`. Claude hooks may associate a
@@ -233,6 +246,7 @@ operations. Bindings are bounded, ephemeral, absent from durable state,
 snapshots, events, and remote projections, and add no old-response transform.
 Handoff generation 6 accepts generation 5 and transfers valid bindings without
 descriptors; generation-5 manifests default to no bindings.
+
 Protocol 44 adds `collaborative_exact_run_attachment`. A distinct exact-run-only
 request adds a bounded writable participant without replacing the ordinary
 primary controller. It cannot start or resize a PTY, and clients never downgrade
@@ -240,6 +254,7 @@ it to takeover on an older daemon. The runtime-only participant map requires no
 state or handoff format change. Its `Attached` response includes the primary
 terminal profile, and later primary resize frames are copied to collaborators so
 their local renderers retain the authoritative PTY grid.
+
 Protocol 45 adds `kiro_exact_launch_holders`. A supervised exact-argv Kiro
 launcher acquires one bounded ephemeral capability tied to its PID/start identity
 and exact current ShellRun. Kiro hooks can ensure and report canonical Sessions
@@ -249,6 +264,7 @@ generation 7, which accepted generation 6 and transferred live holders and their
 associations; cold recovery starts with none. Capacity is 256 holders with 16
 Sessions per holder, whose maximal handoff encoding remains below the control
 frame bound.
+
 Protocol 46 adds `kiro_stop_idle`. Kiro v3 Stop hooks report Idle turn
 completion. Protocol-46 clients downgrade Stop to Unknown when connected to a
 protocol-45 daemon, preserving the original holder-report admission contract.
@@ -258,6 +274,7 @@ wire shapes and capabilities are absent from the current protocol. State schema
 14 contains no schedule definitions, execution records, private prompts, runner
 capabilities, or schedule-owned Shells. Because this is an alpha breaking
 change, state schemas 9 through 13 are rejected rather than migrated.
+
 Coordinator Workspace schema 7 likewise rejects schema 6, and disposable Node
 cache schemas 3 and 4 are rejected so their projections are rebuilt. Cold
 recovery cannot recreate removed scheduled work.
@@ -271,6 +288,7 @@ incompatible runtime, coordinator, journal, selection, and projection state,
 remove the old scheduling and scheduled-notification config keys, then install
 and start the new binary. [`local-update.md`](local-update.md) defines the exact
 operator sequence.
+
 Protocol 48 adds `node_uninstall_coordination`. It atomically consumes an exact
 Node maintenance lease into registration removal only after the interactive
 client confirms identity-pinned remote uninstall, then best-effort removes the
@@ -289,6 +307,7 @@ owner attempted. Definitive unsupported owners and cold-recovered preparations
 that never crossed that attempted boundary leave no recovery state. The
 coordinator also cancels the exact preparation after a definitive owner
 rejection while retaining transport-ambiguous outcomes for readback recovery.
+
 The owner persists before emitting `workspace_default_cwd_changed`; protocol-48
 event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
@@ -300,6 +319,7 @@ stays paused until persistence succeeds; `shell_created` then `run_started` are
 published in the same event batch before output is released. Failed creation,
 spawn, or persistence rolls back membership and reaps any newly started process
 and reader. The supplied startup environment is ephemeral, never persisted.
+
 As with first attachment, the child can execute before the commit is acknowledged;
 rollback does not undo external command side effects.
 The response carries the exact first run for subsequent exact-run attachment.
@@ -376,6 +396,7 @@ registration-time source cwd with the same bounded Git inspection, excludes that
 canonical launch root from observed-work presentation, deduplicates the remaining
 roots across exact Agent occurrences, reports their total distinct count, and
 returns at most the four newest repository/branch/timestamp summaries in lists.
+
 Exact inspection returns up to 64 deduplicated contexts while limiting response-
 time Git push and worktree inspection to the first four. The Agent retains its
 launch-root observation. The independent nullable `git_branch`
@@ -568,6 +589,7 @@ state rather than mirroring the registry shape, so unrelated mutations do not
 clone the registry and new entity fields remain part of rollback automatically.
 Workspace-owned Session display-name metadata and hidden-Session tombstones are
 part of that registry without making projected Agent Sessions durable entities.
+
 Their semantic keys survive projected UUID mechanics and temporary catalog
 disappearance, while Workspace closure removes the metadata with its sole owner.
 `EventStream` owns retained events, cursors, long-poll wakeups, and
@@ -580,6 +602,7 @@ transition frontier, retained event state, durable collection, then applicable
 shell/runtime locks. Paths that need only a suffix of that order start at the
 first required owner; PTY output releases runtime locks before entering the
 `EventStream` publication boundary.
+
 The local coordinated Shell transaction extends the nested order with the
 global Workspace stage before durable collection mutation and the journal append
 after both staged projections are validated. Checkpointing retains the mutation
@@ -661,6 +684,7 @@ and web-client restart. Graceful handoff transfers its strict PID/start/runtime
 identity and generation; cold startup adopts only an exactly matching runtime.
 Daemon stop terminates it. A hidden shared launcher establishes a scoped `PATH`
 only for eligible Boomux login Shells and is not stable public automation.
+
 When cold recovery selects one exact resumable OpenCode Agent, the replacement
 ShellRun uses that same hidden launcher with the canonical Session ID. The TUI
 therefore attaches to the current Shared Harness Runtime generation and creates
@@ -693,6 +717,7 @@ serialization boundary so bytes within a frame cannot interleave. Collaborative
 resize is ignored; only the primary can update the PTY and retained terminal
 dimensions. Explicit takeover detaches the prior primary and all
 collaborators; graceful handoff instead reconnects and awaits every participant.
+
 The listener admits at most 64 concurrent handshake and management handlers and
 closes newly accepted sockets while that capacity is exhausted. Decoded native,
 collaborative, and routed attachment requests move to a separate pool of at most
@@ -701,6 +726,7 @@ Each pool releases its permit when its handler exits. Management responses and
 attachment output use bounded write deadlines. Attachment input handlers join
 the output worker after either side closes the shared socket, so abandoned
 clients cannot delay shutdown indefinitely.
+
 It also feeds a shadow `vt100` parser while forwarding the original PTY bytes
 unchanged. Alternate-screen reconstruction reads the primary grid and saved
 cursor from a temporary copy of that parser's screen. It does not depend on PTY
@@ -711,6 +737,7 @@ clone the bounded shadow screen under the per-shell terminal lock, then format
 that snapshot after releasing the lock. They traverse physical rows from newest
 to oldest and stop once the requested byte, logical-line, and span bounds are
 satisfied, so retained history does not extend PTY-writer lock hold time.
+
 DEC private modes 1004 (focus reporting) and 2031 (color-scheme reporting) are
 tracked across split or combined output sequences and restored after attachment,
 resize reconstruction, reconnect, and daemon handoff. Color-scheme reports remain
@@ -742,6 +769,7 @@ Agent completion. Protocol 39 also records a relayed
 focus gain as ephemeral presentation state on the local daemon after forwarding
 it to the owner. The presentation identity is the exact owner Node and Shell;
 it does not transfer focus authority or enter the remote projection cache.
+
 Presentation recording reflects the physical local focus report after the frame
 is written to the owner stream; it is not an acknowledgment that the owner
 accepted the frame and is never used as lifecycle evidence.
@@ -765,6 +793,7 @@ the resolved terminal through exact argument vectors without `dispatch exec` or
 shell interpolation. Addresses are never persisted, projected, sent to an owner
 Node, or treated as resource identity. Query, correlation, or placement failure
 after spawn is presentation-only and leaves the terminal open.
+
 Before placement or visibility, the adapter applies an exact runtime Workspace
 rule selecting `dwindle` for that Boomux special Workspace; it never changes the
 global or ordinary-Workspace layout.
@@ -778,6 +807,7 @@ workspace navigation and terminal retains ordinary `xdg-terminal-exec`
 behavior. Desktop presentation attaches existing Shells but is not a Workspace
 open or restore and does not invoke launchers. No daemon protocol, persistence
 schema, or handoff state represents the desktop layer.
+
 Navigation dispatches the already-materialized compositor Workspace before
 durably updating the default Workspace selection, and identical selections are
 not rewritten, so selection fsync latency does not delay the visual transition.
@@ -789,6 +819,7 @@ captured ephemeral address and Hyprland stable window ID immediately before the
 close. A later focus change cannot retarget the action. It fails closed on an
 identity, window, or membership mismatch; outside the layer it delegates
 ordinary active window closure to Hyprland.
+
 Contextual pop avoids Hyprland pinning inside a Boomux special Workspace because
 unpinning a tiled window can return it to the underlying ordinary Workspace. It
 uses ordinary float-and-pin behavior outside the Boomux layer.
@@ -798,6 +829,7 @@ active coordinator placement, and moves only that exact window back. It does not
 open, restart, take over, or otherwise mutate the Shell. Return requires the
 exact qualified identity in the immutable initial title and does not fall back
 to matching a mutable human title.
+
 Desktop gather targets the visible Boomux Workspace, or the selected Workspace
 when none is visible. It moves matching terminal attachments back into that
 layer and opens missing attachments for user-owned Shells without invoking
@@ -806,6 +838,7 @@ An exact `open --workspace` request validates the Shell's Node-qualified owner
 against an active placement in that coordinated Workspace before presentation.
 With the adapter enabled it shows the owning layer and places only that Shell's
 terminal; no sibling Shell or launcher is opened.
+
 An explicit coordinated `workspace open --show` reveals the target desktop
 layer before performing normal Workspace restore semantics. It therefore opens
 all user Shell attachments and invokes every launcher exactly as `workspace
@@ -816,6 +849,7 @@ item reports unavailable placement operations as a nonfatal warning; an attempt
 with no successful item remains an error. The TUI remains active in its terminal
 after desktop focus moves to the revealed Hyprland Workspace, and refreshes its
 model so it is current when the user returns.
+
 Spawned terminal windows start in independent process sessions with null
 standard streams, so exiting the dashboard cannot close their attachments.
 The internal attachment process restarts an exited shell only after the terminal
@@ -830,12 +864,14 @@ events back into the model; model transitions do not call daemon or terminal
 callbacks directly. The backend runs effects serially off the terminal thread,
 so daemon, SSH, and preview latency cannot delay input or rendering; periodic
 refresh and preview reads are single-flight to keep stale work from accumulating.
+
 Rendering remains a function of typed model state. One
 daemon snapshot contains each workspace, its launchers, and its shells, avoiding
 races between separate list operations. Configured project roots provide
 Workspace-name suggestions. Selecting one validates its discovered path on the
 local Node and atomically creates the coordinated Workspace, its local placement,
 and a first pending Shell with that path as both Shell cwd and placement default.
+
 Arbitrary by-name creation still creates empty coordinator metadata, and older
 peers retain the path as the empty local Workspace default. Git information is
 still collected independently from item directories and cached. Paths do not
@@ -872,6 +908,7 @@ selection, so manual navigation remains usable until another terminal focus
 gain. Focus changes are deferred while an overlay or close confirmation is
 active. The setting is dashboard-local and disabling it does not stop focus
 reporting by attachments.
+
 Temporary projection absence does not reset the client's observed focus
 frontier. A replaced event stream or a handoff that changes the negotiated
 protocol resets it once. Same-version handoff retains the exact presentation
@@ -951,6 +988,7 @@ at most 64 one-use grants for 30 seconds. The WebSocket upgrade requires an
 allowlisted loopback or active Tailscale dashboard Origin and carries the grant
 in a secondary WebSocket subprotocol rather than a URL. Consumption removes the
 grant before attachment.
+
 At most four browser terminal bridges may remain active, and each bridge uses
 eight-entry transport queues plus a bounded browser write deadline. Protocol 44
 also bounds daemon collaborators to four per Shell.
@@ -978,6 +1016,7 @@ route, while Claude and other presentation remain available. Port conflicts,
 runtime exit or timeout, protocol incompatibility, and daemon transport failures
 still fail startup. Requested OpenCode configuration is retained separately from
 actual runtime availability so detached equivalent starts remain idempotent.
+
 For an authoritative claimed local OpenCode Agent with a canonical external
 Session ID and UTF-8 working directory, Boomux
 base64url-encodes the directory and constructs OpenCode's exact
@@ -1014,6 +1053,7 @@ peers from bypassing that external boundary. API responses use `no-store`,
 the service worker caches only the public application shell, and a restrictive
 content security policy prevents external script, style, object, and framing
 origins. This edge does not expose the owner-only daemon socket over TCP.
+
 Web terminal input is remote shell access. WebSocket frames and queues are
 bounded to the attachment limit, browser backgrounding releases control, and all
 terminal API responses remain outside service-worker and HTTP caches. The
@@ -1057,6 +1097,7 @@ durable state observation, persistence, or events. It displays `untracked` until
 lifecycle data exists, then yields to that authoritative observation. `doctor`
 checks installed integration assets and reports a running untracked host with
 explicit install or restart guidance.
+
 Under protocol 40, a pending Shell snapshot exposes its exact interrupted last
 run and owner-selected Agent ID only when the owning daemon's startup
 configuration and durable state prove one unambiguous lifecycle-authoritative
@@ -1487,6 +1528,7 @@ Protocol 21 adds a targeted focused-terminal read so event-driven dashboards can
 refresh non-durable focus without rebuilding the complete registry. Protocols
 7-20 use the event stream with a one-second snapshot fallback for ephemeral
 fields; protocol 6 retains one-second snapshot refreshes.
+
 Protocol 28 and Node identity schema 1 establish the stable local Node ID used by
 federation. The daemon creates owner-only `node.json` independently from
 authoritative `state.json`, preserves malformed or future identity files while
@@ -1539,6 +1581,7 @@ channels share one worker and a bounded, non-blocking queue. Delivery is
 at-most-once and fail-open: queue saturation, a missing command, desktop-bus or
 audio failure, timeout, or non-zero exit neither retries nor changes the
 successful Agent mutation.
+
 Notification payloads include only sanitized Agent, workspace, and shell names;
 if retained Agent context outlives a removed shell, the shell is identified as
 removed rather than suppressing the transition. Notifications never acknowledge
@@ -1697,6 +1740,7 @@ remaining in raw mode. Exited shells transfer their final run metadata and
 bounded reconstructed terminal state without a PTY, pidfd, or replacement
 process. Cold startup and crash recovery still restore shells as pending and do
 not preserve live process or PTY ownership.
+
 The same graceful boundary transfers the Shared Harness Runtime's strict process
 identity and generation but no Agent Session Claims. Surviving TUI holders
 reacquire claims after reconnect. Cold startup adopts a runtime only when all

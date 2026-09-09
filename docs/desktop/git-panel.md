@@ -1,35 +1,35 @@
 # Git panel
 
-Boomux Desktop's Git panel shows repositories discovered from managed Shells and
-active Agent working-context observations. Select Git in the lower sidebar or
-press `Ctrl+Space`, then `G`; the shortcut reveals the sidebar when hidden.
-Agents and Git share this section below Workspaces.
-Drag the horizontal divider above the tabs to change its height. Workspaces,
-Agents, and Git scroll independently. The selected tab is remembered across
-restarts, and the Agents tab shows a count of blocked Agents even while viewing
-Git. Switching tabs does not replace terminal entities or mutate Shells, Agents,
-worktrees, branches, or repositories. Git occupies no space beside the terminal
-canvas beyond the ordinary sidebar.
+Select **Git** in the lower sidebar, or use **Ctrl + Space**, then **G**.
+The shortcut reveals the sidebar when hidden. The panel discovers repositories
+from managed Shells and active Agent working contexts.
 
-Each repository has a heading per owning Node, with indented worktree rows and
-a subtle vertical guide. The expanded row has a highlighted guide and background.
-Rows show the branch and Agent count, then
-compact status indicators for the working tree and upstream comparison. GitHub
-PR/check/review state appears only when a matching PR is available; lookup
-failures and branches without PRs add no placeholder status. Healthy state stays
-visually distinct from warnings and errors. Expand a row for the full path,
-Shell navigation, individual Agent associations, the last commit,
-observation ages, copy-path, and open-PR actions. Path, commit, and upstream use
-aligned labels; linked activity is grouped separately. Other local branches
-are not listed. Untracked
-directories count as one entry rather
-than enumerating every file inside them. Search matches repository, branch,
-path, and Workspace name. Search and refresh controls sit beside the tabs,
-with repositories immediately below. Hiding search clears its query. The refresh
-button highlights during refresh activity without shifting rows.
-Only one worktree row expands at a time. Initial discovery shows an explicit
-loading state with a short description of what is being inspected; it never
-presents an unexplained empty panel.
+## Reading The Panel
+
+| Area | Contents |
+| --- | --- |
+| Repository heading | Repository grouped by owning machine |
+| Worktree row | Branch, Agent count, working-tree state, and upstream comparison |
+| PR status | Checks/reviews only when a matching PR is available; no placeholder for absent PRs or failed lookups |
+| Expanded row | Full path, last commit, upstream, observation ages, linked Shells/Agents, copy-path, and open-PR actions |
+
+Only one row expands at a time. A highlighted guide and background distinguish
+it; aligned labels and a separate linked-activity group keep details readable.
+Healthy, warning, and error states remain visually distinct.
+
+Other local branches are not listed. Untracked directories count as one entry,
+not every file inside them.
+
+## Search, Refresh, And Layout
+
+- Search matches repository, branch, path, and Workspace name. Hiding it clears the query.
+- Search and refresh sit beside the tabs, with repositories immediately below.
+- Initial discovery explains what is loading; refresh highlights its button without moving rows.
+- Drag the divider above the tabs to resize the panel. Its scroll position is independent of Workspaces and Agents.
+- The selected tab is remembered. Blocked-Agent counts remain visible while viewing Git.
+
+Git uses only the existing sidebar. Switching tabs does not replace terminal
+entities or mutate Shells, Agents, worktrees, branches, or repositories.
 
 ## Associations and authority
 
