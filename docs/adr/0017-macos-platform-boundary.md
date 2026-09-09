@@ -17,6 +17,13 @@ which checks the exec generation in the kernel. There is no PID-only fallback
 when that operation is unavailable. This API is resolved at runtime and tested
 on the preview's native CI baseline; its availability is a release gate.
 
+Darwin cannot execute a Mach-O through `/dev/fd/N`. Replacement preparation
+therefore creates a private hard link and verifies its inode against the open
+executable before quiescing. It executes the alias while retaining the original
+absolute argv[0] for subsequent restart and integration paths. A cross-filesystem
+pin fails before transfer. The replacement removes its alias on exit; cold
+startup under the daemon lock reclaims stale aliases.
+
 macOS uses a distinct private `BOOMUXM1` handoff header. Linux retains H8. The
 public protocol and persisted registry schema do not change simply because a
 new host is supported. Process identity descriptors contain no environment.

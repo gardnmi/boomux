@@ -51,15 +51,13 @@ jobs:
         run: cargo +stable test --locked --lib fd_transfer -- --test-threads=1
       - name: Test native process identity
         run: cargo +stable test --locked --lib platform::macos::tests -- --test-threads=1 --nocapture
-      - name: Test detached handoff
-        env:
-          BOOMUX_TEST_DIAGNOSTICS: "1"
-        run: cargo +stable test --locked --test native_backend native_daemon_handoffs_multiple_detached_shells -- --test-threads=1 --nocapture
       - name: Test native lifecycle and recovery
         env:
           BOOMUX_TEST_DIAGNOSTICS: "1"
         run: |
+          failed=0
           for scenario in \
+            native_daemon_handoffs_multiple_detached_shells \
             daemon_bounds_stalled_connections_and_recovers_capacity \
             explicit_executable_handoff_preserves_live_runs_and_rolls_back_on_failure \
             attachment_client_reconnects_across_daemon_restart \
@@ -67,8 +65,9 @@ jobs:
             native_daemon_recovers_reproducible_metadata_after_restart \
             graceful_restart_preserves_opencode_shared_runtime_and_stop_cleans_it_up \
             graceful_restart_transfers_live_kiro_holder_authority_and_rolls_back_safely; do
-            cargo +stable test --locked --test native_backend "$scenario" -- --test-threads=1 --nocapture
+            cargo +stable test --locked --test native_backend "$scenario" -- --test-threads=1 --nocapture || failed=1
           done
+          exit "$failed"
       - name: Check Desktop
         run: cargo +stable check --locked -p boomux-desktop
       - name: Build preview executables

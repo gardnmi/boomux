@@ -149,12 +149,17 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "persistent_workspace_selection",
     "create_and_open_shell",
     "atomic_workspace_shell_creation",
+    #[cfg(target_os = "linux")]
     "hyprland_special_workspaces",
+    #[cfg(target_os = "linux")]
     "contextual_desktop_terminal",
+    #[cfg(target_os = "linux")]
     "coordinated_shell_desktop_placement",
+    #[cfg(target_os = "linux")]
     "desktop_workspace_show",
     "node_reauthentication",
     "local_update_status",
+    #[cfg(target_os = "linux")]
     "guided_local_update",
     "guided_local_uninstall",
     "guided_setup",
@@ -15742,6 +15747,7 @@ mod tests {
             "desktop_notifications",
             "sound_notifications",
             "integration_management",
+            #[cfg(target_os = "linux")]
             "desktop_workspace_show",
             "node_reauthentication",
             "protocol_31",
@@ -15758,7 +15764,7 @@ mod tests {
                 .iter()
                 .filter(|feature| **feature == "desktop_workspace_show")
                 .count(),
-            1
+            usize::from(cfg!(target_os = "linux"))
         );
         assert!(!NON_PROTOCOL_FEATURES.contains(&"workspace_open_desktop_show"));
         assert_eq!(

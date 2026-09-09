@@ -205,8 +205,11 @@ impl AsFd for ProcessHandle {
 }
 impl AsRawFd for ProcessHandle {
     fn as_raw_fd(&self) -> i32 {
-        self.monitor.as_raw_fd()
+        self.identity.as_raw_fd()
     }
+}
+pub fn process_wait_fd(handle: &ProcessHandle) -> i32 {
+    handle.monitor.as_raw_fd()
 }
 impl ProcessHandle {
     pub fn try_clone(&self) -> io::Result<Self> {
@@ -520,6 +523,16 @@ mod tests {
             .spawn()
             .unwrap();
         let handle = open_process(child.id()).unwrap();
+        assert_eq!(
+            process_argv(child.id()).unwrap(),
+            [b"/bin/sleep".to_vec(), b"30".to_vec()]
+        );
+        let mut idle = libc::pollfd {
+            fd: process_wait_fd(&handle),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut idle, 1, 0) }, 0);
         let duplicate = handle.as_fd().try_clone_to_owned().unwrap();
         let imported = import_process(duplicate, child.id()).unwrap();
         assert!(
@@ -532,7 +545,7 @@ mod tests {
         signal_process(imported.as_fd(), libc::SIGKILL).unwrap();
         assert!(!child.wait().unwrap().success());
         let mut event = libc::pollfd {
-            fd: imported.as_raw_fd(),
+            fd: process_wait_fd(&imported),
             events: libc::POLLIN,
             revents: 0,
         };

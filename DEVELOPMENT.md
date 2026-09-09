@@ -8,8 +8,10 @@ authoritative in the documents listed under [Repository Orientation](#repository
 
 ## Prerequisites
 
-Boomux development requires Linux and the stable Rust toolchain with `rustfmt`
-and Clippy. Install the toolchain with:
+The supported release workflow targets Linux. The macOS preview targets Apple
+Silicon on macOS 15+ with Xcode command-line tools and Zig 0.15.2 for Desktop;
+see [macOS development and validation](docs/platforms/macos.md). Both use the
+stable Rust toolchain with `rustfmt` and Clippy. Install the toolchain with:
 
 ```console
 rustup toolchain install stable --profile minimal --component rustfmt,clippy

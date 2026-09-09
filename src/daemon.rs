@@ -1774,6 +1774,11 @@ fn launch_replacement_process(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if env::var_os("BOOMUX_NATIVE_TEST_HOOKS").is_some()
+        && env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some()
+    {
+        command.stderr(Stdio::inherit());
+    }
     // Only async-signal-safe descriptor operations run between fork and exec.
     unsafe {
         command.pre_exec(move || {
@@ -7747,7 +7752,7 @@ impl ReaderWake {
                 revents: 0,
             },
             libc::pollfd {
-                fd: process.map_or(-1, AsRawFd::as_raw_fd),
+                fd: process.map_or(-1, platform::process_wait_fd),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -7895,7 +7900,7 @@ fn open_pidfd(pid: u32) -> io::Result<ProcessHandle> {
 impl ImportedProcess {
     fn has_exited(&self) -> io::Result<bool> {
         let mut descriptor = libc::pollfd {
-            fd: self.pidfd.as_raw_fd(),
+            fd: platform::process_wait_fd(&self.pidfd),
             events: libc::POLLIN,
             revents: 0,
         };

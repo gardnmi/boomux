@@ -149,3 +149,7 @@ pub fn rename_noreplace(
 pub fn current_executable() -> io::Result<PathBuf> {
     std::env::current_exe()
 }
+
+pub fn process_wait_fd(handle: &ProcessHandle) -> i32 {
+    handle.as_raw_fd()
+}
