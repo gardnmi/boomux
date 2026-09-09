@@ -168,6 +168,8 @@ drag right from the window’s left edge to reopen. Its preferred width is saved
 ### Terminal Input
 
 Outside layout mode, ordinary typing and control keys reach the Shell.
+The active terminal shows a filled cursor; unfocused panes and inactive Desktop
+windows show a hollow outline.
 
 | Shortcut | Action |
 | --- | --- |

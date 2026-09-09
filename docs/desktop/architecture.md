@@ -155,8 +155,11 @@ The GPUI layer draws background images, cells, and foreground images in z-order,
 clips every placement to its pane, and caches GPU images by terminal generation.
 Images are explicitly dropped when their generation disappears or their pane
 closes. Each pane also owns one shaped-text paint cache keyed by the exact screen
-snapshot and selection. Layout-only animation frames reuse that cache, while a
-new snapshot or selection invalidates it.
+snapshot, selection, and cursor focus. Layout-only animation frames reuse that
+cache, while changes to those inputs invalidate it. Window activation and pane
+focus determine whether the cursor is filled or outlined; activation changes
+request a repaint without waiting for terminal output. Unfocused cursors retain
+the underlying cell's foreground and background, and selection takes precedence.
 
 Settings replaces the sidebar resource list while open, so scrolling its controls
 does not build or lay out the covered Workspace, Shell, and Agent rows. The

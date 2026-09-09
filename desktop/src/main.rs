@@ -1608,6 +1608,8 @@ struct TerminalPaintCache {
     selection: Option<TerminalSelection>,
     lines: Vec<ShapedLine>,
     backgrounds: Vec<TerminalBackground>,
+    cursor_focused: bool,
+    cursor_outline: Option<TerminalBackground>,
 }
 
 impl Workspace {
@@ -1825,6 +1827,7 @@ impl Workspace {
                 this.layout_leader_entered = false;
                 this.layout_suppressed_keys.clear();
             }
+            cx.notify();
         })
         .detach();
         workspace.watch_omarchy_theme(cx);
@@ -5765,18 +5768,27 @@ impl Workspace {
     }
 
     fn refresh_terminal_paint_caches(&mut self, window: &mut Window) {
-        for pane in self.terminals.values_mut() {
+        let terminal_focused = window.is_window_active()
+            && self.navigation_region == NavigationRegion::Terminal
+            && !self.layout_mode
+            && !self.help_open
+            && self.resource_dialog.is_none();
+        for (id, pane) in &mut self.terminals {
+            let cursor_focused = terminal_focused && *id == self.focused;
             let Some(screen) = pane.screen.as_ref() else {
                 pane.paint_cache = None;
                 continue;
             };
             let current = pane.paint_cache.as_ref().is_some_and(|cache| {
-                Arc::ptr_eq(&cache.screen, screen) && cache.selection == pane.selection
+                Arc::ptr_eq(&cache.screen, screen)
+                    && cache.selection == pane.selection
+                    && cache.cursor_focused == cursor_focused
             });
             if !current {
                 pane.paint_cache = Some(Arc::new(prepare_terminal_paint(
                     Arc::clone(screen),
                     pane.selection,
+                    cursor_focused,
                     window,
                 )));
             }
@@ -10030,12 +10042,14 @@ fn push_text_run(runs: &mut Vec<TextRun>, run: TextRun) {
 fn prepare_terminal_paint(
     screen: Arc<TerminalScreen>,
     selection: Option<TerminalSelection>,
+    cursor_focused: bool,
     window: &mut Window,
 ) -> TerminalPaintCache {
     let terminal_theme = theme::current_terminal();
     let cols = usize::from(screen.cols);
     let mut lines = Vec::with_capacity(usize::from(screen.rows));
     let mut backgrounds = Vec::new();
+    let mut cursor_outline = None;
     let mut base_font = font("JetBrainsMono Nerd Font");
     base_font.features = gpui::FontFeatures::disable_ligatures();
     let selection_range = selection.map(|selection| selection_indices(selection, cols));
@@ -10053,11 +10067,18 @@ fn prepare_terminal_paint(
                     theme::resolve_legacy(0xcdd6f4),
                     theme::resolve_legacy(0xf5e0dc),
                 )
-            } else if cell.cursor {
+            } else if cell.cursor && cursor_focused {
                 (terminal_theme.background, terminal_theme.cursor)
             } else {
                 (cell.foreground, cell.background)
             };
+            if cell.cursor && !cursor_focused && !selected {
+                cursor_outline = Some(TerminalBackground {
+                    row,
+                    col,
+                    color: terminal_theme.cursor,
+                });
+            }
             if background != terminal_theme.background {
                 backgrounds.push(TerminalBackground {
                     row,
@@ -10109,6 +10130,8 @@ fn prepare_terminal_paint(
         selection,
         lines,
         backgrounds,
+        cursor_focused,
+        cursor_outline,
     }
 }
 
@@ -10149,6 +10172,19 @@ fn terminal_view(paint_cache: Arc<TerminalPaintCache>, images: Vec<RenderedTermi
                     );
                 }
                 paint_terminal_images(bounds, &images, |z| z >= 0, window);
+                if let Some(cursor) = cached_paint.cursor_outline {
+                    window.paint_quad(gpui::outline(
+                        Bounds::new(
+                            point(
+                                bounds.left() + px(8.0 + cursor.col as f32 * TERMINAL_CELL_WIDTH),
+                                bounds.top() + px(8.0 + cursor.row as f32 * TERMINAL_CELL_HEIGHT),
+                            ),
+                            size(px(TERMINAL_CELL_WIDTH), px(TERMINAL_CELL_HEIGHT)),
+                        ),
+                        gpui::rgb(cursor.color),
+                        gpui::BorderStyle::Solid,
+                    ));
+                }
             },
         )
         .size_full(),
