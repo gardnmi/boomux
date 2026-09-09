@@ -8,8 +8,10 @@ Ghostty’s terminal core, backed by persistent Boomux Shells.
 [Controls](#controls) · [Settings](#settings) · [Development](#run-from-source)
 
 > [!NOTE]
-> Desktop is experimental. Its interface and supported feature set are evolving.
-> See [current limitations](#current-limitations).
+> Stable Desktop releases support GNU/Linux x86_64 with glibc 2.39+, X11 or
+> Wayland, and a working Vulkan driver. Ubuntu 24.04+ and current Arch are the
+> runtime baseline. Shells persist when you close Desktop; pane arrangements
+> and window geometry are not yet saved. See [current limitations](#current-limitations).
 
 ## Install Release Builds
 

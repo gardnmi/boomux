@@ -81,8 +81,10 @@ The installer checks glibc and required graphics libraries; it does not install
 system packages. Rust and Zig are only needed for source builds.
 
 > [!NOTE]
-> Boomux Desktop is experimental. Its interface and supported feature set are
-> still evolving. See the [Desktop guide](desktop/README.md) for current limitations.
+> Stable Desktop releases support the Linux platforms listed above. Shells
+> persist when you close Desktop, but pane arrangements and window geometry are
+> not yet saved. See [current limitations](desktop/README.md#current-limitations)
+> for terminal features that remain incomplete.
 
 ## Get Into Your Flow
 

@@ -71,6 +71,7 @@ const features = [
           <div id="install-desktop" class="install-panel"><h3>Boomux Desktop</h3><p>The native app, with the matching Boomux CLI included.</p><div class="command-box"><code id="command-desktop">{install} --desktop</code><button type="button" class="copy-button" data-copy="command-desktop" aria-label="Copy desktop install command" hidden>Copy</button></div></div>
           <p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
           <div class="install-footer"><span class="live-dot"></span> GNU/Linux · x86_64<a href={`${repo}/releases/latest`}>Release downloads ↗</a></div>
+          <p class="install-disclosure">Requires glibc 2.39+, X11 or Wayland, and a working Vulkan driver. Ubuntu 24.04+ and current Arch are the runtime baseline. <a href={`${repo}/blob/main/README.md#requirements`}>Required system packages ↗</a></p>
           <p class="install-disclosure">Downloads and runs the official release installer. <a href={`${repo}/blob/main/docs/install.md#integrity`}>Review how it works.</a> Existing installations use their update flow.</p>
         </div>
       </section>
