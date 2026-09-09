@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.12.0](https://github.com/gardnmi/boomux/compare/v1.11.1...v1.12.0) (2026-09-09)
+
+
+### Features
+
+* **desktop:** add an option to hide the layout overlay ([0407674](https://github.com/gardnmi/boomux/commit/04076745531908f4d8c68cdf7fdaa2f7fbe61d7c))
+
+
+### Bug Fixes
+
+* **desktop:** show one update notice for the shared release ([#385](https://github.com/gardnmi/boomux/issues/385)) ([fd4c072](https://github.com/gardnmi/boomux/commit/fd4c072129520a5bac88ed2d0f6e9b8176c8e7ad))
+* **integrations:** preserve harness failure reporting ([b810acc](https://github.com/gardnmi/boomux/commit/b810acc76d776477cae26994281851cfce173724))
+
 ## [1.11.1](https://github.com/gardnmi/boomux/compare/v1.11.0...v1.11.1) (2026-09-09)
 
 
