@@ -5987,7 +5987,7 @@ mod tests {
         let mac = RemotePlatform::parse_probe(b"boomux-platform-v1\0Darwin\0arm64\0").unwrap();
         assert_eq!(mac.operating_system, RemoteOperatingSystem::MacOs);
         assert_eq!(mac.architecture, RemoteArchitecture::Aarch64);
-        assert_eq!(mac.release_target(), None);
+        assert_eq!(mac.release_target(), Some("aarch64-apple-darwin"));
 
         for invalid in [
             &b"wrong\0Linux\0x86_64\0"[..],

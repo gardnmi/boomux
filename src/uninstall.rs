@@ -452,7 +452,10 @@ fn validate_directory_fd(directory: &OwnedFd) -> io::Result<()> {
 
 fn validate_owned_directory_contents(directory: &OwnedFd, count: &mut usize) -> io::Result<()> {
     validate_directory_fd(directory)?;
-    for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+    for (name, metadata) in boomux::platform::directory_entries(
+        directory.as_raw_fd(),
+        MAX_PURGE_ENTRIES.saturating_sub(*count),
+    )? {
         *count += 1;
         if *count > MAX_PURGE_ENTRIES {
             return Err(io::Error::new(
@@ -460,22 +463,18 @@ fn validate_owned_directory_contents(directory: &OwnedFd, count: &mut usize) -> 
                 "Boomux data tree exceeds the purge entry bound",
             ));
         }
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_str().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "purge entry is not UTF-8")
-        })?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.file_type().is_symlink()
-            || (!metadata.is_dir() && !metadata.is_file())
+        let name = name.as_str();
+        if metadata.st_uid != unsafe { libc::geteuid() }
+            || (metadata.st_mode & libc::S_IFMT == libc::S_IFLNK)
+            || (!(metadata.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                && !(metadata.st_mode & libc::S_IFMT == libc::S_IFREG))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "purge tree contains an unsafe entry",
             ));
         }
-        if metadata.is_dir() {
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFDIR {
             let child = openat_directory(directory.as_raw_fd(), name)?;
             validate_owned_directory_contents(&child, count)?;
         }
@@ -485,7 +484,10 @@ fn validate_owned_directory_contents(directory: &OwnedFd, count: &mut usize) -> 
 
 fn remove_directory_contents(directory: &OwnedFd, count: &mut usize) -> io::Result<()> {
     validate_directory_fd(directory)?;
-    for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+    for (name, metadata) in boomux::platform::directory_entries(
+        directory.as_raw_fd(),
+        MAX_PURGE_ENTRIES.saturating_sub(*count),
+    )? {
         *count += 1;
         if *count > MAX_PURGE_ENTRIES {
             return Err(io::Error::new(
@@ -493,23 +495,22 @@ fn remove_directory_contents(directory: &OwnedFd, count: &mut usize) -> io::Resu
                 "Boomux data tree exceeded the purge entry bound during removal",
             ));
         }
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_str().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "purge entry is not UTF-8")
-        })?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.uid() != unsafe { libc::geteuid() } {
+        let name = name.as_str();
+        if metadata.st_uid != unsafe { libc::geteuid() } {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "purge tree changed to an entry owned by another user",
             ));
         }
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        if (metadata.st_mode & libc::S_IFMT == libc::S_IFDIR)
+            && !(metadata.st_mode & libc::S_IFMT == libc::S_IFLNK)
+        {
             let child = openat_directory(directory.as_raw_fd(), name)?;
             remove_directory_contents(&child, count)?;
             unlinkat(directory.as_raw_fd(), name, libc::AT_REMOVEDIR)?;
-        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+        } else if (metadata.st_mode & libc::S_IFMT == libc::S_IFREG)
+            && !(metadata.st_mode & libc::S_IFMT == libc::S_IFLNK)
+        {
             unlinkat(directory.as_raw_fd(), name, 0)?;
         } else {
             return Err(io::Error::new(

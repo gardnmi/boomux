@@ -1,10 +1,7 @@
 //! Read-only release discovery. No installs or daemon lifecycle operations.
 use semver::Version;
 use serde_json::Value;
-use std::{
-    io::Read,
-    process::{Command, Stdio},
-};
+use std::{io::Read, process::Stdio};
 
 const LIMIT: u64 = 128 * 1024;
 #[cfg(target_os = "linux")]

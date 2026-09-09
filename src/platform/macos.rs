@@ -506,3 +506,39 @@ pub fn daemon_listener_holder(path: &std::path::Path, uid: u32) -> io::Result<u3
     }
     Ok(candidates[0])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn identity_transfer_and_signaling_preserve_exact_process() {
+        prepare_default_runtime_root().unwrap();
+        let root = super::super::runtime_root().unwrap().join("boomux");
+        fs::create_dir_all(root).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let handle = open_process(child.id()).unwrap();
+        let duplicate = handle.as_fd().try_clone_to_owned().unwrap();
+        let imported = import_process(duplicate, child.id()).unwrap();
+        assert!(
+            import_process(
+                handle.as_fd().try_clone_to_owned().unwrap(),
+                std::process::id()
+            )
+            .is_err()
+        );
+        signal_process(imported.as_fd(), libc::SIGKILL).unwrap();
+        assert!(!child.wait().unwrap().success());
+        let mut event = libc::pollfd {
+            fd: imported.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut event, 1, 1000) }, 1);
+        assert_ne!(event.revents & libc::POLLIN, 0);
+        // A stale identity must not turn into a PID-only kill.
+        signal_process(handle.as_fd(), libc::SIGKILL).unwrap();
+    }
+}

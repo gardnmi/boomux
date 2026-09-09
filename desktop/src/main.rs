@@ -3939,11 +3939,14 @@ impl Workspace {
         };
         pane.selection = Some(selection);
         self.terminal_selection_release = Some(drag.pane_id);
-        let selected = pane
-            .selection
-            .map(|selection| terminal_selected_text(screen, selection));
-        if let Some(text) = selected.filter(|text| !text.is_empty()) {
-            cx.write_to_primary(ClipboardItem::new_string(text));
+        #[cfg(target_os = "linux")]
+        {
+            let selected = pane
+                .selection
+                .map(|selection| terminal_selected_text(screen, selection));
+            if let Some(text) = selected.filter(|text| !text.is_empty()) {
+                cx.write_to_primary(ClipboardItem::new_string(text));
+            }
         }
         cx.stop_propagation();
         cx.notify();
@@ -4008,7 +4011,11 @@ impl Workspace {
     }
 
     fn paste_primary(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
+        #[cfg(target_os = "linux")]
+        let item = cx.read_from_primary();
+        #[cfg(target_os = "macos")]
+        let item = cx.read_from_clipboard();
+        if let Some(text) = item.and_then(|item| item.text()) {
             self.paste_into_focused(&text, cx);
         }
     }
@@ -10051,7 +10058,11 @@ fn prepare_terminal_paint(
     let mut lines = Vec::with_capacity(usize::from(screen.rows));
     let mut backgrounds = Vec::new();
     let mut cursor_outline = None;
-    let mut base_font = font("JetBrainsMono Nerd Font");
+    let mut base_font = font(if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "JetBrainsMono Nerd Font"
+    });
     base_font.features = gpui::FontFeatures::disable_ligatures();
     let selection_range = selection.map(|selection| selection_indices(selection, cols));
 

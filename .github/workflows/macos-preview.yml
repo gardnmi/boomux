@@ -29,12 +29,30 @@ jobs:
         with:
           key: macos-preview-v1
           cache-on-failure: true
+      - name: Probe native executable and process APIs
+        run: |
+          uname -m
+          python3 - <<'PYCODE'
+          import ctypes, os, subprocess
+          libc = ctypes.CDLL(None)
+          print("identity signal API:", getattr(libc, "proc_signal_with_audittoken", None))
+          fd = os.open("/bin/echo", os.O_RDONLY)
+          try:
+              result = subprocess.run([f"/dev/fd/{fd}", "descriptor-exec-ok"], pass_fds=(fd,), capture_output=True, text=True)
+              print("descriptor exec:", result.returncode, result.stdout, result.stderr)
+          except OSError as error:
+              print("descriptor exec unavailable:", error)
+          finally:
+              os.close(fd)
+          PYCODE
       - name: Check backend
         run: cargo +stable check --locked --all-targets
       - name: Check Desktop
         run: cargo +stable check --locked -p boomux-desktop
       - name: Test descriptor transfer
         run: cargo +stable test --locked --lib fd_transfer -- --test-threads=1
+      - name: Test native process identity
+        run: cargo +stable test --locked --lib platform::macos::tests -- --test-threads=1 --nocapture
       - name: Test detached handoff
         run: cargo +stable test --locked --test native_backend native_daemon_handoffs_multiple_detached_shells -- --test-threads=1 --nocapture
       - name: Build preview executables

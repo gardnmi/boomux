@@ -46,6 +46,8 @@ mod host_session_titles;
 mod hyprland;
 mod integration_management;
 mod kiro_hooks;
+#[cfg(target_os = "macos")]
+mod macos_terminal;
 mod mobile_web;
 mod process_adapter;
 mod projects;
@@ -1671,6 +1673,10 @@ impl CliExit {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(code) = macos_terminal::dispatch() {
+        return code;
+    }
     if env::var_os("BOOMUX_INTERNAL_GUIDED_STOP").as_deref() == Some(std::ffi::OsStr::new("1")) {
         unsafe {
             env::remove_var("BOOMUX_INTERNAL_GUIDED_STOP");

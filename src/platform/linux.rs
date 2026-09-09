@@ -15,15 +15,15 @@ pub fn default_runtime_root() -> io::Result<PathBuf> {
 
 pub fn process_snapshot(pid: u32) -> io::Result<ProcessSnapshot> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let fields: Vec<_> = stat
+    let fields = stat
         .rsplit_once(')')
         .ok_or_else(|| io::Error::other("invalid process stat"))?
         .1
-        .split_whitespace()
-        .collect();
+        .split_whitespace();
     let number = |index: usize| -> io::Result<i64> {
         fields
-            .get(index)
+            .clone()
+            .nth(index)
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| io::Error::other("invalid process stat field"))
     };
