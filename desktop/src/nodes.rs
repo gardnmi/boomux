@@ -45,7 +45,7 @@ impl NodeView {
                 "This route no longer identifies the expected Node. Inspect it before changing the registration."
             }
             NodeProjectionHealthCode::Unsupported => {
-                "The remote helper or daemon is incompatible. Review it in the Boomux dashboard."
+                "The remote Boomux version is incompatible. Update Boomux on that machine to match this installation."
             }
             _ if !self.connected() => {
                 "Showing the last observation. A lost connection does not establish whether remote work has stopped."

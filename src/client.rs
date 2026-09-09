@@ -337,7 +337,8 @@ impl std::fmt::Display for RemoteError {
 impl Error for RemoteError {}
 
 pub fn socket_path() -> io::Result<PathBuf> {
-    let runtime = env::var_os("XDG_RUNTIME_DIR")
+    let runtime = env::var_os("BOOMUX_RUNTIME_DIR")
+        .or_else(|| env::var_os("XDG_RUNTIME_DIR"))
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
     if !runtime.is_absolute() {
@@ -987,6 +988,42 @@ impl Client {
         }
     }
 
+    /// Create an owner-local remote Workspace and its first Shell. The owner
+    /// resolves the initial directory; this never forwards local environment or paths.
+    pub fn create_remote_workspace(&self, node_id: &str, name: &str) -> Result<ShellSnapshot> {
+        let cwd = match self.route_node_host_service(
+            node_id,
+            protocol::HostServiceOperation::ResolveDirectory {
+                path: std::path::PathBuf::from("."),
+            },
+        )? {
+            protocol::HostServiceResult::Directory { path } => path,
+            response => {
+                return Err(io::Error::other(format!(
+                    "unexpected remote directory response: {response:?}"
+                ))
+                .into());
+            }
+        };
+        let name_shell = crate::generated_names::random_excluding(std::iter::empty())
+            .ok_or_else(|| io::Error::other("Shell names exhausted"))?;
+        let operation = RoutedOperation::CreateWorkspaceShell {
+            workspace_id: uuid::Uuid::new_v4().to_string(),
+            workspace_name: name.into(),
+            default_cwd: Some(cwd.clone()),
+            shell_id: uuid::Uuid::new_v4().to_string(),
+            shell: ShellSpec::login(name_shell, cwd),
+        };
+        // Do not retry an ambiguous mutation with different resource identities.
+        match self.route_node_operation(node_id, operation)? {
+            RoutedOperationResult::Shell { shell } => Ok(shell),
+            response => Err(io::Error::other(format!(
+                "unexpected remote workspace response: {response:?}"
+            ))
+            .into()),
+        }
+    }
+
     pub fn set_agent_session_display_name(
         &self,
         operation_id: impl Into<String>,
@@ -1263,6 +1300,18 @@ impl Client {
         })
     }
 
+    /// Refresh daemon-owned services from the caller without changing live PTYs.
+    /// The caller must retain the same Boomux socket and durable state roots.
+    pub fn restart_with_client_environment(
+        &self,
+        notifications: NotificationDeliveryConfig,
+    ) -> Result<()> {
+        self.restart_request(Request::RestartWithNotificationConfig {
+            notifications,
+            environment: Some(current_environment()),
+        })
+    }
+
     fn restart_request(&self, request: Request) -> Result<()> {
         expect_ok(self.request(request)?, Response::Ok)?;
         let mut last_error = None;
@@ -1373,6 +1422,29 @@ impl Client {
         match self.request(Request::CreateShell {
             workspace_id: None,
             shell,
+        })? {
+            Response::Shell { shell } => Ok(shell),
+            other => unexpected(other),
+        }
+    }
+
+    /// Create and start with one durable commit when supported. Older peers
+    /// return a Pending Shell, which the caller must start by attaching as usual.
+    /// Never retry creation after an ambiguous transport failure.
+    pub fn create_started_shell(
+        &self,
+        workspace_id: &str,
+        shell: ShellSpec,
+        profile: TerminalProfile,
+    ) -> Result<ShellSnapshot> {
+        if !self.supports(protocol::ProtocolFeature::CreateStartedShell)? {
+            return self.create_shell(workspace_id, shell);
+        }
+        match self.request(Request::CreateStartedShell {
+            workspace_id: workspace_id.into(),
+            shell,
+            profile,
+            environment: Some(current_environment()),
         })? {
             Response::Shell { shell } => Ok(shell),
             other => unexpected(other),
@@ -2541,6 +2613,77 @@ mod tests {
 
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn create_started_shell_negotiates_before_creation_and_never_replays() {
+        for peer_version in [53, protocol::PROTOCOL_VERSION] {
+            let directory = env::temp_dir().join(format!("boomux-client-start-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                for version in (peer_version..=protocol::PROTOCOL_VERSION).rev() {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                    assert_eq!(request.message, Request::Ping);
+                    assert_eq!(request.version, version);
+                    let response = if version > peer_version {
+                        Response::Error {
+                            message: "unsupported".into(),
+                            code: Some(ErrorCode::UnsupportedVersion),
+                        }
+                    } else {
+                        Response::Pong
+                    };
+                    protocol::write_message(
+                        &mut stream,
+                        &Envelope::with_version(peer_version, response),
+                    )
+                    .unwrap();
+                }
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.version, peer_version);
+                if peer_version == 53 {
+                    assert!(matches!(request.message, Request::CreateShell { .. }));
+                } else {
+                    assert!(matches!(
+                        request.message,
+                        Request::CreateStartedShell {
+                            environment: Some(_),
+                            ..
+                        }
+                    ));
+                }
+                // Lose the response after receiving a potentially committed mutation.
+                drop(stream);
+                listener.set_nonblocking(true).unwrap();
+                listener
+            });
+            let client = Client::from_socket_path(socket);
+            let profile = TerminalProfile {
+                term: None,
+                colorterm: None,
+                term_program: None,
+                term_program_version: None,
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+            assert!(
+                client
+                    .create_started_shell("workspace", ShellSpec::login("shell", "/tmp"), profile)
+                    .is_err()
+            );
+            let listener = server.join().unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

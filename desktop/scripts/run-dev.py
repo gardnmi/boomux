@@ -17,18 +17,14 @@ def main():
                    cwd=root, check=True)
     target = root / "target" / ("release" if options.release else "debug")
     env = {key: value for key, value in os.environ.items() if not key.startswith("BOOMUX_")}
-    display = env.get("WAYLAND_DISPLAY")
-    if display and not Path(display).is_absolute() and env.get("XDG_RUNTIME_DIR"):
-        env["WAYLAND_DISPLAY"] = str(Path(env["XDG_RUNTIME_DIR"]) / display)
-    # Keep the user's existing GitHub CLI authentication available to read-only
-    # PR inspection while Boomux's runtime/configuration remain isolated.
-    env.setdefault("GH_CONFIG_DIR", str(Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "gh"))
-    for name in ["RUNTIME_DIR", "CONFIG_HOME", "STATE_HOME", "DATA_HOME", "CACHE_HOME"]:
+    # Only Boomux reads these overrides. Terminal applications retain the user's
+    # XDG configuration, data, cache, runtime services, and authentication.
+    for name in ["RUNTIME_DIR", "CONFIG_HOME", "STATE_HOME"]:
         path = root / "target/desktop-dev" / name.lower()
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        env[f"XDG_{name}"] = str(path)
+        env[f"BOOMUX_{name}"] = str(path)
     env["PATH"] = str(target) + os.pathsep + env.get("PATH", "")
-    print(f"Development runtime: {env['XDG_RUNTIME_DIR']}", flush=True)
+    print(f"Development runtime: {env['BOOMUX_RUNTIME_DIR']}", flush=True)
     cli = target / "boomux"
     status = subprocess.run([cli, "daemon", "status", "--json"], env=env,
                             check=True, timeout=30, capture_output=True, text=True)
@@ -36,7 +32,7 @@ def main():
     if state not in {"running", "stopped"}:
         raise RuntimeError(f"Unexpected development daemon status: {state}")
     # Start does not reload an existing daemon; explicitly select this build for handoff.
-    action = ["restart", "--executable", str(cli)] if state == "running" else ["start"]
+    action = ["restart", "--executable", str(cli), "--refresh-environment"] if state == "running" else ["start"]
     subprocess.run([cli, "daemon", *action], env=env, check=True, timeout=30)
     executable = str(target / "boomux-desktop")
     os.execve(executable, [executable, *desktop_args], env)

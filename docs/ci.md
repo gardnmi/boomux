@@ -23,6 +23,14 @@ binary and used by update/packaging behavior.
 
 ## Conservative Selection
 
+The static marketing site in `website/` has a separate Website workflow with
+an Astro production build and desktop/mobile browser tests. Website-only changes
+(including its own workflow) do not select Rust or packaging checks. Mixed
+changes retain the validation for their affected product components; renames
+out of packaged/runtime paths cannot use the website-only skip. The site workflow
+also watches its imported repository screenshot. Successful main site builds
+deploy to GitHub Pages once Pages is enabled; local builds never publish.
+
 `.github/scripts/classify-ci.py` produces independent decisions for backend
 validation, Desktop validation, packaging, and backend benchmark smoke. A failed diff, missing Git base,
 unavailable CI evidence, or malformed release metadata requires full validation.

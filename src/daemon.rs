@@ -63,13 +63,11 @@ use crate::protocol::{
     WorkspaceLauncherSnapshot, WorkspaceLauncherSpec, WorkspaceSnapshot,
 };
 use crate::ssh_bootstrap::{self, RemoteBootstrapPlan, SshAuthenticationMode, SshTarget};
-#[cfg(debug_assertions)]
-use crate::state_store::state_directory_from_environment;
 use crate::state_store::{
     PersistedAgentInstance, PersistedHiddenSession, PersistedSessionDisplayName,
     PersistedSessionDisplayNameOperation, PersistedSessionHideOperation, PersistedSessionIdentity,
     PersistedShell, PersistedShellRun, PersistedState, PersistedWorkspace,
-    PersistedWorkspaceLauncher, StateStore,
+    PersistedWorkspaceLauncher, StateStore, state_directory_from_environment,
 };
 use crate::terminal_state::TerminalState;
 
@@ -617,7 +615,10 @@ fn run_daemon(
                 );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
+                // Wake immediately for new connections instead of adding a
+                // fixed sleep to each request in a create/attach sequence.
+                // Retain the maintenance/shutdown check interval when idle.
+                wait_for_listener(&listener, Duration::from_millis(25))?;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
@@ -644,6 +645,30 @@ fn run_daemon(
     drop(socket_cleanup);
     drop(daemon_lock);
     result
+}
+
+fn wait_for_listener(listener: &UnixListener, timeout: Duration) -> io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let milliseconds = timeout.as_millis().min(i32::MAX as u128) as i32;
+    // The listener remains owned for the whole wait and poll receives one
+    // initialized, writable descriptor. No per-connection timer or worker.
+    let result = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return Err(io::Error::other("daemon listener became unavailable"));
+    }
+    Ok(descriptor.revents & libc::POLLIN != 0)
 }
 
 #[cfg(debug_assertions)]
@@ -1375,9 +1400,11 @@ fn inject_opencode_shim_environment(
     claude_remote_control: bool,
 ) -> io::Result<UnixEnvironment> {
     let runtime_root = PathBuf::from(
-        environment_value(environment, b"XDG_RUNTIME_DIR").ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is unavailable")
-        })?,
+        environment_value(environment, b"BOOMUX_RUNTIME_DIR")
+            .or_else(|| environment_value(environment, b"XDG_RUNTIME_DIR"))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is unavailable")
+            })?,
     );
     if !runtime_root.is_absolute() {
         return Err(io::Error::new(
@@ -1522,6 +1549,43 @@ fn configure_opencode_shell_startup(
 }
 
 fn atomic_runtime_asset(path: &Path, content: &[u8], mode: u32) -> io::Result<()> {
+    // Runtime support files are shared by all Shells. Avoid rewriting and
+    // fsyncing identical assets on every start while holding the mutation lock.
+    // Compare through a no-follow descriptor with bounded scratch space.
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(mut file) => {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "runtime asset is not an owned regular file",
+                ));
+            }
+            if metadata.len() == content.len() as u64
+                && metadata.mode() & 0o7777 == mode
+                && metadata.nlink() == 1
+            {
+                let mut buffer = [0u8; 8192];
+                let mut matches = true;
+                for expected in content.chunks(buffer.len()) {
+                    let actual = &mut buffer[..expected.len()];
+                    if file.read_exact(actual).is_err() || actual != expected {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    return Ok(());
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     if let Ok(metadata) = fs::symlink_metadata(path)
         && (metadata.file_type().is_symlink() || !metadata.is_file())
     {
@@ -1643,6 +1707,32 @@ struct ReplacementOptions {
     opencode_runtime: Option<OutgoingOpenCodeRuntime>,
     claude_remote_control_bindings: Vec<ClaudeRemoteControlBindingSnapshot>,
     kiro_launch_holders: Vec<handoff::KiroLaunchHolderManifest>,
+}
+
+fn validate_restart_environment_roots(environment: &UnixEnvironment) -> io::Result<()> {
+    let runtime = environment_value(environment, b"BOOMUX_RUNTIME_DIR")
+        .or_else(|| environment_value(environment, b"XDG_RUNTIME_DIR"))
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("restart environment has no runtime root"))?;
+    let state = environment_value(environment, b"BOOMUX_STATE_HOME")
+        .or_else(|| environment_value(environment, b"XDG_STATE_HOME").filter(|p| !p.is_empty()))
+        .map(PathBuf::from)
+        .or_else(|| {
+            environment_value(environment, b"HOME").map(|p| PathBuf::from(p).join(".local/state"))
+        })
+        .ok_or_else(|| io::Error::other("restart environment has no state root"))?;
+    if !runtime.is_absolute()
+        || !state.is_absolute()
+        || fs::canonicalize(runtime.join("boomux"))?
+            != fs::canonicalize(client::socket_path()?.parent().expect("socket parent"))?
+        || fs::canonicalize(state.join("boomux"))?
+            != fs::canonicalize(state_directory_from_environment()?)?
+    {
+        return Err(io::Error::other(
+            "restart environment must preserve Boomux runtime and state roots",
+        ));
+    }
+    Ok(())
 }
 
 fn launch_replacement_process(
@@ -2269,6 +2359,7 @@ fn handle_connection_inner(
         } => {
             if let Some(environment) = environment
                 && let Err(error) = validate_unix_environment(environment)
+                    .and_then(|()| validate_restart_environment_roots(environment))
             {
                 return send_response(
                     &mut stream,
@@ -3775,7 +3866,12 @@ impl OpenCodeCoordinator {
             .stderr(Stdio::null())
             .env_clear();
         for variable in sanitized_environment.variables {
-            if !variable.name.starts_with(b"BOOMUX_") {
+            if !variable.name.starts_with(b"BOOMUX_")
+                || matches!(
+                    variable.name.as_slice(),
+                    b"BOOMUX_RUNTIME_DIR" | b"BOOMUX_STATE_HOME" | b"BOOMUX_CONFIG_HOME"
+                )
+            {
                 command.env(
                     std::ffi::OsString::from_vec(variable.name),
                     std::ffi::OsString::from_vec(variable.value),
@@ -11628,6 +11724,99 @@ impl DaemonService {
         request: Request,
         response_version: u32,
     ) -> DaemonResult<Response> {
+        if let Request::CreateStartedShell {
+            workspace_id,
+            shell,
+            profile,
+            environment,
+        } = request
+        {
+            validate_terminal_profile(&profile)?;
+            if let Some(environment) = &environment {
+                validate_unix_environment(environment)?;
+            }
+            let mut started = None;
+            let result = self.durable_mutation(|undo| {
+                let created = self.create_shell_mutation(undo, Some(&workspace_id), shell)?;
+                let shell = self.shell(&created.id)?;
+                let workspace = self.workspace(&workspace_id)?;
+                let workspace_name = lock(&workspace.name)?.clone();
+                let run = Arc::new(ShellRun::new(1));
+                let persisted_run = run.persisted(profile.clone())?;
+                let mut lifecycle = lock(&shell.lifecycle)?;
+                let (runtime, reader) = self
+                    .runtimes
+                    .spawn_runtime(
+                        &shell,
+                        &run,
+                        RuntimeStart {
+                            workspace_name: &workspace_name,
+                            shell_name: &created.name,
+                            profile: &profile,
+                            environment: environment.as_ref(),
+                            recovery: RuntimeRecovery::default(),
+                            claude_remote_control: self.notification_settings.claude_remote_control,
+                        },
+                    )
+                    .map_err(|error| {
+                        DaemonError::lifecycle(
+                            ErrorCode::ShellStartFailed,
+                            format!("could not start shell: {error}"),
+                        )
+                    })?;
+                *lifecycle = ShellLifecycle::Running {
+                    profile: profile.clone(),
+                    run: Arc::clone(&run),
+                    runtime: Arc::clone(&runtime),
+                };
+                started = Some((Arc::clone(&shell), Arc::clone(&runtime)));
+                drop(lifecycle);
+                *lock(&shell.last_run)? = Some(persisted_run);
+                self.runtimes.start_pty_reader(
+                    Arc::downgrade(self),
+                    Arc::clone(&shell),
+                    Arc::clone(&run),
+                    runtime,
+                    reader,
+                    true,
+                )?;
+                let snapshot = shell.snapshot()?;
+                Ok((
+                    Response::Shell { shell: snapshot },
+                    vec![
+                        DaemonEventKind::ShellCreated {
+                            workspace_id: workspace_id.clone(),
+                            shell_id: created.id.clone(),
+                            name: created.name,
+                        },
+                        DaemonEventKind::RunStarted {
+                            workspace_id: workspace_id.clone(),
+                            shell_id: created.id,
+                            run: run.snapshot()?,
+                        },
+                    ],
+                ))
+            });
+            return match (result, started) {
+                (Ok(response), Some((_, runtime))) => {
+                    self.runtimes.resume_reader(&runtime)?;
+                    Ok(response)
+                }
+                (Err(error), Some((shell, _))) => {
+                    // CreatedShell rollback removes membership but retains this
+                    // exact runtime, so failed persistence also reaps the child
+                    // and its paused reader before returning the original error.
+                    match self.runtimes.kill(&shell) {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(Self::append_error_context(
+                            error,
+                            format!("process cleanup also failed: {cleanup}"),
+                        )),
+                    }
+                }
+                (result, None) => result,
+            };
+        }
         if matches!(request, Request::AddNodeRegistration { .. }) {
             let response = self.dispatch_for_version(request, response_version)?;
             if let Response::NodeRegistration { registration } = &response {
@@ -13117,6 +13306,9 @@ impl DaemonService {
                     self.add_recovery_presentation(shell)?;
                 }
                 Ok(Response::Workspace { workspace })
+            }
+            Request::CreateStartedShell { .. } => {
+                unreachable!("started Shell creation requires Arc dispatch")
             }
             Request::GetShell { shell_id } => {
                 let mut shell = self.shell(&shell_id)?.snapshot()?;
@@ -18072,6 +18264,86 @@ mod tests {
     }
 
     #[test]
+    fn create_started_shell_rolls_back_process_and_events_on_failure() {
+        for failure in ["spawn", "mutation", "persistence"] {
+            let directory = env::temp_dir().join(format!("boomux-start-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let registry = Arc::new(
+                DaemonService::restore(StateStore::at(directory.join("state.json")), false, None)
+                    .unwrap(),
+            );
+            let workspace = registry.create_workspace("test".into(), vec![]).unwrap();
+            let events_before = registry.events.manifest().unwrap().events.len();
+            let pid_file = directory.join("pid");
+            if failure == "mutation" {
+                registry.fail_after_mutation.store(true, Ordering::Release);
+            }
+            if failure == "persistence" {
+                registry.fail_next_persistence();
+            }
+            let result = registry.dispatch_arc(
+                Request::CreateStartedShell {
+                    workspace_id: workspace.id.clone(),
+                    shell: ShellSpec {
+                        name: "test".into(),
+                        cwd: directory.clone(),
+                        command: if failure == "spawn" {
+                            vec![directory.join("missing").to_string_lossy().into_owned()]
+                        } else {
+                            vec![
+                                "/bin/sh".into(),
+                                "-c".into(),
+                                "echo $$ > pid; exec sleep 60".into(),
+                            ]
+                        },
+                    },
+                    profile: profile(),
+                    environment: None,
+                },
+                protocol::PROTOCOL_VERSION,
+            );
+            assert!(result.is_err(), "{failure}");
+            assert!(
+                lock(&registry.workspace(&workspace.id).unwrap().shell_ids)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(lock(&registry.durable.state).unwrap().shells.is_empty());
+            assert_eq!(
+                registry.events.manifest().unwrap().events.len(),
+                events_before
+            );
+            if let Ok(pid) = fs::read_to_string(pid_file) {
+                let pid: i32 = pid.trim().parse().unwrap();
+                assert_eq!(
+                    unsafe { libc::kill(pid, 0) },
+                    -1,
+                    "failed start leaked process {pid}"
+                );
+            }
+            drop(registry);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn listener_wait_is_bounded_and_wakes_for_connections() {
+        let directory = env::temp_dir().join(format!("boomux-listener-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(!wait_for_listener(&listener, Duration::ZERO).unwrap());
+        let connecting = thread::spawn(move || UnixStream::connect(path).unwrap());
+        assert!(wait_for_listener(&listener, Duration::from_secs(1)).unwrap());
+        let (accepted, _) = listener.accept().unwrap();
+        let client = connecting.join().unwrap();
+        assert!(!wait_for_listener(&listener, Duration::ZERO).unwrap());
+        drop((accepted, client, listener));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn new_shell_terminal_starts_without_injected_output() {
         let terminal = initial_terminal_state(24, 80, None);
 
@@ -18422,6 +18694,37 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_assets_reuse_matching_files_and_repair_changed_content_or_mode() {
+        let directory = env::temp_dir().join(format!("boomux-runtime-asset-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("shim");
+        let content = vec![b'x'; 20_000];
+        atomic_runtime_asset(&path, &content, 0o700).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        for _ in 0..12 {
+            atomic_runtime_asset(&path, &content, 0o700).unwrap();
+        }
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(before.ino(), after.ino());
+        assert_eq!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        let mut changed = content.clone();
+        changed[19_999] = b'y';
+        atomic_runtime_asset(&path, &changed, 0o700).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), changed);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+        atomic_runtime_asset(&path, &changed, 0o700).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(atomic_runtime_asset(&link, &changed, 0o700).is_err());
+        assert_eq!(fs::read(&path).unwrap(), changed);
         fs::remove_dir_all(directory).unwrap();
     }
 

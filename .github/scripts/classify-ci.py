@@ -17,6 +17,12 @@ def documentation(path):
             or (path.startswith("docs/") and path.endswith(".md")))
 
 
+def website(path):
+    # Static marketing assets are not embedded or packaged by either binary.
+    # The separate Website workflow owns their build and browser validation.
+    return path.startswith("website/") or path == ".github/workflows/website.yml"
+
+
 def git(*args):
     return subprocess.check_output(["git", *args], timeout=30)
 
@@ -94,11 +100,13 @@ def classify(base, head, proof=validated_base):
         paths = set(git("diff", "--name-only", "--no-renames", "-z", base, head).decode().rstrip("\0").split("\0")) - {""}
         if all(documentation(path) for path in paths):
             return dict.fromkeys(FULL, False), "Documentation-only change; no executable or packaged inputs changed."
+        if all(documentation(path) or website(path) for path in paths):
+            return dict.fromkeys(FULL, False), "Website-only change; the Website workflow owns validation."
         if release_only(base, head, paths):
             if proof(base):
                 return {"run_code": False, "run_desktop": False, "run_package": True, "run_benchmarks": False}, f"Version-only release; reuse successful push CI for {base}. Build and smoke test the new version."
             return FULL.copy(), "Version-only change has no successful base push CI; full validation."
-        executable_paths = {path for path in paths if not documentation(path)}
+        executable_paths = {path for path in paths if not documentation(path) and not website(path)}
         if executable_paths and all(path.startswith("desktop/src/") and path.endswith(".rs")
                                     for path in executable_paths):
             return {"run_code": False, "run_desktop": True, "run_package": False, "run_benchmarks": False}, "Desktop-only Rust change; validate and build Desktop. Backend, dependencies, and packaging inputs are unchanged."

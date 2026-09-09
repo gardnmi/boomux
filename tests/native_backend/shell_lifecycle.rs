@@ -15,6 +15,223 @@ use crate::support::{
 };
 
 #[test]
+#[ignore = "explicit startup timing diagnostic; optionally set BOOMUX_TIMING_STATE_ROOT"]
+fn shell_startup_phase_timings() {
+    use std::time::Instant;
+    let state = std::env::var_os("BOOMUX_TIMING_STATE_ROOT").map(|root| {
+        std::path::PathBuf::from(root).join(format!("boomux-timing-{}", Uuid::new_v4()))
+    });
+    let daemon = TestDaemon::start_with(|command, _| {
+        if let Some(state) = &state {
+            command.env("BOOMUX_STATE_HOME", state);
+        }
+    });
+    let workspace = daemon.client.create_workspace("timing", vec![]).unwrap();
+    for index in 0..6 {
+        let combined = index % 2 == 1;
+        let start = Instant::now();
+        let spec = ShellSpec::login(format!("shell-{index}"), &daemon.runtime_dir);
+        let shell = if combined {
+            let response = daemon
+                .client
+                .request(protocol::Request::CreateStartedShell {
+                    workspace_id: workspace.id.clone(),
+                    shell: spec,
+                    profile: profile(),
+                    environment: None,
+                })
+                .unwrap();
+            let protocol::Response::Shell { shell } = response else {
+                panic!("unexpected response")
+            };
+            shell
+        } else {
+            daemon.client.create_shell(&workspace.id, spec).unwrap()
+        };
+        let created = start.elapsed();
+        let mut attachment = daemon.client.attach(&shell.id, true, profile()).unwrap();
+        let attached = start.elapsed();
+        let current = daemon.client.get_shell(&shell.id).unwrap();
+        let inspected = start.elapsed();
+        AttachFrame::Input(b"printf 'timing-%s\\n' ready\n".to_vec())
+            .write_to(&mut attachment.stream)
+            .unwrap();
+        read_until(&mut attachment.stream, b"timing-ready");
+        let ready = start.elapsed();
+        AttachFrame::Detached
+            .write_to(&mut attachment.stream)
+            .unwrap();
+        drop(attachment);
+        let reattach_start = Instant::now();
+        let run = current.run.unwrap().id;
+        let mut reopened = daemon
+            .client
+            .attach_exact_run(&shell.id, &run, true, profile())
+            .unwrap();
+        let reopened_at = reattach_start.elapsed();
+        AttachFrame::Detached
+            .write_to(&mut reopened.stream)
+            .unwrap();
+        assert_eq!(
+            daemon.client.get_shell(&shell.id).unwrap().run.unwrap().id,
+            run
+        );
+        eprintln!(
+            "shell {index} combined={combined}: create={created:?}, attach={:?}, inspect={:?}, ready={ready:?}, reopen={reopened_at:?}",
+            attached - created,
+            inspected - attached
+        );
+    }
+    drop(daemon);
+    if let Some(state) = state {
+        fs::remove_dir_all(state).unwrap();
+    }
+}
+
+#[test]
+fn create_started_shell_persists_one_run_and_attaches_without_restarting() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon.client.create_workspace("started", vec![]).unwrap();
+    let cursor = daemon.client.events(None, 100, 0).unwrap().cursor;
+    let request = protocol::Request::CreateStartedShell {
+        workspace_id: workspace.id.clone(),
+        shell: ShellSpec {
+            name: "started".into(),
+            command: vec!["/bin/sh".into()],
+            cwd: daemon.runtime_dir.clone(),
+        },
+        profile: profile(),
+        environment: Some(UnixEnvironment {
+            variables: vec![UnixEnvironmentVariable {
+                name: b"START_TEST_VALUE".to_vec(),
+                value: b"ephemeral-secret".to_vec(),
+            }],
+        }),
+    };
+    // A protocol-53 caller cannot accidentally execute the new mutation.
+    let mut stream = UnixStream::connect(daemon.client.socket_path()).unwrap();
+    protocol::write_message(
+        &mut stream,
+        &protocol::Envelope::with_version(53, request.clone()),
+    )
+    .unwrap();
+    let response: protocol::Envelope<protocol::Response> =
+        protocol::read_message(&mut stream).unwrap();
+    assert!(matches!(
+        response.message,
+        protocol::Response::Error {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }
+    ));
+    assert!(
+        daemon
+            .client
+            .get_workspace(&workspace.id)
+            .unwrap()
+            .shells
+            .is_empty()
+    );
+    let protocol::Response::Shell { shell } = daemon.client.request(request).unwrap() else {
+        panic!("unexpected response")
+    };
+    assert_eq!(shell.status, ShellStatus::Running);
+    let run = shell.run.unwrap();
+    assert_eq!(run.generation, 1);
+    let saved = fs::read_to_string(daemon.runtime_dir.join("state/boomux/state.json")).unwrap();
+    assert!(saved.contains(&shell.id));
+    assert!(saved.contains(&run.id));
+    assert!(!saved.contains("ephemeral-secret"));
+    assert!(!saved.contains("START_TEST_VALUE"));
+    let events = daemon.client.events(Some(cursor), 100, 0).unwrap().events;
+    assert!(
+        matches!(&events[0].kind, protocol::DaemonEventKind::ShellCreated { shell_id, .. } if shell_id == &shell.id)
+    );
+    assert!(
+        matches!(&events[1].kind, protocol::DaemonEventKind::RunStarted { shell_id, run: started, .. } if shell_id == &shell.id && started.id == run.id)
+    );
+    let mut attachment = daemon
+        .client
+        .attach_exact_run(&shell.id, &run.id, true, profile())
+        .unwrap();
+    AttachFrame::Input(b"printf 'value-%s\\n' \"$START_TEST_VALUE\"\n".to_vec())
+        .write_to(&mut attachment.stream)
+        .unwrap();
+    read_until(&mut attachment.stream, b"value-ephemeral-secret");
+    assert_eq!(
+        daemon.client.get_shell(&shell.id).unwrap().run.unwrap().id,
+        run.id
+    );
+    drop(attachment);
+    daemon.crash();
+    daemon.restart();
+    let recovered = daemon.client.get_shell(&shell.id).unwrap();
+    assert_eq!(recovered.status, ShellStatus::Pending);
+    assert!(recovered.run.is_none());
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
+    )
+    .unwrap();
+    let last_run = &persisted["workspaces"][0]["shells"][0]["last_run"];
+    assert_eq!(last_run["id"], run.id);
+    assert_eq!(last_run["exit_reason"]["reason"], "interrupted");
+    let restarted = daemon.client.attach(&shell.id, false, profile()).unwrap();
+    let next_run = daemon.client.get_shell(&shell.id).unwrap().run.unwrap();
+    assert_ne!(next_run.id, run.id);
+    assert_eq!(next_run.generation, 2);
+    drop(restarted);
+}
+
+#[test]
+fn boomux_path_overrides_preserve_application_environment() {
+    let mut daemon = TestDaemon::start_with(|command, root| {
+        command
+            .env("BOOMUX_RUNTIME_DIR", root)
+            .env("BOOMUX_STATE_HOME", root.join("state"))
+            .env("BOOMUX_CONFIG_HOME", root.join("config"))
+            .env("XDG_RUNTIME_DIR", root.join("user-runtime"))
+            .env("XDG_STATE_HOME", root.join("user-state"))
+            .env("XDG_CONFIG_HOME", root.join("user-config"))
+            .env("XDG_DATA_HOME", root.join("user-data"));
+    });
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "private-paths",
+            vec![ShellSpec::login("shell", daemon.runtime_dir.clone())],
+        )
+        .unwrap();
+    let mut attachment = daemon
+        .client
+        .attach(&workspace.shells[0].id, false, profile())
+        .unwrap();
+    AttachFrame::Input(b"printf '%s\\n' \"$XDG_CONFIG_HOME\" \"$XDG_DATA_HOME\" \"$XDG_RUNTIME_DIR\" \"$BOOMUX_OPENCODE_SHIM_DIR\"; printf 'paths-%s\\n' done\n".to_vec())
+        .write_to(&mut attachment.stream).unwrap();
+    let output = read_until(&mut attachment.stream, b"paths-done");
+    for suffix in ["user-config", "user-data", "user-runtime", "boomux/shims"] {
+        assert!(contains(
+            &output,
+            daemon.runtime_dir.join(suffix).to_str().unwrap().as_bytes()
+        ));
+    }
+    assert!(daemon.runtime_dir.join("state/boomux/state.json").exists());
+    assert!(!daemon.runtime_dir.join("user-state/boomux").exists());
+    assert!(!daemon.runtime_dir.join("user-runtime/boomux").exists());
+    let status = daemon
+        .command()
+        .env("BOOMUX_RUNTIME_DIR", &daemon.runtime_dir)
+        .env("XDG_RUNTIME_DIR", daemon.runtime_dir.join("user-runtime"))
+        .args(["daemon", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["data"]["status"], "running");
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn bare_claude_command_uses_owner_remote_control_policy_without_rewriting_stored_argv() {
     for (enabled, expected) in [
         (true, b"--remote-control\0".as_slice()),
@@ -86,7 +303,8 @@ fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
         fs::write(
             &codex,
             format!(
-                "#!/bin/sh\nif [ \"${{1-}}\" = --version ]; then printf '1.0.0\\n'; exit 0; fi\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_CODEX_RUN_SCOPED-unset}}\" > '{}'\nprintf '%s' \"${{CODEX_HOME-unset}}\" > '{}'\n",
+                "#!/bin/sh\nif [ \"${{1-}}\" = --version ]; then printf '1.0.0\\n'; exit 0; fi\ncommand -v boomux > '{}'\n: > '{}'\nfor arg do printf '%s\\0' \"$arg\" >> '{}'; done\nprintf '%s' \"${{BOOMUX_CODEX_RUN_SCOPED-unset}}\" > '{}'\nprintf '%s' \"${{CODEX_HOME-unset}}\" > '{}'\n",
+                runtime_dir.join("codex-boomux").display(),
                 runtime_dir.join("codex-argv").display(),
                 runtime_dir.join("codex-argv").display(),
                 runtime_dir.join("codex-marker").display(),
@@ -95,6 +313,8 @@ fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
         )
         .unwrap();
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(bin.join("boomux"), "#!/bin/sh\nexit 91\n").unwrap();
+        fs::set_permissions(bin.join("boomux"), fs::Permissions::from_mode(0o700)).unwrap();
         command.env("CODEX_HOME", codex_home).env("PATH", &bin);
     });
     let codex = daemon.runtime_dir.join("codex-bin/codex");
@@ -123,6 +343,12 @@ fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
         "marker={marker} CODEX_HOME={codex_home}"
     );
     assert_eq!(marker, "1");
+    assert_eq!(
+        fs::read_to_string(daemon.runtime_dir.join("codex-boomux"))
+            .unwrap()
+            .trim(),
+        daemon.executable.to_str().unwrap()
+    );
     assert_eq!(
         daemon.client.get_shell(shell_id).unwrap().command,
         [codex.display().to_string()]
@@ -195,7 +421,8 @@ fn claude_typed_in_managed_login_shell_preserves_dispatch_shim_and_arguments() {
     let home = daemon.runtime_dir.join("home");
     let output = daemon.runtime_dir.join("typed-claude-argv");
     fs::create_dir(&bin).unwrap();
-    fs::create_dir(&home).unwrap();
+    // Automatic integration preparation may already have created this home.
+    fs::create_dir_all(&home).unwrap();
     let dispatcher = bin.join("mise");
     fs::write(
         &dispatcher,

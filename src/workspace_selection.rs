@@ -56,7 +56,9 @@ pub(crate) fn clear_from_environment() -> io::Result<bool> {
 }
 
 fn selection_path_from_environment() -> io::Result<PathBuf> {
-    let root = match env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
+    let root = match env::var_os("BOOMUX_STATE_HOME")
+        .or_else(|| env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()))
+    {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(
             env::var_os("HOME")

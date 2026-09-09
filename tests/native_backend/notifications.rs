@@ -20,6 +20,105 @@ struct RemoteSubscriber {
 }
 
 #[test]
+fn environment_refresh_restores_sound_without_restarting_shells() {
+    let (mut daemon, _, notify_send, sound_capture) = start_with_notifications();
+    let player = notify_send.with_file_name("canberra-gtk-play");
+    fs::write(&player, "#!/bin/sh\n[ \"$XDG_RUNTIME_DIR\" = \"$EXPECTED_AUDIO_RUNTIME\" ] || exit 1\nprintf '%s\\0' \"$@\" >> \"$BOOMUX_SOUND_CAPTURE\"\n").unwrap();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "sound-refresh",
+            vec![ShellSpec::login("shell", daemon.runtime_dir.clone())],
+        )
+        .unwrap();
+    let shell_id = &workspace.shells[0].id;
+    let attachment = daemon.client.attach(shell_id, false, profile()).unwrap();
+    let before = daemon.client.get_shell(shell_id).unwrap();
+    let run_id = &before.run.as_ref().unwrap().id;
+    drop(attachment);
+    let audio_runtime = daemon.runtime_dir.join("user-runtime");
+    fs::create_dir(&audio_runtime).unwrap();
+    let mut paths = vec![player.parent().unwrap().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let restart = daemon
+        .command()
+        .env("BOOMUX_RUNTIME_DIR", &daemon.runtime_dir)
+        .env("XDG_RUNTIME_DIR", &audio_runtime)
+        .env("EXPECTED_AUDIO_RUNTIME", &audio_runtime)
+        .env("BOOMUX_CONFIG", daemon.runtime_dir.join("config.toml"))
+        .env("BOOMUX_SOUND_CAPTURE", &sound_capture)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .args(["daemon", "restart", "--refresh-environment"])
+        .arg("--executable")
+        .arg(&daemon.executable)
+        .output()
+        .unwrap();
+    assert!(
+        restart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    let after = daemon.client.get_shell(shell_id).unwrap();
+    assert_eq!(before.status, after.status);
+    assert_eq!(before.run, after.run);
+    let agent = daemon
+        .client
+        .register_agent(
+            shell_id,
+            run_id,
+            AgentRegistrationSpec {
+                name: "sound-agent".into(),
+                integration: "native-test".into(),
+                external_session_id: None,
+                report: AgentReport {
+                    state: AgentState::Blocked,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "blocked after environment refresh".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    wait_until(
+        || captured_notification_count(&sound_capture) == 1,
+        "refreshed blocked sound was not delivered",
+    );
+    for state in [AgentState::Working, AgentState::Idle] {
+        daemon
+            .client
+            .report_agent(
+                &agent.id,
+                run_id,
+                AgentReport {
+                    state,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "test turn transition".into(),
+                    confidence: 100,
+                },
+            )
+            .unwrap();
+    }
+    wait_until(
+        || captured_notification_count(&sound_capture) == 2,
+        "refreshed completion sound was not delivered",
+    );
+    let wrong_state = daemon.runtime_dir.join("wrong-state/boomux");
+    fs::create_dir_all(&wrong_state).unwrap();
+    let rejected = daemon
+        .command()
+        .env("BOOMUX_STATE_HOME", wrong_state.parent().unwrap())
+        .args(["daemon", "restart", "--refresh-environment"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("must preserve"));
+    assert_eq!(daemon.client.get_shell(shell_id).unwrap().run, after.run);
+    daemon.stop_with_cli();
+}
+
+#[test]
 fn desktop_notifications_are_deduplicated_private_and_survive_handoff() {
     let (daemon, capture, notify_send, sound_capture) = start_with_notifications();
     let workspace = daemon

@@ -4,6 +4,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -321,10 +322,21 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
     let kiro = daemon.runtime_dir.join("kiro-holder-cli");
     fs::write(
         &kiro,
-        "#!/bin/sh\nprintf '%s' \"$$\" > \"$KIRO_TEST_PID\"\nprintf '{\"session_id\":\"%s\",\"hook_event_name\":\"UserPromptSubmit\"}' \"$KIRO_TEST_SESSION\" | \"$KIRO_TEST_BOOMUX\" kiro hook\nwhile [ ! -e \"$KIRO_TEST_STOP\" ]; do sleep 0.01; done\nprintf '{\"session_id\":\"%s\",\"hook_event_name\":\"Stop\"}' \"$KIRO_TEST_SESSION\" | \"$KIRO_TEST_BOOMUX\" kiro hook\n/bin/sleep 300 &\nprintf '%s' \"$!\" > \"$KIRO_TEST_DESCENDANT_PID\"\nwait\n",
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$KIRO_TEST_PID\"\nprintf '{\"session_id\":\"%s\",\"hook_event_name\":\"UserPromptSubmit\"}' \"$KIRO_TEST_SESSION\" | boomux kiro hook\nwhile [ ! -e \"$KIRO_TEST_STOP\" ]; do sleep 0.01; done\nprintf '{\"session_id\":\"%s\",\"hook_event_name\":\"Stop\"}' \"$KIRO_TEST_SESSION\" | boomux kiro hook\n/bin/sleep 300 &\nprintf '%s' \"$!\" > \"$KIRO_TEST_DESCENDANT_PID\"\nwait\n",
     )
     .unwrap();
     fs::set_permissions(&kiro, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // An unrelated installation wins in both the caller's and restored PATH.
+    // Real hooks use bare `boomux`, not an absolute fixture-only executable.
+    let stale_bin = daemon.runtime_dir.join("old-installation");
+    fs::create_dir(&stale_bin).unwrap();
+    let stale_cli = stale_bin.join("boomux");
+    fs::write(&stale_cli, "#!/bin/sh\nexit 91\n").unwrap();
+    fs::set_permissions(&stale_cli, fs::Permissions::from_mode(0o755)).unwrap();
+    let hook_path =
+        std::env::join_paths([stale_bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+            .unwrap();
 
     let run_unclaimed_hook = || {
         let mut command = daemon.command();
@@ -366,7 +378,8 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
             .env("KIRO_TEST_PID", &pid_file)
             .env("KIRO_TEST_DESCENDANT_PID", &descendant_pid_file)
             .env("KIRO_TEST_STOP", &stop_file)
-            .env("KIRO_TEST_BOOMUX", env!("CARGO_BIN_EXE_boomux"));
+            .env("PATH", &hook_path)
+            .env("BOOMUX_ORIGINAL_PATH", &hook_path);
         command.process_group(0);
         let mut child = command.spawn().unwrap();
         wait_until(

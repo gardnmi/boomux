@@ -3808,6 +3808,35 @@ fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<Ss
 }
 
 fn classify_ssh_command_failure(status: Option<i32>, stderr: &[u8]) -> io::Error {
+    // Surface known ownership refusals without relaying arbitrary remote stderr
+    // (which can contain secrets or terminal control sequences).
+    if status == Some(1) {
+        for (reason, message) in [
+            (
+                "this Boomux executable is a source or development build; remove it through its build or installation workflow",
+                "the remote helper rejects development-build uninstall; update Boomux on this machine to a build with remote development-uninstall support, then retry",
+            ),
+            (
+                "this Boomux executable is package-managed; uninstall it with the package manager that installed it",
+                "remote Boomux is package-managed; remove it using its package manager",
+            ),
+            (
+                "remote uninstall requires the canonical user-owned ~/.local/bin/boomux installation",
+                "remote uninstall requires the canonical user-owned ~/.local/bin/boomux installation",
+            ),
+        ] {
+            if stderr
+                .split(|byte| *byte == b'\n')
+                .any(|line| line.strip_prefix(b"boomux: ") == Some(reason.as_bytes()))
+            {
+                return classified_error(
+                    io::ErrorKind::PermissionDenied,
+                    "remote_uninstall_ineligible",
+                    message,
+                );
+            }
+        }
+    }
     let lower = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     if lower.contains("permission denied")
         || lower.contains("authentication failed")
@@ -6178,6 +6207,24 @@ mod tests {
                 .any(|path| path.as_str() == destination.to_str().unwrap())
         );
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn remote_uninstall_refusal_is_actionable_without_exposing_stderr() {
+        let stderr = b"private output\nboomux: this Boomux executable is a source or development build; remove it through its build or installation workflow\n";
+        let error = classify_ssh_command_failure(Some(1), stderr);
+        assert_eq!(error_code(&error), "remote_uninstall_ineligible");
+        assert!(error.to_string().contains("update Boomux"));
+        assert!(!error.to_string().contains("private output"));
+        assert!(
+            !classify_ssh_command_failure(Some(1), b"secret token")
+                .to_string()
+                .contains("secret token")
+        );
+        assert_eq!(
+            error_code(&classify_ssh_command_failure(Some(255), stderr)),
+            "bootstrap_transport_failed"
+        );
     }
 
     #[test]

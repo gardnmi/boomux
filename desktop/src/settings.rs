@@ -39,12 +39,18 @@ impl Default for Settings {
             focus_highlight_strength: 100,
             motion_speed: MotionSpeed::Smooth,
             workspace_pane_mode: WorkspacePaneMode::Workspace,
-            pane_layout_mode: PaneLayoutMode::Tiled,
+            pane_layout_mode: PaneLayoutMode::default(),
             confirm_destructive_actions: true,
         }
     }
 }
 pub fn path() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("BOOMUX_CONFIG_HOME") {
+        let root = PathBuf::from(root);
+        return root
+            .is_absolute()
+            .then(|| root.join("boomux-desktop/settings.toml"));
+    }
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -318,6 +324,13 @@ mod tests {
         };
         assert_eq!(Settings::parse(&settings.encode()).unwrap(), settings);
         assert_eq!(Settings::parse("").unwrap(), Settings::default());
+        assert_eq!(Settings::default().pane_layout_mode, PaneLayoutMode::Tabbed);
+        assert_eq!(
+            Settings::parse("pane_layout_mode = 'tiled'")
+                .unwrap()
+                .pane_layout_mode,
+            PaneLayoutMode::Tiled
+        );
         assert_eq!(
             Settings::parse("pane_layout_mode = 'tabbed'\nworkspace_pane_mode = 'mixed'")
                 .unwrap()

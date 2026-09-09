@@ -467,6 +467,8 @@ enum Commands {
     GuidedNodeAdd,
     #[command(name = "__guided-node-upgrade", hide = true)]
     GuidedNodeUpgrade { selector: String },
+    #[command(name = "__guided-node-uninstall", hide = true)]
+    GuidedNodeUninstall { selector: String },
     #[command(name = "__guided-node-reauthenticate", hide = true)]
     GuidedNodeReauthenticate { selector: String },
     #[command(name = "__bootstrap-activate", hide = true)]
@@ -553,6 +555,8 @@ enum NodeCommands {
     Add {
         alias: Option<String>,
         target: Option<String>,
+        #[arg(long, hide = true)]
+        desktop_workspace: bool,
     },
     /// List registered remote Nodes
     List,
@@ -1229,6 +1233,9 @@ enum DaemonCommands {
         /// Hand off to this executable (requires daemon protocol 52+)
         #[arg(long)]
         executable: Option<PathBuf>,
+        /// Refresh daemon services from this terminal's environment; retain the same Boomux roots
+        #[arg(long)]
+        refresh_environment: bool,
     },
     /// Stop the daemon and its managed shells
     Stop,
@@ -1622,6 +1629,7 @@ impl Cli {
             Some(Commands::FederationStdio) => CommandKey::Attach,
             Some(Commands::GuidedNodeAdd) => CommandKey::NodeAdd,
             Some(Commands::GuidedNodeUpgrade { .. }) => CommandKey::NodeUpgrade,
+            Some(Commands::GuidedNodeUninstall { .. }) => CommandKey::NodeUninstall,
             Some(Commands::GuidedNodeReauthenticate { .. }) => CommandKey::NodeReauthenticate,
             Some(Commands::UninstallRemote { .. }) => CommandKey::UninstallRemote,
             Some(Commands::UninstallFingerprint) => CommandKey::UninstallFingerprint,
@@ -1861,13 +1869,16 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             return Ok(CliExit::Success);
         }
         Some(Commands::GuidedNodeAdd) => {
-            return guided_node_add().map(CliExit::Child);
+            return finish_guided_shell(guided_node_add()?).map(CliExit::Child);
         }
         Some(Commands::GuidedNodeUpgrade { selector }) => {
-            return guided_node_upgrade(selector).map(CliExit::Child);
+            return finish_guided_shell(guided_node_upgrade(selector)?).map(CliExit::Child);
+        }
+        Some(Commands::GuidedNodeUninstall { selector }) => {
+            return finish_guided_shell(guided_node_uninstall(selector)?).map(CliExit::Child);
         }
         Some(Commands::GuidedNodeReauthenticate { selector }) => {
-            return guided_node_reauthenticate(selector).map(CliExit::Child);
+            return finish_guided_shell(guided_node_reauthenticate(selector)?).map(CliExit::Child);
         }
         Some(Commands::BootstrapActivate {
             transaction,
@@ -2069,13 +2080,14 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::FederationStdio) => unreachable!(),
         Some(Commands::GuidedNodeAdd) => unreachable!(),
         Some(Commands::GuidedNodeUpgrade { .. }) => unreachable!(),
+        Some(Commands::GuidedNodeUninstall { .. }) => unreachable!(),
         Some(Commands::GuidedNodeReauthenticate { .. }) => unreachable!(),
         Some(Commands::UninstallRemote {
             expected_node_id,
             expected_executable,
         }) => uninstall::remote_uninstall(&expected_node_id, &expected_executable),
         Some(Commands::UninstallFingerprint) => {
-            let target = update::uninstall_target()?;
+            let target = update::remote_uninstall_target()?;
             println!(
                 "boomux-uninstall-fingerprint-v1 {}",
                 target.authorization_token()
@@ -2459,7 +2471,16 @@ fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
 
 fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>> {
     match command {
-        NodeCommands::Add { alias, target } => {
+        NodeCommands::Add {
+            alias,
+            target,
+            desktop_workspace,
+        } => {
+            if desktop_workspace && json {
+                return Err(
+                    io::Error::other("Desktop remote workspace setup is interactive only").into(),
+                );
+            }
             let (alias, target) = resolve_node_add_inputs(alias, target, json)?;
             let remote = verified_remote_connection(&target, !json)?;
             let registration = client::connect_or_start()?.add_node_registration(
@@ -2467,7 +2488,16 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                 target,
                 remote.handshake.node_id.clone(),
             )?;
-            print_node_registration(CommandKey::NodeAdd, &registration, json)
+            print_node_registration(CommandKey::NodeAdd, &registration, json)?;
+            if desktop_workspace {
+                let shell = client::connect_or_start()?
+                    .create_remote_workspace(&registration.node_id, &registration.alias)?;
+                println!(
+                    "Remote workspace created with Shell {}. Open it from the Desktop sidebar.",
+                    shell.name
+                );
+            }
+            Ok(())
         }
         NodeCommands::List => {
             let client = client::connect_or_start()?;
@@ -2697,6 +2727,54 @@ fn guided_node_add() -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     )
 }
 
+fn finish_guided_shell(
+    status: process_adapter::ProcessExit,
+) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let (Ok(shell_id), Ok(run_id)) = (env::var("BOOMUX_SHELL_ID"), env::var("BOOMUX_RUN_ID"))
+    else {
+        return Ok(status);
+    };
+    let client = client::connect()?;
+    let shell = client.get_shell(&shell_id)?;
+    if let Some(request) =
+        guided_shell_close_request(&shell, &shell_id, &run_id, &env::current_exe()?)
+    {
+        client.request(request)?;
+    }
+    Ok(status)
+}
+
+fn guided_shell_close_request(
+    shell: &protocol::ShellSnapshot,
+    shell_id: &str,
+    run_id: &str,
+    executable: &Path,
+) -> Option<protocol::Request> {
+    let command_matches = match shell.command.get(1).map(String::as_str) {
+        Some("__guided-node-add") => shell.command.len() == 2,
+        Some(
+            "__guided-node-upgrade" | "__guided-node-reauthenticate" | "__guided-node-uninstall",
+        ) => shell.command.len() == 3,
+        _ => false,
+    };
+    (command_matches
+        && shell.id == shell_id
+        && shell.status == protocol::ShellStatus::Running
+        && shell
+            .command
+            .first()
+            .is_some_and(|command| Path::new(command) == executable)
+        && !run_id.is_empty()
+        && shell
+            .run
+            .as_ref()
+            .is_some_and(|run| run.id == run_id && run.ended_at_ms.is_none()))
+    .then(|| protocol::Request::GuardedCloseShell {
+        shell_id: shell_id.into(),
+        expected_revision: shell.revision,
+    })
+}
+
 fn guided_node_upgrade(selector: &str) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     let executable = env::current_exe()?;
     let stdin = io::stdin();
@@ -2707,6 +2785,23 @@ fn guided_node_upgrade(selector: &str) -> Result<process_adapter::ProcessExit, B
         &executable,
         &["node", "upgrade", selector],
         "Node upgrade",
+        &mut input,
+        &mut output,
+        interactive,
+        interactive.then(|| stdin.as_raw_fd()),
+    )
+}
+
+fn guided_node_uninstall(selector: &str) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let executable = env::current_exe()?;
+    let stdin = io::stdin();
+    let interactive = stdin.is_terminal() && io::stdout().is_terminal();
+    let mut input = stdin.lock();
+    let mut output = io::stdout().lock();
+    guided_node_command_with(
+        &executable,
+        &["node", "uninstall", selector],
+        "Remote machine removal",
         &mut input,
         &mut output,
         interactive,
@@ -2750,7 +2845,7 @@ fn guided_node_add_with(
 ) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     guided_node_command_with(
         executable,
-        &["node", "add"],
+        &["node", "add", "--desktop-workspace"],
         "Node setup",
         input,
         output,
@@ -3286,13 +3381,17 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
                 client.socket_path().display()
             );
         }
-        DaemonCommands::Restart { executable } => {
+        DaemonCommands::Restart {
+            executable,
+            refresh_environment,
+        } => {
             let client = running_client.as_ref().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "Boomux daemon is stopped")
             })?;
-            let notifications = config::load_notification_settings()?.into();
+            let notifications: protocol::NotificationDeliveryConfig =
+                config::load_notification_settings()?.into();
             if let Some(executable) = executable {
-                client.restart_with_executable(executable.clone(), notifications)?;
+                client.restart_with_executable(executable.clone(), notifications.clone())?;
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     if daemon_process_identity(client)
@@ -3309,8 +3408,11 @@ fn daemon_control(command: DaemonCommands, json: bool) -> Result<(), Box<dyn Err
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
-            } else {
-                client.restart_with_notification_config(notifications)?;
+            } else if !refresh_environment {
+                client.restart_with_notification_config(notifications.clone())?;
+            }
+            if refresh_environment {
+                client.restart_with_client_environment(notifications)?;
             }
             println!("Restarted Boomux daemon");
         }
@@ -10058,6 +10160,7 @@ fn launch_codex(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     let mut command = Command::new(executable);
     sanitize_inherited_opencode_shim(&mut command);
     if managed_chat && hooks_current {
+        prioritize_boomux_hook_executable(&mut command)?;
         command
             .args(["--enable", "hooks"])
             .env("BOOMUX_CODEX_RUN_SCOPED", "1");
@@ -10143,6 +10246,9 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit,
     let argv = kiro_argv(executable, arguments, managed_v3 && hooks_current);
     let mut command = Command::new(&argv[0]);
     sanitize_inherited_opencode_shim(&mut command);
+    if managed_v3 && hooks_current {
+        prioritize_boomux_hook_executable(&mut command)?;
+    }
     let holder = if managed_v3 && hooks_current {
         match (
             env::var("BOOMUX_SHELL_ID").ok(),
@@ -10955,6 +11061,29 @@ fn invoke_workspace_launcher(
             let _ = child.wait();
         })
         .map_err(|error| io::Error::other(format!("could not start launcher reaper: {error}")))?;
+    Ok(())
+}
+
+fn prioritize_boomux_hook_executable(command: &mut Command) -> io::Result<()> {
+    let executable = env::current_exe()?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| io::Error::other("Boomux executable has no parent directory"))?;
+    // Sanitization restores the user's PATH, which can put another Boomux
+    // installation first. Hooks must resolve this launcher's matching CLI.
+    let path = command
+        .get_envs()
+        .find_map(|(key, value)| {
+            (key == "PATH")
+                .then_some(value)
+                .flatten()
+                .map(OsString::from)
+        })
+        .or_else(|| env::var_os("PATH"))
+        .unwrap_or_default();
+    let paths = std::iter::once(directory.to_path_buf())
+        .chain(env::split_paths(&path).filter(|entry| entry != directory));
+    command.env("PATH", env::join_paths(paths).map_err(io::Error::other)?);
     Ok(())
 }
 
@@ -12616,6 +12745,7 @@ mod tests {
                 command: NodeCommands::Add {
                     alias: Some(alias),
                     target: Some(target),
+                    desktop_workspace: false,
                 }
             }) if alias == "work" && target == "user@host"
         ));
@@ -12626,6 +12756,7 @@ mod tests {
                 command: NodeCommands::Add {
                     alias: None,
                     target: None,
+                    desktop_workspace: false,
                 }
             })
         ));
@@ -12639,6 +12770,52 @@ mod tests {
         let held = Cli::try_parse_from(["boomux", "__guided-node-add"]).unwrap();
         assert!(matches!(held.command, Some(Commands::GuidedNodeAdd)));
         assert_eq!(held.command_descriptor().key, "node.add");
+    }
+
+    #[test]
+    fn guided_remote_cleanup_requires_exact_command_owner_and_run() {
+        let cli =
+            Cli::try_parse_from(["boomux", "__guided-node-uninstall", "exact-owner"]).unwrap();
+        assert!(
+            matches!(cli.command.as_ref(), Some(Commands::GuidedNodeUninstall { selector }) if selector == "exact-owner")
+        );
+        assert_eq!(cli.command_descriptor().key, "node.uninstall");
+        assert_eq!(cli.command_descriptor().output, OutputMode::HumanOnly);
+        let mut shell: protocol::ShellSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "setup-shell", "revision": 7, "workspace_id": "workspace",
+            "name": "Connect remote", "cwd": "/tmp", "status": "running",
+            "command": ["/bin/boomux", "__guided-node-add"],
+            "run": {"id": "setup-run", "generation": 1, "started_at_ms": 1,
+                "ended_at_ms": null, "exit_reason": null, "output_revision": 0,
+                "environment_has_run_id": true}
+        }))
+        .unwrap();
+        let request = |shell: &protocol::ShellSnapshot| {
+            guided_shell_close_request(shell, "setup-shell", "setup-run", Path::new("/bin/boomux"))
+        };
+        assert_eq!(
+            request(&shell),
+            Some(protocol::Request::GuardedCloseShell {
+                shell_id: "setup-shell".into(),
+                expected_revision: 7
+            })
+        );
+        shell.command[0] = "/other/boomux".into();
+        assert!(request(&shell).is_none());
+        shell.command[0] = "/bin/boomux".into();
+        shell.command[1] = "__guided-node-uninstall".into();
+        assert!(request(&shell).is_none());
+        shell.command.push("exact-owner".into());
+        assert!(request(&shell).is_some());
+        shell.command.pop();
+        shell.command[1] = "node".into();
+        assert!(request(&shell).is_none());
+        shell.command[1] = "__guided-node-add".into();
+        shell.run.as_mut().unwrap().id = "other-run".into();
+        assert!(request(&shell).is_none());
+        shell.run.as_mut().unwrap().id = "setup-run".into();
+        shell.id = "other-shell".into();
+        assert!(request(&shell).is_none());
     }
 
     #[test]
@@ -15580,7 +15757,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 53);
+        assert_eq!(protocol::PROTOCOL_VERSION, 54);
     }
 
     #[test]

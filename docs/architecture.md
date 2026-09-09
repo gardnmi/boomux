@@ -51,11 +51,19 @@
 
 ## Managed Integration Assets
 
+Per-Shell runtime shim preparation compares existing owner-controlled regular
+files through no-follow descriptors using bounded scratch space. Identical content
+and mode are reused without rewrite or fsync; changed content or permissions still
+use atomic replacement. Durable Shell state and event publication ordering are
+unchanged. This avoids repeating shared-asset disk flushes under the mutation lock
+for every login Shell.
+
 After cold startup or finalized handoff, the committed daemon owner starts one
 bounded background maintenance pass. It never delays terminal admission, restarts
-harnesses, or polls in steady state. Successfully probed local harnesses receive
-missing assets; existing managed targets are reconciled even if the executable
-is temporarily absent. `integration sync` exposes the same local operation as a
+harnesses, or polls in steady state. All bundled integrations receive missing
+assets without host probes or PATH discovery, including on remote owners started
+through SSH with a restricted environment. Harnesses need not be installed yet.
+`integration sync` exposes the same local operation as a
 human-only CLI command. Read-only status/capabilities calls remain non-mutating.
 
 Each resolved asset target has a sibling `.<filename>.boomux-managed.json`
@@ -73,7 +81,8 @@ An owner-validated nonblocking per-directory file lock serializes core writers.
 Reads reject symlinks/non-regular or foreign-owned files and are bounded to 1 MiB.
 Updates use temporary files, baseline revalidation, atomic rename, and fsync;
 receipt failure is surfaced, not treated as permission to replace unknown assets.
-Host probes have existing five-second/output limits; there is at most one worker
+Explicit status host probes retain their five-second/output limits; maintenance
+executes no host processes. There is at most one worker
 and one receipt per bundled integration target. Errors are logged without failing
 daemon startup. Desktop owns no integration discovery worker or update prompts.
 
@@ -285,6 +294,20 @@ event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
 default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
 unchanged because owner Workspaces already persist `default_cwd`.
+Protocol 54 adds `create_started_shell`: local `CreateStartedShell` creates a
+Shell and its first ShellRun in one durable state replacement. The PTY reader
+stays paused until persistence succeeds; `shell_created` then `run_started` are
+published in the same event batch before output is released. Failed creation,
+spawn, or persistence rolls back membership and reaps any newly started process
+and reader. The supplied startup environment is ephemeral, never persisted.
+As with first attachment, the child can execute before the commit is acknowledged;
+rollback does not undo external command side effects.
+The response carries the exact first run for subsequent exact-run attachment.
+Clients negotiate before mutation and use ordinary pending-Shell creation plus
+attachment on older peers; they do not replay an ambiguous create response.
+Remote routing is unchanged. Existing state schema and cold-recovery semantics
+are unchanged: the stored Shell and run use their existing representations.
+
 Protocol 53 adds `git_work_overview`: a read-only `GitOverview` host-service
 operation and result, available locally and through verified Node routing.
 The owner discovers repositories from managed Shells and observed Agent contexts,
@@ -531,6 +554,11 @@ are synchronized after commit.
 
 `src/daemon.rs` owns all PTY masters and child processes. Its runtime directory
 is restricted to the current user and the socket mode is `0600`.
+When no connection is queued, the accept loop waits for socket readability with
+the existing 25 ms maintenance timeout rather than sleeping unconditionally.
+Connection arrival wakes it immediately without adding a worker or increasing
+the idle maintenance rate. State-directory ownership/type/mode checks still run
+on each save, but correct `0700` permissions are not rewritten unnecessarily.
 
 The daemon is composed from state-owning services rather than one shared
 registry. `DurableRegistry` owns workspace, shell, launcher, and Agent
@@ -1208,7 +1236,12 @@ Boomux does not share that file with unrelated Kiro configuration.
 Eligible managed Kiro invocations pass through the common Shell-scoped shim and
 hidden launcher. A bare `kiro-cli` becomes `kiro-cli --v3`, while an explicit
 leading `--v3` is preserved. The launcher supervises the exact argument vector
-with inherited terminal streams and foreground process-group behavior, and
+with the matching Boomux executable directory first on the sanitized child PATH,
+so bare lifecycle hook commands cannot select an older user installation instead
+of the launcher's CLI. Managed Codex launches use the same path priority; the
+selected harness executable and argument vector remain unchanged. Unmanaged
+invocations retain their ordinary PATH. The launcher inherits terminal streams
+and foreground process-group behavior, and
 acquires a private daemon-owned Launch Holder
 only while the installed asset is current. Only that Kiro process tree receives
 the holder capability. Eligible login ShellRuns stage the delegating shim even
@@ -1606,6 +1639,16 @@ this boundary, but sink dispatch occurs only after all coordinator and mutation
 locks are released.
 
 ## Runtime Semantics
+
+Local development can isolate Boomux without changing application environments:
+`BOOMUX_RUNTIME_DIR`, `BOOMUX_STATE_HOME`, and `BOOMUX_CONFIG_HOME` override the
+corresponding XDG roots only for Boomux-owned socket/shim paths, state (including
+Node identity and Workspace selection), and core/Desktop configuration. The
+development helper supplies absolute paths at the existing development locations.
+These routing variables remain inherited by local Shells and the Shared Harness
+Runtime so integration callbacks reach the same Node; Shell/Agent identity is
+still stripped from the shared runtime. XDG variables remain application-owned,
+and remote attachments continue to use the owning Node's environment.
 
 Closing a terminal window closes only its socket attachment. The daemon retains
 the PTY master and child. Reopening a native window acquires the primary

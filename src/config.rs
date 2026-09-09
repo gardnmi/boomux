@@ -356,6 +356,10 @@ fn verify_inherited_baseline(
 }
 
 pub(crate) fn global_config_path() -> Option<PathBuf> {
+    if let Some(root) = env::var_os("BOOMUX_CONFIG_HOME") {
+        let root = PathBuf::from(root);
+        return root.is_absolute().then(|| root.join("boomux/config.toml"));
+    }
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())

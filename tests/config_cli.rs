@@ -29,6 +29,9 @@ impl TestDirectory {
             .env("XDG_CONFIG_HOME", self.path().join("xdg"))
             .env("XDG_RUNTIME_DIR", self.path().join("runtime"))
             .env_remove("BOOMUX_CONFIG")
+            .env_remove("BOOMUX_CONFIG_HOME")
+            .env_remove("BOOMUX_STATE_HOME")
+            .env_remove("BOOMUX_RUNTIME_DIR")
             .env_remove("VISUAL")
             .env_remove("EDITOR");
         command
@@ -77,6 +80,34 @@ fn path_uses_environment_override_then_canonical_global_path() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
         override_path.display().to_string()
+    );
+}
+
+#[test]
+fn development_config_home_does_not_load_the_users_global_config() {
+    let test = TestDirectory::new();
+    let global = test.path().join("xdg/boomux/config.toml");
+    fs::create_dir_all(global.parent().unwrap()).unwrap();
+    fs::write(&global, "this is intentionally invalid TOML").unwrap();
+    let private = test.path().join("development-config");
+    let output = test
+        .command()
+        .env("BOOMUX_CONFIG_HOME", &private)
+        .args(["config", "path"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        private.join("boomux/config.toml").display().to_string()
+    );
+    assert_success(
+        &test
+            .command()
+            .env("BOOMUX_CONFIG_HOME", &private)
+            .args(["config", "validate"])
+            .output()
+            .unwrap(),
     );
 }
 

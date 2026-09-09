@@ -1,5 +1,11 @@
 # Daemon Event Stream
 
+Protocol 54's local `CreateStartedShell` publishes the existing `shell_created`
+and `run_started` events in order as one batch after the single durable commit.
+Its reader remains paused until that commit, so output cannot precede creation.
+Failed creation emits neither event. Older event readers need no new fields or
+event filtering for this operation.
+
 > **Status: Current protocol contract.** Source and compatibility tests are
 > authoritative for exact version gates; this document defines event and cursor
 > semantics.

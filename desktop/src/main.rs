@@ -5,6 +5,7 @@ mod git_panel;
 mod layout;
 mod layout_badge;
 mod nodes;
+mod remote;
 mod runtime;
 mod settings;
 mod terminal;
@@ -49,6 +50,34 @@ fn rgb(color: u32) -> gpui::Rgba {
 }
 
 struct HeaderTooltip(&'static str);
+
+fn sidebar_brand_mark() -> impl IntoElement {
+    div()
+        .size(px(32.0))
+        .flex_none()
+        .rounded(px(9.0))
+        .bg(rgb(0x89b4fa))
+        .child(
+            canvas(
+                |_, _, _| (),
+                |bounds, (), window, _| {
+                    // Vector strokes stay crisp at small sizes and do not
+                    // depend on the user's font or symbol coverage.
+                    let mut prompt = gpui::PathBuilder::stroke(px(2.5));
+                    let at = |x, y| point(bounds.left() + px(x), bounds.top() + px(y));
+                    prompt.move_to(at(8.0, 10.0));
+                    prompt.line_to(at(14.0, 16.0));
+                    prompt.line_to(at(8.0, 22.0));
+                    prompt.move_to(at(17.0, 22.0));
+                    prompt.line_to(at(24.0, 22.0));
+                    if let Ok(path) = prompt.build() {
+                        window.paint_path(path, rgb(0x11111b));
+                    }
+                },
+            )
+            .size_full(),
+        )
+}
 
 impl Render for HeaderTooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -95,7 +124,7 @@ fn sidebar_header_button(
         .child(glyph)
 }
 
-fn sidebar_menu_row(id: &'static str) -> Stateful<Div> {
+fn sidebar_menu_row(id: impl Into<gpui::ElementId>) -> Stateful<Div> {
     div()
         .id(id)
         .role(gpui::Role::MenuItem)
@@ -724,8 +753,8 @@ enum WorkspacePaneMode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PaneLayoutMode {
-    #[default]
     Tiled,
+    #[default]
     Tabbed,
 }
 
@@ -952,6 +981,14 @@ impl Render for TerminalSelectionDrag {
 struct TerminalSelection {
     anchor: (usize, usize),
     head: (usize, usize),
+}
+
+fn lifted_drag_bounds(mut bounds: FloatingPane, delta: (f32, f32)) -> FloatingPane {
+    // A tiled pane may span the entire panel. Keep the grab point under the
+    // pointer even when part of the temporary floating pane leaves the panel.
+    bounds.x += delta.0;
+    bounds.y += delta.1;
+    bounds
 }
 
 fn dragged_bounds(
@@ -1426,10 +1463,19 @@ struct Workspace {
     minimized_tab_scroll_handle: ScrollHandle,
     sidebar_menu: Option<SidebarMenu>,
     sidebar_header_menu_open: bool,
+    project_menu_open: bool,
+    projects_loading: bool,
+    projects_result: Option<Result<boomux::protocol::HostProjectDiscovery, String>>,
+    project_folder_picker_pending: bool,
+    project_folder_picker_open: bool,
     nodes_open: bool,
     node_views: Vec<nodes::NodeView>,
     nodes_error: Option<String>,
+    node_forget_confirm: Option<String>,
+    node_forget_busy: bool,
+    node_forget_error: Option<String>,
     selected_node: Option<String>,
+    expanded_node: Option<String>,
     resource_dialog: Option<ResourceDialog>,
     sidebar_visible: bool,
     sidebar_preferred_width: f32,
@@ -1612,10 +1658,19 @@ impl Workspace {
             minimized_tab_scroll_handle,
             sidebar_menu: None,
             sidebar_header_menu_open: false,
+            project_menu_open: false,
+            projects_loading: false,
+            projects_result: None,
+            project_folder_picker_pending: false,
+            project_folder_picker_open: false,
             nodes_open: false,
             node_views: Vec::new(),
             nodes_error: None,
+            node_forget_confirm: None,
+            node_forget_busy: false,
+            node_forget_error: None,
             selected_node: None,
+            expanded_node: None,
             resource_dialog: None,
             sidebar_visible: saved.sidebar_visible,
             sidebar_preferred_width: saved.sidebar_width,
@@ -2498,6 +2553,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let previous_width = self.sidebar_width();
+        self.project_menu_open = false;
         self.sidebar_visible = !self.sidebar_visible;
         self.nodes_open = false;
         self.save_settings();
@@ -2517,6 +2573,7 @@ impl Workspace {
     }
 
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.project_menu_open = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         if self.settings_open {
@@ -2535,6 +2592,7 @@ impl Workspace {
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.project_folder_picker_pending = false;
         if !self.settings_open {
             return;
         }
@@ -3074,7 +3132,13 @@ impl Workspace {
             self.begin_layout_animation(previous_rects);
         }
 
-        if let (Some(duration), Some(from)) = (self.motion_speed.duration(), from) {
+        // Restore tabs must be available as soon as their pane leaves the layout.
+        // Keeping the pane alive for the minimize animation delays tab creation.
+        let minimize_duration = self
+            .motion_speed
+            .duration()
+            .filter(|_| self.pane_layout_mode != PaneLayoutMode::Tabbed);
+        if let (Some(duration), Some(from)) = (minimize_duration, from) {
             self.animation_generation = self.animation_generation.wrapping_add(1);
             let generation = self.animation_generation;
             self.minimizing_panes.push(PaneMinimizeAnimation {
@@ -3986,6 +4050,7 @@ impl Workspace {
         }
         let (panel_width, panel_height) = self.panel_size(window);
 
+        let lifted = matches!(drag.subject, PointerSubject::Lifted(_));
         match drag.subject {
             PointerSubject::Floating(start_bounds) | PointerSubject::Lifted(start_bounds) => {
                 let Some(pane) = self
@@ -3996,12 +4061,16 @@ impl Workspace {
                     self.pointer_drag = None;
                     return;
                 };
-                *pane = dragged_bounds(
-                    start_bounds,
-                    drag.operation,
-                    (dx, dy),
-                    (panel_width, panel_height),
-                );
+                *pane = if lifted && matches!(drag.operation, PointerOperation::Move) {
+                    lifted_drag_bounds(start_bounds, (dx, dy))
+                } else {
+                    dragged_bounds(
+                        start_bounds,
+                        drag.operation,
+                        (dx, dy),
+                        (panel_width, panel_height),
+                    )
+                };
             }
             PointerSubject::Tiled(start_layout) => match drag.operation {
                 PointerOperation::Move => unreachable!("tiled moves are lifted before dragging"),
@@ -4471,7 +4540,7 @@ impl Workspace {
             return;
         }
 
-        if self.nodes_open {
+        if self.nodes_open && self.navigation_region == NavigationRegion::Sidebar {
             let modifiers = event.keystroke.modifiers;
             if modifiers.control
                 || modifiers.alt
@@ -4485,23 +4554,34 @@ impl Workspace {
             match event.keystroke.key.as_str() {
                 "escape" => self.nodes_open = false,
                 "up" | "down" => {
-                    let len = self.node_views.len();
+                    let nodes = self
+                        .node_views
+                        .iter()
+                        .filter(|node| !node.local)
+                        .collect::<Vec<_>>();
+                    let len = nodes.len();
                     if len > 0 {
                         let current = self
                             .selected_node
                             .as_ref()
-                            .and_then(|id| self.node_views.iter().position(|node| &node.id == id));
+                            .and_then(|id| nodes.iter().position(|node| &node.id == id));
                         let index = match (current, event.keystroke.key.as_str()) {
                             (Some(index), "up") => (index + len - 1) % len,
                             (Some(index), _) => (index + 1) % len,
                             (None, "up") => len - 1,
                             _ => 0,
                         };
-                        self.selected_node = Some(self.node_views[index].id.clone());
+                        self.selected_node = Some(nodes[index].id.clone());
                     }
                 }
                 "a" => self.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx),
-                "d" => self.launch_node_action(terminal::WorkspaceLaunch::Dashboard, window, cx),
+                "enter" | "space" => {
+                    self.expanded_node = if self.expanded_node == self.selected_node {
+                        None
+                    } else {
+                        self.selected_node.clone()
+                    };
+                }
                 "r" => {
                     if let Some(node) = self.node_views.iter().find(|node| Some(&node.id) == self.selected_node.as_ref()
                         && !node.local && node.health == boomux::protocol::NodeProjectionHealthCode::AuthenticationRequired) {
@@ -4542,6 +4622,12 @@ impl Workspace {
         }
         if self.sidebar_menu.is_some() && event.keystroke.key == "escape" {
             self.sidebar_menu = None;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.project_menu_open && event.keystroke.key == "escape" {
+            self.project_menu_open = false;
             cx.stop_propagation();
             cx.notify();
             return;
@@ -4739,7 +4825,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let shell = terminal::create_shell(&anchor)?;
+                    let shell = terminal::create_shell(&anchor, size)?;
                     let session = match TerminalSession::attach(
                         shell.clone(),
                         size.0,
@@ -4753,8 +4839,9 @@ impl Workspace {
                             return Err(error);
                         }
                     };
-                    let overview = terminal::discover_overview().ok();
-                    Ok::<_, String>((shell, session, overview))
+                    // The existing overview worker refreshes sidebar resources.
+                    // Do not hold an attached terminal behind that extra request.
+                    Ok::<_, String>((shell, session))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -4763,14 +4850,11 @@ impl Workspace {
                 };
                 pane.attaching = false;
                 match result {
-                    Ok((shell, session, overview)) => {
+                    Ok((shell, session)) => {
                         let shell_id = session.shell_id.clone();
                         pane.screen = Some(session.screen());
                         pane.shell = Some(shell);
                         pane.session = Some(session);
-                        if let Some(overview) = overview {
-                            this.set_boomux_overview(overview);
-                        }
                         this.watch_terminal(pane_id, shell_id, cx);
                     }
                     Err(error) => pane.error = Some(error),
@@ -4829,7 +4913,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let shell = terminal::create_shell_in_workspace(&workspace_id)?;
+                    let shell = terminal::create_shell_in_workspace(&workspace_id, size)?;
                     let session = match TerminalSession::attach(
                         shell.clone(),
                         size.0,
@@ -4843,8 +4927,9 @@ impl Workspace {
                             return Err(error);
                         }
                     };
-                    let overview = terminal::discover_overview().ok();
-                    Ok::<_, String>((shell, session, overview))
+                    // The existing overview worker refreshes sidebar resources.
+                    // Do not hold an attached terminal behind that extra request.
+                    Ok::<_, String>((shell, session))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -4853,14 +4938,11 @@ impl Workspace {
                 };
                 pane.attaching = false;
                 match result {
-                    Ok((shell, session, overview)) => {
+                    Ok((shell, session)) => {
                         let shell_id = session.shell_id.clone();
                         pane.screen = Some(session.screen());
                         pane.shell = Some(shell);
                         pane.session = Some(session);
-                        if let Some(overview) = overview {
-                            this.set_boomux_overview(overview);
-                        }
                         this.watch_terminal(pane_id, shell_id, cx);
                     }
                     Err(error) => pane.error = Some(error),
@@ -4873,6 +4955,7 @@ impl Workspace {
     }
 
     fn create_and_attach_new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.project_menu_open = false;
         self.create_workspace_terminal(terminal::WorkspaceLaunch::Shell, window, cx);
     }
 
@@ -4913,15 +4996,16 @@ impl Workspace {
                         Ok(session) => session,
                         Err(error) => {
                             // Setup ownership does not authorize deleting resources added meanwhile.
-                            if !shell.desktop_setup {
+                            if !shell.desktop_setup && remote::identity(&shell.id).is_none() {
                                 let _ = terminal::remove_workspace(&shell.workspace_id);
                             }
                             return Err(error);
                         }
                     };
                     session.setup_workspace_cleanup = setup_workspace_cleanup;
-                    let overview = terminal::discover_overview().ok();
-                    Ok::<_, String>((shell, session, overview))
+                    // The existing overview worker refreshes sidebar resources.
+                    // Do not hold an attached terminal behind that extra request.
+                    Ok::<_, String>((shell, session))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -4930,7 +5014,7 @@ impl Workspace {
                 };
                 pane.attaching = false;
                 match result {
-                    Ok((shell, session, overview)) => {
+                    Ok((shell, session)) => {
                         let shell_id = session.shell_id.clone();
                         let workspace_id = shell.workspace_id.clone();
                         pane.screen = Some(session.screen());
@@ -4943,9 +5027,6 @@ impl Workspace {
                         );
                         if !this.workspace_order.contains(&workspace_id) {
                             this.workspace_order.push(workspace_id.clone());
-                        }
-                        if let Some(overview) = overview {
-                            this.set_boomux_overview(overview);
                         }
                         this.watch_terminal(pane_id, shell_id, cx);
                     }
@@ -5197,6 +5278,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.project_menu_open = false;
         let Some(shells) = self
             .boomux_overview
             .workspaces
@@ -5374,6 +5456,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.project_menu_open = false;
         if let Some(pane_id) = self.terminals.iter().find_map(|(pane_id, pane)| {
             pane.shell
                 .as_ref()
@@ -5605,14 +5688,29 @@ impl Workspace {
     }
 
     fn open_nodes(&mut self, cx: &mut Context<Self>) {
+        self.project_menu_open = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
         self.nodes_open = true;
+        self.git_panel.open = false;
+        self.git_panel.task = None;
+        self.sidebar_visible = true;
+        self.navigation_region = NavigationRegion::Sidebar;
         self.selected_node = self
             .selected_node
             .take()
-            .or_else(|| self.node_views.first().map(|node| node.id.clone()));
+            .filter(|id| {
+                self.node_views
+                    .iter()
+                    .any(|node| !node.local && node.id == *id)
+            })
+            .or_else(|| {
+                self.node_views
+                    .iter()
+                    .find(|node| !node.local)
+                    .map(|node| node.id.clone())
+            });
         cx.notify();
     }
 
@@ -5629,6 +5727,40 @@ impl Workspace {
         self.create_workspace_terminal(launch, window, cx);
     }
 
+    fn forget_remote_connection(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.node_forget_busy || self.node_forget_confirm.as_ref() != Some(&id) {
+            return;
+        }
+        self.node_forget_busy = true;
+        self.node_forget_error = None;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    boomux::client::connect()
+                        .and_then(|client| client.forget_node_registration(id))
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.node_forget_busy = false;
+                match result {
+                    Ok(_) => {
+                        this.node_forget_confirm = None;
+                    }
+                    Err(error) => {
+                        this.node_forget_error =
+                            Some(format!("Could not forget connection: {error}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn nodes_panel(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.nodes_open {
             return None;
@@ -5636,13 +5768,10 @@ impl Workspace {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis() as u64);
-        let selected = self
-            .selected_node
-            .as_ref()
-            .and_then(|id| self.node_views.iter().find(|node| &node.id == id));
         let rows = self
             .node_views
             .iter()
+            .filter(|node| !node.local)
             .map(|node| {
                 let id = node.id.clone();
                 div()
@@ -5660,64 +5789,399 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.selected_node = Some(id.clone());
+                        this.expanded_node = if this.expanded_node.as_ref() == Some(&id) {
+                            None
+                        } else {
+                            Some(id.clone())
+                        };
                         cx.notify();
                     }))
-                    .child(div().text_sm().child(node.label.clone()))
+                    .child(div().flex().items_center().gap_2()
+                        .child(div().flex_1().min_w_0().text_sm().truncate().child(node.label.clone()))
+                        .child(div().flex_none().text_xs().text_color(rgb(0x7f849c))
+                            .child(if self.expanded_node.as_ref() == Some(&node.id) { "▾" } else { "▸" })))
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(if node.connected() { 0xa6e3a1 } else { 0xf9e2af }))
                             .child(node.status()),
                     )
-            })
-            .collect::<Vec<_>>();
-        Some(div().id("nodes-backdrop").absolute().occlude().size_full().top_0().left_0()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.nodes_open = false;
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(div().id("nodes-panel").absolute().occlude()
-            .top(px(54.0)).left(px(10.0)).w(px(280.0)).max_h(relative(0.85)).overflow_y_scroll()
-            .p_3().flex().flex_col().gap_2().rounded_lg().border_1()
-            .border_color(rgb(0x45475a)).bg(rgb(0x1e1e2e)).shadow_lg()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().flex().items_center().justify_between()
-                .child(div().font_weight(gpui::FontWeight::BOLD).child("Nodes"))
-                .child(Self::settings_option("close-nodes", "Close", false)
-                    .on_click(cx.listener(|this, _, _, cx| { this.nodes_open = false; cx.notify(); }))))
-            .when_some(self.nodes_error.clone(), |panel, error| panel.child(div().text_xs().text_color(rgb(0xf9e2af)).child(error)))
-            .child(div().id("node-list").max_h(px(180.0)).overflow_y_scroll().children(rows))
-            .when_some(selected, |panel, node| {
-                panel.child(div().flex().flex_col().gap_2().text_xs()
-                    .when_some(node.route.clone(), |detail, route| detail.child(div().child(route)))
-                    .child(format!("{} Workspaces · {} Shells{}", node.workspace_count, node.shell_count,
+            .when(self.expanded_node.as_ref() == Some(&node.id), |panel| {
+                panel.child(div().mt_2().pt_2().border_t_1().border_color(rgb(0x45475a))
+                    .id("remote-machine-details")
+                    .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .flex().flex_col().gap_2().text_xs().text_color(rgb(0xa6adc8))
+                    .when_some(node.route.clone(), |detail, route| detail.child(div().truncate().child(format!("SSH · {route}"))))
+                    .child(format!("{} workspace{} · {} shell{}{}", node.workspace_count,
+                        if node.workspace_count == 1 { "" } else { "s" }, node.shell_count,
+                        if node.shell_count == 1 { "" } else { "s" },
                         if node.connected() { "" } else { " · cached" }))
-                    .child(node.last_seen(now_ms))
                     .when_some(node.version.clone(), |detail, version| detail.child(format!("Boomux {version}")))
-                    .child(node.guidance())
+                    .when(!node.connected(), |detail| detail.child(node.last_seen(now_ms)).child(node.guidance()))
+                    .when(!node.local && node.connected(), |detail| {
+                        let node_id = node.id.clone();
+                        let name = node.label.clone();
+                        let upgrade_id = node.id.clone();
+                        detail.child(Self::settings_option("create-remote-workspace", "New workspace", false)
+                            .flex_none()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                let name = terminal::project_workspace_name(&name, this.boomux_overview.workspaces.iter()
+                                    .filter(|w| remote::identity(&w.id).is_some_and(|id| id.node_id == node_id))
+                                    .map(|w| w.name.as_str()));
+                                this.launch_node_action(terminal::WorkspaceLaunch::RemoteWorkspace { node_id: node_id.clone(), name }, window, cx);
+                            })))
+                            .child(Self::settings_option("update-remote", "Update Boomux", false)
+                            .flex_none()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.launch_node_action(terminal::WorkspaceLaunch::UpgradeNode(upgrade_id.clone()), window, cx);
+                            })))
+                    })
                     .when(!node.local && node.health == boomux::protocol::NodeProjectionHealthCode::AuthenticationRequired, |detail| {
                         let id = node.id.clone();
                         detail.child(Self::settings_option("reauthenticate-node", "Sign in…", false)
+                            .flex_none()
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
                                 this.launch_node_action(terminal::WorkspaceLaunch::ReauthenticateNode(id.clone()), window, cx);
                             })))
-                    }))
+                    })
+                    .child(div().mt_2().pt_2().border_t_1().border_color(rgb(0x45475a))
+                        .flex().flex_col().gap_2()
+                        .child(Self::settings_option("remove-remote-machine", "Remove machine & uninstall Boomux…", false)
+                            .flex_none()
+                            .text_color(rgb(0xf38ba8))
+                            .on_click(cx.listener({
+                                let id = node.id.clone();
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.launch_node_action(terminal::WorkspaceLaunch::UninstallNode(id.clone()), window, cx);
+                                }
+                            })))
+                        .child(format!("Stops all managed shells on {}. Opens a terminal for confirmation.", node.label))
+                        .child(Self::settings_control("forget-remote-machine", "Forget connection only…", false, !self.node_forget_busy)
+                            .flex_none()
+                            .on_click(cx.listener({
+                                let id = node.id.clone();
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if !this.node_forget_busy { this.node_forget_confirm = Some(id.clone()); }
+                                    cx.notify();
+                                }
+                            })))
+                        .when(self.node_forget_confirm.as_ref() == Some(&node.id), |section| {
+                            section.child(div().flex().flex_col().gap_2()
+                                .when_some(self.node_forget_error.clone(), |confirmation, error| confirmation.child(div().text_color(rgb(0xf38ba8)).child(error)))
+                                .child("Remove this connection and its cached workspaces from this computer? This does not contact the machine, uninstall Boomux, or stop remote work.")
+                                .child(Self::settings_control("confirm-forget-remote", if self.node_forget_busy { "Forgetting…" } else { "Forget connection" }, false, !self.node_forget_busy)
+                                    .flex_none().text_color(rgb(0xf38ba8))
+                                    .on_click(cx.listener({
+                                        let id = node.id.clone();
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.forget_remote_connection(id.clone(), cx);
+                                        }
+                                    })))
+                                .child(Self::settings_option("cancel-forget-remote", "Cancel", false).flex_none()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if !this.node_forget_busy { this.node_forget_confirm = None; }
+                                        cx.notify();
+                                    }))))
+                        })))
             })
-            .child(div().h(px(1.0)).bg(rgb(0x45475a)))
-            .child(Self::settings_option("add-remote-node", "Add remote Node…", false)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
-                })))
-            .child(Self::settings_option("manage-nodes", "Open Boomux dashboard", false)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.launch_node_action(terminal::WorkspaceLaunch::Dashboard, window, cx);
-                })))
-            .child(div().text_xs().text_color(rgb(0xa6adc8))
-                .child("Setup and sign-in open a terminal. Manage remote work in the dashboard’s Nodes tab."))
-            .child(div().text_xs().text_color(rgb(0x7f849c)).child("↑/↓ select · A add · R sign in · D dashboard · Esc close")))
-            .into_any_element())
+            })
+            .collect::<Vec<_>>();
+        Some(
+            div()
+                .id("nodes-panel")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_3()
+                .pb_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.navigation_region = NavigationRegion::Sidebar;
+                        window.focus(&this.focus_handle, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    Self::settings_option("add-remote-node", "Connect another machine…", false)
+                        .flex_none()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
+                        })),
+                )
+                .when_some(self.nodes_error.clone(), |panel, error| {
+                    panel.child(div().text_xs().text_color(rgb(0xf9e2af)).child(error))
+                })
+                .when(!self.node_views.iter().any(|node| !node.local), |panel| {
+                    panel.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x9399b2))
+                            .child("Connect a machine to create your first remote workspace."),
+                    )
+                })
+                .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(rgb(0x9399b2))
+                        .child("REMOTE MACHINES"),
+                )
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    fn toggle_project_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.project_menu_open = !self.project_menu_open;
+        self.sidebar_header_menu_open = false;
+        self.sidebar_menu = None;
+        window.focus(&self.focus_handle, cx);
+        if self.project_menu_open && !self.projects_loading {
+            self.projects_loading = true;
+            self.projects_result = None;
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async { boomux_settings::discover_projects() })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.projects_loading = false;
+                    this.projects_result = Some(result);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn open_project_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.project_menu_open = false;
+        self.settings_open = true;
+        self.help_open = false;
+        self.nodes_open = false;
+        self.boomux_settings_message = None;
+        self.browse_project_folders(cx);
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn browse_project_folders(&mut self, cx: &mut Context<Self>) {
+        if self.project_folder_picker_open {
+            return;
+        }
+        if self.boomux_settings_snapshot.is_none() {
+            self.project_folder_picker_pending = true;
+            self.load_boomux_settings(cx);
+            return;
+        }
+        if self.boomux_settings_busy || self.boomux_setting_input.is_some() {
+            self.boomux_settings_message =
+                Some("Finish saving or editing settings before choosing a folder.".into());
+            cx.notify();
+            return;
+        }
+        self.project_folder_picker_open = true;
+        self.boomux_settings_message = None;
+        let selection = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: Some("Add project folders".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = selection.await.map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            this.update(cx, |this, cx| {
+                this.project_folder_picker_open = false;
+                match result {
+                    Ok(Some(paths)) => {
+                        if let Some(snapshot) = &mut this.boomux_settings_snapshot {
+                            match snapshot.add_project_folders(&paths) {
+                                Ok(true) => this.save_boomux_settings(cx),
+                                Ok(false) => {},
+                                Err(error) => this.boomux_settings_message = Some(error),
+                            }
+                        }
+                    }
+                    Ok(None) => {},
+                    Err(error) => this.boomux_settings_message = Some(format!("Could not open folder picker: {error}. You can still use Edit to enter folders manually.")),
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+        cx.notify();
+    }
+
+    fn project_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.project_menu_open {
+            return None;
+        }
+        let mut entries = div()
+            .id("project-menu-list")
+            .max_h(px(320.0))
+            .overflow_y_scroll();
+        let mut configured = false;
+        if self.projects_loading {
+            entries = entries.child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .text_color(rgb(0x9399b2))
+                    .child("Loading projects…"),
+            );
+        } else if let Some(result) = &self.projects_result {
+            match result {
+                Ok(discovery) => {
+                    configured = discovery.roots_configured;
+                    if discovery.projects.is_empty() {
+                        entries =
+                            entries.child(div().p_3().text_sm().text_color(rgb(0x9399b2)).child(
+                                if configured {
+                                    "No projects found in your folders."
+                                } else {
+                                    "Add a project folder to find projects here."
+                                },
+                            ));
+                    }
+                    for (index, project) in discovery.projects.iter().enumerate() {
+                        let project = project.clone();
+                        entries = entries.child(
+                            sidebar_menu_row(("project-choice", index))
+                                .h_auto()
+                                .py_2()
+                                .flex_col()
+                                .items_start()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .text_sm()
+                                        .child(project.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(rgb(0x9399b2))
+                                        .child(project.path.display().to_string()),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.project_menu_open = false;
+                                    if this.settings_open {
+                                        this.close_settings(cx);
+                                    }
+                                    this.create_workspace_terminal(
+                                        terminal::WorkspaceLaunch::Project {
+                                            name: project.name.clone(),
+                                            path: project.path.clone(),
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        );
+                    }
+                    for warning in &discovery.warnings {
+                        entries = entries.child(
+                            div()
+                                .p_2()
+                                .text_xs()
+                                .text_color(rgb(0xf9e2af))
+                                .child(warning.clone()),
+                        );
+                    }
+                }
+                Err(error) => {
+                    entries = entries.child(
+                        div()
+                            .p_3()
+                            .text_sm()
+                            .text_color(rgb(0xf38ba8))
+                            .child(format!("Could not load projects: {error}")),
+                    )
+                }
+            }
+        }
+        Some(
+            div()
+                .id("project-menu")
+                .role(gpui::Role::Menu)
+                .aria_label("Create Workspace")
+                .absolute()
+                .occlude()
+                .top(px(54.0))
+                .left(px(10.0))
+                .right(px(10.0))
+                .p_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(0x45475a))
+                .bg(rgb(0x1e1e2e))
+                .shadow_lg()
+                .child(
+                    sidebar_menu_row("project-new-workspace")
+                        .child("New Workspace")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            if this.settings_open {
+                                this.close_settings(cx);
+                            }
+                            this.create_and_attach_new_workspace(window, cx);
+                        })),
+                )
+                .child(
+                    sidebar_menu_row("project-new-remote-workspace")
+                        .child("New remote workspace…")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            if this.settings_open {
+                                this.close_settings(cx);
+                            }
+                            this.open_nodes(cx);
+                        })),
+                )
+                .child(div().mx_2().my_1().h(px(1.0)).bg(rgb(0x313244)))
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(0x9399b2))
+                        .child("LOCAL PROJECTS"),
+                )
+                .child(entries)
+                .child(div().mx_2().my_1().h(px(1.0)).bg(rgb(0x313244)))
+                .child(
+                    sidebar_menu_row("project-manage-folders")
+                        .child(if configured {
+                            "Manage project folders…"
+                        } else {
+                            "Add project folder…"
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_project_settings(window, cx);
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn sidebar_header_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -5737,14 +6201,6 @@ impl Workspace {
                 .border_color(rgb(0x45475a))
                 .bg(rgb(0x1e1e2e))
                 .shadow_lg()
-                .child(
-                    sidebar_menu_row("header-menu-nodes")
-                        .child("Nodes")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.open_nodes(cx);
-                        })),
-                )
                 .child(
                     sidebar_menu_row("header-menu-updates")
                         .child(if self.updates_checking {
@@ -5804,6 +6260,7 @@ impl Workspace {
     }
 
     fn sidebar(&self, window: &Window, cx: &mut Context<Self>) -> Div {
+        let project_menu = self.project_menu(cx);
         let header_menu = self.sidebar_header_menu(cx);
         let settings_panel = self.settings_overlay(cx);
         let (workspaces, agents) =
@@ -5845,6 +6302,10 @@ impl Workspace {
                     && self.sidebar_item.as_ref() == Some(&workspace_item);
                 let expanded = self.expanded_workspaces.contains(&workspace.id);
                 let active = focused_workspace_id == Some(workspace.id.as_str());
+                let remote_identity = remote::identity(&workspace.id);
+                let remote_machine = remote_identity
+                    .as_ref()
+                    .and_then(|id| self.node_views.iter().find(|node| node.id == id.node_id));
                 let shell_count = workspace.shells.len();
                 let shell_rows =
                     workspace
@@ -5872,7 +6333,7 @@ impl Workspace {
                             let status = shell.status_label();
                             div()
                                 .id(SharedString::from(format!("sidebar-shell-{}", shell.id)))
-                                .ml_6()
+                                .ml_8()
                                 .h(px(39.0))
                                 .px_2()
                                 .flex()
@@ -5904,7 +6365,11 @@ impl Workspace {
                                                 0x6c7086
                                             },
                                         ))
-                                        .child(pane_presence.glyph()),
+                                        .child(if self.shell_has_agent(&shell) {
+                                            "✦"
+                                        } else {
+                                            pane_presence.glyph()
+                                        }),
                                 )
                                 .child(
                                     div()
@@ -5915,7 +6380,7 @@ impl Workspace {
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .font_weight(gpui::FontWeight::NORMAL)
                                                 .text_color(rgb(0xcdd6f4))
                                                 .child(shell.name),
                                         )
@@ -5964,7 +6429,6 @@ impl Workspace {
                     )))
                     .w_full()
                     .rounded_md()
-                    .bg(if active { rgb(0x202235) } else { rgb(0x181825) })
                     .when(active, |element| {
                         element.border_l_2().border_color(rgb(0x45475a))
                     })
@@ -5979,6 +6443,8 @@ impl Workspace {
                                     .then(|| self.sidebar_scroll_anchor.clone()),
                             )
                             .h(px(52.0))
+                            .rounded_md()
+                            .bg(if active { rgb(0x313244) } else { rgb(0x252536) })
                             .px_2()
                             .flex()
                             .items_center()
@@ -5989,7 +6455,7 @@ impl Workspace {
                                     .border_l_2()
                                     .border_color(rgb(0xcba6f7))
                             })
-                            .hover(|element| element.bg(rgb(0x29293d)))
+                            .hover(|element| element.bg(rgb(0x313244)))
                             .cursor_pointer()
                             .on_drag(
                                 WorkspaceRowDrag {
@@ -6012,22 +6478,66 @@ impl Workspace {
                             }))
                             .child(
                                 div()
-                                    .w(px(14.0))
-                                    .text_xs()
-                                    .text_color(if active { rgb(0x89b4fa) } else { rgb(0x6c7086) })
-                                    .child(if self.pane_layout_mode == PaneLayoutMode::Tabbed {
-                                        ""
-                                    } else if expanded {
-                                        "▾"
+                                    .relative()
+                                    .flex_none()
+                                    .w(px(16.0))
+                                    .h(px(14.0))
+                                    .rounded(px(2.0))
+                                    .border_1()
+                                    .border_color(if active {
+                                        rgb(0x89b4fa)
                                     } else {
-                                        "▸"
+                                        rgb(0x9399b2)
+                                    })
+                                    .when(remote_identity.is_some(), |icon| {
+                                        icon.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(6.0))
+                                                .top(px(13.0))
+                                                .w(px(2.0))
+                                                .h(px(3.0))
+                                                .bg(rgb(0x9399b2)),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(3.0))
+                                                .top(px(16.0))
+                                                .w(px(8.0))
+                                                .h(px(1.0))
+                                                .bg(rgb(0x9399b2)),
+                                        )
+                                    })
+                                    .when(remote_identity.is_none(), |icon| {
+                                        icon.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .bottom_0()
+                                                .left(px(5.0))
+                                                .w(px(1.0))
+                                                .bg(if active {
+                                                    rgb(0x89b4fa)
+                                                } else {
+                                                    rgb(0x9399b2)
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(px(6.0))
+                                                .left(px(6.0))
+                                                .right_0()
+                                                .h(px(1.0))
+                                                .bg(if active {
+                                                    rgb(0x89b4fa)
+                                                } else {
+                                                    rgb(0x9399b2)
+                                                }),
+                                        )
                                     }),
                             )
-                            .child(div().size_2().rounded_full().bg(if active {
-                                rgb(0x89b4fa)
-                            } else {
-                                rgb(0x6c7086)
-                            }))
                             .child(
                                 div()
                                     .min_w_0()
@@ -6037,25 +6547,35 @@ impl Workspace {
                                     .child(
                                         div()
                                             .text_sm()
-                                            .font_weight(if active {
-                                                gpui::FontWeight::SEMIBOLD
-                                            } else {
-                                                gpui::FontWeight::NORMAL
-                                            })
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .child(workspace.name.clone()),
                                     )
-                                    .child(div().text_xs().text_color(rgb(0x6c7086)).child(
-                                        format!(
-                                            "{shell_count} {} · {} {}",
-                                            if shell_count == 1 { "shell" } else { "shells" },
-                                            workspace.agent_count,
-                                            if workspace.agent_count == 1 {
-                                                "agent"
+                                    .child(
+                                        div().truncate().text_xs().text_color(rgb(0x6c7086)).child(
+                                            if let Some(node) = remote_machine {
+                                                format!(
+                                                    "{} · {} · {shell_count} shells",
+                                                    node.label,
+                                                    node.status()
+                                                )
                                             } else {
-                                                "agents"
-                                            }
+                                                format!(
+                                                    "{shell_count} {} · {} {}",
+                                                    if shell_count == 1 {
+                                                        "shell"
+                                                    } else {
+                                                        "shells"
+                                                    },
+                                                    workspace.agent_count,
+                                                    if workspace.agent_count == 1 {
+                                                        "agent"
+                                                    } else {
+                                                        "agents"
+                                                    }
+                                                )
+                                            },
                                         ),
-                                    )),
+                                    ),
                             )
                             .child(
                                 div()
@@ -6157,18 +6677,7 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(
-                                div()
-                                    .size(px(28.0))
-                                    .flex_none()
-                                    .rounded_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(rgb(0x11111b))
-                                    .text_color(rgb(0xf9e2af))
-                                    .child("✦"),
-                            )
+                            .child(sidebar_brand_mark())
                             .child(
                                 div()
                                     .min_w_0()
@@ -6198,13 +6707,19 @@ impl Workspace {
                                                         .count();
                                                     if unavailable == 0 {
                                                         format!(
-                                                            "{} Nodes · connected",
-                                                            self.node_views.len()
+                                                            "{} remotes · connected",
+                                                            self.node_views
+                                                                .iter()
+                                                                .filter(|node| !node.local)
+                                                                .count()
                                                         )
                                                     } else {
                                                         format!(
-                                                            "{} Nodes · {} unavailable",
-                                                            self.node_views.len(),
+                                                            "{} remotes · {} unavailable",
+                                                            self.node_views
+                                                                .iter()
+                                                                .filter(|node| !node.local)
+                                                                .count(),
                                                             unavailable
                                                         )
                                                     }
@@ -6227,15 +6742,15 @@ impl Workspace {
                             .child(
                                 sidebar_header_button(
                                     "create-workspace",
-                                    "New Workspace",
+                                    "New Workspace or project",
                                     "+",
-                                    false,
+                                    self.project_menu_open,
                                 )
                                 .on_click(cx.listener(
                                     |this, _, window, cx| {
                                         cx.stop_propagation();
                                         this.sidebar_header_menu_open = false;
-                                        this.create_and_attach_new_workspace(window, cx);
+                                        this.toggle_project_menu(window, cx);
                                     },
                                 )),
                             )
@@ -6265,6 +6780,7 @@ impl Workspace {
                                         cx.stop_propagation();
                                         this.sidebar_header_menu_open =
                                             !this.sidebar_header_menu_open;
+                                        this.project_menu_open = false;
                                         this.sidebar_menu = None;
                                         cx.notify();
                                     },
@@ -6351,36 +6867,44 @@ impl Workspace {
                                 .px_3()
                                 .py_1()
                                 .items_center()
-                                .children([false, true].map(|git| {
+                                .children([0, 1, 2].map(|tab| {
+                                    let selected = if self.nodes_open {
+                                        tab == 2
+                                    } else {
+                                        tab == usize::from(self.git_panel.open)
+                                    };
                                     div()
-                                        .id(if git {
-                                            "sidebar-git-tab"
-                                        } else {
-                                            "sidebar-agents-tab"
+                                        .id(match tab {
+                                            0 => "sidebar-agents-tab",
+                                            1 => "sidebar-git-tab",
+                                            _ => "sidebar-nodes-tab",
                                         })
                                         .cursor_pointer()
                                         .text_sm()
                                         .pb_1()
                                         .border_b_2()
-                                        .border_color(rgb(if self.git_panel.open == git {
+                                        .border_color(rgb(if selected {
                                             0x89b4fa
                                         } else {
                                             0x181825
                                         }))
-                                        .text_color(rgb(if self.git_panel.open == git {
-                                            0xcdd6f4
-                                        } else {
-                                            0x7f849c
-                                        }))
-                                        .child(if git {
+                                        .text_color(rgb(if selected { 0xcdd6f4 } else { 0x7f849c }))
+                                        .child(if tab == 2 {
+                                            "Remotes".to_owned()
+                                        } else if tab == 1 {
                                             "Git".to_owned()
                                         } else if attention > 0 {
                                             format!("Agents · {attention}")
                                         } else {
                                             "Agents".to_owned()
                                         })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.select_git_tab(git, cx)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            window.focus(&this.focus_handle, cx);
+                                            if tab == 2 {
+                                                this.open_nodes(cx);
+                                            } else {
+                                                this.select_git_tab(tab == 1, cx);
+                                            }
                                         }))
                                 }))
                                 .child(div().flex_1())
@@ -6389,7 +6913,8 @@ impl Workspace {
                                 }),
                         )
                         .when_some(self.render_git_panel(cx), |section, git| section.child(git))
-                        .when(!self.git_panel.open, |section| {
+                        .when_some(self.nodes_panel(cx), |section, nodes| section.child(nodes))
+                        .when(!self.git_panel.open && !self.nodes_open, |section| {
                             section.child(
                                 div()
                                     .id("sidebar-agents-scroll")
@@ -6415,6 +6940,7 @@ impl Workspace {
             })
             .when_some(settings_panel, |element, settings| element.child(settings))
             .when_some(header_menu, |element, menu| element.child(menu))
+            .when_some(project_menu, |element, menu| element.child(menu))
     }
 
     fn sidebar_menu_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -6530,7 +7056,7 @@ impl Workspace {
 
     fn settings_option(
         id: impl Into<gpui::ElementId>,
-        label: &'static str,
+        label: impl Into<SharedString>,
         selected: bool,
     ) -> Stateful<Div> {
         Self::settings_control(id, label, selected, true)
@@ -6538,30 +7064,32 @@ impl Workspace {
 
     fn settings_control(
         id: impl Into<gpui::ElementId>,
-        label: &'static str,
+        label: impl Into<SharedString>,
         selected: bool,
         enabled: bool,
     ) -> Stateful<Div> {
         div()
             .id(id)
-            .h(px(34.0))
+            .h(px(30.0))
             .flex_1()
+            .min_w_0()
+            .px_2()
             .flex()
             .items_center()
             .justify_center()
             .rounded_md()
             .border_1()
-            .border_color(rgb(if selected { 0xcba6f7 } else { 0x45475a }))
+            .border_color(rgb(if selected { 0x89b4fa } else { 0x313244 }))
             .bg(rgb(if selected { 0x313244 } else { 0x181825 }))
-            .text_sm()
-            .text_color(rgb(0xcdd6f4))
+            .text_xs()
+            .text_color(rgb(if selected { 0xcdd6f4 } else { 0xa6adc8 }))
             .when(enabled, |button| {
                 button
                     .cursor_pointer()
                     .hover(|button| button.bg(rgb(0x313244)))
             })
             .when(!enabled, |button| button.cursor_default())
-            .child(label)
+            .child(label.into())
     }
 
     fn settings_shell(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -6630,12 +7158,96 @@ impl Workspace {
     fn settings_category(label: &'static str) -> Div {
         div()
             .mt_2()
-            .pt_3()
-            .border_t_1()
-            .border_color(rgb(0x313244))
+            .px_1()
             .text_sm()
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .child(label)
+    }
+
+    fn settings_group() -> Div {
+        div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x313244))
+            .bg(rgb(0x1e1e2e))
+            .overflow_hidden()
+    }
+
+    fn settings_row() -> Div {
+        div()
+            .flex_none()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .border_b_1()
+            .border_color(rgb(0x313244))
+    }
+
+    fn settings_field(label: &'static str, description: &'static str) -> Div {
+        Self::settings_row()
+            .child(div().text_sm().child(label))
+            .when(!description.is_empty(), |row| {
+                row.child(div().text_xs().text_color(rgb(0x7f849c)).child(description))
+            })
+    }
+
+    fn settings_switch(
+        id: impl Into<gpui::ElementId>,
+        label: &'static str,
+        checked: bool,
+        enabled: bool,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .role(gpui::Role::Switch)
+            .aria_label(label)
+            .aria_toggled(if checked {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+            .w(px(36.0))
+            .h(px(22.0))
+            .flex_none()
+            .p(px(3.0))
+            .flex()
+            .items_center()
+            .rounded_full()
+            .bg(rgb(if checked { 0x89b4fa } else { 0x45475a }))
+            .when(checked, |track| track.justify_end())
+            .when(enabled, |track| track.cursor_pointer())
+            .when(!enabled, |track| track.cursor_default())
+            .child(div().size(px(16.0)).rounded_full().bg(rgb(0xcdd6f4)))
+    }
+
+    fn settings_toggle_row(
+        label: &'static str,
+        description: &'static str,
+        control: impl IntoElement,
+    ) -> Div {
+        Self::settings_row().child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_sm().child(label))
+                        .when(!description.is_empty(), |text| {
+                            text.child(div().text_xs().text_color(rgb(0x7f849c)).child(description))
+                        }),
+                )
+                .child(control),
+        )
     }
 
     fn settings_status(&self, cx: &mut Context<Self>) -> Div {
@@ -6743,6 +7355,10 @@ impl Workspace {
                     Ok(snapshot) => {
                         this.boomux_settings_snapshot = Some(snapshot);
                         this.boomux_settings_message = None;
+                        if this.project_folder_picker_pending {
+                            this.project_folder_picker_pending = false;
+                            this.browse_project_folders(cx);
+                        }
                     }
                     Err(error) => {
                         this.boomux_settings_snapshot = None;
@@ -6857,12 +7473,62 @@ impl Workspace {
             for &index in indices {
                 let field = &boomux_settings::FIELDS[index];
                 let enabled = snapshot.control_enabled(index);
-                let mut row = div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .when(!enabled, |row| row.opacity(0.4))
-                    .child(div().text_xs().text_color(rgb(0x7f849c)).child(field.label));
+                if matches!(field.kind, boomux_settings::Kind::Bool) {
+                    let description = match field.key {
+                        "notifications.enabled" => "Desktop alerts when an Agent needs attention.",
+                        "notifications.blocked" => "An Agent needs your input to continue.",
+                        "notifications.completed" => "An Agent reports that its work is done.",
+                        "notifications.sound.enabled" => "Play a sound with Agent alerts.",
+                        "recovery.resume_agents" => "Resume supported Agents after recovery.",
+                        "recovery.persist_terminal_history" => {
+                            "Keep terminal history across recovery."
+                        }
+                        _ => "",
+                    };
+                    let control = Self::settings_switch(
+                        ("boomux-switch", index),
+                        field.label,
+                        snapshot.control_text(index) == "true",
+                        enabled && !self.boomux_settings_busy,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.boomux_settings_busy {
+                            return;
+                        }
+                        if let Some(snapshot) = &mut this.boomux_settings_snapshot {
+                            if !snapshot.control_enabled(index) {
+                                return;
+                            }
+                            let value = if snapshot.control_text(index) == "true" {
+                                "false"
+                            } else {
+                                "true"
+                            };
+                            this.boomux_settings_message = None;
+                            if let Err(error) = snapshot.set_control(index, value) {
+                                this.boomux_settings_message = Some(error);
+                            } else {
+                                if this
+                                    .boomux_setting_input
+                                    .as_ref()
+                                    .is_some_and(|(field, _)| !snapshot.control_enabled(*field))
+                                {
+                                    this.boomux_setting_input = None;
+                                }
+                                this.save_boomux_settings(cx);
+                            }
+                        }
+                        cx.notify();
+                    }));
+                    rows.push(
+                        Self::settings_toggle_row(field.label, description, control)
+                            .when(!enabled, |row| row.opacity(0.4))
+                            .into_any_element(),
+                    );
+                    continue;
+                }
+                let mut row =
+                    Self::settings_field(field.label, "").when(!enabled, |row| row.opacity(0.4));
                 if self
                     .boomux_setting_input
                     .as_ref()
@@ -6876,8 +7542,11 @@ impl Workspace {
                                 .min_h(px(32.0))
                                 .max_h(px(140.0))
                                 .overflow_hidden()
-                                .bg(rgb(0x313244))
-                                .text_xs()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x89b4fa))
+                                .bg(rgb(0x181825))
+                                .text_sm()
                                 .child(if text.is_empty() {
                                     "Type a value…".into()
                                 } else {
@@ -6947,7 +7616,17 @@ impl Workspace {
                                 }
                             })
                             .unwrap_or_else(|| "Not set".into());
-                        row = row.child(div().text_xs().text_color(rgb(0xa6adc8)).child(preview));
+                        row = row.child(
+                            div()
+                                .p_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x313244))
+                                .bg(rgb(0x181825))
+                                .text_xs()
+                                .text_color(rgb(0xa6adc8))
+                                .child(preview),
+                        );
                     }
                     let mut buttons = div().flex().gap_2();
                     for (option_index, (label, value)) in options.into_iter().enumerate() {
@@ -6999,154 +7678,68 @@ impl Workspace {
     }
 
     fn settings_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        self.settings_open.then(|| {
-            let content = div().flex_none().flex().flex_col().gap_4()
-                .child(Self::settings_control("manual-setup", "Open advanced setup in terminal", false, true)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.close_settings(cx);
-                        this.create_workspace_terminal(terminal::WorkspaceLaunch::Setup, window, cx);
-                    })))
-                .child(Self::settings_category("Layout & workspaces"))
-                .when_some(self.settings_error.clone(), |panel, error| panel.child(
-                    div().text_xs().text_color(rgb(0xf38ba8)).child(format!("Settings could not be saved or loaded: {error}. Check settings.toml and restart."))
-                ))
+        if !self.settings_open {
+            return None;
+        }
+        {
+            let layout = Self::settings_group()
                 .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f849c))
-                                .child("Pane layout"),
-                        )
+                    Self::settings_field("Pane layout", "Choose how open Shells are arranged.")
                         .child(
                             div()
                                 .flex()
-                                .gap_2()
+                                .gap_1()
                                 .child(
-                                    div()
-                                        .id("pane-layout-tiled")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.pane_layout_mode == PaneLayoutMode::Tiled {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(
-                                            if self.pane_layout_mode == PaneLayoutMode::Tiled {
-                                                0x313244
-                                            } else {
-                                                0x181825
-                                            },
-                                        ))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, window, cx| {
+                                    Self::settings_control(
+                                        "pane-layout-tiled",
+                                        "Tree",
+                                        self.pane_layout_mode == PaneLayoutMode::Tiled,
+                                        true,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
                                             this.set_pane_layout_mode(
                                                 PaneLayoutMode::Tiled,
                                                 window,
                                                 cx,
                                             );
-                                        }))
-                                        .child("Tiled"),
+                                        },
+                                    )),
                                 )
                                 .child(
-                                    div()
-                                        .id("pane-layout-tabbed")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.pane_layout_mode == PaneLayoutMode::Tabbed {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(
-                                            if self.pane_layout_mode == PaneLayoutMode::Tabbed {
-                                                0x313244
-                                            } else {
-                                                0x181825
-                                            },
-                                        ))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, window, cx| {
+                                    Self::settings_control(
+                                        "pane-layout-tabbed",
+                                        "Tabs",
+                                        self.pane_layout_mode == PaneLayoutMode::Tabbed,
+                                        true,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
                                             this.set_pane_layout_mode(
                                                 PaneLayoutMode::Tabbed,
                                                 window,
                                                 cx,
                                             );
-                                        }))
-                                        .child("Tabs"),
+                                        },
+                                    )),
                                 ),
-                        )
-                        .child(div().text_xs().text_color(rgb(0x6c7086)).child(
-                            if self.pane_layout_mode == PaneLayoutMode::Tiled {
-                                "Show every open pane in the tiled and floating canvas."
-                            } else {
-                                "Keep windows tiled; minimized Shells become tabs at the top."
-                            },
-                        )),
+                        ),
                 )
                 .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f849c))
-                                .child("Pane scope"),
-                        )
+                    Self::settings_field("Pane scope", "")
                         .child(
                             div()
                                 .flex()
-                                .gap_2()
+                                .gap_1()
                                 .child(
-                                    div()
-                                        .id("pane-scope-workspace")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.workspace_pane_mode
-                                                == WorkspacePaneMode::Workspace
-                                            {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(
-                                            if self.workspace_pane_mode
-                                                == WorkspacePaneMode::Workspace
-                                            {
-                                                0x313244
-                                            } else {
-                                                0x181825
-                                            },
-                                        ))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, window, cx| {
+                                    Self::settings_control(
+                                        "pane-scope-workspace",
+                                        "Workspace",
+                                        self.workspace_pane_mode == WorkspacePaneMode::Workspace,
+                                        true,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
                                             this.workspace_pane_mode = WorkspacePaneMode::Workspace;
                                             let workspace_id = this
                                                 .terminals
@@ -7164,50 +7757,21 @@ impl Workspace {
                                                 cx.notify();
                                             }
                                             this.save_settings();
-                                        }))
-                                        .child("Workspace"),
+                                        },
+                                    )),
                                 )
                                 .child(
-                                    div()
-                                        .id("pane-scope-mixed")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.workspace_pane_mode == WorkspacePaneMode::Mixed
-                                            {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(
-                                            if self.workspace_pane_mode == WorkspacePaneMode::Mixed
-                                            {
-                                                0x313244
-                                            } else {
-                                                0x181825
-                                            },
-                                        ))
-                                        .when(
-                                            pane_layout_supports_scope(
-                                                self.pane_layout_mode,
-                                                WorkspacePaneMode::Mixed,
-                                            ),
-                                            |button| button.cursor_pointer(),
-                                        )
-                                        .text_color(rgb(
-                                            if self.pane_layout_mode == PaneLayoutMode::Tabbed {
-                                                0x6c7086
-                                            } else {
-                                                0xcdd6f4
-                                            },
-                                        ))
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                    Self::settings_control(
+                                        "pane-scope-mixed",
+                                        "Mixed",
+                                        self.workspace_pane_mode == WorkspacePaneMode::Mixed,
+                                        pane_layout_supports_scope(
+                                            self.pane_layout_mode,
+                                            WorkspacePaneMode::Mixed,
+                                        ),
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
                                             if pane_layout_supports_scope(
                                                 this.pane_layout_mode,
                                                 WorkspacePaneMode::Mixed,
@@ -7216,547 +7780,284 @@ impl Workspace {
                                                 this.save_settings();
                                                 cx.notify();
                                             }
-                                        }))
-                                        .child("Mixed"),
+                                        },
+                                    )),
                                 ),
                         )
-                        .child(div().text_xs().text_color(rgb(0x6c7086)).child(
+                        .child(div().text_xs().text_color(rgb(0x7f849c)).child(
                             if self.pane_layout_mode == PaneLayoutMode::Tabbed {
-                                "Tabs is Workspace-only; Mixed is unavailable in this layout."
+                                "Tabs keeps each Workspace separate; Mixed is unavailable."
                             } else if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
-                                "Opening a Workspace replaces the canvas with all of its Shells."
+                                "Opening a Workspace replaces the canvas with its Shells."
                             } else {
-                                "Shells from different Workspaces can share the canvas."
+                                "Shells from different Workspaces share the canvas."
                             },
                         )),
+                );
+            let appearance = Self::settings_group()
+                .child(Self::settings_toggle_row(
+                    "Window headings",
+                    "Show a heading above each pane.",
+                    Self::settings_switch(
+                        "pane-headings",
+                        "Window headings",
+                        self.pane_headings_visible,
+                        true,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.pane_headings_visible = !this.pane_headings_visible;
+                        this.save_settings();
+                        cx.notify();
+                    })),
+                ))
+                .child(
+                    Self::settings_field("Window edges", "").child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                Self::settings_control(
+                                    "pane-edges-rounded",
+                                    "Rounded",
+                                    self.pane_corner_style == PaneCornerStyle::Rounded,
+                                    true,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.pane_corner_style = PaneCornerStyle::Rounded;
+                                        this.save_settings();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                Self::settings_control(
+                                    "pane-edges-square",
+                                    "Square",
+                                    self.pane_corner_style == PaneCornerStyle::Square,
+                                    true,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.pane_corner_style = PaneCornerStyle::Square;
+                                        this.save_settings();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                Self::settings_control(
+                                    "pane-edges-mixed",
+                                    "Mixed",
+                                    self.pane_corner_style == PaneCornerStyle::Mixed,
+                                    true,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.pane_corner_style = PaneCornerStyle::Mixed;
+                                        this.save_settings();
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    ),
                 )
+                .child(
+                    Self::settings_field("Window spacing", "Space between panes.").child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                Self::settings_control("decrease-pane-gap", "−", false, true)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.pane_gap = (this.pane_gap - 2.0).max(0.0);
+                                        this.save_settings();
+                                        cx.notify();
+                                    }))
+                                    .flex_none()
+                                    .w(px(30.0)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(30.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_sm()
+                                    .child(format!("{:.0} px", self.pane_gap)),
+                            )
+                            .child(
+                                Self::settings_control("increase-pane-gap", "+", false, true)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.pane_gap = (this.pane_gap + 2.0).min(32.0);
+                                        this.save_settings();
+                                        cx.notify();
+                                    }))
+                                    .flex_none()
+                                    .w(px(30.0)),
+                            ),
+                    ),
+                )
+                .child(
+                    Self::settings_field("Motion", "Speed of pane transitions.").child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                Self::settings_control(
+                                    "motion-instant",
+                                    "Instant",
+                                    self.motion_speed == MotionSpeed::Instant,
+                                    true,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.motion_speed = MotionSpeed::Instant;
+                                        this.layout_animation = None;
+                                        this.floating_animation = None;
+                                        this.save_settings();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                Self::settings_control(
+                                    "motion-fast",
+                                    "Fast",
+                                    self.motion_speed == MotionSpeed::Fast,
+                                    true,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.motion_speed = MotionSpeed::Fast;
+                                        this.save_settings();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                Self::settings_control(
+                                    "motion-smooth",
+                                    "Smooth",
+                                    self.motion_speed == MotionSpeed::Smooth,
+                                    true,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.motion_speed = MotionSpeed::Smooth;
+                                        this.save_settings();
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    ),
+                )
+                .child(
+                    Self::settings_field(
+                        "Focus highlight",
+                        "Strength of the active pane highlight.",
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                Self::settings_control(
+                                    "decrease-focus-highlight",
+                                    "−",
+                                    false,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.focus_highlight_strength =
+                                        this.focus_highlight_strength.saturating_sub(10);
+                                    this.save_settings();
+                                    cx.notify();
+                                }))
+                                .flex_none()
+                                .w(px(30.0)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(30.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_sm()
+                                    .child(format!("{}%", self.focus_highlight_strength)),
+                            )
+                            .child(
+                                Self::settings_control(
+                                    "increase-focus-highlight",
+                                    "+",
+                                    false,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.focus_highlight_strength =
+                                        this.focus_highlight_strength.saturating_add(10).min(100);
+                                    this.save_settings();
+                                    cx.notify();
+                                }))
+                                .flex_none()
+                                .w(px(30.0)),
+                            ),
+                    ),
+                );
+            let content = div().flex_none().flex().flex_col().gap_2()
+                .when_some(self.settings_error.clone(), |panel, error| panel.child(
+                    div().p_3().rounded_md().bg(rgb(0x1e1e2e)).text_xs().text_color(rgb(0xf38ba8))
+                        .child(format!("Settings could not be saved or loaded: {error}. Check settings.toml and restart."))
+                ))
+                .child(Self::settings_category("Layout & workspaces"))
+                .child(layout)
                 .child(Self::settings_category("Appearance"))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f849c))
-                                .child("Window headings"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("pane-headings-on")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(if self.pane_headings_visible {
-                                            0xcba6f7
-                                        } else {
-                                            0x45475a
-                                        }))
-                                        .bg(rgb(if self.pane_headings_visible {
-                                            0x313244
-                                        } else {
-                                            0x181825
-                                        }))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pane_headings_visible = true;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("On"),
-                                )
-                                .child(
-                                    div()
-                                        .id("pane-headings-off")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(if !self.pane_headings_visible {
-                                            0xcba6f7
-                                        } else {
-                                            0x45475a
-                                        }))
-                                        .bg(rgb(if !self.pane_headings_visible {
-                                            0x313244
-                                        } else {
-                                            0x181825
-                                        }))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pane_headings_visible = false;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("Off"),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f849c))
-                                .child("Window edges"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("pane-edges-rounded")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.pane_corner_style == PaneCornerStyle::Rounded {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(
-                                            if self.pane_corner_style == PaneCornerStyle::Rounded {
-                                                0x313244
-                                            } else {
-                                                0x181825
-                                            },
-                                        ))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pane_corner_style = PaneCornerStyle::Rounded;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("Rounded"),
-                                )
-                                .child(
-                                    div()
-                                        .id("pane-edges-square")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.pane_corner_style == PaneCornerStyle::Square {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(
-                                            if self.pane_corner_style == PaneCornerStyle::Square {
-                                                0x313244
-                                            } else {
-                                                0x181825
-                                            },
-                                        ))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pane_corner_style = PaneCornerStyle::Square;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("Square"),
-                                )
-                                .child(
-                                    div()
-                                        .id("pane-edges-mixed")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.pane_corner_style == PaneCornerStyle::Mixed {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(
-                                            if self.pane_corner_style == PaneCornerStyle::Mixed {
-                                                0x313244
-                                            } else {
-                                                0x181825
-                                            },
-                                        ))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pane_corner_style = PaneCornerStyle::Mixed;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("Mixed"),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f849c))
-                                .child("Window spacing"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("decrease-pane-gap")
-                                        .w(px(44.0))
-                                        .h(px(34.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
-                                        .cursor_pointer()
-                                        .hover(|button| button.bg(rgb(0x313244)))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pane_gap = (this.pane_gap - 2.0).max(0.0);
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("−"),
-                                )
-                                .child(
-                                    div()
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
-                                        .bg(rgb(0x1e1e2e))
-                                        .text_sm()
-                                        .text_color(rgb(0xa6adc8))
-                                        .child(format!("{:.0}px", self.pane_gap)),
-                                )
-                                .child(
-                                    div()
-                                        .id("increase-pane-gap")
-                                        .w(px(44.0))
-                                        .h(px(34.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
-                                        .cursor_pointer()
-                                        .hover(|button| button.bg(rgb(0x313244)))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pane_gap = (this.pane_gap + 2.0).min(32.0);
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("+"),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f849c))
-                                .child("Window motion"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("motion-instant")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.motion_speed == MotionSpeed::Instant {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(if self.motion_speed == MotionSpeed::Instant {
-                                            0x313244
-                                        } else {
-                                            0x181825
-                                        }))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.motion_speed = MotionSpeed::Instant;
-                                            this.layout_animation = None;
-                                            this.floating_animation = None;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("Instant"),
-                                )
-                                .child(
-                                    div()
-                                        .id("motion-fast")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.motion_speed == MotionSpeed::Fast {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(if self.motion_speed == MotionSpeed::Fast {
-                                            0x313244
-                                        } else {
-                                            0x181825
-                                        }))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.motion_speed = MotionSpeed::Fast;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("Fast"),
-                                )
-                                .child(
-                                    div()
-                                        .id("motion-smooth")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(
-                                            if self.motion_speed == MotionSpeed::Smooth {
-                                                0xcba6f7
-                                            } else {
-                                                0x45475a
-                                            },
-                                        ))
-                                        .bg(rgb(if self.motion_speed == MotionSpeed::Smooth {
-                                            0x313244
-                                        } else {
-                                            0x181825
-                                        }))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.motion_speed = MotionSpeed::Smooth;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("Smooth"),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f849c))
-                                .child("Focus highlight"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("decrease-focus-highlight")
-                                        .w(px(44.0))
-                                        .h(px(34.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
-                                        .cursor_pointer()
-                                        .hover(|button| button.bg(rgb(0x313244)))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.focus_highlight_strength =
-                                                this.focus_highlight_strength.saturating_sub(10);
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("−"),
-                                )
-                                .child(
-                                    div()
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
-                                        .bg(rgb(0x1e1e2e))
-                                        .text_sm()
-                                        .text_color(rgb(0xa6adc8))
-                                        .child(format!("{}%", self.focus_highlight_strength)),
-                                )
-                                .child(
-                                    div()
-                                        .id("increase-focus-highlight")
-                                        .w(px(44.0))
-                                        .h(px(34.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
-                                        .cursor_pointer()
-                                        .hover(|button| button.bg(rgb(0x313244)))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.focus_highlight_strength = this
-                                                .focus_highlight_strength
-                                                .saturating_add(10)
-                                                .min(100);
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("+"),
-                                ),
-                        ),
-                )
+                .child(appearance)
                 .child(Self::settings_category("Notifications & sounds"))
-                .children(self.shared_settings_rows(&[0, 1, 2, 3, 4, 5], cx))
+                .child(Self::settings_group().children(self.shared_settings_rows(&[0, 1, 2, 3, 4, 5], cx)))
                 .child(Self::settings_category("Recovery & history"))
-                .children(self.shared_settings_rows(&[6, 7], cx))
+                .child(Self::settings_group().children(self.shared_settings_rows(&[6, 7], cx)))
                 .child(Self::settings_category("Safety"))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f849c))
-                                .child("Confirm removals"),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("removal-confirmation-on")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(if self.confirm_destructive_actions {
-                                            0xcba6f7
-                                        } else {
-                                            0x45475a
-                                        }))
-                                        .bg(rgb(if self.confirm_destructive_actions {
-                                            0x313244
-                                        } else {
-                                            0x181825
-                                        }))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.confirm_destructive_actions = true;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("On"),
-                                )
-                                .child(
-                                    div()
-                                        .id("removal-confirmation-off")
-                                        .h(px(34.0))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(if !self.confirm_destructive_actions {
-                                            0xcba6f7
-                                        } else {
-                                            0x45475a
-                                        }))
-                                        .bg(rgb(if !self.confirm_destructive_actions {
-                                            0x313244
-                                        } else {
-                                            0x181825
-                                        }))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.confirm_destructive_actions = false;
-                                            this.save_settings();
-                                    cx.notify();
-                                        }))
-                                        .child("Off"),
-                                ),
-                        ),
-                )
-                ;
-            let body = div().id("settings-list").flex_1().min_h_0().overflow_y_scroll()
+                .child(Self::settings_group().child(Self::settings_toggle_row("Confirm removals", "Ask before permanently removing a Shell or Workspace.", Self::settings_switch("removal-confirmation", "Confirm removals", self.confirm_destructive_actions, true).on_click(cx.listener(|this, _, _, cx| { this.confirm_destructive_actions = !this.confirm_destructive_actions; this.save_settings(); cx.notify(); })))))
+                .child(Self::settings_category("Projects"))
+                .child(div().text_xs().text_color(rgb(0x9399b2)).child("Scan these folders for projects to open from the + menu. Local Node only; no restart needed."))
+                .child(Self::settings_group()
+                    .child(Self::settings_row().child(Self::settings_control("browse-project-folders", "Browse for folders…", false, !self.boomux_settings_busy && !self.project_folder_picker_open)
+                        .on_click(cx.listener(|this, _, _, cx| this.browse_project_folders(cx)))))
+                    .children(self.shared_settings_rows(&[10, 11], cx)))
+                .child(Self::settings_category("Advanced"))
+                .child(Self::settings_group().child(
+                    Self::settings_field("Core configuration", "Open in your configured editor. Changes are validated before saving.")
+                        .when_some(self.boomux_settings_snapshot.as_ref(), |row, snapshot| row.child(
+                            div().text_xs().text_color(rgb(0x7f849c))
+                                .child(snapshot.path.display().to_string())
+                        ))
+                        .child(Self::settings_control("open-config-file", "Open config file", false, !self.boomux_settings_busy)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.boomux_settings_busy { return; }
+                                this.close_settings(cx);
+                                this.create_workspace_terminal(terminal::WorkspaceLaunch::ConfigEdit, window, cx);
+                            })))
+                ))
+                .child(Self::settings_control("manual-setup", "Open advanced setup in terminal", false, true)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_settings(cx);
+                        this.create_workspace_terminal(terminal::WorkspaceLaunch::Setup, window, cx);
+                    })));
+            let body = div()
+                .id("settings-list")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
                 .child(content.child(div().h(px(16.0)).flex_none()));
-            self.settings_shell("settings", cx).child(body).into_any_element()
-        })
+            Some(
+                self.settings_shell("settings", cx)
+                    .child(body)
+                    .into_any_element(),
+            )
+        }
     }
 
     fn resource_dialog_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -8468,6 +8769,14 @@ impl Workspace {
         handles
     }
 
+    fn shell_has_agent(&self, shell: &ShellChoice) -> bool {
+        self.boomux_overview.agents.iter().any(|agent| {
+            agent.shell_id == shell.id
+                && shell.run_id.as_deref() == Some(agent.run_id.as_str())
+                && !matches!(agent.state, AgentState::Inactive | AgentState::Done)
+        })
+    }
+
     fn pane(&self, id: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         self.pane_with_heading(id, self.pane_headings_visible, cx)
     }
@@ -8487,6 +8796,9 @@ impl Workspace {
             |terminal| terminal.shell_name.clone().into(),
         );
         let accent = rgb(0xa6e3a1);
+        let is_agent = pane
+            .and_then(|pane| pane.shell.as_ref())
+            .is_some_and(|shell| self.shell_has_agent(shell));
         let corners = pane_corner_radii(id, self.pane_corner_style);
         let focused_border = blend_rgb(
             theme::resolve_legacy(0x313244),
@@ -8567,7 +8879,11 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(div().size_2().rounded_full().bg(accent))
+                                .child(if is_agent {
+                                    div().flex_none().text_sm().text_color(accent).child("✦")
+                                } else {
+                                    div().size_2().flex_none().rounded_full().bg(accent)
+                                })
                                 .child(div().min_w_0().overflow_hidden().child(title))
                                 .child(
                                     div()
@@ -8798,7 +9114,7 @@ impl Workspace {
                         div()
                             .min_w_0()
                             .flex_1()
-                            .overflow_hidden()
+                            .truncate()
                             .text_sm()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(shell.name),
@@ -9308,7 +9624,6 @@ impl Render for Workspace {
             })
             .into_any_element();
         let sidebar_menu = self.sidebar_menu_overlay(cx);
-        let nodes_panel = self.nodes_panel(cx);
         let resource_dialog = self.resource_dialog_overlay(cx);
         let settings_restart = self.settings_restart_overlay(cx);
         let help = self.help_overlay(cx);
@@ -9317,7 +9632,7 @@ impl Render for Workspace {
             .id("workspace")
             .track_focus(&self.focus_handle)
             .key_context(
-                if self.nodes_open
+                if (self.nodes_open && self.navigation_region == NavigationRegion::Sidebar)
                     || self.git_panel.search_focused
                     || self.boomux_setting_input.is_some()
                     || self.settings_restart_confirm
@@ -9406,7 +9721,6 @@ impl Render for Workspace {
             .text_color(rgb(0xcdd6f4))
             .child(content)
             .when_some(sidebar_menu, |element, menu| element.child(menu))
-            .when_some(nodes_panel, |element, panel| element.child(panel))
             .when_some(resource_dialog, |element, dialog| element.child(dialog))
             .when_some(settings_restart, |element, dialog| element.child(dialog))
             .when_some(help, |element, help| element.child(help))
@@ -10133,6 +10447,23 @@ mod pointer_tests {
     use boomux::protocol::{AgentState, ShellStatus};
 
     #[test]
+    fn lifted_pane_follows_pointer_beyond_panel_edges_without_resizing() {
+        let start = FloatingPane {
+            id: 7,
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 800.0,
+        };
+        for delta in [(-200.0, -150.0), (300.0, 250.0), (0.0, 0.0)] {
+            let moved = lifted_drag_bounds(start.clone(), delta);
+            assert_eq!((moved.x, moved.y), delta);
+            assert_eq!((moved.width, moved.height), (1000.0, 800.0));
+            assert_eq!(moved.id, start.id);
+        }
+    }
+
+    #[test]
     fn corner_drag_resizes_both_axes_and_preserves_opposite_corner() {
         for (horizontal, vertical, expected) in [
             (Direction::Left, Direction::Up, (130.0, 140.0, 370.0, 260.0)),
@@ -10733,8 +11064,8 @@ mod pointer_tests {
     }
 
     #[test]
-    fn minimized_tabs_are_opt_in_and_hide_shell_rows_from_the_sidebar() {
-        assert_eq!(PaneLayoutMode::default(), PaneLayoutMode::Tiled);
+    fn minimized_tabs_are_default_and_hide_shell_rows_from_the_sidebar() {
+        assert_eq!(PaneLayoutMode::default(), PaneLayoutMode::Tabbed);
         assert!(pane_layout_supports_scope(
             PaneLayoutMode::Tiled,
             WorkspacePaneMode::Mixed
@@ -11106,6 +11437,7 @@ mod pointer_tests {
                 agent_count: 1,
             }],
             agents: vec![AgentChoice {
+                run_id: "run-1".into(),
                 id: "agent-1".into(),
                 shell_name: "lively-dolphin".into(),
                 display_name: "lively-dolphin".into(),

@@ -10,7 +10,7 @@ The prototype uses [GPUI Community Edition](https://gpui-ce.github.io/) and `lib
 
 The layout panes are managed inside one GPUI window, and every pane hosts an independent **real local Boomux shell**. Each pane renders its shell's terminal output in GPUI and sends keyboard input and terminal resize events back through Boomux's attachment protocol. This lets us test the product shape without embedding Wayland client buffers or running a terminal emulator process per tile.
 
-An Omarchy Boomux-inspired sidebar presents the local workspace tree, shell status, and current/attention-bearing agents. When an agent settles from working to idle, its row remains marked **finished** until **Dismiss** is clicked; durable Boomux attention is acknowledged with the exact observation revision. Workspace rows expand and collapse. Clicking a shell or agent focuses its existing tile, or attaches its shell in a new tile when it is not already open. The overview refreshes from Boomux in the background without putting daemon requests on the GPUI render path. Nodes and web controls remain outside this proof of concept.
+An Omarchy Boomux-inspired sidebar presents local and remote workspaces, shell status, and current/attention-bearing agents. When an agent settles from working to idle, its row remains marked **finished** until **Dismiss** is clicked; durable Boomux attention is acknowledged with the exact observation revision. Workspace rows expand and collapse. Clicking a shell or agent focuses its existing tile, or attaches its shell in a new tile when it is not already open. The overview refreshes from Boomux in the background without putting daemon requests on the GPUI render path. Remote machine controls live in the lower sidebar's Remotes tab.
 
 When several visible Agents share a Shell, their rows include distinct Agent ID
 prefixes. They represent separate threads, and clicking either row opens the
@@ -49,14 +49,35 @@ are preserved. See
 [release packaging](../docs/desktop/releases.md) for version selection, install locations,
 release preparation, uninstall instructions, and the required platform smoke tests.
 
-Core installs detected harness integrations in the background when the Boomux
-service starts, including after an update handoff. Unchanged Boomux-managed
+Core prepares all bundled harness integrations in the background when the Boomux
+service starts, including after an update handoff. Installation does not require
+the harness to be visible on the service's PATH. Unchanged Boomux-managed
 integrations are refreshed to the bundled version automatically. Desktop has no
 harness detection, install prompts, or update prompts. User customizations and
 uninstall choices are preserved. Running harnesses may need a restart; Codex
 still requires its own hook trust approval. See [automatic integration management](../docs/install.md#automatic-integration-management).
 
-The header menu contains **Nodes**, updates, and keyboard shortcuts. The gear
+The header menu contains updates and keyboard shortcuts. **Agents | Git | Remotes**
+share the lower sidebar. Remote workspaces use a monitor icon, show their machine's
+connection status, and keep all Shells on that owner. Use **+ → New remote workspace…**
+to choose or connect a machine. Connecting creates its initial workspace and Shell;
+open it from the tree. **Remotes → New remote workspace** creates and opens another
+workspace on the selected machine. Each machine card contains its own sign-in
+and update controls; connecting another machine is a separate action above the
+cards. Closing a workspace does not uninstall the remote machine.
+Machine cards start collapsed, showing only their name and connection status.
+Click a card header to expand or collapse its details; Enter or Space toggles
+the selected machine when the Remotes panel has keyboard focus.
+**Remove machine & uninstall Boomux…** opens a terminal for explicit confirmation:
+it stops all Boomux-managed processes on that machine and removes its executable
+and unchanged integration assets, preserving durable state, configuration, and
+customizations. The connection is forgotten only after confirmed remote removal;
+an unavailable machine cannot be silently removed as if uninstallation succeeded.
+If Boomux was already removed remotely, or the machine is no longer reachable,
+use **Forget connection only…** and confirm. This removes only the local
+registration and cached presentation; it does not contact the machine, uninstall
+software, or stop remote work.
+The gear
 opens Settings. **Settings → Open advanced setup in terminal** remains available
 for the guided terminal checklist: **Up/Down** to choose, **Space** to toggle,
 **Enter** to apply, and **Esc** to cancel. See the
@@ -212,8 +233,9 @@ Settings default to **Workspace** pane scope: opening a Workspace replaces the
 canvas with its remembered non-minimized Shells, while opening a Shell restores
 only that Shell. **Mixed** scope preserves the free-form behavior where Shells
 from different Workspaces can share the canvas. Settings can also hide pane
-headings and switch the pane layout between **Tiled** (the default) and
-**Tabs**. Tabs leaves every open terminal in the tiled and floating canvas.
+headings and switch the pane layout between **Tree** and
+**Tabs** (the default). Existing saved layout preferences are preserved.
+Tabs leaves every open terminal in the tiled and floating canvas.
 When `Ctrl+W` minimizes a pane, its detached Boomux Shell appears in a strip
 across the top; clicking that tab restores the Shell as a pane. Tabs keeps the
 sidebar's Workspace list compact by hiding all nested Shell rows. The strip's

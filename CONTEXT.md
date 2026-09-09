@@ -56,6 +56,25 @@ an ambiguous start is never replayed automatically. Closing a Workspace retains
 its metadata and unresolved membership until every owning Node has confirmed
 the guarded removal of its resources.
 
+## Remote Workspace (Desktop)
+
+A machine-owned Workspace presented in Desktop with a remote-machine icon and
+connection status. It contains only resources owned by that machine. Desktop
+retains both Node identity and owner-local resource identity for every action;
+the display name or SSH alias never establishes ownership. New Shells inherit
+the owner's Workspace directory, not the Desktop machine's environment or cwd.
+
+Remote Workspaces reuse the existing owner-local Workspace representation. They
+do not change the multi-placement coordinator Workspace contract above. Existing
+coordinator membership is neither inferred nor rewritten by Desktop discovery.
+One registered machine can host multiple Remote Workspaces. Removing one does
+not forget the connection, uninstall Boomux, or remove other Workspaces.
+
+The Desktop **Remotes** tab manages machine connections, sign-in, and updates.
+Node remains the protocol and lifecycle-authority term, not the primary Desktop
+navigation label. A disconnected Remote Workspace remains visible from its last
+observation; that observation cannot authorize mutation or establish completion.
+
 ## Workspace Launcher
 
 A durable detached argument-vector command associated with a workspace and invoked on every
