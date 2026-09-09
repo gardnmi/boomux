@@ -1960,32 +1960,18 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !this.update_busy {
                             this.dismissed_desktop_update = version.clone();
+                            this.dismissed_boomux_update = version.clone();
                             this.save_settings();
                             cx.notify();
                         }
                     })))
                 .into_any_element());
         }
-        for (index, notice, dismissed, name) in [
-            (
-                0usize,
-                &self.update_check.desktop,
-                &self.dismissed_desktop_update,
-                "Desktop",
-            ),
-            (
-                1,
-                &self.update_check.boomux,
-                &self.dismissed_boomux_update,
-                "Boomux",
-            ),
-        ] {
-            let Some(notice) = notice.as_ref().filter(|notice| notice.visible(dismissed)) else {
-                continue;
-            };
-            if index == 0 && self.prepared_update.is_some() {
-                continue;
-            }
+        if let Some(notice) = self.update_check.release_notice(
+            &self.dismissed_desktop_update,
+            &self.dismissed_boomux_update,
+        ) && self.prepared_update.is_none()
+        {
             let download_version = notice.latest.clone();
             let version = notice.latest.clone();
             let url = notice.url.clone();
@@ -2003,55 +1989,57 @@ impl Workspace {
                         div()
                             .text_sm()
                             .text_color(rgb(0xcdd6f4))
-                            .child(format!("{name} update available")),
+                            .child("Boomux update available"),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(0xa6adc8))
-                            .child(format!("{} → {}", notice.current, notice.latest)),
+                            .child(self.update_check.version_summary(notice)),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_2()
                             .child(
-                                Self::settings_option(
-                                    ("view-update", index),
-                                    "View release",
-                                    false,
-                                )
-                                .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
+                                Self::settings_option("view-update", "View release", false)
+                                    .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
                             )
-                            .when(index == 0 && self.update_check.installable, |row| {
-                                row.child(
-                                    Self::settings_option(
-                                        "download-update",
-                                        if self.update_busy {
-                                            "Updating…"
-                                        } else {
-                                            "Update"
-                                        },
-                                        true,
+                            .when(
+                                self.update_check.installable
+                                    && self
+                                        .update_check
+                                        .desktop
+                                        .as_ref()
+                                        .is_some_and(|desktop| desktop.latest == notice.latest),
+                                |row| {
+                                    row.child(
+                                        Self::settings_option(
+                                            "download-update",
+                                            if self.update_busy {
+                                                "Updating…"
+                                            } else {
+                                                "Update"
+                                            },
+                                            true,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.download_update(download_version.clone(), cx)
+                                            }),
+                                        ),
                                     )
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.download_update(download_version.clone(), cx)
-                                        },
-                                    )),
-                                )
-                            })
+                                },
+                            )
                             .child(
-                                Self::settings_option(("dismiss-update", index), "Dismiss", false)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if index == 0 {
-                                            this.dismissed_desktop_update = version.clone();
-                                        } else {
-                                            this.dismissed_boomux_update = version.clone();
-                                        }
+                                Self::settings_option("dismiss-update", "Dismiss", false).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.dismissed_desktop_update = version.clone();
+                                        this.dismissed_boomux_update = version.clone();
                                         this.save_settings();
                                         cx.notify();
-                                    })),
+                                    }),
+                                ),
                             ),
                     )
                     .into_any_element(),
