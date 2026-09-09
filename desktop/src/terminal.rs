@@ -620,6 +620,89 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
     discover_overview_and_nodes().0
 }
 
+/// Desktop refresh policy, separate from read-only discovery. Only the owner
+/// can confirm emptiness; the guarded close rejects concurrent Shell creation.
+pub fn refresh_overview_and_nodes() -> (
+    Result<BoomuxOverview, String>,
+    Result<Vec<crate::nodes::NodeView>, String>,
+) {
+    let (mut overview, nodes) = discover_overview_and_nodes();
+    if let Ok(current) = &mut overview {
+        let candidates = current
+            .workspaces
+            .iter()
+            .filter(|workspace| {
+                workspace.shells.is_empty()
+                    && crate::remote::identity(&workspace.id).is_none_or(|id| {
+                        nodes.as_ref().is_ok_and(|nodes| {
+                            nodes
+                                .iter()
+                                .any(|node| node.id == id.node_id && node.connected())
+                        })
+                    })
+            })
+            .take(8)
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            let cleanup = (|| {
+                let client = client::connect_if_running()
+                    .map_err(|error| error.to_string())?
+                    .ok_or("Boomux is not running")?;
+                for id in candidates {
+                    if close_empty_workspace(&client, &id).map_err(|error| error.to_string())? {
+                        current.workspaces.retain(|workspace| workspace.id != id);
+                    }
+                }
+                Ok::<_, String>(())
+            })();
+            if let Err(error) = cleanup {
+                overview = Err(format!("Could not remove empty Workspace: {error}"));
+            }
+        }
+    }
+    (overview, nodes)
+}
+
+fn close_empty_workspace(client: &Client, id: &str) -> Result<bool, client::ClientError> {
+    use boomux::protocol::{RoutedOperation, RoutedOperationResult};
+    let result = (|| {
+        let workspace = crate::remote::workspace(client, id)?;
+        if !workspace.shells.is_empty() {
+            return Ok(false);
+        }
+        if let Some(owner) = crate::remote::identity(id) {
+            match client.route_node_operation(
+                owner.node_id,
+                RoutedOperation::CloseWorkspace {
+                    workspace_id: owner.inner_id,
+                    expected_revision: workspace.revision,
+                },
+            )? {
+                RoutedOperationResult::Ok => Ok(true),
+                _ => Ok(false),
+            }
+        } else {
+            match client.request(Request::GuardedCloseWorkspace {
+                workspace_id: workspace.id,
+                expected_revision: workspace.revision,
+            })? {
+                Response::Ok => Ok(true),
+                _ => Ok(false),
+            }
+        }
+    })();
+    match result {
+        Err(client::ClientError::Remote(error)) if error.code == Some(ErrorCode::NotFound) => {
+            Ok(true)
+        }
+        Err(client::ClientError::Remote(error)) if error.code == Some(ErrorCode::RevisionAhead) => {
+            Ok(false)
+        }
+        result => result,
+    }
+}
+
 fn discover_local_overview() -> Result<BoomuxOverview, String> {
     let Some(client) = client::connect_if_running()
         .map_err(|error| format!("could not connect to Boomux: {error}"))?
@@ -2667,6 +2750,80 @@ mod tests {
         super::reconnect(&client, &shell.id, Some("run"), &profile).unwrap();
         server.join().unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn empty_workspace_cleanup_rechecks_shells_and_rejects_concurrent_changes() {
+        use boomux::protocol::{self, Envelope, ErrorCode, Request, Response};
+        use std::os::unix::net::UnixListener;
+
+        for (has_shell, race) in [(true, false), (false, false), (false, true)] {
+            let directory =
+                std::env::temp_dir().join(format!("desktop-empty-cleanup-{}", fastrand::u64(..)));
+            std::fs::create_dir(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let mut workspace = setup_workspace_creation();
+            if !has_shell {
+                workspace.shells.clear();
+            }
+            workspace.revision = 7;
+            let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let mut exchanges = vec![(
+                    Request::GetWorkspace {
+                        workspace_id: workspace.id.clone(),
+                    },
+                    Response::Workspace { workspace },
+                )];
+                if !has_shell {
+                    exchanges.push((
+                        Request::GuardedCloseWorkspace {
+                            workspace_id: "created-workspace".into(),
+                            expected_revision: 7,
+                        },
+                        if race {
+                            Response::Error {
+                                code: Some(ErrorCode::RevisionAhead),
+                                message: "Shell added after inspection".into(),
+                            }
+                        } else {
+                            Response::Ok
+                        },
+                    ));
+                }
+                for (expected, response) in exchanges {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                    assert_eq!(request.message, expected);
+                    protocol::write_message(
+                        &mut stream,
+                        &Envelope::with_version(request.version, response),
+                    )
+                    .unwrap();
+                }
+                finished_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                listener.set_nonblocking(true).unwrap();
+                assert!(
+                    listener.accept().is_err(),
+                    "never retry an empty-workspace close after a race"
+                );
+            });
+            let result = super::close_empty_workspace(
+                &boomux::client::Client::from_socket_path(socket),
+                "created-workspace",
+            )
+            .unwrap();
+            assert_eq!(result, !has_shell && !race);
+            finished_sender.send(()).unwrap();
+            server.join().unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

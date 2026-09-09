@@ -5036,7 +5036,7 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let result = cx
-                    .background_spawn(async { terminal::discover_overview_and_nodes() })
+                    .background_spawn(async { terminal::refresh_overview_and_nodes() })
                     .await;
                 let mut removed_setup_shells = Vec::new();
                 let mut setup_workspace_cleanups = Vec::new();

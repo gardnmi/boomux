@@ -40,6 +40,13 @@ The launcher starts or reuses the Boomux service automatically.
 
 ## Workspaces And Shells
 
+Desktop automatically removes Workspaces that have no Shells, including empty
+entries left from earlier use. Opening a project again creates a fresh Workspace;
+project shortcuts and files on disk are preserved. Workspace-specific launchers,
+folder defaults, and retained Agent history are removed with the Workspace.
+Exited Shells still count as Shells until explicitly removed. Unavailable remote
+Workspaces remain visible until their owning machine can confirm they are empty.
+
 | To… | Use… |
 | --- | --- |
 | Create a Workspace | **+ → New workspace** |
