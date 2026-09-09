@@ -74,17 +74,20 @@ exact retry command, and exits nonzero.
 
 The Boomux service makes one background integration-maintenance pass when it
 starts, including after a committed update handoff. It installs missing
-integrations for detected, successfully probed harnesses and updates unchanged
+bundled integrations without requiring harness detection and updates unchanged
 Boomux-managed integrations to the version bundled with that binary. Desktop
 does not separately detect harnesses or ask users to install/update integrations.
+Integration files are prepared even for tools not yet installed or absent from
+the service's PATH, including remote machines started through SSH. Maintenance
+does not execute harnesses or interactive shell startup scripts.
 Already-running harnesses may need restarting to load changed files. Codex's
 own hook trust approval is still required; Boomux does not bypass it.
 
 Use `boomux integration uninstall <name>` to opt out, and
 `boomux integration install <name>` to opt back in. Uninstall choices survive
 service restarts and Boomux updates. Removing a previously managed asset by hand
-also leaves it off. `boomux integration sync` runs maintenance immediately after
-installing a new harness, without restarting the service or existing Shells.
+also leaves it off. `boomux integration sync` runs maintenance immediately,
+without restarting the service or existing Shells.
 `integration status` remains read-only. Maintenance failures are logged to the
 service's stderr and can be retried with `integration sync`.
 

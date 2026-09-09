@@ -36,6 +36,78 @@ Measure these independently before combining them:
 
 ## Metrics
 
+### Local Shell startup diagnostic (2026-09-08)
+
+An opt-in native diagnostic separates create, attach, run lookup, first usable
+output, and exact-run reopening without using live user Workspaces:
+
+```console
+cargo test --test native_backend shell_startup_phase_timings --locked -- --ignored --nocapture --test-threads=1
+BOOMUX_TIMING_STATE_ROOT=/absolute/path/on/test/filesystem cargo test --test native_backend shell_startup_phase_timings --locked -- --ignored --nocapture --test-threads=1
+```
+
+The second form creates and removes a uniquely named state directory under the
+specified root; runtime sockets and harness settings remain isolated. On the
+development host, the same debug test binary and three plain `/bin/sh` Shells
+took 75–76 ms from creation through usable output with the default temporary
+state location, versus 1.32–1.48 s with state under the project's Btrfs `target`.
+On Btrfs, creation took 515–753 ms and first attachment 704–803 ms; exact-run
+reopening took 25 ms in both runs. These are backend diagnostic measurements,
+not Desktop end-to-end latency, remote latency, or a before/after speedup claim.
+They identify the two durable commits as a substantial remaining startup cost.
+Do not remove persistence barriers or move durable state to volatile storage as
+a latency workaround.
+
+The diagnostic now alternates the old create/attach path with protocol-54
+create-and-start, three samples each, six sequential 24×80 plain `/bin/sh`
+Shells in one isolated Workspace. An optimized same-binary comparison on this
+host's Btrfs state directory used:
+
+```console
+BOOMUX_TIMING_STATE_ROOT=/home/gardnmi/Projects/boomux/target cargo test --release --test native_backend shell_startup_phase_timings --locked -- --ignored --nocapture --test-threads=1
+```
+
+Old-path usable-output times were 1.631, 1.494, and 1.325 seconds; combined-path
+times were 0.780, 0.479, and 0.697 seconds (median reduction about 53%). First
+attachment after combined creation took 7–25 ms instead of 600–904 ms. Exact-run
+reopening remained about 25 ms. The test took 10.84 seconds including setup and
+cleanup. It includes an extra run lookup on both paths; Desktop uses the returned
+run directly on the combined path. Disk timings vary with filesystem activity.
+These are backend timings, not an end-to-end Desktop or remote benchmark.
+Steady-state CPU, memory, and frame latency were not measured in this diagnostic;
+the change uses the existing process/reader lifecycle and adds no idle polling,
+cache, queue, or per-Shell runtime beyond the existing one.
+
+#### Follow-up: connection wakeups and directory metadata
+
+The daemon now waits for listener readability instead of sleeping 25 ms after
+an empty accept. The idle timeout and maintenance checks remain 25 ms; incoming
+connections wake the same thread immediately. State-directory validation also
+avoids reapplying `0700` when it is already correct, while still checking ownership,
+rejecting symlinks, and repairing incorrect modes on every call.
+
+Using the same optimized diagnostic on the same host, exact-run reopen fell from
+about 25 ms to 0.088–0.129 ms. Combined creation through usable output with disk
+state was 0.603, 0.598, and 0.400 seconds. A fresh pre-change comparison was
+0.401, 0.800, and 0.201 seconds, so disk variability prevents claiming an overall
+creation speedup from this follow-up. With default temporary memory-backed state,
+the new optimized combined path took 1.87–2.04 ms. That measures the backend's
+non-disk floor, not a recommended volatile-state configuration or Desktop latency.
+
+An opt-in 8 KiB storage diagnostic separates writing, file synchronization,
+rename/directory synchronization, and append/data synchronization:
+
+```console
+BOOMUX_TIMING_STATE_ROOT=/absolute/path/on/test/filesystem cargo test --lib persistence_barrier_timings --locked -- --ignored --nocapture --test-threads=1
+```
+
+On this host, buffered writes took under 0.2 ms but individual synchronization
+barriers took up to about 402 ms. Even the synthetic append-only case varied
+from 46 to 402 ms. This is not a production journal implementation or a promise
+that switching formats would eliminate disk waits. The follow-up leaves state
+formats, fsync barriers, event ordering, and recovery guarantees unchanged.
+It adds no worker, queue, or cache; idle CPU and retained memory were not measured.
+
 - RSS and PSS for Boomux Desktop and the Boomux daemon
 - private clean/dirty memory and swap
 - incremental memory per attached idle pane

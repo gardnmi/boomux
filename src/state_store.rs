@@ -1105,7 +1105,9 @@ fn unix_time_ms() -> u64 {
 }
 
 pub(crate) fn state_directory_from_environment() -> io::Result<PathBuf> {
-    let root = match env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
+    let root = match env::var_os("BOOMUX_STATE_HOME")
+        .or_else(|| env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()))
+    {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(
             env::var_os("HOME")
@@ -1135,7 +1137,13 @@ pub(crate) fn secure_state_dir(path: &Path) -> io::Result<()> {
             "boomux state path is not an owned directory",
         ));
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    // Reapplying an unchanged mode still dirties directory metadata. This
+    // helper runs on every durable save; validate every time, but only repair
+    // permissions when needed so the following fsync has no redundant work.
+    if metadata.mode() & 0o7777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn effective_uid() -> u32 {
@@ -1146,6 +1154,90 @@ pub(crate) fn effective_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_state_directory_reuses_safe_permissions_and_repairs_unsafe_modes() {
+        let directory = env::temp_dir().join(format!("boomux-permissions-{}", Uuid::new_v4()));
+        let state = directory.join("state");
+        secure_state_dir(&state).unwrap();
+        let before = fs::symlink_metadata(&state).unwrap();
+        assert_eq!(before.mode() & 0o7777, 0o700);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for _ in 0..8 {
+            secure_state_dir(&state).unwrap();
+        }
+        let after = fs::symlink_metadata(&state).unwrap();
+        assert_eq!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        for mode in [0o755, 0o1700, 0o2700] {
+            fs::set_permissions(&state, fs::Permissions::from_mode(mode)).unwrap();
+            secure_state_dir(&state).unwrap();
+            assert_eq!(fs::symlink_metadata(&state).unwrap().mode() & 0o7777, 0o700);
+        }
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&state, &link).unwrap();
+        assert_eq!(
+            secure_state_dir(&link).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let file = directory.join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        assert!(secure_state_dir(&file).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "explicit disk diagnostic; set BOOMUX_TIMING_STATE_ROOT to the test filesystem"]
+    fn persistence_barrier_timings() {
+        use std::time::Instant;
+        let root = env::var_os("BOOMUX_TIMING_STATE_ROOT").expect("choose a test filesystem");
+        let directory = PathBuf::from(root).join(format!("boomux-barriers-{}", Uuid::new_v4()));
+        secure_state_dir(&directory).unwrap();
+        let mut journal = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .mode(0o600)
+            .open(directory.join("journal"))
+            .unwrap();
+        journal.sync_all().unwrap();
+        File::open(&directory).unwrap().sync_all().unwrap();
+        let payload = vec![b'x'; 8192];
+        for round in 0..3 {
+            for change_mode in [true, false] {
+                let start = Instant::now();
+                if change_mode {
+                    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                let temporary = directory.join("temporary");
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&temporary)
+                    .unwrap();
+                file.write_all(&payload).unwrap();
+                let written = start.elapsed();
+                file.sync_all().unwrap();
+                let synced = start.elapsed();
+                fs::rename(temporary, directory.join("state")).unwrap();
+                File::open(&directory).unwrap().sync_all().unwrap();
+                eprintln!(
+                    "round {round} chmod={change_mode}: write={written:?} file_sync={:?} rename_directory_sync={:?} total={:?}",
+                    synced - written,
+                    start.elapsed() - synced,
+                    start.elapsed()
+                );
+            }
+            let start = Instant::now();
+            journal.write_all(&payload).unwrap();
+            journal.sync_data().unwrap();
+            eprintln!("round {round} append_sync={:?}", start.elapsed());
+        }
+        drop(journal);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn rejects_unsupported_state_versions() {

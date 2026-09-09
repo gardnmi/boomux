@@ -25,6 +25,15 @@ encoding and forwarding them; this keeps Kitty keyboard, modifyOtherKeys,
 cursor, keypad, and backarrow negotiation ordered with terminal output.
 Detaching a pane never implies closing its Boomux Shell.
 
+New terminal creation publishes the attachment before any sidebar overview refresh;
+the existing overview worker refreshes resource rows independently. New local
+Shells in existing Workspaces use protocol-54 `CreateStartedShell` to combine
+creation and first-run persistence, then attach to the returned exact run.
+Older owners fall back to pending creation followed by attachment; remote and
+new-Workspace creation retain their existing paths. Reattachment
+to a running Shell retains the exact run already validated by attach, without a
+second owner lookup. Newly started/restarted Shells still resolve their new run.
+
 GPUI key contexts separate ordinary terminal input from desktop layout actions.
 The default `Terminal` context reserves only explicit lifecycle, clipboard, and
 mode-entry commands; other keys reach the pane encoder. `Ctrl+Space` activates
@@ -117,8 +126,9 @@ Settings replaces the sidebar resource list while open, so scrolling its control
 does not build or lay out the covered Workspace, Shell, and Agent rows. The
 sidebar scroll handle remains window-owned and restores its offset on close.
 
-The default presentation draws the binary tile layout and floating layer. The
-optional tabbed-minimization presentation keeps every open pane in that canvas.
+Both Tree and Tabs draw the binary tile layout and floating layer. The
+default Tabs presentation keeps every open pane in that canvas; saved Tree
+preferences retain their existing behavior.
 `Ctrl+W` still detaches and releases the pane-owned emulator and GPU state, but
 the minimized Shell is represented in a restorable strip above the canvas and
 is represented only by its restore tab. Tabs hides all nested Shell rows from
@@ -126,6 +136,24 @@ the sidebar, leaving Workspace rows as its navigation surface. Restoring a tab
 creates a new pane attachment without changing Boomux's durable Shell identity.
 
 ## Resource Projection
+
+Workspace rows use split-pane icons, semibold names, and distinct header surfaces;
+Shell rows use deeper indentation and regular-weight names. Status indicators
+and activation behavior remain separate from this visual hierarchy.
+
+The sidebar `+` opens a local creation menu with New Workspace first, followed by
+projects discovered through the existing bounded `boomux project list --json`
+flow. One background scan runs per opening, without polling or concurrent scans;
+loading, empty, warning, and error states remain visible. Settings exposes
+`projects.roots` and `projects.max_depth` through the validated core config editor,
+with no daemon restart required. Settings and the menu's Add/Manage project folders
+action open a native directory-only picker through GPUI's desktop portal support.
+Selections append to the effective roots without replacing existing entries;
+duplicates are skipped and cancel is a no-op. The manual editor remains available,
+including when a desktop file-picker portal is unavailable. Selecting a project creates a new local Workspace named after
+the project (adding a numeric suffix on collision), with its default directory
+and initial login Shell set to the revalidated project path. It does not infer
+membership from an existing Workspace's equal name or launch commands from files.
 
 The sidebar is a bounded, read-only Boomux snapshot. Active Agent rows require an
 exact current ShellRun. Historical records appear only through explicit Boomux
@@ -146,7 +174,25 @@ Workspace authority.
 
 ## Remote Node Entry Points
 
-The sidebar overflow menu opens a bounded, scrollable Nodes popover. Once remote
+The lower sidebar has Agents, Git, and Remotes tabs. Remotes contains the scrollable
+machine cards with selected-machine details and create/update/sign-in controls.
+The general connect action sits above the cards, outside any machine's controls;
+it is no longer an overflow-menu popover. Node shortcuts apply only while the
+sidebar has keyboard focus, so the selected tab does not consume terminal input.
+Remote-owned Workspaces appear in the main tree with a monitor icon and machine
+status. Desktop keys encode both owner and resource identity, and are decoded
+only at the RPC boundary; encoded keys are never passed as owner-local IDs.
+Shell creation, attachment, reconnect, rename, close, and attention acknowledgment
+use the registered owner's existing guarded APIs. Cached directories are not
+invented from local paths. Remote creation resolves the owner's starting directory
+and creates the owner-local Workspace and first pending Shell with fresh exact IDs;
+ambiguous mutation failures are surfaced without automatic replay.
+The initial connect flow creates this Workspace after successful registration.
+Open its Shell from the sidebar; creating another Workspace from Remotes also
+attaches its first Shell. Multi-placement coordinator metadata is left unchanged.
+The Remotes tab retains sign-in actions and adds an explicitly confirmed
+remote update action. No background installation or upgrade is performed.
+Once remote
 Nodes are registered, the existing sidebar subtitle shows a compact Node count
 and connection summary. Selection uses stable Node IDs, including when aliases
 or routes happen to match. Details show observed health, last observation,
@@ -157,25 +203,34 @@ The existing window-owned overview worker reads one combined snapshot per
 refresh for both local resources and Node summaries. It falls back to local
 discovery if federation is unavailable. A failed refresh retains prior Node
 summaries but removes their connected presentation. Observation timestamp changes
-do not alone repaint a closed popover. There is no additional SSH worker,
+do not alone repaint an inactive Remotes tab. There is no additional SSH worker,
 registration store, or discovery loop in Desktop. Snapshot and registration
 bounds remain daemon-owned; the client retains only the latest summary per Node.
 
-Add Node and reauthentication open the matching Boomux CLI's existing guided
+Connect, update, uninstall, and reauthentication open the matching Boomux CLI's guided
 flow in a local daemon-owned Shell, using exact argument vectors. Reauthentication
 passes the stable Node ID and leaves route/identity verification to Boomux.
 SSH credentials, browser challenges, host verification, installation consent,
-and protocol compatibility remain owned by that interactive flow. These Shells
-and their Workspaces follow the existing setup-terminal lifecycle and remain
-visible after the command exits until explicitly removed. An Open Boomux
-dashboard action provides access to the existing TUI's Nodes tab.
+and protocol compatibility remain owned by that interactive flow. After the
+result acknowledgment, the exact dedicated command Shell/run is removed with a
+revision guard. Desktop removes its temporary Workspace only with ephemeral
+creation proof, the expected post-removal revision, and no remaining resources.
+Ordinary Shells invoking the CLI are not cleanup targets. Remotes does not launch
+the separate terminal dashboard. Healthy cards omit generic lifecycle guidance;
+unavailable machines retain their observation age and recovery guidance.
+The machine-card remove action uses `node uninstall` with the exact Node ID,
+retaining its interactive consent, identity/revision checks, and confirmed-removal
+registration cleanup. Desktop never substitutes a local forget on failure.
+An independent, inline-confirmed **Forget connection only…** action uses the
+existing local `ForgetNodeRegistration` request with the selected exact Node ID.
+It runs off the UI thread, does not require remote availability, and is never
+presented as successful remote uninstall. Concurrent clicks are suppressed;
+normal overview refresh removes the forgotten registration's cached rows.
 
-This first native entry point does not yet put remote Shells in the Desktop
-canvas. Local Shell/Agent projection and attachment retain their current scope.
-Node-qualified remote pane identities, coordinated Workspace presentation, and
-connection-loss recovery are the next implementation stages. The popover has its
-own input context, closes on Escape or outside click, and blocks terminal input
-while open; releases for keys sent before opening still reach their original pane.
+Remote attachment uses `AttachNode`, preserving the exact owner/run on reconnect
+and leaving environment ownership on that machine. Local attachment continues
+to supply the local ephemeral client environment. This presentation does not
+flatten or adopt existing multi-placement coordinator Workspaces.
 
 ## Dependency Boundary
 
@@ -206,7 +261,15 @@ defaults come from its public library; CLI-only display defaults mirror the
 workspace version and must be reviewed on dependency updates. This is a presentation
 projection, not the running daemon's state. Only edited fields are written.
 The comment-preserving active draft and global fallback are each capped at 1 MiB.
-Text entry is limited to 16 KiB. The UI presents one categorized list with shared control styling.
+Text entry is limited to 16 KiB. The UI presents one categorized list with
+bordered section groups, label/description rows, compact boolean switches,
+segmented choices, and inset editable fields. These are native GPUI-CE controls
+using the existing theme palette, not a GPUI Kit dependency. Advanced terminal
+setup is placed after the everyday settings.
+The Advanced section shows the active core configuration path and opens
+`boomux config edit` in a local terminal using the matching CLI. This preserves
+the core editor's validation and transactional save behavior; it does not edit
+Desktop's separate `boomux-desktop/settings.toml` appearance preferences.
 
 Each completed edit invokes `boomux config edit` with Desktop as its temporary-file editor.
 The helper runs before GPUI initialization, checks the original active-layer

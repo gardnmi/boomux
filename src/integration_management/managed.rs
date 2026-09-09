@@ -331,18 +331,15 @@ fn reconcile_locked(id: IntegrationId, target: &InstallTarget) -> Result<bool, B
     Ok(true)
 }
 
-/// One bounded pass, never a polling loop. No daemon connection or host restart.
+/// Prepare bundled assets regardless of the daemon's PATH. Remote services may
+/// not see tools installed through interactive shell configuration. One bounded
+/// pass, with no host execution, daemon connection, or host restart.
 pub(crate) fn synchronize(environment: &Environment) -> Vec<String> {
     let mut errors = Vec::new();
     for id in IntegrationId::all() {
         let result = (|| -> Result<(), Box<dyn Error>> {
             let target = install_target(id, environment)?;
             validate_existing_directory_chain(&target.directory)?;
-            if load(&target)?.is_none()
-                && inspect_host(id.installation(), environment).state != HostState::Available
-            {
-                return Ok(());
-            }
             reconcile(id, &target)
         })();
         if let Err(error) = result {
@@ -539,10 +536,55 @@ mod tests {
     }
 
     #[test]
-    fn managed_integration_sync_does_not_create_config_for_absent_hosts() {
+    fn managed_integration_sync_preinstalls_assets_without_hosts_on_path() {
         let fixture = Fixture::new();
-        assert!(synchronize(&fixture.environment()).is_empty());
-        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 0);
+        let environment = fixture.environment();
+        assert!(synchronize(&environment).is_empty());
+        for id in IntegrationId::all() {
+            let target = install_target(id, &environment).unwrap();
+            assert!(is_owned(id, &target).unwrap(), "{}", id.spec().key);
+            assert_eq!(
+                inspect_without_host_probe(id, &environment, None)
+                    .asset
+                    .state,
+                AssetState::Current
+            );
+        }
+        // Repeated startup must not overwrite assets or ownership receipts.
+        let id = IntegrationId::OPENCODE;
+        let target = install_target(id, &environment).unwrap();
+        let asset_inode = fs::metadata(&target.path).unwrap().ino();
+        let receipt_inode = fs::metadata(receipt_path(&target)).unwrap().ino();
+        assert!(synchronize(&environment).is_empty());
+        assert_eq!(fs::metadata(&target.path).unwrap().ino(), asset_inode);
+        assert_eq!(
+            fs::metadata(receipt_path(&target)).unwrap().ino(),
+            receipt_inode
+        );
+    }
+
+    #[test]
+    fn managed_integration_sync_preserves_opt_outs_and_customizations_without_hosts() {
+        let fixture = Fixture::new();
+        let environment = fixture.environment();
+        assert!(synchronize(&environment).is_empty());
+        let opted_out = IntegrationId::OPENCODE;
+        uninstall(opted_out, &environment, false).unwrap();
+        let customized = install_target(IntegrationId::PI, &environment).unwrap();
+        fs::write(&customized.path, "// user customization").unwrap();
+        let errors = synchronize(&environment);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("customized integration preserved"));
+        assert!(
+            !install_target(opted_out, &environment)
+                .unwrap()
+                .path
+                .exists()
+        );
+        assert_eq!(
+            fs::read(&customized.path).unwrap(),
+            b"// user customization"
+        );
     }
 
     #[test]

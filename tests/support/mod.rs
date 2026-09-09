@@ -35,6 +35,14 @@ pub(crate) struct TestDaemon {
 }
 
 fn remove_boomux_shim_environment(command: &mut Command) {
+    // Test daemons must never inherit the developer's private daemon routing.
+    for name in [
+        "BOOMUX_RUNTIME_DIR",
+        "BOOMUX_CONFIG_HOME",
+        "BOOMUX_STATE_HOME",
+    ] {
+        command.env_remove(name);
+    }
     let original_path = env::var_os("BOOMUX_ORIGINAL_PATH");
     let shim_dir = env::var_os("BOOMUX_OPENCODE_SHIM_DIR").map(PathBuf::from);
     let user_zdotdir = env::var_os("BOOMUX_USER_ZDOTDIR");

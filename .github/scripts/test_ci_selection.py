@@ -57,6 +57,31 @@ class SelectionTests(unittest.TestCase):
         self.write("docs/architecture.md", "updated")
         self.assertEqual(self.classify(), dict.fromkeys(selection.FULL, False))
 
+    def test_website_has_separate_validation(self):
+        self.write("website/src/pages/index.astro", "page")
+        self.write("website/package-lock.json", "lock")
+        self.write(".github/workflows/website.yml", "workflow")
+        self.write("docs/ci.md", "guidance")
+        self.assertEqual(self.classify(), dict.fromkeys(selection.FULL, False))
+
+    def test_website_cannot_hide_core_changes(self):
+        self.write("website/src/pages/index.astro", "page")
+        self.write("src/lib.rs", "changed")
+        self.assertEqual(self.classify(), selection.FULL)
+
+    def test_website_with_desktop_source_still_checks_desktop(self):
+        self.write("website/src/pages/index.astro", "page")
+        self.write("desktop/src/main.rs", "changed")
+        self.assertEqual(self.classify(), {
+            "run_code": False, "run_desktop": True,
+            "run_package": False, "run_benchmarks": False,
+        })
+
+    def test_moving_packaged_content_to_website_cannot_skip_checks(self):
+        Path("website").mkdir()
+        self.git("mv", "README.md", "website/README.md")
+        self.assertTrue(self.classify()["run_code"])
+
     def test_desktop_source_and_guidance_select_only_desktop(self):
         self.write("desktop/src/terminal.rs", "changed")
         self.write("docs/desktop/architecture.md", "updated")

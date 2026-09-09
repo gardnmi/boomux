@@ -35,6 +35,17 @@ executable. Versioned Desktop bundles instead use:
 boomux daemon restart --executable /absolute/release/path/bin/boomux
 ```
 
+`--refresh-environment` explicitly refreshes daemon-owned services from the
+invoking client's ephemeral environment. The existing
+`RestartWithNotificationConfig.environment` field carries it; it is never
+persisted. The receiver validates the environment and requires the same resolved
+runtime and state directories before beginning handoff. Running Shells and the
+Shared Harness Runtime retain their original processes and environments.
+Without the option, restart preserves the daemon environment. Combined with
+`--executable`, the CLI first completes and verifies executable handoff, then
+requests a second environment-refresh handoff. A second-step failure leaves the
+upgraded daemon running and is reported as a failure, never a destructive stop.
+
 Protocol 52 adds `restart_executable` and `RestartWithExecutable`. The current
 client refuses this mutation on older daemons before requesting a restart. The
 owner daemon requires a canonical absolute path to a regular native ELF binary,

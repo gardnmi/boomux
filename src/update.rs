@@ -273,6 +273,36 @@ pub(crate) fn uninstall_target() -> io::Result<UninstallTarget> {
     })
 }
 
+/// Remote bootstrap may install a pinned development executable. Build flavor
+/// is not ownership: require the same canonical, private user installation and
+/// retain the exact fingerprint for the separately identity-guarded removal.
+pub(crate) fn remote_uninstall_target() -> io::Result<UninstallTarget> {
+    remote_uninstall_target_at(
+        &env::current_exe()?,
+        env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+fn remote_uninstall_target_at(path: &Path, home: Option<&Path>) -> io::Result<UninstallTarget> {
+    let home = home.filter(|home| home.is_absolute()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote uninstall requires an absolute HOME",
+        )
+    })?;
+    if path != home.join(".local/bin/boomux") || unsafe { libc::geteuid() } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote uninstall requires the canonical user-owned ~/.local/bin/boomux installation",
+        ));
+    }
+    validate_install_path(home, path, unsafe { libc::geteuid() })?;
+    Ok(UninstallTarget {
+        path: path.to_owned(),
+        baseline: fingerprint(path)?,
+    })
+}
+
 pub(crate) fn stop_daemon_for_uninstall(
     target: &UninstallTarget,
 ) -> io::Result<client::DaemonLockReservation> {
@@ -1302,6 +1332,36 @@ mod tests {
             classify_installation(&executable, Some(&home), Some("github-release")).0,
             InstallKind::GithubRelease
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn remote_uninstall_accepts_canonical_development_copy_but_preserves_ownership_guards() {
+        let home = temporary_directory();
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("boomux");
+        fs::write(&path, b"development binary").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let target = remote_uninstall_target_at(&path, Some(&home)).unwrap();
+        assert!(matches!(
+            classify_installation(&path, Some(&home), None).0,
+            InstallKind::DevelopmentBuild | InstallKind::SourceBuild
+        ));
+        assert!(remote_uninstall_target_at(&path, None).is_err());
+        assert!(remote_uninstall_target_at(Path::new("/usr/bin/boomux"), Some(&home)).is_err());
+        let other = bin.join("other");
+        fs::hard_link(&path, &other).unwrap();
+        assert!(remote_uninstall_target_at(&path, Some(&home)).is_err());
+        fs::remove_file(&other).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(remote_uninstall_target_at(&path, Some(&home)).is_err());
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert!(revalidate_uninstall_target(&target).is_err());
+        fs::rename(&path, &other).unwrap();
+        std::os::unix::fs::symlink(&other, &path).unwrap();
+        assert!(remote_uninstall_target_at(&path, Some(&home)).is_err());
         fs::remove_dir_all(home).unwrap();
     }
 

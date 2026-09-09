@@ -210,7 +210,7 @@ pub(crate) fn remote_uninstall(
 ) -> Result<(), Box<dyn std::error::Error>> {
     uuid::Uuid::parse_str(expected_node_id)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "expected Node ID is invalid"))?;
-    let target = update::uninstall_target()?;
+    let target = update::remote_uninstall_target()?;
     if target.authorization_token() != expected_executable {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

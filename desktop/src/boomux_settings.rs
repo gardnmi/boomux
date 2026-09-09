@@ -114,6 +114,52 @@ pub struct Snapshot {
     defaults: DocumentMut,
 }
 impl Snapshot {
+    /// Append picker selections without rewriting existing paths or splitting
+    /// legitimate whitespace in directory names through the manual text editor.
+    pub fn add_project_folders(&mut self, paths: &[PathBuf]) -> Result<bool, String> {
+        let mut roots = self
+            .value("projects.roots")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let original_len = roots.len();
+        for path in paths {
+            if !path.is_absolute() {
+                return Err("Select an absolute project folder path".into());
+            }
+            let text = path
+                .to_str()
+                .ok_or("Project folder paths must be valid UTF-8")?;
+            let exists = roots.iter().filter_map(Value::as_str).any(|root| {
+                if root == text {
+                    return true;
+                }
+                let relative = if root == "~" {
+                    Some("")
+                } else {
+                    root.strip_prefix("~/")
+                };
+                relative
+                    .and_then(|relative| {
+                        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(relative))
+                    })
+                    .as_deref()
+                    == Some(path.as_path())
+            });
+            if !exists {
+                roots.push(text);
+            }
+        }
+        if roots.len() == original_len {
+            return Ok(false);
+        }
+        if self.document.get("projects").is_none() {
+            self.document["projects"] = Item::Table(toml_edit::Table::new());
+        }
+        self.document["projects"]["roots"] = Item::Value(Value::Array(roots));
+        Ok(true)
+    }
+
     pub fn notifications_enabled(&self) -> bool {
         self.value("notifications.enabled").and_then(Value::as_bool) == Some(true)
             || self
@@ -327,9 +373,22 @@ impl Drop for Temporary {
 }
 
 // Coreutils timeout owns the entire process group, including our editor helper.
-// Pipe readers retain at most 64 KiB each. All waits happen on a worker thread.
+// Pipe readers retain at most 64 KiB (1 MiB for project discovery).
+// All waits happen on a worker thread.
 fn run(args: &[&str], editor: Option<String>) -> Result<String, String> {
     run_layer(args, editor, false)
+}
+
+pub fn discover_projects() -> Result<boomux::protocol::HostProjectDiscovery, String> {
+    let output = run(&["project", "list", "--json"], None)?;
+    let envelope: serde_json::Value = serde_json::from_str(&output).map_err(|e| e.to_string())?;
+    serde_json::from_value(
+        envelope
+            .get("data")
+            .cloned()
+            .ok_or("Missing project discovery result")?,
+    )
+    .map_err(|e| format!("Invalid project discovery result: {e}"))
 }
 fn run_layer(args: &[&str], editor: Option<String>, global: bool) -> Result<String, String> {
     let mut command = Command::new("timeout");
@@ -358,11 +417,16 @@ fn run_layer(args: &[&str], editor: Option<String>, global: bool) -> Result<Stri
         .map_err(|e| format!("Could not run Boomux: {e}"))?;
     let output = child.stdout.take().ok_or("Missing Boomux output pipe")?;
     let errors = child.stderr.take().ok_or("Missing Boomux error pipe")?;
+    let output_limit = if args == ["project", "list", "--json"] {
+        LIMIT
+    } else {
+        65536
+    };
     let collect = |reader: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut text = String::new();
             reader
-                .take(65536)
+                .take(output_limit)
                 .read_to_string(&mut text)
                 .map(|_| text)
                 .map_err(|e| e.to_string())
@@ -502,6 +566,100 @@ mod tests {
         assert_eq!(snapshot.control_text(0), "true");
         snapshot.set_control(0, "false").unwrap();
         assert!(!snapshot.notifications_enabled());
+    }
+
+    #[test]
+    fn folder_picker_appends_inherited_roots_and_preserves_path_text() {
+        let mut snapshot = Snapshot {
+            path: PathBuf::new(),
+            original: None,
+            document: "# user comment\n[projects]\nmax_depth = 4\n"
+                .parse()
+                .unwrap(),
+            inherited: "[projects]\nroots = ['/existing']\n".parse().unwrap(),
+            defaults: defaults(),
+        };
+        assert!(
+            snapshot
+                .add_project_folders(&[
+                    PathBuf::from("/existing"),
+                    PathBuf::from("/Side projects"),
+                    PathBuf::from("/Side projects"),
+                    PathBuf::from("/ whitespace \nfolder "),
+                ])
+                .unwrap()
+        );
+        let roots = snapshot
+            .value("projects.roots")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            roots.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+            ["/existing", "/Side projects", "/ whitespace \nfolder "]
+        );
+        assert_eq!(snapshot.text(11), "4");
+        assert!(snapshot.document.to_string().contains("# user comment"));
+        assert!(!snapshot.restart_changed());
+    }
+
+    #[test]
+    fn folder_picker_cancel_duplicates_and_invalid_paths_do_not_change_settings() {
+        let mut snapshot = Snapshot {
+            path: PathBuf::new(),
+            original: None,
+            document: "[projects]\nroots = ['/existing']\n".parse().unwrap(),
+            inherited: DocumentMut::new(),
+            defaults: defaults(),
+        };
+        let original = snapshot.document.to_string();
+        assert!(!snapshot.add_project_folders(&[]).unwrap());
+        assert!(
+            !snapshot
+                .add_project_folders(&[PathBuf::from("/existing")])
+                .unwrap()
+        );
+        assert!(
+            snapshot
+                .add_project_folders(&[PathBuf::from("/new"), PathBuf::from("relative")])
+                .is_err()
+        );
+        assert_eq!(snapshot.document.to_string(), original);
+    }
+
+    #[test]
+    fn project_roots_preserve_spaces_and_do_not_require_restart() {
+        let mut snapshot = Snapshot {
+            path: PathBuf::new(),
+            original: None,
+            document: DocumentMut::new(),
+            inherited: DocumentMut::new(),
+            defaults: defaults(),
+        };
+        snapshot
+            .set_control(10, "~/Work\n/home/person/Side projects")
+            .unwrap();
+        let roots = snapshot
+            .value("projects.roots")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(
+            roots.get(1).unwrap().as_str(),
+            Some("/home/person/Side projects")
+        );
+        assert!(!snapshot.restart_changed());
+        snapshot.set_control(10, "").unwrap();
+        assert!(
+            snapshot
+                .value("projects.roots")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!snapshot.restart_changed());
     }
 
     #[test]

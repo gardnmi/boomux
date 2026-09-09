@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -74,6 +74,7 @@ pub struct WorkspaceChoice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentChoice {
     pub id: String,
+    pub run_id: String,
     pub shell_name: String,
     pub display_name: String,
     pub workspace: String,
@@ -411,11 +412,16 @@ impl TerminalSession {
         start_emulator(&shared, rows, cols, pixel_width, pixel_height)?;
         shared.process(attachment.reconstruction);
 
-        let expected_run_id = client
-            .get_shell(&shell.id)
-            .ok()
-            .and_then(|snapshot| snapshot.run.map(|run| run.id))
-            .or(shell.run_id.clone());
+        // An exact-running attach already validated this run on the owner.
+        // Only a newly started/restarted Shell needs its new run fetched.
+        let expected_run_id =
+            if matches!(shell.status, ShellStatus::Running) && shell.run_id.is_some() {
+                shell.run_id.clone()
+            } else {
+                crate::remote::shell(&client, &shell.id)
+                    .ok()
+                    .and_then(|snapshot| snapshot.run.map(|run| run.id))
+            };
         spawn_reader(
             client,
             shell.id.clone(),
@@ -611,6 +617,10 @@ impl Drop for TerminalSession {
 }
 
 pub fn discover_overview() -> Result<BoomuxOverview, String> {
+    discover_overview_and_nodes().0
+}
+
+fn discover_local_overview() -> Result<BoomuxOverview, String> {
     let Some(client) = client::connect_if_running()
         .map_err(|error| format!("could not connect to Boomux: {error}"))?
     else {
@@ -637,17 +647,114 @@ pub fn discover_overview_and_nodes() -> (
     match combined {
         Ok(combined) => {
             let nodes = crate::nodes::project(&combined);
-            let overview = combined
+            let mut overview = combined
                 .nodes
-                .into_iter()
+                .iter()
                 .find(|node| node.local)
-                .and_then(|node| node.local_snapshot)
+                .and_then(|node| node.local_snapshot.clone())
                 .map(overview_from_snapshot)
                 .ok_or_else(|| "Boomux omitted the local Node snapshot".into());
+            if let Ok(overview) = &mut overview {
+                append_remote_workspaces(overview, &combined);
+            }
             (overview, Ok(nodes))
         }
         // Federation availability must not stop local discovery.
-        Err(error) => (discover_overview(), Err(error)),
+        Err(error) => (discover_local_overview(), Err(error)),
+    }
+}
+
+fn append_remote_workspaces(
+    overview: &mut BoomuxOverview,
+    combined: &boomux::protocol::CombinedNodeSnapshot,
+) {
+    for node in combined.nodes.iter().filter(|node| !node.local) {
+        let Some(projection) = &node.remote_projection else {
+            continue;
+        };
+        let shell_index = projection
+            .shells
+            .iter()
+            .map(|s| (s.id.as_str(), s))
+            .collect::<HashMap<_, _>>();
+        let workspace_index = projection
+            .workspaces
+            .iter()
+            .map(|w| (w.id.as_str(), w))
+            .collect::<HashMap<_, _>>();
+        let mut shell_groups = HashMap::<&str, Vec<_>>::new();
+        for shell in &projection.shells {
+            shell_groups
+                .entry(&shell.workspace_id)
+                .or_default()
+                .push(shell);
+        }
+        let mut agent_counts = HashMap::<&str, usize>::new();
+        for agent in &projection.agents {
+            let current = shell_index
+                .get(agent.shell_id.as_str())
+                .is_some_and(|shell| shell.run_id.as_ref() == Some(&agent.run_id));
+            if agent_is_visible(agent.state, agent.attention.is_some(), current) {
+                *agent_counts.entry(&agent.workspace_id).or_default() += 1;
+            }
+        }
+        for workspace in &projection.workspaces {
+            let shells = shell_groups
+                .remove(workspace.id.as_str())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|shell| ShellChoice {
+                    id: crate::remote::key(&node.node_id, &shell.id),
+                    workspace_id: crate::remote::key(&node.node_id, &workspace.id),
+                    name: shell.name.clone(),
+                    cwd: PathBuf::new(),
+                    status: shell.status.clone(),
+                    run_id: shell.run_id.clone(),
+                    desktop_setup: false,
+                })
+                .collect();
+            overview.workspaces.push(WorkspaceChoice {
+                id: crate::remote::key(&node.node_id, &workspace.id),
+                name: workspace.name.clone(),
+                shells,
+                agent_count: agent_counts
+                    .get(workspace.id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            });
+        }
+        for agent in &projection.agents {
+            let current = shell_index
+                .get(agent.shell_id.as_str())
+                .is_some_and(|s| s.run_id.as_ref() == Some(&agent.run_id));
+            if !agent_is_visible(agent.state, agent.attention.is_some(), current) {
+                continue;
+            }
+            overview.agents.push(AgentChoice {
+                id: crate::remote::key(&node.node_id, &agent.id),
+                run_id: agent.run_id.clone(),
+                shell_id: crate::remote::key(&node.node_id, &agent.shell_id),
+                shell_name: shell_index
+                    .get(agent.shell_id.as_str())
+                    .map_or_else(|| agent.name.clone(), |s| s.name.clone()),
+                display_name: agent.name.clone(),
+                workspace: workspace_index
+                    .get(agent.workspace_id.as_str())
+                    .map_or_else(|| node.alias.clone(), |w| w.name.clone()),
+                integration: agent.integration.clone(),
+                state: agent.state,
+                updated_at_ms: agent.observed_at_ms,
+                needs_attention: agent
+                    .attention
+                    .as_ref()
+                    .is_some_and(|a| a.reason == AgentAttentionReason::Blocked),
+                completed_attention: agent
+                    .attention
+                    .as_ref()
+                    .is_some_and(|a| a.reason == AgentAttentionReason::Completed),
+                attention_revision: agent.attention.as_ref().map(|a| a.observation_revision),
+            });
+        }
     }
 }
 
@@ -692,6 +799,7 @@ fn overview_from_snapshot(snapshot: boomux::protocol::Snapshot) -> BoomuxOvervie
                 .is_some_and(|attention| attention.reason == AgentAttentionReason::Blocked);
             AgentChoice {
                 id: agent.id.clone(),
+                run_id: agent.run_id.clone(),
                 shell_name: workspace
                     .shells
                     .iter()
@@ -784,6 +892,18 @@ pub fn acknowledge_agent_attention(
     else {
         return Err("Boomux is not running".into());
     };
+    if let Some(id) = crate::remote::identity(agent_id) {
+        return client
+            .route_node_operation(
+                id.node_id,
+                boomux::protocol::RoutedOperation::AcknowledgeAgentAttention {
+                    agent_id: id.inner_id,
+                    observation_revision,
+                },
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
     client
         .acknowledge_agent_attention(agent_id, observation_revision)
         .map(|_| ())
@@ -803,13 +923,27 @@ fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
         cwd: shell.cwd,
         status: shell.status,
         run_id: shell.run.map(|run| run.id),
-        desktop_setup: shell.command.len() == 2 && shell.command[1] == "__desktop-setup",
+        desktop_setup: match shell.command.get(1).map(String::as_str) {
+            Some("__desktop-setup" | "__guided-node-add") => shell.command.len() == 2,
+            Some(
+                "__guided-node-upgrade"
+                | "__guided-node-reauthenticate"
+                | "__guided-node-uninstall",
+            ) => shell.command.len() == 3,
+            _ => false,
+        },
     }
 }
 
 /// Create a pending shell next to an existing shell. Boomux remains the owner
 /// of the PTY; the caller can immediately attach the returned choice.
-pub fn create_shell(anchor: &ShellChoice) -> Result<ShellChoice, String> {
+pub fn create_shell(
+    anchor: &ShellChoice,
+    size: (u16, u16, u16, u16),
+) -> Result<ShellChoice, String> {
+    if crate::remote::identity(&anchor.workspace_id).is_some() {
+        return create_shell_in_workspace(&anchor.workspace_id, size);
+    }
     let Some(client) = client::connect_if_running()
         .map_err(|error| format!("could not connect to Boomux: {error}"))?
     else {
@@ -822,23 +956,30 @@ pub fn create_shell(anchor: &ShellChoice) -> Result<ShellChoice, String> {
         generated_names::random_excluding(workspace.shells.iter().map(|shell| shell.name.as_str()))
             .ok_or_else(|| "Boomux shell names are exhausted".to_string())?;
     let shell = client
-        .create_shell(
+        .create_started_shell(
             &workspace.id,
             ShellSpec::login(
                 name,
                 workspace.default_cwd.unwrap_or_else(|| anchor.cwd.clone()),
             ),
+            terminal_profile(size.0, size.1, size.2, size.3),
         )
         .map_err(|error| format!("could not create Boomux shell: {error}"))?;
     Ok(shell_choice(shell))
 }
 
-pub fn create_shell_in_workspace(workspace_id: &str) -> Result<ShellChoice, String> {
+pub fn create_shell_in_workspace(
+    workspace_id: &str,
+    size: (u16, u16, u16, u16),
+) -> Result<ShellChoice, String> {
     let Some(client) = client::connect_if_running()
         .map_err(|error| format!("could not connect to Boomux: {error}"))?
     else {
         return Err("Boomux is not running".into());
     };
+    if crate::remote::identity(workspace_id).is_some() {
+        return crate::remote::create_shell(&client, workspace_id).map(shell_choice);
+    }
     let workspace = client
         .get_workspace(workspace_id)
         .map_err(|error| format!("could not read Boomux workspace: {error}"))?;
@@ -851,7 +992,11 @@ pub fn create_shell_in_workspace(workspace_id: &str) -> Result<ShellChoice, Stri
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| "could not determine a working directory for the new shell".to_string())?;
     client
-        .create_shell(&workspace.id, ShellSpec::login(name, cwd))
+        .create_started_shell(
+            &workspace.id,
+            ShellSpec::login(name, cwd),
+            terminal_profile(size.0, size.1, size.2, size.3),
+        )
         .map(shell_choice)
         .map_err(|error| format!("could not create Boomux shell: {error}"))
 }
@@ -860,25 +1005,86 @@ pub fn create_shell_in_workspace(workspace_id: &str) -> Result<ShellChoice, Stri
 #[derive(Clone, Debug)]
 pub enum WorkspaceLaunch {
     Shell,
+    Project {
+        name: String,
+        path: std::path::PathBuf,
+    },
     Setup,
+    ConfigEdit,
     AddNode,
+    RemoteWorkspace {
+        node_id: String,
+        name: String,
+    },
+    UpgradeNode(String),
+    UninstallNode(String),
     ReauthenticateNode(String),
-    Dashboard,
 }
 
 impl WorkspaceLaunch {
-    fn command(&self) -> Option<(&'static str, Vec<String>)> {
-        match self {
-            Self::Shell => None,
-            Self::Setup => Some(("Set up agents", vec!["__desktop-setup".into()])),
-            Self::AddNode => Some(("Add remote Node", vec!["__guided-node-add".into()])),
-            Self::ReauthenticateNode(id) => Some((
-                "Sign in to Node",
-                vec!["__guided-node-reauthenticate".into(), id.clone()],
-            )),
-            Self::Dashboard => Some(("Boomux dashboard", vec![])),
+    fn temporary_setup(&self) -> bool {
+        matches!(
+            self,
+            Self::Setup
+                | Self::AddNode
+                | Self::UpgradeNode(_)
+                | Self::ReauthenticateNode(_)
+                | Self::UninstallNode(_)
+        )
+    }
+    fn working_directory(&self) -> Result<std::path::PathBuf, String> {
+        if let Self::Project { path, .. } = self {
+            let path = path
+                .canonicalize()
+                .map_err(|error| format!("Project folder is unavailable: {error}"))?;
+            if !path.is_dir() {
+                return Err("Project path is no longer a directory".into());
+            }
+            Ok(path)
+        } else {
+            std::env::current_dir().map_err(|error| {
+                format!("could not determine the new workspace directory: {error}")
+            })
         }
     }
+
+    fn command(&self) -> Option<(&'static str, Vec<String>)> {
+        match self {
+            Self::Shell | Self::Project { .. } | Self::RemoteWorkspace { .. } => None,
+            Self::Setup => Some(("Set up agents", vec!["__desktop-setup".into()])),
+            Self::ConfigEdit => Some(("Edit Boomux config", vec!["config".into(), "edit".into()])),
+            Self::AddNode => Some(("Connect remote machine", vec!["__guided-node-add".into()])),
+            Self::UpgradeNode(id) => Some((
+                "Update remote Boomux",
+                vec!["__guided-node-upgrade".into(), id.clone()],
+            )),
+            Self::UninstallNode(id) => Some((
+                "Remove remote machine",
+                vec!["__guided-node-uninstall".into(), id.clone()],
+            )),
+            Self::ReauthenticateNode(id) => Some((
+                "Sign in to remote machine",
+                vec!["__guided-node-reauthenticate".into(), id.clone()],
+            )),
+        }
+    }
+}
+
+pub(crate) fn project_workspace_name<'a>(
+    name: &str,
+    existing: impl Iterator<Item = &'a str>,
+) -> String {
+    let existing: std::collections::HashSet<_> = existing.collect();
+    if !existing.contains(name) {
+        return name.to_owned();
+    }
+    for suffix in 2..=existing.len() + 2 {
+        let candidate = format!("{name}-{suffix}");
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 /// Create a local Workspace and its first pending Shell; Boomux owns both.
@@ -890,25 +1096,38 @@ pub fn create_workspace_with_shell(
     else {
         return Err("Boomux is not running".into());
     };
-    let setup_node = if matches!(launch, WorkspaceLaunch::Setup) {
+    let setup_node = if launch.temporary_setup() {
         Some(client.node_identity().map_err(|error| error.to_string())?)
     } else {
         None
     };
+    if let WorkspaceLaunch::RemoteWorkspace { node_id, name } = &launch {
+        return crate::remote::create_workspace(&client, node_id, name)
+            .map(|shell| (shell_choice(shell), None));
+    }
     let snapshot = client
         .snapshot()
         .map_err(|error| format!("could not read Boomux workspaces: {error}"))?;
-    let workspace_name = generated_names::random_excluding(
-        snapshot
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.name.as_str()),
-    )
-    .ok_or_else(|| "Boomux workspace names are exhausted".to_string())?;
+    let workspace_name = if let WorkspaceLaunch::Project { name, .. } = &launch {
+        project_workspace_name(
+            name,
+            snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.name.as_str()),
+        )
+    } else {
+        generated_names::random_excluding(
+            snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.name.as_str()),
+        )
+        .ok_or_else(|| "Boomux workspace names are exhausted".to_string())?
+    };
     let shell_name = generated_names::random_excluding(std::iter::empty())
         .ok_or_else(|| "Boomux shell names are exhausted".to_string())?;
-    let cwd = std::env::current_dir()
-        .map_err(|error| format!("could not determine the new workspace directory: {error}"))?;
+    let cwd = launch.working_directory()?;
     let mut spec = ShellSpec::login(shell_name, cwd.clone());
     if let Some((label, arguments)) = launch.command() {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
@@ -960,11 +1179,14 @@ impl SetupWorkspaceCleanup {
         node_id: String,
         workspace: &WorkspaceSnapshot,
     ) -> Option<Self> {
-        if !matches!(launch, WorkspaceLaunch::Setup)
+        if !launch.temporary_setup()
             || workspace.shells.len() != 1
             || !workspace.launchers.is_empty()
             || !workspace.agents.is_empty()
         {
+            return None;
+        }
+        if launch.command()?.1 != workspace.shells[0].command.get(1..)? {
             return None;
         }
         Some(Self {
@@ -1027,6 +1249,9 @@ pub fn rename_workspace(workspace_id: &str, name: &str) -> Result<(), String> {
     else {
         return Err("Boomux is not running".into());
     };
+    if crate::remote::identity(workspace_id).is_some() {
+        return crate::remote::rename(&client, workspace_id, name, true);
+    }
     client
         .rename_workspace(workspace_id, name)
         .map_err(|error| format!("could not rename Boomux workspace: {error}"))
@@ -1038,6 +1263,9 @@ pub fn rename_shell(shell_id: &str, name: &str) -> Result<(), String> {
     else {
         return Err("Boomux is not running".into());
     };
+    if crate::remote::identity(shell_id).is_some() {
+        return crate::remote::rename(&client, shell_id, name, false);
+    }
     client
         .rename_shell(shell_id, name)
         .map_err(|error| format!("could not rename Boomux shell: {error}"))
@@ -1049,6 +1277,9 @@ pub fn remove_workspace(workspace_id: &str) -> Result<(), String> {
     else {
         return Err("Boomux is not running".into());
     };
+    if crate::remote::identity(workspace_id).is_some() {
+        return crate::remote::close(&client, workspace_id, true);
+    }
     client
         .close_workspace(workspace_id)
         .map_err(|error| format!("could not remove Boomux workspace: {error}"))
@@ -1060,6 +1291,9 @@ pub fn close_shell(shell_id: &str) -> Result<(), String> {
     else {
         return Err("Boomux is not running".into());
     };
+    if crate::remote::identity(shell_id).is_some() {
+        return crate::remote::close(&client, shell_id, false);
+    }
     client
         .close_shell(shell_id)
         .map_err(|error| format!("could not close Boomux shell: {error}"))
@@ -1084,6 +1318,17 @@ fn attach_shell(
     profile: TerminalProfile,
     takeover: bool,
 ) -> Result<client::Attachment, String> {
+    if let Some(identity) = crate::remote::identity(&shell.id) {
+        return client
+            .attach_node(
+                identity,
+                takeover,
+                matches!(shell.status, ShellStatus::Exited { .. }),
+                shell.run_id.clone(),
+                profile,
+            )
+            .map_err(|error| format!("could not attach {}: {error}", shell.name));
+    }
     let result = match (&shell.status, shell.run_id.as_deref()) {
         (ShellStatus::Running, Some(run_id)) => {
             client.attach_exact_run_with_client_environment(&shell.id, run_id, takeover, profile)
@@ -1864,7 +2109,15 @@ fn reconnect(
 ) -> Result<client::Attachment, String> {
     let mut last_error = None;
     for _ in 0..RECONNECT_ATTEMPTS {
-        let result = if let Some(run_id) = expected_run_id {
+        let result = if let Some(identity) = crate::remote::identity(shell_id) {
+            client.attach_node(
+                identity,
+                false,
+                false,
+                expected_run_id.map(str::to_owned),
+                profile.clone(),
+            )
+        } else if let Some(run_id) = expected_run_id {
             client.attach_exact_run(shell_id, run_id, false, profile.clone())
         } else {
             client.attach(shell_id, false, profile.clone())
@@ -2301,6 +2554,122 @@ mod tests {
     }
 
     #[test]
+    fn remote_setup_cleanup_owns_only_the_created_temporary_workspace() {
+        for launch in [
+            super::WorkspaceLaunch::AddNode,
+            super::WorkspaceLaunch::UpgradeNode("remote".into()),
+            super::WorkspaceLaunch::UninstallNode("remote".into()),
+            super::WorkspaceLaunch::ReauthenticateNode("remote".into()),
+        ] {
+            let mut created = setup_workspace_creation();
+            created.shells[0].command = vec!["/build/boomux".into()];
+            created.shells[0]
+                .command
+                .extend(launch.command().unwrap().1);
+            assert!(super::shell_choice(created.shells[0].clone()).desktop_setup);
+            let cleanup = super::SetupWorkspaceCleanup::from_creation(
+                &launch,
+                "local-owner".into(),
+                &created,
+            )
+            .unwrap();
+            assert!(cleanup.close_request("local-owner", &created).is_none());
+            created.shells.clear();
+            created.revision += 1;
+            assert!(cleanup.close_request("local-owner", &created).is_some());
+            assert!(cleanup.close_request("remote", &created).is_none());
+            created.revision += 1;
+            assert!(cleanup.close_request("local-owner", &created).is_none());
+        }
+    }
+
+    #[test]
+    fn remote_projection_keeps_owner_identity_and_cached_shells() {
+        let nodes = ["first", "second"].map(|owner| serde_json::json!({
+            "node_id": owner, "alias": "same-machine-label", "local": false,
+            "health": "unreachable", "current": false, "stale": true, "observed_at_ms": 1,
+            "remote_projection": {"node_id": owner,
+                "workspaces": [{"id": "same-workspace", "name": "work", "item_count": 1, "attention_count": 0}],
+                "shells": [{"id": "same-shell", "workspace_id": "same-workspace", "name": "shell", "status": "running", "run_id": "run"}],
+                "agents": [], "launchers": []}
+        }));
+        let combined = serde_json::from_value(serde_json::json!({"nodes": nodes})).unwrap();
+        let mut overview = super::BoomuxOverview::default();
+        super::append_remote_workspaces(&mut overview, &combined);
+        assert_eq!(overview.workspaces.len(), 2);
+        let first = &overview.workspaces[0];
+        let second = &overview.workspaces[1];
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.shells[0].id, second.shells[0].id);
+        assert_eq!(first.shells[0].workspace_id, first.id);
+        assert_eq!(
+            first.shells[0].status,
+            boomux::protocol::ShellStatus::Running
+        );
+        assert!(first.shells[0].cwd.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn remote_attachment_and_reconnect_keep_exact_owner_and_run() {
+        use boomux::protocol::{self, Envelope, Request, Response};
+        use std::os::unix::net::UnixListener;
+        let directory =
+            std::env::temp_dir().join(format!("remote-attach-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for takeover in [true, false] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                let Request::AttachNode {
+                    identity,
+                    takeover: actual,
+                    restart_exited,
+                    expected_run_id,
+                    ..
+                } = request.message
+                else {
+                    panic!("must not attach locally")
+                };
+                assert_eq!(identity.node_id, "owner");
+                assert_eq!(identity.inner_id, "shell");
+                assert_eq!(actual, takeover);
+                assert!(!restart_exited);
+                assert_eq!(expected_run_id.as_deref(), Some("run"));
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::with_version(
+                        protocol::PROTOCOL_VERSION,
+                        Response::Attached {
+                            token: "token".into(),
+                            reconstruction: vec![],
+                            warning: None,
+                            profile: None,
+                        },
+                    ),
+                )
+                .unwrap();
+            }
+        });
+        let client = boomux::client::Client::from_socket_path(socket);
+        let shell = super::ShellChoice {
+            id: crate::remote::key("owner", "shell"),
+            workspace_id: crate::remote::key("owner", "workspace"),
+            name: "shell".into(),
+            cwd: std::path::PathBuf::new(),
+            status: boomux::protocol::ShellStatus::Running,
+            run_id: Some("run".into()),
+            desktop_setup: false,
+        };
+        let profile = terminal_profile(24, 80, 800, 480);
+        super::attach_shell(&client, &shell, profile.clone(), true).unwrap();
+        super::reconnect(&client, &shell.id, Some("run"), &profile).unwrap();
+        server.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn setup_workspace_cleanup_requires_creation_identity_and_only_its_shell_removal() {
         let created = setup_workspace_creation();
         let cleanup = super::SetupWorkspaceCleanup::from_creation(
@@ -2311,7 +2680,7 @@ mod tests {
         .unwrap();
         for launch in [
             super::WorkspaceLaunch::Shell,
-            super::WorkspaceLaunch::Dashboard,
+            super::WorkspaceLaunch::ConfigEdit,
             super::WorkspaceLaunch::AddNode,
         ] {
             assert!(
@@ -2483,6 +2852,42 @@ mod tests {
     }
 
     #[test]
+    fn project_launch_uses_the_selected_directory_without_a_command() {
+        let path = std::env::temp_dir();
+        let launch = super::WorkspaceLaunch::Project {
+            name: "project with spaces".into(),
+            path: path.clone(),
+        };
+        assert_eq!(
+            launch.working_directory().unwrap(),
+            path.canonicalize().unwrap()
+        );
+        assert!(launch.command().is_none());
+        let missing = super::WorkspaceLaunch::Project {
+            name: "missing".into(),
+            path: path.join(format!("boomux-missing-project-{}", fastrand::u64(..))),
+        };
+        assert!(missing.working_directory().is_err());
+        let file = super::WorkspaceLaunch::Project {
+            name: "not a directory".into(),
+            path: std::env::current_exe().unwrap(),
+        };
+        assert!(file.working_directory().is_err());
+    }
+
+    #[test]
+    fn project_workspace_names_do_not_reuse_existing_workspaces() {
+        assert_eq!(
+            super::project_workspace_name("api", ["other"].into_iter()),
+            "api"
+        );
+        assert_eq!(
+            super::project_workspace_name("api", ["api", "api-2", "api-4"].into_iter()),
+            "api-3"
+        );
+    }
+
+    #[test]
     fn node_launches_preserve_exact_arguments_and_do_not_request_upgrades() {
         use super::WorkspaceLaunch;
         assert!(WorkspaceLaunch::Shell.command().is_none());
@@ -2490,14 +2895,28 @@ mod tests {
             WorkspaceLaunch::AddNode.command().unwrap().1,
             ["__guided-node-add"]
         );
-        assert!(WorkspaceLaunch::Dashboard.command().unwrap().1.is_empty());
         let id = "node with spaces; $(touch should-not-exist)";
+        assert_eq!(
+            WorkspaceLaunch::UninstallNode(id.into())
+                .command()
+                .unwrap()
+                .1,
+            ["__guided-node-uninstall", id]
+        );
         assert_eq!(
             WorkspaceLaunch::ReauthenticateNode(id.into())
                 .command()
                 .unwrap()
                 .1,
             ["__guided-node-reauthenticate", id]
+        );
+    }
+
+    #[test]
+    fn config_editor_launch_uses_the_validated_cli_flow() {
+        assert_eq!(
+            super::WorkspaceLaunch::ConfigEdit.command().unwrap(),
+            ("Edit Boomux config", vec!["config".into(), "edit".into()])
         );
     }
 
@@ -2539,6 +2958,7 @@ mod tests {
     #[test]
     fn shared_shell_agents_keep_distinct_labels_and_lifecycle_observations() {
         let original = AgentChoice {
+            run_id: "run-1".into(),
             id: "12345678-original".into(),
             shell_name: "fair-koala".into(),
             display_name: String::new(),
@@ -3011,6 +3431,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(&lines[..3], ["abcde", "fghij", "klmno"]);
         assert!(lines[3].starts_with('p'));
+    }
+
+    #[test]
+    fn ghostty_resize_redraw_does_not_insert_blank_history() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(6, 80, 800, 120)));
+        let mut core = EmulatorCore::new(&shared, 6, 80, 800, 120).unwrap();
+        for cols in [80, 40, 120, 60, 80] {
+            core.apply(EmulatorCommand::Resize {
+                rows: 6,
+                cols,
+                cell_width: 10,
+                cell_height: 20,
+            })
+            .unwrap();
+            // Kiro's width-change redraw clears scrollback and the screen,
+            // then writes the complete frame inside synchronized output.
+            let frame = format!(
+                "\x1b[?2026h\x1b[3J\x1b[2J\x1b[H{}\x1b[?2026l",
+                (0..30)
+                    .map(|line| format!("row-{line:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\r\n")
+            );
+            // PTY reads need not align with escape sequences or lines.
+            for chunk in frame.as_bytes().chunks(7) {
+                core.apply(EmulatorCommand::Output(chunk.to_vec())).unwrap();
+            }
+            for first in [0, 6, 12, 18, 24] {
+                core.apply(EmulatorCommand::Scroll(
+                    libghostty_vt::terminal::ScrollViewport::Row(first),
+                ))
+                .unwrap();
+                let screen = core.screen().unwrap();
+                assert_eq!(screen.scroll_total, 30, "width {cols}");
+                for (offset, row) in screen.cells.chunks(usize::from(cols)).enumerate() {
+                    let text = row
+                        .iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>();
+                    assert_eq!(text.trim_end(), format!("row-{:02}", first + offset));
+                }
+            }
+        }
     }
 
     #[test]

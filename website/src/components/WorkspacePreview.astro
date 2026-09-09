@@ -1,0 +1,21 @@
+---
+const projects = ['website', 'api-server', 'design-system'];
+---
+<figure class="product-preview">
+  <div class="preview-top"><span><span class="live-dot"></span> YOUR WORK, IN ONE PLACE</span><span>LOCAL NODE <span class="subtle">/</span> CONNECTED</span></div>
+  <div class="preview-app" aria-label="Illustration of a Boomux workspace with terminals and Agent status">
+    <aside class="preview-sidebar">
+      <div class="preview-brand"><span class="mini-logo">&gt;_</span> BOOMUX</div>
+      <p class="micro">WORKSPACES</p>
+      {projects.map((name, index) => <div class:list={['project-row', { current: index === 0 }]}><span class="project-name">{index === 0 ? '⌄' : '›'} &nbsp; {name}</span><small>{index === 0 ? '3 Shells · 1 Agent' : '1 Shell'}</small></div>)}
+      <div class="preview-agents"><p class="micro">AGENTS</p><div class="agent-line"><span class="live-dot"></span><div>mellow-raven<small>Working · Codex</small></div></div></div>
+      <div class="preview-bottom"><span class="live-dot"></span> Processes stay with Boomux.</div>
+    </aside>
+    <div class="preview-terminals">
+      <section class="sample-terminal agent-terminal"><div class="terminal-title"><span><span class="live-dot"></span> mellow-raven</span><span>CODEx / AGENT</span></div><div class="terminal-content"><p class="terminal-path">~/work/website <span>main</span></p><p><span class="prompt">❯</span> codex</p><p class="agent-prompt">Add keyboard navigation to the settings menu.</p><p class="output"><span class="accent">›</span> Reviewing the existing focus behavior.</p><p class="output"><span class="accent">›</span> Updating the settings controls.</p><div class="code-diff"><span>+ Arrow keys move between options</span><span>+ Escape returns focus to the terminal</span><span>+ Tests cover keyboard interaction</span></div><p class="working"><span class="live-dot"></span> Working <span class="subtle">· your other terminals are ready</span></p></div></section>
+      <section class="sample-terminal git-terminal"><div class="terminal-title"><span>silver-raven</span><span>SHELL</span></div><div class="terminal-content"><p class="terminal-path">~/work/website <span>main</span></p><p><span class="prompt">❯</span> git status --short</p><p class="file-change">M &nbsp; src/settings.rs</p><p class="file-change">M &nbsp; tests/keyboard.rs</p><p class="terminal-command"><span class="prompt">❯</span> <span class="cursor-block"></span></p></div></section>
+      <section class="sample-terminal test-terminal"><div class="terminal-title"><span>golden-beaver</span><span>SHELL</span></div><div class="terminal-content"><p><span class="prompt">❯</span> cargo test keyboard</p><p class="output">running 3 tests</p><p class="test-output">test focus_next … <span>ok</span><br/>test focus_previous … <span>ok</span><br/>test escape_restores_focus … <span>ok</span></p><p class="success">3 passed. 0 failed.</p></div></section>
+    </div>
+  </div>
+  <figcaption><span>Illustrative workspace · not a live session</span><span><kbd>Ctrl</kbd> + <kbd>Space</kbd> <span class="caption-hint">to enter layout mode</span></span></figcaption>
+</figure>

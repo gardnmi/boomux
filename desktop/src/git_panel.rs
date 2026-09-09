@@ -72,7 +72,7 @@ fn fetch(previous: Vec<NodeOverview>, refresh: bool) -> Vec<NodeOverview> {
                     Duration::from_secs(2),
                 )
             } else {
-                item.error = Some("Node unavailable; last Git observation retained".into());
+                item.error = Some("Machine unavailable; last Git observation retained".into());
                 nodes.push(item);
                 continue;
             };
@@ -87,8 +87,8 @@ fn fetch(previous: Vec<NodeOverview>, refresh: bool) -> Vec<NodeOverview> {
         }
         if snapshot.nodes.len() > 16 {
             nodes.push(NodeOverview {
-                label: "More Nodes".into(),
-                error: Some("Showing the first 16 Nodes".into()),
+                label: "More machines".into(),
+                error: Some("Showing the first 16 machines".into()),
                 ..Default::default()
             });
         }
@@ -98,7 +98,8 @@ fn fetch(previous: Vec<NodeOverview>, refresh: bool) -> Vec<NodeOverview> {
         let mut previous = previous;
         if previous.is_empty() {
             previous.push(NodeOverview {
-                label: "Local Node".into(),
+                label: "This machine".into(),
+                local: true,
                 ..Default::default()
             });
         }
@@ -254,6 +255,7 @@ impl Workspace {
     }
 
     pub(crate) fn select_git_tab(&mut self, git: bool, cx: &mut Context<Self>) {
+        self.nodes_open = false;
         if self.git_panel.open == git {
             self.save_settings();
             cx.notify();
@@ -406,9 +408,9 @@ impl Workspace {
                         .text_xs()
                         .text_color(rgb(0xa6adc8))
                         .child(if node.local {
-                            "Node · This machine".into()
+                            "This machine".into()
                         } else {
-                            format!("Node · {}", node.label)
+                            format!("Remote · {}", node.label)
                         })
                         .into_any_element(),
                 );

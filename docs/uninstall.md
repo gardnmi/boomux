@@ -37,6 +37,16 @@ Package-managed, root-owned, source, development, custom, symlinked, multiply
 linked, changed, and otherwise unprovable executables are refused. Package
 installations must be removed with their owning package manager.
 
+Registered remote uninstall also accepts source/development copies at that exact
+canonical user-owned path, because remote bootstrap can install the pinned current
+binary. Build distribution is not used as remote ownership evidence. The private
+fingerprint probe and removal share this check; owner-controlled directories,
+regular single-link executable, pinned Node identity, explicit confirmation, and
+unchanged executable fingerprint remain required. No installer provenance receipt
+is assumed. Local self-update and self-uninstall remain official-release-only.
+Older remote helpers with the release-only check must be updated before removing
+a development copy; the coordinator does not bypass their refusal.
+
 Unchanged bundled integration assets and the unchanged Boomux Agent Skill are
 removed. Modified or uninspectable assets are preserved and reported; uninstall
 never uses integration force-removal implicitly. Host configuration and session
