@@ -522,22 +522,9 @@ fn remove_directory_contents(directory: &OwnedFd, count: &mut usize) -> io::Resu
 }
 
 fn renameat_noreplace(parent: i32, from: &str, to: &str) -> io::Result<()> {
-    let from = std::ffi::CString::new(from).unwrap();
-    let to = std::ffi::CString::new(to).unwrap();
-    if unsafe {
-        libc::renameat2(
-            parent,
-            from.as_ptr(),
-            parent,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    let from = std::ffi::CString::new(from).map_err(io::Error::other)?;
+    let to = std::ffi::CString::new(to).map_err(io::Error::other)?;
+    boomux::platform::rename_noreplace(parent, &from, parent, &to)
 }
 
 fn unlinkat(parent: i32, name: &str, flags: i32) -> io::Result<()> {

@@ -29,6 +29,8 @@ mod local_shell_journal;
 mod node_identity;
 mod node_projection;
 mod node_registration;
+#[doc(hidden)]
+pub mod platform;
 pub mod protocol;
 mod session_projection;
 pub mod ssh_bootstrap;

@@ -15,13 +15,7 @@ pub(crate) fn send_descriptor(
     let descriptors = [descriptor.as_raw_fd()];
     let control = [ControlMessage::ScmRights(&descriptors)];
     loop {
-        match sendmsg::<()>(
-            stream.as_raw_fd(),
-            &data,
-            &control,
-            MsgFlags::MSG_NOSIGNAL,
-            None,
-        ) {
+        match sendmsg::<()>(stream.as_raw_fd(), &data, &control, send_flags(), None) {
             Ok(1) => return Ok(()),
             Ok(count) => {
                 return Err(io::Error::new(
@@ -44,7 +38,7 @@ pub(crate) fn receive_descriptor(stream: &UnixStream, expected_marker: u8) -> io
             stream.as_raw_fd(),
             &mut data,
             Some(&mut control),
-            MsgFlags::MSG_CMSG_CLOEXEC,
+            receive_flags(),
         ) {
             Ok(message) => {
                 let mut descriptors = Vec::new();
@@ -71,6 +65,12 @@ pub(crate) fn receive_descriptor(stream: &UnixStream, expected_marker: u8) -> io
         }
     };
 
+    #[cfg(target_os = "macos")]
+    for fd in &descriptors {
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     if bytes == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -156,17 +156,31 @@ mod tests {
         let data = [IoSlice::new(&marker)];
         let descriptors = [first.as_raw_fd(), second.as_raw_fd()];
         let control = [ControlMessage::ScmRights(&descriptors)];
-        sendmsg::<()>(
-            sender.as_raw_fd(),
-            &data,
-            &control,
-            MsgFlags::MSG_NOSIGNAL,
-            None,
-        )
-        .unwrap();
+        sendmsg::<()>(sender.as_raw_fd(), &data, &control, send_flags(), None).unwrap();
 
         let error = receive_descriptor(&receiver, MARKER).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+fn send_flags() -> MsgFlags {
+    #[cfg(target_os = "linux")]
+    {
+        MsgFlags::MSG_NOSIGNAL
+    }
+    #[cfg(target_os = "macos")]
+    {
+        MsgFlags::empty()
+    }
+}
+fn receive_flags() -> MsgFlags {
+    #[cfg(target_os = "linux")]
+    {
+        MsgFlags::MSG_CMSG_CLOEXEC
+    }
+    #[cfg(target_os = "macos")]
+    {
+        MsgFlags::empty()
     }
 }

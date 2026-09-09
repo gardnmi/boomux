@@ -10280,6 +10280,7 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit,
     // signals. A direct holder death also terminates the exact managed child.
     unsafe {
         command.pre_exec(move || {
+            #[cfg(target_os = "linux")]
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
                 return Err(io::Error::last_os_error());
             }

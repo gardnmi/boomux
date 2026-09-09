@@ -337,10 +337,7 @@ impl std::fmt::Display for RemoteError {
 impl Error for RemoteError {}
 
 pub fn socket_path() -> io::Result<PathBuf> {
-    let runtime = env::var_os("BOOMUX_RUNTIME_DIR")
-        .or_else(|| env::var_os("XDG_RUNTIME_DIR"))
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    let runtime = crate::platform::runtime_root()?;
     if !runtime.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
