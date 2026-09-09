@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 
-test("page, base-prefixed assets, and expanded capture fit the viewport", async ({
+test("page, base-prefixed recordings, and poster fit the viewport", async ({
   page,
 }) => {
   const errors: string[] = [];
@@ -14,15 +14,15 @@ test("page, base-prefixed assets, and expanded capture fit the viewport", async 
   });
   await page.goto("./");
   await expect(page.getByRole("heading", { level: 1 })).toContainText(
-    "Keep the work.",
+    "Your rules.",
   );
-  await page.getByText("See a real workspace capture").click();
-  const capture = page.locator(".capture img");
+  await page.getByRole("link", { name: "See it move" }).click();
+  const capture = page.locator("#motion-move video");
   await expect(capture).toBeVisible();
   await expect
     .poll(() =>
       capture.evaluate(
-        (img: HTMLImageElement) => img.complete && img.naturalWidth > 0,
+        (video: HTMLVideoElement) => video.readyState >= 2 && video.videoWidth === 1280,
       ),
     )
     .toBeTruthy();
@@ -38,23 +38,48 @@ test("page, base-prefixed assets, and expanded capture fit the viewport", async 
   expect(errors).toEqual([]);
 });
 
-test("install selection preserves exact mode-specific commands and supports keyboard navigation", async ({
+test("demonstrations support keyboard selection and pause hidden clips", async ({ page }) => {
+  await page.goto("./#in-motion");
+  const move = page.getByRole("tab", { name: "Move", exact: true });
+  await move.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(page.getByRole("tab", { name: "Resize", exact: true })).toBeFocused();
+  await expect(page.locator("#motion-move")).toBeHidden();
+  expect(await page.locator("#motion-move video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true);
+  await expect.poll(() => page.locator("#motion-resize video").evaluate((v: HTMLVideoElement) => v.videoWidth)).toBe(1280);
+  await page.keyboard.press("End");
+  await expect(page.locator("#motion-keyboard")).toBeVisible();
+  await expect.poll(() => page.locator("#motion-keyboard video").evaluate((v: HTMLVideoElement) => v.videoWidth)).toBe(1280);
+  await expect(page.locator("#motion-keyboard a[download]")).toHaveAttribute("href", "/boomux/demos/keyboard.gif");
+  await page.keyboard.press("Home");
+  await expect(move).toBeFocused();
+  await page.locator("#motion-move video").evaluate((v: HTMLVideoElement) => v.pause());
+  await page.locator("#install").scrollIntoViewIfNeeded();
+  await page.locator("#in-motion").scrollIntoViewIfNeeded();
+  expect(await page.locator("#motion-move video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true);
+});
+
+test("reduced motion prevents autoplay but keeps manual playback available", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("./#in-motion");
+  const video = page.locator("#motion-move video");
+  expect(await video.evaluate((v: HTMLVideoElement) => v.paused && !v.autoplay)).toBe(true);
+  await video.evaluate((v: HTMLVideoElement) => v.play());
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.currentTime)).toBeGreaterThan(0);
+  await page.getByRole("tab", { name: "Keyboard", exact: true }).click();
+  expect(await page.locator("#motion-keyboard video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true);
+  expect(await video.evaluate((v: HTMLVideoElement) => v.paused)).toBe(true);
+});
+
+test("installation offers only the exact Desktop command", async ({
   page,
 }) => {
   await page.goto("./#install");
-  const desktop = page.getByRole("tab", { name: "Desktop + CLI" });
-  await expect(desktop).toHaveAttribute("aria-selected", "true");
-  await desktop.focus();
-  await page.keyboard.press("ArrowRight");
-  await expect(page.getByRole("tab", { name: "CLI only" })).toBeFocused();
-  await expect(page.locator("#install-desktop")).toBeHidden();
-  await expect(page.locator("#command-cli")).toHaveText(
-    "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh -s -- --cli",
-  );
-  await page.keyboard.press("Home");
   await expect(page.locator("#install-desktop")).toBeVisible();
-  await expect(page.locator("#command-desktop")).toContainText(
-    "sh -s -- --desktop",
+  await expect(page.locator("#install code")).toHaveCount(1);
+  await expect(page.locator("#install [role=tab]")).toHaveCount(0);
+  await expect(page.locator("#command-desktop")).toHaveText(
+    "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh -s -- --desktop",
   );
 });
 
@@ -116,15 +141,19 @@ test("theme persists and remains usable when storage is blocked", async ({
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
 });
 
-test("both install commands and navigation work without JavaScript", async ({
+test("Desktop installation and navigation work without JavaScript", async ({
   browser,
 }) => {
   const context = await browser.newContext({ javaScriptEnabled: false });
   const page = await context.newPage();
   await page.goto("http://127.0.0.1:4321/boomux/");
   await expect(page.locator("#command-desktop")).toBeVisible();
-  await expect(page.locator("#command-cli")).toBeVisible();
-  await expect(page.locator("#install-tabs")).toBeHidden();
+  await expect(page.locator("#install code")).toHaveCount(1);
+  await expect(page.locator(".motion-tabs")).toBeHidden();
+  for (const clip of ["move", "resize", "keyboard"]) {
+    await expect(page.locator(`#motion-${clip} video`)).toBeVisible();
+    await expect(page.locator(`#motion-${clip} video`)).toHaveAttribute("controls", "");
+  }
   await page.getByRole("link", { name: "Get Boomux" }).click();
   await expect(page).toHaveURL(/#install$/);
   await context.close();
