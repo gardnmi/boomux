@@ -1366,14 +1366,17 @@ Boomux environment ensure the exact `(claude, session, shell, run)` Agent key.
 Subagent hooks retain the root `session_id` and therefore reduce into that Agent
 Instance rather than creating separate Agents.
 
-Session start, a completed foreground turn, and an API-error turn report Idle;
+Session start and a completed foreground turn report Idle;
 prompts, tool work, denied tool permissions, and subagent activity report
-Working; permission or user-input waits report Blocked; session end reports
-Inactive and never Done. A Stop with reported background tasks or session crons
+Working; permission or user-input waits and StopFailure report Blocked; session
+end reports Inactive and never Done. A Stop with reported background tasks or session crons
 remains Working. Reports use LifecycleIntegration authority and reuse the existing
 protocol Agent operations, so lifecycle reporting needs no Claude-specific wire
 request or durable state. Hook failures are fail-open for Claude Code and are
-written only to stderr.
+written only to stderr. StopFailure retains blocked attention even if SessionEnd
+subsequently reports Inactive or a new turn reports Working. Attention remains
+until acknowledged, following the common attention contract. A failed
+turn is not successful idle completion or permanent Session completion.
 
 While Remote Control is connected, Claude exposes
 `CLAUDE_CODE_BRIDGE_SESSION_ID` only to hook subprocesses. The hook synchronizes
@@ -1438,6 +1441,16 @@ timeout, bounded output, and the stable JSON envelope. Unclaimed Sessions are a
 no-op; Boomux, ancestry, claim, or version-gating failures are rate-limited and
 fail open so OpenCode continues. `run_changed` or runtime-generation replacement
 removes report authority rather than redirecting it.
+
+OpenCode's event callbacks are not awaited by the host. On hosts with plugin
+disposal support (source-verified at `1.18.29`), the server plugin's `dispose`
+hook drains already-queued lifecycle reports before shutdown. The total drain
+has a five-second deadline; late events and work still queued after the deadline
+are discarded, and an already-running command retains its own bounded deadline.
+This preserves observed error reports during short-lived `run` failures without
+polling or inferring completion from process exit. Disposal itself reports no
+lifecycle transition. Older hosts without this hook retain their existing
+best-effort event delivery.
 
 ### Pi Lifecycle Extension
 

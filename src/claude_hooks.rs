@@ -127,7 +127,7 @@ fn reduce(input: HookInput) -> Option<LifecycleObservation> {
             (AgentState::Working, "Claude background work active")
         }
         HookEvent::Stop => (AgentState::Idle, "Claude session idle"),
-        HookEvent::StopFailure => (AgentState::Idle, "Claude turn failed"),
+        HookEvent::StopFailure => (AgentState::Blocked, "Claude turn failed"),
         HookEvent::SessionEnd if in_subagent => {
             (AgentState::Working, "Claude subagent session ended")
         }
@@ -186,7 +186,7 @@ mod tests {
                 "Claude subagent stopped",
             ),
             ("Stop", AgentState::Idle, "Claude session idle"),
-            ("StopFailure", AgentState::Idle, "Claude turn failed"),
+            ("StopFailure", AgentState::Blocked, "Claude turn failed"),
             (
                 "SessionEnd",
                 AgentState::Inactive,

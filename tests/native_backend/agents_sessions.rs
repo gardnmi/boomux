@@ -128,6 +128,23 @@ fn claude_hook_reports_lifecycle_and_synchronizes_ephemeral_bridge_binding() {
             .is_none()
     );
 
+    run_hook("StopFailure", None);
+    let failed = daemon.client.get_agent(&agent.id).unwrap();
+    assert_eq!(failed.observation.state, AgentState::Blocked);
+    let attention = failed.attention.unwrap();
+    assert_eq!(attention.reason, protocol::AgentAttentionReason::Blocked);
+    assert!(failed.ended_at_ms.is_none());
+
+    run_hook("SessionEnd", None);
+    let inactive = daemon.client.get_agent(&agent.id).unwrap();
+    assert_eq!(inactive.observation.state, AgentState::Inactive);
+    assert_eq!(inactive.attention, Some(attention.clone()));
+
+    run_hook("UserPromptSubmit", None);
+    let resumed = daemon.client.get_agent(&agent.id).unwrap();
+    assert_eq!(resumed.observation.state, AgentState::Working);
+    assert_eq!(resumed.attention, Some(attention));
+
     daemon.stop_with_cli();
 }
 
