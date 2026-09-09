@@ -64,8 +64,10 @@ Control-modified Layout bindings support navigation while holding the chord.
 Keys pressed in Layout are prevented from repeating into the terminal after
 release of the leader; releases for previously forwarded keys still reach their
 original pane. Output processing continues while each visible pane
-shows a dimming overlay and animated tile icon. Overlay removal shares the
-badge’s single cancelable exit task; it does not delay restoring input.
+shows a dimming overlay and animated tile icon by default. The saved
+`layout_overlay_visible` preference skips constructing these per-pane overlays
+when disabled, while retaining the mode badge and input behavior. Overlay removal
+shares the badge’s single cancelable exit task; it does not delay restoring input.
 
 ## Module Map
 

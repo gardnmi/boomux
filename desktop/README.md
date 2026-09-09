@@ -112,7 +112,10 @@ header menu opens the same help.
 | Double-tap **Ctrl + Space** | Send Ctrl + Space to the terminal |
 | **Escape** | Leave layout mode |
 
-Layout mode shows a badge and dims the panes. Terminal output continues, but
+Layout mode shows a badge and dims the panes by default. Turn off **Layout
+overlay** in **Settings → Appearance** to keep terminal contents visible without
+the animated pane overlay. The choice saves automatically; the mode badge and
+layout controls remain available. Terminal output continues, but
 typing, paste, and terminal wheel input are blocked until you leave.
 Layout commands also work with Control held during the temporary chord.
 
