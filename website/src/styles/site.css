@@ -230,6 +230,95 @@ h2 > span {
 .platform-note > span {
   margin: 0 8px;
 }
+.motion-showcase {
+  margin-top: 48px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow: 0 24px 80px #0003;
+}
+.motion-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.motion-bar > span,
+.motion-note {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+}
+.motion-tabs {
+  display: flex;
+  gap: 6px;
+}
+.motion-tabs button {
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  padding: 7px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.motion-tabs button span {
+  font-family: var(--mono);
+  margin-right: 5px;
+  opacity: .65;
+}
+.motion-tabs button[aria-selected="true"] {
+  background: var(--raised);
+  border-color: var(--border);
+  color: var(--text);
+}
+.motion-panel video {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 8 / 5;
+  background: #11111b;
+}
+.motion-panel figcaption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px 24px;
+  padding: 22px 24px 12px;
+}
+.motion-panel figcaption > div {
+  flex: 1 1 300px;
+}
+.motion-panel h2 {
+  font-size: 19px;
+  letter-spacing: -.4px;
+  line-height: 1.4;
+  margin: 0 0 6px;
+}
+.motion-panel p {
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 720px;
+}
+.motion-panel .text-link {
+  font-size: 12px;
+  white-space: nowrap;
+}
+.motion-note {
+  padding: 4px 24px 20px;
+}
+@media (max-width: 600px) {
+  .motion-bar { padding: 12px; }
+  .motion-tabs { width: 100%; }
+  .motion-tabs button { flex: 1; padding-inline: 8px; }
+  .motion-panel figcaption { padding: 16px 14px 10px; }
+  .motion-note { padding: 4px 14px 16px; }
+}
 .product-preview {
   margin-top: 58px;
   text-align: left;
@@ -636,24 +725,6 @@ h3 {
   background: var(--surface);
   padding: 22px;
   min-width: 0;
-}
-.install-tabs {
-  display: flex;
-  border-bottom: 1px solid var(--border);
-  gap: 25px;
-  margin-bottom: 23px;
-}
-.install-tabs button {
-  background: transparent;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  padding: 0 0 11px;
-  color: var(--muted);
-  font-size: 12px;
-}
-.install-tabs button[aria-selected="true"] {
-  color: var(--text);
-  border-color: var(--accent);
 }
 .install-panel h3 {
   font-size: 16px;

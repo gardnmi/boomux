@@ -24,21 +24,23 @@ npm run preview
 ```
 
 An existing Chromium can be used with `CHROMIUM_PATH=/usr/bin/chromium npm test`.
-Tests cover mobile layout, assets, install modes, clipboard failure, theme
-persistence, blocked storage, and the no-JavaScript fallback.
+Tests cover mobile layout, media playback and selection, reduced motion, assets,
+Desktop installation, clipboard failure, theme persistence, blocked storage, and the
+no-JavaScript fallback.
 
 ## Content and assets
 
-- `src/pages/index.astro`: copy, links, and official installer commands.
-- `src/components/WorkspacePreview.astro`: explicitly labeled illustration with
-  fictional sample content, not live terminal output or an actual screenshot.
+- `src/pages/index.astro`: copy, links, and the official Desktop installer command.
+- `src/components/MotionShowcase.astro`: real Desktop recordings with a Move /
+  Resize / Keyboard selector, native playback controls, and GIF downloads.
+- `src/scripts/motion.ts`: progressively enhanced selection and playback. Reduced
+  motion disables autoplay; leaving the showcase or browser tab pauses playback.
+  Without JavaScript, all three recordings remain manually playable.
 - `src/styles/site.css`: responsive dark/light design.
-- The expandable screenshot imports `../assets/boomux-workspace-desktop.png`;
-  it is explicitly labeled as an earlier interface and optimized at build time.
-  Replace with a reviewed current capture before a marketing launch. Do not use
-  private paths, conversations, credentials, or client data in new captures.
-- A current demo recording is not included. Add only after recording and review;
-  do not label an illustration as a recording.
+- `public/demos/`: reviewed real application captures. MP4 is used on the page;
+  GIFs are downloaded only on request. See [recording notes](demos.md) before
+  replacing them. Do not include private paths, conversations, credentials, or
+  client data in new captures.
 
 ## Publishing
 
