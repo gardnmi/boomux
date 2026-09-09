@@ -1,5 +1,10 @@
 # Desktop releases
 
+**Jump to:** [Install and update](#distribution-and-installation) · [Older installations](#older-installations) · [Build](#build-and-publish) · [Preferences](#desktop-integration-and-preferences) · [Uninstall](#uninstall)
+
+Users can start with [Desktop installation](../../desktop/README.md#install-release-builds).
+This document retains the packaging, migration, and ownership guarantees.
+
 ## Distribution and installation
 
 One Boomux release contains the CLI packages for x86_64/ARM64 and the Desktop
@@ -21,6 +26,8 @@ The release installer pins its own release by default. To select another release
 containing Desktop assets, set `BOOMUX_DESKTOP_VERSION=vX.Y.Z` on the `sh` process.
 Unsupported old versions fail without changing the current installation.
 
+### Install Locations And Ownership
+
 Installed paths remain `~/.local/share/boomux-desktop/releases/<version>-<digest>`
 and the atomic `current` link. Commands are linked under `~/.local/bin`; existing
 independent CLI installations are preserved. XDG directories and absolute
@@ -31,6 +38,8 @@ ownership. The Desktop installer checks glibc 2.39+, both executable versions,
 and fixed graphics libraries with `--check-runtime` before activating a release.
 Missing libraries produce distro package guidance; it never invokes sudo or a
 package manager. The archive and checksum downloads have explicit byte limits.
+
+### Prepare And Activate An Update
 
 The app's **Update** action executes its embedded installer with `--prepare` on a
 bounded worker. This downloads and verifies the complete bundle and atomically
@@ -56,6 +65,8 @@ or overwriting running executable files. On opening the newly installed app, a
 daemon running from another executable produces a **Restart now**/**Later**
 reminder to finish installation. Closing the old app alone does not restart its
 daemon. In-app restart opens the replacement window only after daemon handoff.
+
+### Older Installations
 
 Executable handoff requires a running daemon with protocol 52 or newer. Older
 daemons need a one-time upgrade through their owning installation method before

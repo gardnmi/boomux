@@ -1,5 +1,10 @@
 # CLI JSON Contract
 
+**Jump to:** [Discovery](#discovery) · [Projects](#project-data) · [Integrations](#integration-data) · [Shells](#shell-data) · [Sessions](#session-data) · [Errors](#errors)
+
+Start with Discovery before scripting. Capability gates and compatibility rules
+below are part of the contract, not optional setup steps.
+
 > **Status: Current stable contract.** Incompatible output requires a new schema
 > value; human-readable output is not a parsing contract.
 
@@ -29,6 +34,7 @@ compatibility test points, not runtime pins or minimum-version guarantees.
 Integration ordering and host metadata come from the same capability descriptor
 registry used by installation, foreground recognition, recovery, titles, and
 session resume.
+
 Protocol-backed feature names are derived from the same typed registry as
 request gating and negotiated client feature checks, so each name has one
 minimum protocol version authority.
@@ -76,6 +82,7 @@ The static `hyprland_special_workspaces`, `contextual_desktop_terminal`,
 `node_reauthentication` features advertise that the installed CLI contains
 these human-facing paths; they do not claim that Hyprland is running, that the
 adapter is enabled, or that a registered Node currently needs authentication.
+
 The static `local_update_status`, `guided_local_update`, and
 `guided_local_uninstall` features advertise the local release-management
 surfaces. They do not claim that the current executable is an eligible official
@@ -135,6 +142,7 @@ actionable resource is identified structurally by both its owning Node ID and
 unchanged resource ID. Routed commands that accept names resolve them only in an
 explicit Node context; `workspace open --node`, `shell suggest-name --node`, and
 `launcher invoke --node` require exact owner resource IDs.
+
 `workspace open TARGET --node NODE` accepts the local Node only by exact Node ID,
 never by its display alias `local`, so an unlinked local owner Workspace cannot
 be confused with a same-ID global Workspace. Registered remote Nodes retain
@@ -169,6 +177,7 @@ candidate is a known published build below the federation floor it returns
 in an interactive terminal. Indeterminate executable, SSH, authentication,
 handshake, identity, and newer-version failures retain their own failure rather
 than being reported as either code, and no bootstrap mutation occurs.
+
 After authorization the pinned binary is uploaded to private transaction state,
 not the destination, and its current `daemon status --json` client proves the
 running daemon executable. Automatic upgrade requires that process executable,
@@ -178,6 +187,7 @@ without activation. When no helper is discovered, a runtime probe must prove the
 socket path absent before upload and guarded activation repeats the check; an
 existing, racing, stale, or unprovable socket returns `install_required` without
 destination replacement or stop.
+
 On Linux, upgrade proof includes daemon PID, executable, negotiated protocol, and
 socket device/inode. The uploaded current binary revalidates that fingerprint on
 one open daemon connection immediately before activation; any race or unsupported
@@ -188,6 +198,7 @@ poisoned `PATH` cannot select bootstrap tools; a missing layout is
 JSON and background bootstrap never mirror raw SSH master stderr. They retain
 only its bounded in-memory prefix for classification; overflow terminates the
 private master and returns a fixed transport failure.
+
 Bootstrap failures retain stable classes: `bootstrap_authentication_failed`,
 `bootstrap_transport_failed`, `bootstrap_malformed_helper`,
 `bootstrap_unsupported_platform`, `bootstrap_install_failed`, and
@@ -200,6 +211,7 @@ control-character-containing paths in framed discovery output are
 uses `unsupported_version`; changing or conflicting verified identities use
 `node_identity_changed` and `node_identity_conflict`. These classes contain only
 bounded diagnostics and are not collapsed into `invalid_argument` or `internal`.
+
 Install-stage failures identify a fixed non-secret stage such as stream, backup,
 activation, or watchdog readiness. They never include raw remote stderr, paths,
 shell startup output, or streamed bytes.
@@ -207,6 +219,7 @@ The backup stage also covers rejection of an existing destination that is not an
 owner-owned bounded regular executable, metadata or byte-copy mismatch, and
 copy/fsync failure. These failures occur before atomic destination activation and
 leave the old executable pathname untouched.
+
 Bootstrap returns a connection only after exactly one live protocol ping. Ready
 helpers are pinged after connection; installed helpers use the pre-commit ping
 and are not pinged again by add, retarget, ad hoc, or dashboard callers. Failure
@@ -216,6 +229,7 @@ unsafe remote daemon runtime discovery. Linux derives `/run/user/<numeric uid>`
 only when the remote environment omits `XDG_RUNTIME_DIR`; no local environment is
 forwarded. Post-install status, restart, helper verification, handshake, and ping
 failures identify that fixed stage without exposing remote stderr.
+
 An already-active remote bootstrap transaction returns the existing stable
 `busy` code before changing the destination.
 `boomux node reauthenticate NODE` is human-only and absent from `json_commands`.
@@ -225,18 +239,21 @@ identity, requires a subsequent prompt-free verification, revalidates unchanged
 registration state, and requests a prompt-free projection retry. It requires
 daemon protocol 38 or newer and never installs, upgrades, retargets, or mutates
 the registration.
+
 `boomux node upgrade NODE` is a human-only operation and rejects `--json` before
 SSH discovery or mutation. It requires a currently compatible helper to verify
 the registration's pinned Node ID, asks once after showing source, destination,
 and process impact, and rechecks the registration before activation. A changed
 binary gracefully restarts any present daemon even when its protocol remains
 compatible; the transaction verifies the same Node identity again before commit.
+
 A bounded local maintenance lease drains and closes registration admission from
 the final revision check through transaction completion, then reopens it on
 successful commit or lease expiry. The CLI renews the lease while active, and
 local daemon restart or stop returns `busy` until release or expiry.
 Successful commit releases it immediately; a failed or ambiguous upgrade keeps
 it closed through bounded expiry so remote watchdog rollback cannot race routing.
+
 `boomux node uninstall NODE` is likewise human-only and rejects `--json` before
 SSH discovery. Protocol 48 atomically consumes its exact maintenance lease into
 registration removal only after the identity-pinned remote executable has been
@@ -499,6 +516,7 @@ Protocol 38 adds `protocol_38`, `global_workspaces`,
 `multi_node_workspace_placements`, `guarded_workspace_adoption`, and
 `resumable_workspace_close`.
 Protocol 39 adds `protocol_39` and `qualified_focused_terminal`.
+
 Protocol 40 adds `protocol_40`, `recovered_agent_presentation`, and
 `cached_projection_dismissal`.
 Protocol 41 adds `protocol_41`, `observed_node_helper_version`, and
@@ -512,6 +530,7 @@ Protocol 44 adds `protocol_44` and `collaborative_exact_run_attachment`. The
 attachment request and terminal profile response are private local protocol
 messages and add no public CLI JSON field, snapshot field, event, or remote Node
 projection field.
+
 Protocol 45 adds `protocol_45` and `kiro_exact_launch_holders`. Holder acquire,
 hook report, and release are private local protocol messages and add no public
 CLI JSON field, snapshot field, event, or remote Node projection field.
@@ -519,6 +538,7 @@ Protocol 46 added `protocol_46` and `kiro_stop_idle`; its Kiro hook report wire
 shape was unchanged. Protocol 47 advertises `protocol_47` and is the minimum
 supported protocol, so the historical protocol-45/46 downgrade path
 is no longer negotiated.
+
 Protocol 47 also removes Agent Schedule and Scheduled Execution commands, JSON
 payloads, capabilities, snapshot fields, and event types. Historical schedule
 request shapes are not part of the protocol-47 wire contract.
@@ -530,6 +550,7 @@ Protocol 49 adds `protocol_49` and `workspace_placement_default_cwd` plus the
 coordinated Workspace, exact existing Node placement, fresh global and owner
 Workspace revisions, and an owner-resolved existing directory. Repeating the
 same path returns `unchanged` without incrementing either revision.
+
 Protocols 50 and 51 historically added Session presentation fields, mutations,
 and capabilities. ADR 0014 retires those public interfaces. Their wire shapes
 remain decodable for protocol-51 compatibility, but current daemons do not
@@ -548,6 +569,7 @@ the path is resolved by that exact eligible owner. Boomux collision-excludes
 generated Workspace and Shell names; omission of `NAME` generates the
 Workspace name. `--open` prepares the exact Shell terminal but releases its
 attachment gate only after the owner and coordinator commit succeeds.
+
 First global `shell create` or `launcher create` resolves
 `--node` against eligible owners. If exactly one
 owner is eligible it may be used without `--node`; zero or multiple eligible
@@ -556,6 +578,7 @@ owner-local cwd is resolved on that Node. Exact argv arrays are unchanged by
 coordination. `workspace open`, `close`, `rename`,
 `list`, and `inspect` resolve global IDs or names before considering external
 local records.
+
 `workspace adopt TARGET --node NODE`, `workspace link GLOBAL OWNER --node NODE`,
 and `workspace retry GLOBAL` expose guarded adoption, linking, and unresolved
 close retry without requiring the TUI. Repeating `workspace close` for a closing
@@ -565,6 +588,7 @@ and project path. Arbitrary by-name creation remains empty.
 An explicit `--node` on `shell create` or `launcher create` never falls back to
 local mutation. It fails with `unsupported_version` when global Workspaces are
 unavailable and with `invalid_argument` when the target is not coordinated.
+
 `workspace adopt`, `link`, and `retry` likewise fail with `unsupported_version`
 before target resolution on a pre-38 daemon.
 Prepared resource requests carry one caller-stable operation UUID. The client
@@ -575,6 +599,7 @@ while the success remains among at most the newest 256 completed operations and
 within the 1 MiB coordinator-store bound; oldest-first eviction ends the
 guarantee. Prepared requests reserve their completed-response footprint within
 the 1 MiB store and fail before owner mutation when capacity is unavailable.
+
 Adoption and linking fetch a fresh
 protocol-38 combined local snapshot over the admitted identity-pinned route and
 require its runtime `global_workspaces` capability before using the owner revision;
@@ -792,6 +817,7 @@ zero occurrences. An exact-ID Pi, Claude, or Kiro host title may enrich an
 already-observed Session for that integration but never creates a catalog-only
 row. `description` remains the effective display value and follows user override,
 current harness title, then latest Agent name or fallback.
+
 Protocol-49 peers retain effective `description` but receive a null
 `user_display_name`, a safe zero default for `workspace_revision`, an empty
 `attentions` array, null `git_branch`, and no working-context fields. Missing
@@ -829,6 +855,7 @@ probe omits only its status where practical; no remotes can therefore omit
 no upstream remains `unpublished`. Neither status is persisted or published as
 an event. Protocol-50 responses omit both objects rather than serializing false
 or null values.
+
 The owner excludes the canonical launch root already
 represented by `git_branch`, deduplicates the remaining exact canonical worktree
 roots across the Session's Agent occurrences, sorts newest-first with
@@ -838,6 +865,7 @@ truncation. Explicit inspection returns up to 64 of those ordered contexts; to
 keep owner response work bounded, contexts after the first four omit response-
 time push and worktree status. The root path and any launch-root observation
 remain in the owning Agent's durable snapshot and are deliberately omitted from Session JSON.
+
 Catalog-only Sessions have no observed contexts. These fields record bounded
 evidence supplied by structured integration events; they do not claim to list
 every repository touched and do not replace `source_cwd`.
@@ -866,6 +894,7 @@ ID and supplies authoritative lifecycle state and occurrences. Bounded Pi,
 Claude, and Kiro title sources require the exact external ID and normalized
 Workspace directory; they may change only the description of an already-observed
 Session and cannot add history.
+
 Exact inspection and resume do not synchronously refresh host catalogs when the
 ID resolves from durable state or the existing catalog cache. A catalog-only ID
 falls back to bounded discovery when the daemon has no cache that can resolve it.
@@ -881,6 +910,7 @@ identity (`external:<id>` or `instance:<agent-id>`). This algorithm is frozen to
 keep emitted IDs stable, not exposed for callers to reproduce or guess. Only an
 exact ID returned by `session.list` resolves; external IDs, descriptions, shell
 IDs, and Agent IDs never resolve through `session.inspect`.
+
 All session commands require a negotiated daemon protocol of at least 12 and return
 `unsupported_version` before projection against an older daemon.
 `session list`, `session inspect`, and human-only `session open` and `session
@@ -888,6 +918,7 @@ resume` accept `--node SELECTOR` under protocol 36. Remote JSON responses add th
 `node_id`. Resume opens a local native terminal but resolves the opaque ID and
 executes the integration argv only on the owner; it creates no ordinary
 Workspace or Shell.
+
 Rename and reset additionally require protocol 50. The CLI creates a mutation
 operation UUID, and the owner retains the newest 256 replays per Workspace so an
 exact retry after an ambiguous transport result is safe. A replay returns the

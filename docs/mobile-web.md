@@ -1,5 +1,7 @@
 # Mobile Web Dashboard
 
+**Jump to:** [Start](#start-it) · [OpenCode runtime](#opencode-runtime) · [Private access](#private-access-with-tailscale) · [Security](#security-and-privacy) · [Endpoints](#mvp-endpoints)
+
 > **Status: Experimental MVP.** The HTTP response shapes are not a stable
 > automation contract. The daemon protocol and `boomux.cli/v1` remain the stable
 > integration surfaces.
@@ -43,6 +45,8 @@ start is idempotent, including when the requested OpenCode host is unavailable;
 different options on the same HTTP port are rejected. Status reports requested
 OpenCode port/URL separately from the active runtime port/URL.
 
+### OpenCode Runtime
+
 The default URL is `http://127.0.0.1:3737`. Select another loopback port with
 `--port`. The command also attempts to ensure one daemon-supervised Shared
 Harness Runtime generation on `127.0.0.1:4097`; choose another stable loopback
@@ -50,6 +54,7 @@ port with `--opencode-web-port`. If the OpenCode executable is absent, the
 dashboard starts without OpenCode links and continues to expose other eligible
 native handoffs such as Claude Remote Control. Port conflicts, installed-runtime
 startup failures, readiness timeouts, and daemon/protocol failures remain fatal.
+
 The same Node-local generation is used by eligible native OpenCode TUIs and the
 phone. Restarting `boomux web` does not replace that generation. The gateway
 refreshes its presentation identity from the authoritative daemon and follows a
@@ -57,6 +62,8 @@ replacement generation only on its originally requested port. Runtime exit or
 an identity mismatch withdraws native links until the daemon starts or strictly
 cold-adopts a replacement generation; the browser's normal polling presents an
 eligible replacement without a page reload.
+
+### Stop The Gateway
 
 Stop the default gateway without stopping the Boomux daemon or any managed
 processes:
@@ -69,6 +76,8 @@ For a gateway started with another HTTP port, pass the same port to
 `boomux web stop --port PORT`. The command is idempotent when that gateway is not
 running.
 
+### Runtime Authentication And URLs
+
 Set `OPENCODE_SERVER_PASSWORD` and optionally `OPENCODE_SERVER_USERNAME` before
 the runtime's first start. They are ephemeral startup environment, are never
 persisted by Boomux, and must be supplied consistently to attached clients.
@@ -79,6 +88,8 @@ hostname plus the configured OpenCode port. `--opencode-web-url` overrides that
 public origin for the same local daemon runtime; it never selects an unrelated
 external OpenCode server. `--no-opencode-web` disables runtime startup from
 `boomux web` and native links.
+
+### Sharing OpenCode With The Terminal
 
 Create or open an ordinary Boomux login Shell and type bare, zero-argument,
 interactive `opencode`. A scoped runtime `PATH` shim available only in eligible
@@ -107,6 +118,8 @@ unavailable, exact Session recovery remains fail-open as a standalone TUI and
 the native link remains absent. User-entered argument-bearing commands such as
 `opencode --continue` and `opencode --session ID` continue to bypass the scoped
 shim.
+
+### Private Access With Tailscale
 
 To publish the dashboard and any active OpenCode runtime to the current
 Tailscale tailnet, opt in when starting the foreground or background gateway:

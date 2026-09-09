@@ -1,338 +1,352 @@
 # Boomux Desktop
 
-A fast native tiling terminal workspace for [Boomux](https://github.com/gardnmi/boomux), built with GPUI and Ghostty's terminal core.
+A native terminal workspace with Hyprland-inspired movement and keyboard
+controls. Built with [GPUI Community Edition](https://gpui-ce.github.io/) and
+Ghostty’s terminal core, backed by persistent Boomux Shells.
 
-> [!WARNING]
-> Boomux Desktop is experimental. Official Linux release bundles are available;
-> the desktop interface and supported feature set are still evolving.
+[Install](#install-release-builds) · [Workspaces](#workspaces-and-shells) ·
+[Controls](#controls) · [Settings](#settings) · [Development](#run-from-source)
 
-The prototype uses [GPUI Community Edition](https://gpui-ce.github.io/) and `libghostty-vt`, pinned to released crate versions for reproducible builds. Boomux remains the shell backend: it owns the PTY lifecycle, persistence, reconstruction, and transport, while libghostty interprets those bytes and maintains the reflowing terminal grid rendered by GPUI.
+> [!NOTE]
+> Desktop is experimental. Its interface and supported feature set are evolving.
+> See [current limitations](#current-limitations).
 
-The layout panes are managed inside one GPUI window, and every pane hosts an independent **real local Boomux shell**. Each pane renders its shell's terminal output in GPUI and sends keyboard input and terminal resize events back through Boomux's attachment protocol. This lets us test the product shape without embedding Wayland client buffers or running a terminal emulator process per tile.
+## Install Release Builds
 
-An Omarchy Boomux-inspired sidebar presents local and remote workspaces, shell status, and current/attention-bearing agents. When an agent settles from working to idle, its row remains marked **finished** until **Dismiss** is clicked; durable Boomux attention is acknowledged with the exact observation revision. Workspace rows expand and collapse. Clicking a shell or agent focuses its existing tile, or attaches its shell in a new tile when it is not already open. The overview refreshes from Boomux in the background without putting daemon requests on the GPUI render path. Remote machine controls live in the lower sidebar's Remotes tab.
-
-When several visible Agents share a Shell, their rows include distinct Agent ID
-prefixes. They represent separate threads, and clicking either row opens the
-shared terminal. Select the conversation inside the host application.
-
-## Install release builds
-
-The Linux installer installs Boomux Desktop and its matching Boomux executable
-together, without sudo or a local Rust/Zig toolchain. Unified releases have been
-available since v1.10.0:
+Install Desktop and its matching Boomux CLI together:
 
 ```sh
-curl -fsSL https://github.com/gardnmi/boomux/releases/latest/download/boomux-desktop-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh -s -- --desktop
 ```
 
-The initial release target is Linux x86-64 with glibc 2.39+, built on Ubuntu 24.04.
-It needs the system's graphics drivers and Fontconfig, Wayland/X11, XCB
-shape/xfixes, xkbcommon, and Vulkan libraries plus a working GPU driver. The installer checks
-minimum glibc, executable versions, and graphics-library availability before
-activation; see [runtime packages](../README.md#requirements). Older glibc distributions and musl-based
-distributions such as Alpine are not supported by this bundle. macOS, Windows,
-and ARM builds are not provided yet.
+**Requires:** GNU/Linux x86_64, glibc 2.39+, X11 or Wayland, and a working Vulkan
+driver. Hyprland is not required. See [runtime packages](../README.md#requirements)
+and the [installation contract](../docs/install.md).
 
-Launch **Boomux Desktop** from the application menu, or run `boomux-desktop`. The launcher invokes the bundled
-`boomux daemon start` before opening the window. Boomux reuses a running daemon
-or starts one; closing Desktop leaves the daemon and Shells running.
+The installer runs without sudo or a local Rust/Zig toolchain. It adds an
+application-menu entry and command links under `~/.local/bin`, preserving any
+independent Boomux CLI installation.
 
-Commands are linked in `~/.local/bin`. If that directory is absent from your
-PATH, add `export PATH="$HOME/.local/bin:$PATH"` to your shell configuration.
-The main `boomux-installer.sh` also offers Desktop or CLI-only installation.
-Rerun the Desktop installer to download the latest stable release. Updates switch a
-`current` link without overwriting running executables or restarting the daemon.
-When an existing daemon uses a different executable, the new app offers to
-finish updating it through graceful restart. Existing Boomux CLI installations
-are preserved. See
-[release packaging](../docs/desktop/releases.md) for version selection, install locations,
-release preparation, uninstall instructions, and the required platform smoke tests.
+Launch **Boomux Desktop** from the application menu, or run:
 
-Core prepares all bundled harness integrations in the background when the Boomux
-service starts, including after an update handoff. Installation does not require
-the harness to be visible on the service's PATH. Unchanged Boomux-managed
-integrations are refreshed to the bundled version automatically. Desktop has no
-harness detection, install prompts, or update prompts. User customizations and
-uninstall choices are preserved. Running harnesses may need a restart; Codex
-still requires its own hook trust approval. See [automatic integration management](../docs/install.md#automatic-integration-management).
+```sh
+boomux-desktop
+```
 
-The header menu contains updates and keyboard shortcuts. **Agents | Git | Remotes**
-share the lower sidebar. Remote workspaces use a monitor icon, show their machine's
-connection status, and keep all Shells on that owner. Use **+ → New remote workspace…**
-to choose or connect a machine. Connecting creates its initial workspace and Shell;
-open it from the tree. **Remotes → New remote workspace** creates and opens another
-workspace on the selected machine. Each machine card contains its own sign-in
-and update controls; connecting another machine is a separate action above the
-cards. Closing a workspace does not uninstall the remote machine.
-Machine cards start collapsed, showing only their name and connection status.
-Click a card header to expand or collapse its details; Enter or Space toggles
-the selected machine when the Remotes panel has keyboard focus.
-**Remove machine & uninstall Boomux…** opens a terminal for explicit confirmation:
-it stops all Boomux-managed processes on that machine and removes its executable
-and unchanged integration assets, preserving durable state, configuration, and
-customizations. The connection is forgotten only after confirmed remote removal;
-an unavailable machine cannot be silently removed as if uninstallation succeeded.
-If Boomux was already removed remotely, or the machine is no longer reachable,
-use **Forget connection only…** and confirm. This removes only the local
-registration and cached presentation; it does not contact the machine, uninstall
-software, or stop remote work.
-The gear
-opens Settings. **Settings → Open advanced setup in terminal** remains available
-for the guided terminal checklist: **Up/Down** to choose, **Space** to toggle,
-**Enter** to apply, and **Esc** to cancel. See the
-[checklist controls and defaults](../docs/install.md#harness-checklist).
-Setup does not install the optional Omarchy plugin, change Hyprland, or require
-an external terminal emulator.
-After the completion receipt, **Exit and remove this setup Shell? [Y/n]** defaults
-to yes. Enter or `y` removes the dedicated setup Shell and its pane; `n` keeps
-the output available and prompts again. Setup failures remain labelled as failures.
-Its newly created Workspace is also removed if it is still empty and untouched
-apart from that Shell removal. User resources, edits, or uncertain ownership keep
-the Workspace. Reattached setup panes without the original creation receipt also
-retain it. Ordinary CLI `boomux setup` never removes its Shell or Workspace.
+The launcher starts or reuses the Boomux service automatically.
 
-Desktop appearance and behavior preferences save automatically to
+## Workspaces And Shells
+
+| To… | Use… |
+| --- | --- |
+| Create a Workspace | **+ → New workspace** |
+| Open a project | Choose a configured project from **+** |
+| Add project folders | **Settings → Projects → Browse for folders** |
+| Create a Shell | **Ctrl + Enter** |
+| Rename a Workspace or Shell | Select it, then **F2** |
+| Open or manage a Workspace | Its sidebar row or **⋮** menu |
+| Reorder Workspaces | Drag a row, or focus it and press **Ctrl + Shift + Up/Down** |
+
+New Shells use generated names. With terminal focus, **Ctrl + Enter** uses that
+terminal’s Workspace; with sidebar focus, it uses the selected row’s Workspace.
+
+In the default **Workspace** scope, selecting a Workspace shows its
+non-minimized Shells and collapses the other Workspace rows. Restoring an
+individual Shell opens only that Shell.
+
+### Minimize Is Not Remove
+
+| Action | Result |
+| --- | --- |
+| **Ctrl + W** or the pane’s minimize button | Detach the view; keep the Shell running |
+| Restore a tab or open a Shell from the sidebar | Reattach to that Shell |
+| Quit Desktop | Leave the service and Shells running |
+| Pane close button or **Ctrl + Shift + W** | Permanently remove the Shell and terminate its run |
+| Remove a Workspace | Remove its managed resources through their owners |
+
+Removal confirmation is enabled by default. **Settings → Confirm removals**
+can disable those prompts. Minimized Shells stay minimized when switching
+Workspaces and returning.
+
+## Layout And Movement
+
+- **Move:** drag a pane heading, or Ctrl + left-drag within a pane. The pane
+  lifts out of the tree, follows your pointer, and re-tiles where you drop it.
+- **Resize:** drag a pane edge. Corners resize both axes when adjoining splits
+  allow it. Ctrl + right-drag also resizes.
+- **Float:** use **O** in layout mode to keep a pane floating.
+- **Expand:** use **F** in layout mode to fill the terminal canvas. Press it again
+  to restore the pane’s previous position; the sidebar stays available.
+
+Focus follows genuine pointer movement. A stationary pointer over a pane does
+not steal keyboard focus from the sidebar.
+
+[Movement demo](../website/public/demos/move.gif) ·
+[Resize demo](../website/public/demos/resize.gif) ·
+[Videos with playback controls](https://gardnmi.github.io/boomux/#in-motion)
+
+### Tree, Tabs, And Scope
+
+| Setting | Behavior |
+| --- | --- |
+| **Tabs** — default | Open panes remain tiled or floating. Minimized Shells appear as restore tabs across the top; nested Shell rows are hidden in the sidebar. |
+| **Tree** | Shells remain visible under their Workspaces in the sidebar. |
+| **Workspace** scope — default | Selecting a Workspace replaces the canvas with that Workspace’s panes. |
+| **Mixed** scope | Panes from different Workspaces can share the canvas. Available with Tree, not Tabs. |
+
+Tabs uses Workspace scope. Its strip disappears when no Shells are minimized;
+overflow arrows reveal additional tabs, and tabs have rename controls.
+
+## Controls
+
+Press **F1** for the complete in-app reference. **Keyboard shortcuts** in the
+header menu opens the same help.
+
+### Enter And Leave Layout Mode
+
+| Shortcut | Action |
+| --- | --- |
+| Tap **Ctrl + Space** | Toggle layout mode |
+| Hold **Ctrl + Space** for at least 250 ms | Enter temporarily; release Control or Space to leave |
+| Double-tap **Ctrl + Space** | Send Ctrl + Space to the terminal |
+| **Escape** | Leave layout mode |
+
+Layout mode shows a badge and dims the panes. Terminal output continues, but
+typing, paste, and terminal wheel input are blocked until you leave.
+Layout commands also work with Control held during the temporary chord.
+
+### Navigate And Arrange
+
+These shortcuts apply **inside layout mode**.
+
+| Shortcut | Action |
+| --- | --- |
+| **Arrow keys** | Focus a neighboring pane |
+| **H / K / L** | Focus left / up / right |
+| **Tab / Shift + Tab** | Cycle pane focus |
+| **Shift + Arrow keys** or **Shift + H/J/K/L** | Swap tiled panes or move a floating pane |
+| **Alt + Arrow keys** | Resize by a normal step |
+| **Alt + H/J/K/L** | Resize by a small step |
+| **Alt + Shift + H/J/K/L** | Resize by a large step |
+| **J** or **S** | Toggle split orientation |
+| **E / R** | Equalize / swap the nearest split |
+| **O / F / B** | Toggle floating / expand pane / toggle sidebar |
+| **Page Up / Page Down** | Switch Workspaces in sidebar order |
+
+For floating panes, **Alt + Shift + Arrow keys** aligns to a canvas edge and
+**C** centers the pane. Note that **J toggles a split**; use Down to focus below.
+
+### Sidebar
+
+| Shortcut | Action |
+| --- | --- |
+| **F6** | Switch focus between sidebar and terminal |
+| **Ctrl + Alt + B** | Show or hide the sidebar |
+| **Up/Down** or **J/K** | Navigate visible rows |
+| **Left/Right** or **H/L** | Collapse or expand a Workspace |
+| **Enter** | Open the selected Workspace or Shell |
+| **Space** | Toggle a Workspace’s expanded state |
+| **Tab** | Move between Workspace and Agent sections |
+| **Escape** or **F6** | Return focus to the terminal |
+
+Drag the sidebar’s right edge to resize it. Drag all the way left to collapse;
+drag right from the window’s left edge to reopen. Its preferred width is saved.
+
+### Terminal Input
+
+Outside layout mode, ordinary typing and control keys reach the Shell.
+
+| Shortcut | Action |
+| --- | --- |
+| Left-drag over text | Select visible cells; publish to the primary clipboard |
+| **Ctrl + Shift + C / V** | Copy / paste the system clipboard |
+| Middle click | Paste the Linux primary selection |
+| Mouse wheel | Scroll retained history |
+| **Shift + Page Up / Page Down** | Scroll by a viewport |
+| **Shift + Home / End** | Jump to the top / bottom of retained history |
+
+You can also drag the terminal scrollbar. On Omarchy, its universal
+**Super + C/V** bindings provide copy/paste.
+
+**Shift + Enter** uses the portable Ctrl + J newline representation; Enter
+still submits. Other keys use Ghostty’s negotiated keyboard encoder.
+
+## Sidebar Panels
+
+Drag the divider above **Agents | Git | Remotes** to resize this section.
+
+### Agents
+
+Click an Agent to focus or open its Shell. When an observed working Agent
+becomes idle, its row stays marked **finished** until dismissed.
+
+If several Agent threads share a Shell, their rows include distinct Agent ID
+prefixes. They open the same terminal; choose the conversation in the harness.
+
+Bundled integrations are prepared automatically by the Boomux service, including
+on remote machines. Unchanged managed integrations update with Boomux.
+
+- Customizations and uninstall choices are preserved.
+- Already-running harnesses may need restarting to load changes.
+- Codex still requires its own hook trust approval.
+- Desktop does not ask you to detect, install, or update harness integrations.
+
+See [automatic integration management](../docs/install.md#automatic-integration-management).
+
+### Git Overview
+
+Select **Git** for repositories, worktrees, local changes, upstream comparisons,
+and available GitHub PR/check status. Search and refresh sit beside the tabs.
+
+The selected tab is remembered. A blocked-Agent count remains visible while
+you view Git. See [Git panel behavior](../docs/desktop/git-panel.md).
+
+### Remotes
+
+Connect another machine using the general connect action above the machine
+cards, or **+ → New remote workspace…**.
+
+Remote Workspaces use a machine icon and show connection status. Their Shells
+run on that machine. Connecting creates an initial Workspace and Shell;
+open it from the sidebar.
+
+Machine cards start collapsed. Click a header to expand it, or use Enter/Space
+when the Remotes panel has keyboard focus.
+
+| Machine action | Result |
+| --- | --- |
+| **New workspace** | Create and open another Workspace on that machine |
+| **Update Boomux…** | Open the confirmed remote-update flow |
+| Sign-in action | Reauthenticate the selected machine |
+| **Forget connection only…** | Remove local registration and cached views; do not contact the machine or stop its work |
+| **Remove machine & uninstall Boomux…** | Confirm remote removal, stop its managed processes, and remove the executable and unchanged integrations |
+
+Remote uninstall preserves durable state, configuration, and customizations.
+A failed uninstall never silently becomes a local forget. Use **Forget
+connection only** if Boomux was already removed or the machine is unreachable.
+
+Removing a Workspace does not uninstall its machine.
+See [remote identity and removal guarantees](../docs/remote-nodes.md).
+
+## Settings
+
+Open the **gear** button. Preferences save automatically; settings that require
+a service restart produce one reminder after you finish editing.
+
+| Area | Options |
+| --- | --- |
+| Layout | Tree/Tabs, Workspace/Mixed scope, pane headings |
+| Appearance | Rounded/square/mixed corners, pane spacing, focus emphasis |
+| Motion | Instant, Fast, or Smooth — the default |
+| Projects | Browse for folders and set search depth |
+| Notifications | Desktop and sound notifications |
+| Advanced | Open service configuration or optional terminal setup |
+
+Motion affects swaps, reflow, minimize/restore, floating transitions, and
+Workspace switches. Zero pane spacing removes gaps and canvas insets.
+
+### Themes And Saved Preferences
+
+On Omarchy, the active theme updates the interface and terminal palette live.
+A missing or invalid theme uses Boomux’s built-in palette. Settings shows which
+provider is active.
+
+Desktop preferences live in
 `~/.config/boomux-desktop/settings.toml` (`XDG_CONFIG_HOME` is respected).
-Settings presents one categorized list and saves changes automatically. A single
-restart reminder appears when needed. Finish choosing settings, then
-close the panel to choose **Restart now** or **Later**.
-Restart preserves running shells and commands. Pane arrangements and window
-geometry are not yet saved.
-See [preferences and uninstalling](../docs/desktop/releases.md#desktop-integration-and-preferences).
+Service configuration is separate; the Advanced config action opens its
+validated editor.
 
-Desktop checks for newer stable application releases shortly after startup
-and every six hours. Official installations offer **Update**, **View release**, and **Dismiss**. Dismissal
-is saved for that version; a newer release can notify you again. Use **Check for
-updates** in the header menu to revisit dismissed notices. Checks do not install software or restart anything. **Update** downloads and
-verifies the full application on a worker. Choose **Restart now** to gracefully
-restart Boomux and open the updated Desktop, or **Later** to keep working. The
-prepared update is retained across restarts. A failed replacement-window launch
-restores the old bundle and requests daemon recovery; an error remains visible.
-Official bundles show one notice for the complete application. Source and manually
-unpacked builds retain release links and are not eligible for in-app installation.
+**Pane arrangements and window geometry are not yet saved.**
+See [preferences](../docs/desktop/releases.md#desktop-integration-and-preferences).
 
-## Run from source
+### Optional Advanced Setup
+
+**Open advanced setup in terminal** provides the optional checklist:
+Up/Down selects, Space toggles, Enter applies, and Escape cancels.
+
+After completion, it asks before removing its dedicated setup Shell. Its
+temporary Workspace is removed only if still unused and untouched; reused or
+modified Workspaces are kept. Failures remain visible as failures.
+
+Setup does not install the Omarchy plugin or change Hyprland configuration.
+See [checklist details](../docs/install.md#harness-checklist).
+
+## Updates
+
+Desktop checks for stable releases after startup and every six hours.
+Checks do not download updates or restart anything.
+
+1. Choose **Update** to download and verify the complete bundle.
+2. Choose **Restart now** for a graceful handoff, or **Later** to keep working.
+3. Use **Check for updates** in the header menu to revisit dismissed notices.
+
+Prepared updates survive app restarts. Compatible handoffs preserve running
+Shells. Replacement-window failures restore the old bundle and request service
+recovery; errors remain visible.
+
+In-app installation is for eligible official bundles. Source and manually
+unpacked builds retain release links. Existing independent CLI installations
+keep their own updater.
+
+See [update ownership and older-install migration](../docs/desktop/releases.md#distribution-and-installation).
+
+## Current Limitations
+
+- Desktop is not a compositor and cannot host arbitrary Wayland applications.
+- Full Ghostty rendering parity is not implemented. Advanced cursor styles,
+  PNG transmission, Unicode image placeholders, and some Kitty graphics cases
+  remain incomplete.
+- IME, hyperlinks, ligatures, and selection across unloaded scrollback remain
+  incomplete.
+- Animation curves are not freely configurable.
+- Pane arrangements and window geometry are not persisted.
+
+Per-pane scrollback uses a 4 MiB Ghostty page-memory budget, allocated as output
+arrives. Retained line count varies with terminal width and content. This is
+separate from durable Boomux terminal history and is not a total pane-memory cap.
+
+## Run From Source
+
+From the repository root:
 
 ```sh
 python3 desktop/scripts/run-dev.py
 ```
 
-Building the vendored libghostty dependency requires Zig 0.15.2 on `PATH`. It is only needed at build time. If Zig is installed somewhere outside `PATH`, prepend that directory when invoking Cargo:
+The helper builds both binaries and uses an isolated development runtime under
+`target/desktop-dev/`. Zig **0.15.2** must be on PATH for the vendored Ghostty
+dependency. See [DEVELOPMENT.md](../DEVELOPMENT.md) for all prerequisites.
 
-```sh
-PATH=/path/to/zig-0.15.2:$PATH python3 desktop/scripts/run-dev.py
-```
+<details>
+<summary>Startup selection and repeatable attachment testing</summary>
 
-Both packages are built from this workspace using a shared lockfile and version.
-The development helper builds both binaries, selects the matching CLI, and starts
-an isolated development daemon under `target/desktop-dev/`. Run commands from the
-repository root. On startup the app selects the most
-recently focused local Boomux Shell, falling back to the first available Shell,
-then opens every Shell in its Workspace and focuses the selected one. A pending
-Shell starts, an exited Shell restarts, and a running Shell is taken over from
-its current terminal attachment. There is no intermediate shell picker.
+Desktop selects the most recently focused local Shell, falling back to the
+first available one, then opens its Workspace. Pending Shells start; exited
+Shells restart; running Shells are taken over from their current attachment.
 
-For development and repeatable terminal integration tests, `BOOMUX_DESKTOP_SHELL_ID=<exact-local-shell-id>` overrides the initial shell selection.
+Set `BOOMUX_DESKTOP_SHELL_ID=<exact-local-shell-id>` to choose a specific initial
+Shell for development tests. Use isolated test resources, not live user work.
 
-`Ctrl + Enter` creates a new Shell and opens it in a new tile. With terminal focus, it uses the focused terminal's Boomux Workspace. With sidebar focus, it uses the selected Workspace or the parent Workspace of the selected Shell or Agent. New Shells use collision-safe random `adjective-noun` names. The sidebar's `+` button creates a randomly named Workspace with its first randomly named Shell and opens it immediately. In the default single-Workspace pane mode, clicking a Workspace or pressing `Enter` while its row is selected opens its non-minimized Shells and collapses every other Workspace in the sidebar. Shells minimized with `Ctrl + W` remain minimized when switching away and returning to a Workspace. In Mixed mode, clicking a Workspace collapses or expands it without collapsing the others. `Space` also collapses or expands the selected Workspace, and **Open workspace** remains available from its `⋮` menu. Clicking an individual minimized Shell opens only that Shell. `Ctrl + W` and the pane header's minimize button close the focused tile and detach from its Shell; the Shell and its process remain alive in Boomux and can be reopened from the sidebar. Plain left-drag on a pane heading moves or rearranges it without affecting terminal text selection. The pane heading also provides float/dock, maximize/restore, and close buttons. Maximize uses the same workspace-scoped fullscreen behavior as Layout mode's `F`; close permanently terminates and removes the Boomux Shell. Closing the app itself has the same detach-only behavior, preserving Boomux's normal persistence. Each Workspace row has a `⋮` menu for opening it, creating a Shell, renaming, or permanently removing the Workspace. Each Shell row has a `⋮` menu for renaming or permanently removing that Shell. Destructive operations require confirmation by default; **Confirm removals** in Settings can disable those prompts.
+</details>
 
-New Workspaces append to the bottom of the desktop's Workspace list. Drag a
-Workspace row in either direction to reorder it; the dragged row follows the
-pointer and neighboring rows slide into place using the selected motion speed.
-You can also focus it in the sidebar and use `Ctrl+Shift+Up/Down`.
+## Architecture And Performance
 
-The application window title includes the Workspace owning the focused terminal
-pane.
+For other topics, use the [documentation guide](../docs/README.md).
 
-Kitty graphics are decoded by `libghostty-vt` and composited into each GPUI terminal canvas with placement cropping and z-ordering. This is sufficient for raw RGB/RGBA applications such as Terminal Doom. From a Boomux shell whose working directory contains `doom1.wad`, run:
+Boomux owns PTYs, persistence, identities, and transport. Desktop owns rendering,
+input, layout, and pane resources. Local and remote attachments use Boomux’s
+protocol; no external terminal emulator is launched for each tile.
 
-```sh
-/home/gardnmi/Projects/terminal-doom/zig-out/bin/terminal-doom
-```
-
-The prototype uses Ctrl on Linux so its input reaches the app while it is running under Hyprland; Super combinations are normally intercepted by the real compositor. GPUI's portable `secondary` modifier makes these Command shortcuts on macOS. `F1` opens the complete in-app shortcut reference:
-
-| Shortcut | Behavior |
+| Module | Responsibility |
 | --- | --- |
-| `F1` | Open or close the keyboard-shortcut help menu |
-| `F6` | Move keyboard focus between the sidebar and the active terminal |
-| `F2` | Rename the selected sidebar Workspace/Shell, or the focused terminal's Shell |
-| `Ctrl + Space` | Tap to toggle Layout mode; hold for 250 ms or longer for temporary Layout until Control or Space is released; double-tap to send Ctrl+Space to the terminal |
-| `Ctrl + left drag` | Lift, move, and re-tile a tiled pane |
-| `Ctrl + right drag` | Resize a tiled split or floating pane in both axes |
-| `Left drag on a pane edge` | Resize a floating pane or the adjoining tiled divider |
-| `Left drag on a pane corner` | Resize both axes; tiled corners require two adjoining dividers |
-| `Left drag on the sidebar’s right edge` | Resize the sidebar; width is saved |
-| Layout: `Arrow keys` | Focus a spatially adjacent pane (`H/K/L` also focus left/up/right) |
-| Layout: `Tab` or `Shift + Tab` | Cycle focus through panes forward or backward |
-| Layout: `Shift + Arrow keys` or `Shift + H/J/K/L` | Slide-swap a tiled pane, or move a floating pane |
-| Layout: `Alt + H/J/K/L` | Precisely resize the focused tiled or floating pane |
-| Layout: `Alt + Arrow keys` | Resize the focused tiled or floating pane by a normal step |
-| Layout: `Alt + Shift + H/J/K/L` | Resize the focused tiled or floating pane by a large step |
-| Layout: `J` or `S` | Toggle the nearest split between horizontal and vertical, like Omarchy’s `Super + J` |
-| Layout: `E/R` | Equalize or swap the nearest split |
-| Layout: `Alt + Shift + Arrow keys` | Align a floating pane to the corresponding canvas edge |
-| Layout: `C` | Center a floating pane |
-| Layout: `O/F/B` | Toggle floating, workspace maximize, or the sidebar drawer |
-| Layout: `Page Up/Page Down` | Cycle backward or forward through Workspaces in sidebar order |
-| Layout: `Escape` | Return to normal terminal input |
-| `Ctrl + Enter` | Create a Boomux Shell in the selected or focused Workspace and open it in a new tile |
-| `Ctrl + W` | Minimize and detach the focused pane, preserving its Boomux Shell and creating a top tab in Tabs layout |
-| `Ctrl + Shift + W` | Permanently remove the selected or focused Boomux Shell |
-| `Mouse wheel over terminal` | Scroll through retained terminal history |
-| `Shift + Page Up/Page Down` | Scroll terminal history by one viewport, matching Ghostty on Linux |
-| `Shift + Home/End` | Jump to the top or bottom of terminal history |
-| `Left drag over terminal text` | Select visible terminal cells and publish the selection to the Linux primary clipboard |
-| `Ctrl + Shift + C` | Copy the active terminal selection to the system clipboard |
-| `Ctrl + Shift + V` | Paste the system clipboard into the focused terminal |
-| `Super + C/V` on Omarchy | Universal copy/paste through Omarchy's terminal bindings |
-| `Middle click` | Paste the Linux primary selection into the focused terminal |
+| `src/layout.rs` | Split tree, spatial focus, and pane geometry |
+| `src/terminal.rs` | Attachment adapter and Ghostty terminal worker |
+| `src/main.rs` | Application model, input routing, and rendering |
 
-Terminal keys use Ghostty's negotiated keyboard encoder. `Shift+Enter` uses the
-portable Ctrl+J newline representation so it continues to insert a newline in
-Codex even after attaching to an existing Shell whose earlier Kitty keyboard
-negotiation is unavailable; plain `Enter` still submits. Other legacy keys
-retain their conventional encodings.
+Daemon requests and terminal decoding stay off the GPUI render path.
+Queues and caches are bounded, and pane-owned resources are reclaimed on detach.
 
-While the sidebar has keyboard focus, `Up`/`Down` or `J`/`K` moves through
-visible rows, `Left`/`Right` or `H`/`L` collapses and expands Workspaces,
-`Enter` opens the selected Workspace or Shell, `Space` toggles a Workspace's
-expanded state, `Ctrl+Enter` creates a Shell in that row's Workspace, `F2`
-renames the selected Workspace or Shell, `Tab` moves between the Workspaces and
-Agents sections, and `Escape` or `F6` returns to the terminal.
-
-Focus follows the pointer as it moves over panes. Keyboard focus remains in the
-sidebar when the pointer is stationary over a pane and returns to that pane only
-after genuine pointer movement. Clicking still focuses a pane and begins any
-requested drag operation.
-
-The compact Boomux sidebar header keeps Workspace creation visible and places
-Settings, Keyboard Shortcuts, and Hide Sidebar in its overflow menu. Settings
-opens as a scrollable sidebar screen with consistent segmented and stepper
-controls, and can disable removal confirmations. Layout mode's `B` command opens
-the sidebar again after it has been closed. Drag the sidebar's right edge to
-the far left to collapse it. When collapsed, drag right from the window's left
-edge to reopen it. The sidebar follows the pointer below its normal minimum
-width before collapsing at the edge. Its content is clipped at a readable
-layout width rather than reflowing into the narrow opening. Releasing
-before collapse settles back to the minimum readable width, animated when
-motion is enabled. The sidebar retains its preferred width when collapsed.
-
-On Omarchy, Boomux Desktop follows the active system theme automatically. It
-loads the semantic palette and terminal ANSI colors from
-`~/.local/state/omarchy/current/theme/colors.toml`, then watches Omarchy's
-atomically replaced `current` theme directory for live changes. The sidebar,
-settings, dialogs, pane chrome, focus treatment, terminal defaults, cursor, and
-ANSI palette update without restarting or reconnecting panes. A missing or
-invalid Omarchy theme uses Boomux Desktop's built-in palette, which also keeps
-the application usable on non-Omarchy systems. Settings reports whether the
-Omarchy provider or the fallback is active.
-
-Settings default to **Workspace** pane scope: opening a Workspace replaces the
-canvas with its remembered non-minimized Shells, while opening a Shell restores
-only that Shell. **Mixed** scope preserves the free-form behavior where Shells
-from different Workspaces can share the canvas. Settings can also hide pane
-headings and switch the pane layout between **Tree** and
-**Tabs** (the default). Existing saved layout preferences are preserved.
-Tabs leaves every open terminal in the tiled and floating canvas.
-When `Ctrl+W` minimizes a pane, its detached Boomux Shell appears in a strip
-across the top; clicking that tab restores the Shell as a pane. Tabs keeps the
-sidebar's Workspace list compact by hiding all nested Shell rows. The strip's
-arrow controls reveal overflowed tabs, and each tab has a rename control. Tabs is
-Workspace-only: selecting it changes pane
-scope to **Workspace** and disables **Mixed** in Settings. Settings can also
-switch pane edges between rounded, square, and
-mixed. Mixed gives every pane a stable, randomly varied set of corner curves;
-the same menu adjusts spacing between tiled panes, the strength of the focused
-pane border and heading, and window-motion speed. Motion can be Instant, Fast,
-or Smooth (the default) and applies to pane swaps, reflow, and tiled/floating
-transitions. In Workspace scope it also slides the outgoing and incoming pane
-sets in sidebar order when switching Workspaces. These options affect
-presentation only and do not change Boomux resources.
-
-Minimizing and restoring panes follows the selected motion speed. Fast and
-Smooth animate the pane and surrounding layout; Instant applies the new layout
-immediately.
-
-Sidebar Shell indicators distinguish pane state from process state: `●` is the
-focused pane, `◉` is another open pane, and `○` with `minimized` metadata means
-the pane is closed while its durable Boomux Shell remains available.
-
-Window spacing applies both between panes and around the workspace canvas; at
-0px, panes meet each other and the canvas edges with no inset.
-
-The **Keyboard shortcuts** overflow item opens the same help menu as `F1`. The menu lists shortcuts by section, prioritizes sidebar commands while the sidebar is active, supports the mouse wheel, Arrow keys, `J`/`K`, Page Up/Page Down, Home/End, and closes with `Escape` or `F1`. While it is open, its separate key context prevents pane commands from reaching the terminal or changing the layout behind the overlay.
-
-Attached terminals show a scrollbar on their right edge. Its thumb is derived from libghostty's native `total`, `offset`, and `len` viewport state and can be dragged anywhere in retained history. The scrollbar fades in on hover, remains visible while dragged, fades out after exit, and keeps the normal arrow cursor.
-
-Each pane gives Ghostty a 4 MiB page-memory budget for the primary screen and
-scrollback. History is allocated as output arrives; the number of retained
-lines varies with terminal width and cell contents. This is separate from
-Boomux's durable Shell history and reconstruction on attachment.
-
-When a Boomux terminal tile is focused, ordinary typing and common control and
-navigation keys—including `Ctrl+C`, `Ctrl+Arrow`, and `Ctrl+H/J/K/L`—are sent
-to the shell. `Ctrl+Space` enters an explicit Layout mode whose persistent
-on-canvas indicator remains visible until `Escape` or `Ctrl+Space` exits it.
-Holding the chord for at least 250 ms instead makes Layout temporary: releasing
-Control or Space exits it. Layout commands also work with Control held, including
-arrows and Tab, and key repeat never repeatedly toggles the mode.
-The indicator's four tiles spring into place, gently pulse while the mode is
-active, and fold together on exit. Focus changes and animated layout actions
-replay the tile assembly. It follows the Motion setting; Instant uses a static
-badge. Each visible pane dims its terminal contents and shows the animated tile
-logo in its center. While Layout mode is active, typing, paste, and terminal
-mouse-wheel input are blocked; output continues updating. Exiting immediately
-restores input while the overlay fades away.
-
-After a small movement threshold, a tiled pane is temporarily lifted into the floating layer and follows the pointer. Neighboring tiles ease into the freed space, and dropping over the left, right, top, or bottom side of another tile animates the pane back into the resulting tiled layout. A modified click without movement does not mutate geometry. Directional focus and swaps prioritize panes sharing the requested edge before falling back to diagonal candidates. Explicitly floating panes remain floating, rise above other floating panes when focused, and are clamped to the panel during keyboard movement and resizing; Layout mode's `O` command toggles that persistent mode with an eased grow-and-center transition.
-
-Keyboard swaps use the same eased geometry transition, so both affected panes
-slide between their previous and new tiled positions.
-
-Workspace maximize temporarily expands the focused pane over the main terminal canvas while keeping the sidebar and its controls visible. Its tiled position or floating bounds remain unchanged and return with the reverse animation when Layout mode's `F` command is pressed again.
-
-In Tabs layout, ordinary geometry and focus commands continue to operate on all
-open tiled and floating panes. Tabs consume only the height needed for currently
-minimized Shells and disappear when every tab has been restored.
-
-## What this proves
-
-- A binary split tree maps naturally to nested GPUI flex layouts.
-- Focus can be calculated spatially instead of relying on DOM/render order.
-- Tiled and floating layers can coexist in one GPUI scene.
-- Hyprland-like operations can be expressed as ordinary GPUI actions.
-- Multiple Boomux shells can be created, attached, reconstructed, rendered, typed into, resized, closed, detached, and reconnected without launching separate terminal windows.
-- Kitty graphics capability negotiation, decoded RGB/RGBA images, placement clipping, and z-ordering can be bridged from a Boomux PTY through `libghostty-vt` into GPUI.
-
-## What it does not prove yet
-
-- Full Ghostty rendering parity. GPUI still performs its own cell and image drawing, so advanced cursor styles, PNG transmission, Unicode placeholders, animation, and some Kitty graphics edge cases remain incomplete.
-- Mouse reporting for terminal applications, IME, selection spanning unloaded scrollback, hyperlinks, or ligatures.
-- Hosting or compositing arbitrary Wayland clients.
-- Compositor-grade animation physics and configurable animation curves
-- Multiple workspaces and monitors
-- Damage tracking, client lifecycle, or compositor security boundaries
-
-The layout model is isolated in `src/layout.rs`; the Boomux lifecycle, attachment, and libghostty terminal adapter live in `src/terminal.rs`.
-
-## Performance
-
-For automated checks and recommended branch protection, see
-[continuous integration](../docs/desktop/ci.md).
-
-Boomux Desktop is intended to stay responsive and memory-efficient as humans
-and agents create more terminals than traditional single-user workflows. The
-desktop client therefore treats bounded state, backpressure, render-path
-isolation, and measured regressions as architectural requirements rather than
-late optimization work.
-
-Boomux owns server-side scale across Shells and attached clients. Boomux Desktop
-owns the incremental cost of each visible terminal pane, decoded image, and
-frame. See [docs/performance.md](../docs/desktop/performance.md) for the measurement model
-and [docs/architecture.md](../docs/desktop/architecture.md) for the ownership boundary.
-
-## Git overview
-
-Select **Git** beside **Agents** in the lower sidebar or use Layout mode (`Ctrl+Space`, then `G`). Search and refresh sit beside the tabs. Drag the divider above them to resize the section. The selected tab is remembered, and a blocked-Agent count remains visible on Agents while viewing Git. Git connects worktrees to their Shells and Agents and shows local changes, upstream comparisons, and available GitHub PR/check status. See [Git panel](../docs/desktop/git-panel.md) for refresh behavior and status semantics.
+- [Architecture and ownership](../docs/desktop/architecture.md)
+- [Performance measurements and guardrails](../docs/desktop/performance.md)
+- [Continuous integration](../docs/desktop/ci.md)

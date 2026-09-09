@@ -180,6 +180,9 @@ and [uninstalling](docs/uninstall.md) for ownership and data-preservation detail
 
 ## Go Deeper
 
+Use the [documentation guide](docs/README.md) to find the right user guide,
+developer reference, or protocol contract.
+
 The included CLI supports automation and a terminal dashboard. Use
 `boomux --help` for its current commands. For scripts, use only commands
 advertised in `data.json_commands` by `boomux capabilities --json`, invoke them

@@ -1,5 +1,11 @@
 # Official Installation Contract
 
+For the everyday install-and-launch steps, use the
+[Desktop guide](../desktop/README.md#install-release-builds).
+
+**Jump to:** [Installer options](#surface) · [Integrity](#integrity) ·
+[Integrations](#automatic-integration-management) · [Desktop updates](#desktop-installation-and-updates)
+
 > **Status: Current contract.** This document governs the release-pinned
 > `boomux-installer.sh` asset. Package managers and source builds retain their
 > own installation ownership.
@@ -14,13 +20,19 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh
 ```
 
-The installer accepts `--desktop` or `--cli`, and `--no-setup` for the CLI setup
-handoff. Without a choice it prompts on the controlling terminal, defaulting to
-Desktop. Noninteractive callers must select a mode explicitly. Unknown or
-conflicting arguments fail before network or filesystem mutation. Desktop
-installation is embedded from `desktop/install.sh` at release rendering time, so
-selection does not execute another remotely downloaded script. It never invokes privilege escalation or a package
-manager.
+| Option | Behavior |
+| --- | --- |
+| `--desktop` | Install Desktop with the matching CLI |
+| `--cli` | Install the standalone CLI |
+| `--no-setup` | Skip the CLI setup handoff |
+| No mode | Prompt on the controlling terminal, defaulting to Desktop |
+
+Noninteractive callers must select a mode. Unknown or conflicting arguments fail
+before network or filesystem mutation.
+
+Desktop installation is embedded from `desktop/install.sh` at release rendering
+time; mode selection does not fetch a second script. The installer never invokes
+privilege escalation or a package manager.
 
 ## CLI Platform And Destination
 
@@ -55,6 +67,9 @@ checks pass.
 
 ## Setup Handoff
 
+This handoff applies to CLI installation. Desktop prepares bundled integrations
+automatically and keeps advanced setup optional.
+
 After installation, an available controlling terminal receives:
 
 ```text
@@ -70,7 +85,7 @@ Setup failure does not remove the verified Boomux installation. The installer
 reports that installation succeeded, reports setup as incomplete, prints the
 exact retry command, and exits nonzero.
 
-### Automatic Integration Management
+## Automatic Integration Management
 
 The Boomux service makes one background integration-maintenance pass when it
 starts, including after a committed update handoff. It installs missing
@@ -83,13 +98,18 @@ does not execute harnesses or interactive shell startup scripts.
 Already-running harnesses may need restarting to load changed files. Codex's
 own hook trust approval is still required; Boomux does not bypass it.
 
-Use `boomux integration uninstall <name>` to opt out, and
-`boomux integration install <name>` to opt back in. Uninstall choices survive
-service restarts and Boomux updates. Removing a previously managed asset by hand
-also leaves it off. `boomux integration sync` runs maintenance immediately,
-without restarting the service or existing Shells.
-`integration status` remains read-only. Maintenance failures are logged to the
-service's stderr and can be retried with `integration sync`.
+| Task | Command |
+| --- | --- |
+| Opt out | `boomux integration uninstall <name>` |
+| Opt back in | `boomux integration install <name>` |
+| Run maintenance now | `boomux integration sync` |
+| Inspect without changes | `boomux integration status <name>` |
+
+Uninstall choices survive service restarts and updates. Removing a previously
+managed asset by hand also leaves it off. Sync does not restart the service or
+existing Shells. Maintenance failures are logged to service stderr; sync retries them.
+
+### Ownership And Customizations
 
 Versioned ownership receipts beside each integration record its installed
 fingerprint, Boomux release, and enabled state. Older binaries do not automatically
@@ -130,7 +150,8 @@ launcher. It requires Linux x86_64 with glibc 2.39+ and checks fixed graphics
 libraries and both executable versions before switching the active bundle.
 Neither platform mode invokes package managers or privilege escalation.
 
-The app welcome card offers optional agent setup inside an embedded terminal.
+Desktop prepares integrations automatically. Optional advanced setup remains
+available in Settings, inside an embedded terminal.
 No installer or guided setup action installs Omarchy, modifies Hyprland bindings,
 or enables its Workspace layer. See [Desktop releases](desktop/releases.md) for
 versioned paths, update preparation, restart/rollback, and uninstall ownership.
