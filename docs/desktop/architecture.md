@@ -39,6 +39,17 @@ new-Workspace creation retain their existing paths. Reattachment
 to a running Shell retains the exact run already validated by attach, without a
 second owner lookup. Newly started/restarted Shells still resolve their new run.
 
+### Terminal Selection And Clipboard
+
+Selection drag updates use only the source pane's bounds and retain the original
+mouse-down anchor. The primary selection updates during the drag. On left-button
+release, Desktop copies nonempty selected text from that pane to the system
+clipboard once per gesture when `copy_on_select` is enabled (the default).
+The preference applies immediately and is saved in Desktop settings. Disabling
+it preserves manual copying and primary-selection paste. Pending clipboard work
+is a single pane ID, cleared on completion, window deactivation, or Workspace
+replacement; no polling or additional terminal snapshots are retained.
+
 ### Input And Layout Mode
 
 GPUI key contexts separate ordinary terminal input from desktop layout actions.

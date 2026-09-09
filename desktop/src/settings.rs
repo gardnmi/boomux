@@ -20,6 +20,7 @@ pub struct Settings {
     pub focus_highlight_strength: u8,
     pub motion_speed: MotionSpeed,
     pub layout_overlay_visible: bool,
+    pub copy_on_select: bool,
     pub workspace_pane_mode: WorkspacePaneMode,
     pub pane_layout_mode: PaneLayoutMode,
     pub confirm_destructive_actions: bool,
@@ -40,6 +41,7 @@ impl Default for Settings {
             focus_highlight_strength: 100,
             motion_speed: MotionSpeed::Smooth,
             layout_overlay_visible: true,
+            copy_on_select: true,
             workspace_pane_mode: WorkspacePaneMode::Workspace,
             pane_layout_mode: PaneLayoutMode::default(),
             confirm_destructive_actions: true,
@@ -146,6 +148,7 @@ impl Settings {
                         _ => return Err(invalid()),
                     }
                 }
+                "copy_on_select" => s.copy_on_select = value.as_bool().ok_or_else(invalid)?,
                 "layout_overlay_visible" => {
                     s.layout_overlay_visible = value.as_bool().ok_or_else(invalid)?
                 }
@@ -216,6 +219,7 @@ impl Settings {
             "layout_overlay_visible = {}\n",
             self.layout_overlay_visible
         ));
+        encoded.push_str(&format!("copy_on_select = {}\n", self.copy_on_select));
         encoded
     }
     fn save(&self, path: &Path) -> Result<(), String> {
@@ -330,11 +334,13 @@ mod tests {
             motion_speed: MotionSpeed::Instant,
             pane_headings_visible: false,
             layout_overlay_visible: false,
+            copy_on_select: false,
             ..Settings::default()
         };
         assert_eq!(Settings::parse(&settings.encode()).unwrap(), settings);
         assert_eq!(Settings::parse("").unwrap(), Settings::default());
         assert!(Settings::parse("").unwrap().layout_overlay_visible);
+        assert!(Settings::parse("").unwrap().copy_on_select);
         assert_eq!(Settings::default().pane_layout_mode, PaneLayoutMode::Tabbed);
         assert_eq!(
             Settings::parse("pane_layout_mode = 'tiled'")
@@ -358,6 +364,7 @@ mod tests {
             "motion_speed = 'slow'",
             "sidebar_visible = 'true'",
             "layout_overlay_visible = 'false'",
+            "copy_on_select = 'true'",
             "unknown = 3",
             "broken[",
         ] {

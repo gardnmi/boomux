@@ -171,7 +171,7 @@ Outside layout mode, ordinary typing and control keys reach the Shell.
 
 | Shortcut | Action |
 | --- | --- |
-| Left-drag over text | Select visible cells; publish to the primary clipboard |
+| Left-drag over text | Select visible cells; copy to the clipboard on release by default |
 | **Ctrl + Shift + C / V** | Copy / paste the system clipboard |
 | Middle click | Paste the Linux primary selection |
 | Mouse wheel | Scroll retained history |
@@ -251,12 +251,19 @@ a service restart produce one reminder after you finish editing.
 | Layout | Tree/Tabs, Workspace/Mixed scope, pane headings |
 | Appearance | Rounded/square/mixed corners, pane spacing, focus emphasis |
 | Motion | Instant, Fast, or Smooth — the default |
+| Clipboard | Copy on select (enabled by default) |
 | Projects | Browse for folders and set search depth |
 | Notifications | Desktop and sound notifications |
 | Advanced | Open service configuration or optional terminal setup |
 
 Motion affects swaps, reflow, minimize/restore, floating transitions, and
 Workspace switches. Zero pane spacing removes gaps and canvas insets.
+
+**Settings → Clipboard → Copy on select** copies selected terminal text to the
+system clipboard when you release the left mouse button. It defaults to on and
+changes take effect immediately. Disable it to copy only with the manual copy
+shortcut. Middle-click paste continues to use the primary selection either way.
+The preference is saved as `copy_on_select = true` in Desktop's settings file.
 
 ### Themes And Saved Preferences
 

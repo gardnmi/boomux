@@ -1348,6 +1348,22 @@ fn terminal_selected_text(screen: &TerminalScreen, selection: TerminalSelection)
         .join("\n")
 }
 
+// Consume a completed gesture once, even when automatic copying is disabled.
+// The source pane remains authoritative if focus changed during the drag.
+fn take_terminal_selection_copy(
+    pending: &mut Option<usize>,
+    panes: &HashMap<usize, TerminalPane>,
+    enabled: bool,
+) -> Option<String> {
+    let pane_id = pending.take()?;
+    if !enabled {
+        return None;
+    }
+    let pane = panes.get(&pane_id)?;
+    let text = terminal_selected_text(pane.screen.as_ref()?, pane.selection?);
+    (!text.is_empty()).then_some(text)
+}
+
 fn drop_placement(layout: &Node, point: (f32, f32)) -> Option<(usize, Axis, bool)> {
     let (id, rect) = layout.rects().into_iter().find(|(_, rect)| {
         point.0 >= rect.x
@@ -1463,6 +1479,7 @@ struct Workspace {
     floating: Vec<FloatingPane>,
     pointer_drag: Option<PointerDrag>,
     terminal_scrollbar_drag: Option<TerminalScrollbarPointerDrag>,
+    terminal_selection_release: Option<usize>,
     layout_animation: Option<LayoutAnimation>,
     workspace_order_animation: Option<WorkspaceOrderAnimation>,
     floating_animation: Option<FloatingAnimation>,
@@ -1516,6 +1533,7 @@ struct Workspace {
     focus_highlight_strength: u8,
     motion_speed: MotionSpeed,
     layout_overlay_visible: bool,
+    copy_on_select: bool,
     workspace_pane_mode: WorkspacePaneMode,
     pane_layout_mode: PaneLayoutMode,
     minimized_shells: HashSet<String>,
@@ -1656,6 +1674,7 @@ impl Workspace {
             git_panel: git_panel::Model::default(),
             pointer_drag: None,
             terminal_scrollbar_drag: None,
+            terminal_selection_release: None,
             layout_animation: None,
             workspace_order_animation: None,
             floating_animation: None,
@@ -1713,6 +1732,7 @@ impl Workspace {
             focus_highlight_strength: saved.focus_highlight_strength,
             motion_speed: saved.motion_speed,
             layout_overlay_visible: saved.layout_overlay_visible,
+            copy_on_select: saved.copy_on_select,
             workspace_pane_mode: saved.workspace_pane_mode,
             pane_layout_mode: saved.pane_layout_mode,
             minimized_shells: HashSet::new(),
@@ -1793,6 +1813,7 @@ impl Workspace {
         workspace.watch_updates(cx);
         cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
+                this.terminal_selection_release = None;
                 this.layout_leader_release_task = None;
                 if this.layout_leader_pressed_at.take().is_some() && this.layout_leader_entered {
                     this.leave_layout_mode(cx);
@@ -1823,6 +1844,7 @@ impl Workspace {
                 focus_highlight_strength: self.focus_highlight_strength,
                 motion_speed: self.motion_speed,
                 layout_overlay_visible: self.layout_overlay_visible,
+                copy_on_select: self.copy_on_select,
                 workspace_pane_mode: self.workspace_pane_mode,
                 pane_layout_mode: self.pane_layout_mode,
                 confirm_destructive_actions: self.confirm_destructive_actions,
@@ -3871,6 +3893,7 @@ impl Workspace {
             return;
         }
         if let Some(pane) = self.terminals.get_mut(&pane_id) {
+            self.terminal_selection_release = None;
             pane.selection_anchor_position = Some(event.position);
             pane.selection = None;
             cx.notify();
@@ -3907,6 +3930,7 @@ impl Workspace {
             return;
         };
         pane.selection = Some(selection);
+        self.terminal_selection_release = Some(drag.pane_id);
         let selected = pane
             .selection
             .map(|selection| terminal_selected_text(screen, selection));
@@ -4035,6 +4059,7 @@ impl Workspace {
         if let Some(drag) = self.terminal_scrollbar_drag.clone() {
             if event.pressed_button != Some(MouseButton::Left) {
                 self.terminal_scrollbar_drag = None;
+                self.terminal_selection_release = None;
                 return;
             }
             let offset = scrollbar_offset_from_drag(
@@ -4163,6 +4188,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.button == MouseButton::Left {
+            let enabled = self.copy_on_select && !self.layout_mode && self.pointer_drag.is_none();
+            if let Some(text) = take_terminal_selection_copy(
+                &mut self.terminal_selection_release,
+                &self.terminals,
+                enabled,
+            ) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        }
         if self.sidebar_resizing {
             self.finish_sidebar_resize();
             cx.notify();
@@ -5259,6 +5294,7 @@ impl Workspace {
         self.floating.clear();
         self.pointer_drag = None;
         self.terminal_scrollbar_drag = None;
+        self.terminal_selection_release = None;
         self.layout_animation = None;
         self.floating_animation = None;
         self.minimizing_panes.clear();
@@ -5381,6 +5417,7 @@ impl Workspace {
                 self.floating.clear();
                 self.pointer_drag = None;
                 self.terminal_scrollbar_drag = None;
+                self.terminal_selection_release = None;
                 self.layout_animation = None;
                 self.floating_animation = None;
                 self.minimizing_panes.clear();
@@ -8064,6 +8101,17 @@ impl Workspace {
                 .child(layout)
                 .child(Self::settings_category("Appearance"))
                 .child(appearance)
+                .child(Self::settings_category("Clipboard"))
+                .child(Self::settings_group().child(Self::settings_toggle_row(
+                    "Copy on select",
+                    "Copy selected terminal text to the clipboard when you release the mouse.",
+                    Self::settings_switch("copy-on-select", "Copy on select", self.copy_on_select, true)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.copy_on_select = !this.copy_on_select;
+                            this.save_settings();
+                            cx.notify();
+                        })),
+                )))
                 .child(Self::settings_category("Notifications & sounds"))
                 .child(Self::settings_group().children(self.shared_settings_rows(&[0, 1, 2, 3, 4, 5], cx)))
                 .child(Self::settings_category("Recovery & history"))
@@ -11049,8 +11097,7 @@ mod pointer_tests {
         );
     }
 
-    #[test]
-    fn terminal_selection_extracts_rows_in_either_drag_direction() {
+    fn selection_test_screen() -> TerminalScreen {
         let cells = "abc efg "
             .chars()
             .map(|character| terminal::TerminalCell {
@@ -11065,7 +11112,7 @@ mod pointer_tests {
                 cursor: false,
             })
             .collect();
-        let screen = TerminalScreen {
+        TerminalScreen {
             rows: 2,
             cols: 4,
             cells,
@@ -11074,12 +11121,71 @@ mod pointer_tests {
             scroll_len: 2,
             images: Vec::new(),
             image_placements: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn terminal_selection_extracts_rows_in_either_drag_direction() {
+        let screen = selection_test_screen();
         let selection = TerminalSelection {
             anchor: (1, 1),
             head: (0, 1),
         };
         assert_eq!(terminal_selected_text(&screen, selection), "bc\nef");
+    }
+
+    #[test]
+    fn terminal_selection_copy_on_release_is_optional_nonempty_and_once_per_gesture() {
+        let mut panes = HashMap::from([(
+            2,
+            TerminalPane {
+                screen: Some(Arc::new(selection_test_screen())),
+                selection: Some(TerminalSelection {
+                    anchor: (0, 1),
+                    head: (1, 1),
+                }),
+                ..TerminalPane::default()
+            },
+        )]);
+        let mut pending = Some(2);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true).as_deref(),
+            Some("bc\nef")
+        );
+        assert_eq!(pending, None);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true),
+            None
+        );
+        pending = Some(2);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, false),
+            None
+        );
+        assert_eq!(pending, None);
+        // Disabling automatic copy preserves the selection for manual copying.
+        assert!(panes[&2].selection.is_some());
+        pending = Some(99);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true),
+            None
+        );
+        assert_eq!(pending, None);
+        panes.get_mut(&2).unwrap().selection = Some(TerminalSelection {
+            anchor: (0, 3),
+            head: (0, 3),
+        });
+        pending = Some(2);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true),
+            None
+        );
+        panes.get_mut(&2).unwrap().selection = None;
+        pending = Some(2);
+        assert_eq!(
+            take_terminal_selection_copy(&mut pending, &panes, true),
+            None
+        );
     }
 
     #[test]
