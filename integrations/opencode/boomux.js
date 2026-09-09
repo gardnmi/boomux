@@ -257,7 +257,9 @@ function reduce(state, action, isRootEvent) {
       break;
     case "idle":
       if (!isRootEvent) return undefined;
-      next = isBlocked(state) ? "blocked" : "idle";
+      // A trailing idle event cannot resolve a failure or overwrite its evidence.
+      if (isBlocked(state)) return undefined;
+      next = "idle";
       break;
     case "deleted": {
       if (isRootEvent) {
@@ -551,6 +553,7 @@ function createLifecycle({
   initialWorkingContexts = [],
   log = console.error,
   now,
+  disposeTimeoutMs = COMMAND_TIMEOUT_MS,
 }) {
   const environmentShellID = text(env?.BOOMUX_SHELL_ID);
   const environmentRunID = text(env?.BOOMUX_RUN_ID);
@@ -561,6 +564,9 @@ function createLifecycle({
   const roots = new Map();
   const reportError = rateLimitedLogger(log, now);
   let queue = Promise.resolve();
+  let accepting = true;
+  let abandoned = false;
+  let disposal;
 
   function tracked(rootID) {
     let value = roots.get(rootID);
@@ -580,6 +586,7 @@ function createLifecycle({
   }
 
   async function send(rootID, derived) {
+    if (abandoned) return;
     const item = tracked(rootID);
     if (item.disabled) return;
     try {
@@ -629,6 +636,7 @@ function createLifecycle({
           return;
         }
       }
+      if (abandoned) return;
       await run(
         reportArgv(
           item.agentID,
@@ -650,6 +658,7 @@ function createLifecycle({
   async function observe(item, paths) {
     if (!item.agentID || !item.shellID || !item.runID) return;
     for (const path of paths) {
+      if (abandoned) return;
       try {
         await run(
           observeWorkingContextArgv(
@@ -666,6 +675,7 @@ function createLifecycle({
   }
 
   async function handle(event) {
+    if (abandoned) return;
     const info = event?.properties?.info;
     if (info) resolver.remember(info);
     const action = classifyEvent(event);
@@ -707,12 +717,39 @@ function createLifecycle({
   }
 
   function enqueue(event) {
+    if (!accepting) return Promise.resolve();
     const pending = queue.then(() => handle(event));
     queue = pending.catch(reportError);
     return queue;
   }
 
-  return { enqueue, resolver, roots };
+  function dispose() {
+    if (disposal) return disposal;
+    accepting = false;
+    // OpenCode does not await event callbacks, but does await plugin disposal.
+    // Drain already-observed lifecycle evidence before a short-lived run exits.
+    // Cap the total wait, not just each individual subprocess's deadline.
+    disposal = (async () => {
+      let timer;
+      try {
+        await Promise.race([
+          queue,
+          new Promise((resolve) => {
+            timer = setTimeout(() => {
+              abandoned = true;
+              reportError(new Error("lifecycle shutdown drain timed out"));
+              resolve();
+            }, disposeTimeoutMs);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    })();
+    return disposal;
+  }
+
+  return { enqueue, dispose, resolver, roots };
 }
 
 function hookEvent(type, input) {
@@ -732,6 +769,7 @@ export async function BoomuxOpenCodePlugin({ client, directory, worktree }) {
   });
   return {
     event: ({ event }) => lifecycle.enqueue(event),
+    dispose: () => lifecycle.dispose(),
     "chat.message": (input) =>
       lifecycle.enqueue(hookEvent("chat.message", input)),
     "tool.execute.before": (input) =>

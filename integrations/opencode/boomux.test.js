@@ -83,6 +83,75 @@ function successfulEnsure(
   };
 }
 
+describe("lifecycle shutdown", () => {
+  for (const environment of [env, { BOOMUX_OPENCODE_SHARED_GENERATION: "generation" }]) {
+    test(`drains an unawaited error before disposal (${environment === env ? "standalone" : "shared"})`, async () => {
+      const calls = [];
+      let release;
+      const gate = new Promise((resolve) => { release = resolve; });
+      const lifecycle = createLifecycle({
+        client: {}, env: environment, log: () => {},
+        run: async (argv) => {
+          calls.push(argv);
+          if (calls.length === 1) await gate;
+          return successfulEnsure("agent", "idle", "OpenCode root session created");
+        },
+      });
+      void lifecycle.enqueue(event("session.created", { info: { id: "root" } }));
+      void lifecycle.enqueue(event("session.error", { sessionID: "root", error: { message: "model unavailable" } }));
+      void lifecycle.enqueue(event("session.idle", { sessionID: "root" }));
+      const disposal = lifecycle.dispose();
+      expect(lifecycle.dispose()).toBe(disposal);
+      let finished = false;
+      void disposal.then(() => { finished = true; });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(finished).toBe(false);
+      release();
+      await disposal;
+      expect(calls.at(-1)[calls.at(-1).indexOf("--state") + 1]).toBe("blocked");
+      expect(lifecycle.roots.get("root").reducer.lastState).toBe("blocked");
+      expect(lifecycle.roots.get("root").reducer.lastEvidence).toBe("OpenCode error: model unavailable");
+      const count = calls.length;
+      await lifecycle.enqueue(event("chat.message", { sessionID: "root" }));
+      expect(calls).toHaveLength(count);
+    });
+  }
+
+  test("caps the drain and abandons queued work after the deadline", async () => {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const calls = [];
+    const errors = [];
+    const lifecycle = createLifecycle({
+      client: {}, env, disposeTimeoutMs: 5, log: (error) => errors.push(error),
+      run: async (argv) => {
+        calls.push(argv);
+        await gate;
+        return successfulEnsure("agent", "idle", "OpenCode root session created");
+      },
+    });
+    void lifecycle.enqueue(event("session.created", { info: { id: "root" } }));
+    const pending = lifecycle.enqueue(event("session.error", { sessionID: "root", error: { message: "failed" } }));
+    await lifecycle.dispose();
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("shutdown drain timed out");
+    release();
+    await pending;
+    expect(calls).toHaveLength(1);
+  });
+
+  test("report failure remains fail-open during disposal", async () => {
+    const errors = [];
+    const lifecycle = createLifecycle({
+      client: {}, env, log: (error) => errors.push(error),
+      run: async () => { throw new Error("daemon unavailable"); },
+    });
+    void lifecycle.enqueue(event("session.created", { info: { id: "root" } }));
+    await lifecycle.dispose();
+    expect(errors).toHaveLength(1);
+  });
+});
+
 describe("event mapping and reducer", () => {
   test("extracts only structured allowlisted working-context paths", () => {
     expect(
@@ -211,9 +280,10 @@ describe("event mapping and reducer", () => {
       ).state,
     ).toBe("blocked");
     expect(
-      reduce(state, { kind: "idle", sessionID: "root", evidence: "idle" }, true)
-        .state,
-    ).toBe("blocked");
+      reduce(state, { kind: "idle", sessionID: "root", evidence: "idle" }, true),
+    ).toBeUndefined();
+    expect(state.lastState).toBe("blocked");
+    expect(state.lastEvidence).toBe("error");
     expect(
       reduce(
         state,

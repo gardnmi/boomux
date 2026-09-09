@@ -11,6 +11,105 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-09-09: installed harness smoke refresh
+
+Tested on Linux with a freshly built debug Boomux `1.11.1`, protocol `54`.
+Root and integration sources match `fd4c072` (also unchanged in `3ebbdb9`).
+Each probe used an empty temporary Git repository, a private daemon, and
+isolated home/config/state/runtime directories. Current integrations were
+explicitly installed in that fixture; this does **not** revalidate automatic
+installation, remote deployment, or Desktop presentation.
+
+Lifecycle evidence below comes from public `agent list` observations, joined
+to the exact Agent, external session, Shell, and ShellRun. Terminal output
+established the provider outcome only. Short-lived revisions missed by polling
+are not claimed as observed.
+
+### Live results
+
+| Harness | Tested version | Observed lifecycle | Limits |
+| --- | --- | --- | --- |
+| Pi | `0.85.1` | Successful OpenAI Codex `gpt-6-astra` print-mode turn: Working → Idle (`Pi agent settled`) → Inactive. Provider rejection: Idle → Working → Blocked → Inactive, retaining blocked attention. | Interactive permission waits, retry recovery, `/reload`, and session switching were not exercised. |
+| Codex | `0.153.4` | Successful `exec` turn: Idle → Working → Idle → Inactive. Real Ctrl+C during Working: Idle → Working → Idle (`Codex turn interrupted`) → Inactive. | Same-conversation follow-up after interruption, TUI conversation switching, subagents, and network-failure cancellation remain outside this smoke. |
+| Claude Code | `2.1.263` | Successful Haiku print-mode turn after refreshing login: Working → Idle → Inactive. Expired-login attempt: Working → Idle (`Claude turn failed`), with no blocked attention. | Permission dialogs, background tasks, subagents, Remote Control, and interactive interruption were not refreshed. |
+| OpenCode | `1.18.29` | Standalone `run` with `openai/gpt-6-astra`: Working → Idle. A failed free-provider run registered Idle → Working but never reported the failure to Boomux. | Shared Harness Runtime/TUI claims, permission recovery, subagents, and shutdown cleanup were not revalidated on this host version. |
+| Kiro CLI | `2.21.1` | Launch attempted with the current integration installed; the isolated host stopped at its sign-in prompt before registering an Agent. | No authenticated provider lifecycle claim for `2.21.1`; earlier `2.18.0` evidence below remains historical, not coverage for this version. |
+
+Successful prompts requested only `lifecycle-ok`, without tools. Pi's failure
+was an actual provider rejection of `gpt-5.4-mini` for the copied ChatGPT login,
+not an injected hook event. Its final assistant error produced Blocked before
+shutdown; the attention item survived the Inactive observation.
+
+Codex used the reviewed fixture hooks and invocation-local hook-trust bypass,
+with a read-only sandbox. Ctrl+C was sent through its PTY after an authoritative
+Working observation during a long, tool-free response. The exact Agent reported
+`Codex turn interrupted` at revision 3, then Inactive at revision 4. This closes
+the earlier **live Interrupt** evidence gap for `0.153.4`; it does not extend the
+claim to older hosts or every cancellation path.
+
+### Initial issues exposed by these probes
+
+The two failure-reporting issues below were subsequently fixed and replayed;
+see the follow-up evidence after this initial record. Kiro remains unvalidated.
+
+- **OpenCode failure can leave stale Working.** Selecting
+  `opencode/deepseek-v4-flash-free` failed with `UnknownError: Unexpected server
+  error`. The same error reproduced outside Boomux with a separate, plugin-free
+  configuration. Boomux did not cause that provider/host failure, but its Agent
+  remained at Working revision 2 after the ShellRun exited, without blocked
+  attention. A successful turn through another provider worked. The missing
+  failure observation needs host-event/adapter investigation; process exit must
+  not be used to manufacture permanent Agent completion.
+- **Claude authentication failure is not surfaced as blocked.** The expired
+  OAuth attempt exited with status 1. `StopFailure` produced Idle with evidence
+  `Claude turn failed`, no blocked attention, and no later Inactive observation
+  before fixture teardown. The Idle mapping is explicit in `claude_hooks.rs`,
+  not a missed Working hook. Decide and test failure-attention semantics and
+  failure-path shutdown handling; the successful refreshed-login run did emit
+  Inactive.
+- **Kiro still needs an authenticated isolated smoke.** No user login or running
+  session was modified to bypass this limit. Startup at a login prompt is not
+  evidence that provider-driven hooks work.
+
+### Checks and boundaries
+
+`cargo test --bin boomux _hooks::tests --locked` passed all 14 Claude, Codex,
+and Kiro hook-reducer tests. Bun `1.3.14` passed all 50 focused OpenCode plugin,
+OpenCode TUI, and Pi tests using the repository's `./integrations/...` paths.
+These fixtures do not replace the missing live scenarios listed above.
+
+The initial refresh made no runtime fixes and did not exercise remote machines,
+daemon handoff, notification delivery, forced crashes, or the full lifecycle
+matrix. Private fixture processes and copied authentication were cleaned up;
+existing user sessions were left alone.
+
+### Same-day failure-reporting fixes
+
+With the follow-up working-tree patch, OpenCode `1.18.29`'s same failed `run`
+reported Working → Blocked and retained blocked attention before process exit.
+A metadata-only event trace showed the host already emitted `session.error`
+with the exact Session ID and a model-not-found error. The report was lost
+because event callbacks were not awaited before shutdown, not because error
+classification was absent. OpenCode's
+[tagged plugin implementation](https://github.com/anomalyco/opencode/blob/v1.18.29/packages/opencode/src/plugin/index.ts)
+awaits `dispose`; Boomux now drains pending reports there with a five-second
+total limit. Trailing Idle events no longer replace the failure evidence.
+No lifecycle state is inferred from disposal or process exit.
+
+Claude Code `2.1.263`, run with no credentials in the private fixture, now
+reported Working → Blocked (`Claude turn failed`) with durable blocked attention.
+The host still did not emit SessionEnd on this authentication-failure path;
+Boomux leaves the failure visible instead of inventing inactivity. A native
+fixture verifies that a later SessionEnd can report Inactive and a later prompt
+can report Working on the same Agent, while preserving unacknowledged attention.
+
+Follow-up checks passed: `cargo check --locked`, formatting, six Claude reducer
+tests, the focused native Claude lifecycle/bridge test, and 44 OpenCode server/TUI
+tests. New shutdown cases cover standalone and shared report routing, unawaited
+errors, trailing Idle, idempotent disposal, deadline expiry, and fail-open daemon
+errors. Shared-host shutdown itself was not exercised live. No full suite or
+release build was run. These fixes do not close the other live-test limits above.
+
 ## 2026-09-06: combined Desktop update handoff
 
 Source `138e6d9` was tested on Linux x86_64, kernel `7.2.3-arch1-2`, glibc
