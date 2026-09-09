@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.1](https://github.com/gardnmi/boomux/compare/v1.11.0...v1.11.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* explain desktop bundle uninstall requirements ([#382](https://github.com/gardnmi/boomux/issues/382)) ([cf09b1d](https://github.com/gardnmi/boomux/commit/cf09b1d96c3edac4b50c7a3fb05200c9a7d2a160))
+
 ## [1.11.0](https://github.com/gardnmi/boomux/compare/v1.10.0...v1.11.0) (2026-09-09)
 
 
