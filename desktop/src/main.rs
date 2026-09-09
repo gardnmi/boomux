@@ -8,6 +8,7 @@ mod nodes;
 mod remote;
 mod runtime;
 mod settings;
+mod subprocess;
 mod terminal;
 mod theme;
 mod updates;
@@ -10251,6 +10252,9 @@ fn paint_terminal_images(
 }
 
 fn main() {
+    if subprocess::dispatch() {
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("boomux-desktop {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -10292,6 +10296,17 @@ fn main() {
         Err(error) => (settings::Settings::default(), Some(error)),
     };
     gpui_platform::application().run(move |cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        cx.bind_keys([
+            KeyBinding::new("cmd-c", CopySelection, Some("Terminal")),
+            KeyBinding::new("cmd-v", PasteClipboard, Some("Terminal")),
+            KeyBinding::new("cmd-v", PasteClipboard, Some("BoomuxSettingsInput")),
+            KeyBinding::new("cmd-w", ClosePane, Some("Terminal")),
+            KeyBinding::new("cmd-enter", NewPane, Some("Terminal")),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
+        #[cfg(target_os = "macos")]
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.bind_keys([
             KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("BoomuxSettingsInput")),
             // Layout commands remain available while Control is held with the leader.
@@ -11939,3 +11954,6 @@ mod pointer_tests {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+gpui::actions!(macos, [Quit]);

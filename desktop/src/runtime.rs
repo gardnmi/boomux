@@ -1,5 +1,6 @@
 //! Display-independent checks used before activating a downloaded release.
 
+#[cfg(target_os = "linux")]
 pub fn check() -> Result<(), String> {
     let mut missing = Vec::new();
     for library in [
@@ -32,4 +33,19 @@ pub fn check() -> Result<(), String> {
             missing.join(", ")
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn check() -> Result<(), String> {
+    // System frameworks are supplied by macOS; the actual renderer is tested
+    // by launching the packaged application on a logged-in Mac.
+    let path = c"/System/Library/Frameworks/Metal.framework/Metal";
+    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    if handle.is_null() {
+        return Err("Metal is unavailable on this Mac".into());
+    }
+    unsafe {
+        libc::dlclose(handle);
+    }
+    Ok(())
 }
