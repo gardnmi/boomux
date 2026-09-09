@@ -145,3 +145,7 @@ pub fn rename_noreplace(
         Ok(())
     }
 }
+
+pub fn current_executable() -> io::Result<PathBuf> {
+    std::env::current_exe()
+}

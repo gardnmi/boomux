@@ -2,6 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -684,9 +686,15 @@ fn native_daemon_handoffs_multiple_detached_shells() {
             .unwrap();
         thread::sleep(Duration::from_millis(50));
         let command = format!("printf 'pid{index}=%s:end\\n' \"$$\"\n");
-        AttachFrame::Input(command.into_bytes())
-            .write_to(&mut attachment)
-            .unwrap();
+        if let Err(error) = AttachFrame::Input(command.into_bytes()).write_to(&mut attachment) {
+            let snapshot = daemon.client.get_shell(&shell.id);
+            let mut pending = Vec::new();
+            let _ = attachment.read_to_end(&mut pending);
+            panic!(
+                "input failed: {error}; shell: {snapshot:?}; pending: {:?}",
+                String::from_utf8_lossy(&pending)
+            );
+        }
         let output = read_until(&mut attachment, b":end");
         pids.push(parse_pid(&output, &format!("pid{index}=")).unwrap());
         let run = daemon.client.get_shell(&shell.id).unwrap().run.unwrap();
@@ -825,10 +833,24 @@ fn explicit_executable_handoff_preserves_live_runs_and_rolls_back_on_failure() {
         let pid = daemon.client.daemon_process_credentials().unwrap().pid;
         assert_ne!(pid, previous_pid);
         previous_pid = pid;
+        #[cfg(target_os = "linux")]
         assert_eq!(
             boomux::platform::process_executable(pid).unwrap(),
             *executable
         );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                boomux::platform::daemon_executable_path(pid).unwrap(),
+                *executable
+            );
+            let actual = fs::metadata(boomux::platform::process_executable(pid).unwrap()).unwrap();
+            let expected = fs::metadata(executable).unwrap();
+            assert_eq!(
+                (actual.dev(), actual.ino()),
+                (expected.dev(), expected.ino())
+            );
+        }
         assert_eq!(
             daemon.client.get_shell(shell_id).unwrap().run.unwrap().id,
             run_id

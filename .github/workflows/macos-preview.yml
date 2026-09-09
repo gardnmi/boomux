@@ -52,6 +52,8 @@ jobs:
       - name: Test native process identity
         run: cargo +stable test --locked --lib platform::macos::tests -- --test-threads=1 --nocapture
       - name: Test detached handoff
+        env:
+          BOOMUX_TEST_DIAGNOSTICS: "1"
         run: cargo +stable test --locked --test native_backend native_daemon_handoffs_multiple_detached_shells -- --test-threads=1 --nocapture
       - name: Check Desktop
         run: cargo +stable check --locked -p boomux-desktop

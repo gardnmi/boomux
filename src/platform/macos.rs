@@ -542,3 +542,115 @@ mod tests {
         signal_process(handle.as_fd(), libc::SIGKILL).unwrap();
     }
 }
+
+/// Darwin cannot exec an open file descriptor. A private hard link pins the
+/// inspected inode across pathname replacement. Cross-filesystem linking fails
+/// before ownership transfer instead of falling back to a mutable pathname.
+pub struct ExecutablePin {
+    pub path: PathBuf,
+    pub original: PathBuf,
+    armed: bool,
+}
+impl ExecutablePin {
+    pub fn prepare(file: &File) -> io::Result<Self> {
+        let original = executable_path(file)?;
+        let root = super::runtime_root()?.join("boomux");
+        let path = root.join(format!(".exec-{}", uuid::Uuid::new_v4()));
+        fs::hard_link(&original, &path)?;
+        let pin = Self {
+            path,
+            original,
+            armed: true,
+        };
+        let pinned = file.metadata()?;
+        let linked = fs::symlink_metadata(&pin.path)?;
+        if !linked.is_file() || pinned.dev() != linked.dev() || pinned.ino() != linked.ino() {
+            return Err(io::Error::other(
+                "replacement changed before executable pinning",
+            ));
+        }
+        Ok(pin)
+    }
+    pub fn commit(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for ExecutablePin {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn is_executable_pin(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.strip_prefix(".exec-"))
+        .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+}
+
+pub fn current_executable() -> io::Result<PathBuf> {
+    let actual = std::env::current_exe()?;
+    if is_executable_pin(&actual) {
+        let path = std::env::args_os()
+            .next()
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .ok_or_else(|| io::Error::other("missing original daemon executable path"))?;
+        return Ok(path);
+    }
+    Ok(actual)
+}
+
+pub fn daemon_executable_path(pid: u32) -> io::Result<PathBuf> {
+    let actual = process_executable(pid)?;
+    if is_executable_pin(&actual) {
+        let args = process_argv(pid)?;
+        if args.len() == 5 && args[1] == b"daemon" && args[2] == b"receive-handoff" {
+            let original = PathBuf::from(OsString::from_vec(args[0].clone()));
+            if original.is_absolute() {
+                return Ok(original);
+            }
+        }
+        return Err(io::Error::other("invalid pinned daemon command"));
+    }
+    Ok(actual)
+}
+
+pub fn running_executable_pin() -> io::Result<Option<ExecutablePin>> {
+    let path = std::env::current_exe()?;
+    let root = super::runtime_root()?.join("boomux").canonicalize()?;
+    if is_executable_pin(&path) && path.parent() == Some(root.as_path()) {
+        Ok(Some(ExecutablePin {
+            original: current_executable()?,
+            path,
+            armed: true,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Called only after acquiring the cold-start daemon ownership lock. No live
+/// daemon can own these crash leftovers. Work and retained files stay bounded.
+pub fn remove_stale_executable_pins(root: &std::path::Path) -> io::Result<()> {
+    let current = std::env::current_exe()?;
+    let mut count = 0;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !is_executable_pin(&entry.path()) || entry.path() == current {
+            continue;
+        }
+        count += 1;
+        if count > 1024 {
+            return Err(io::Error::other("too many stale executable pins"));
+        }
+        let meta = fs::symlink_metadata(entry.path())?;
+        if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::other("unsafe stale executable pin"));
+        }
+        fs::remove_file(entry.path())?;
+    }
+    Ok(())
+}

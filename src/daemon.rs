@@ -377,6 +377,8 @@ pub fn run_with_notification_delivery(
         .ok_or_else(|| io::Error::other("socket path has no parent"))?;
     secure_runtime_dir(runtime_dir)?;
     let daemon_lock = acquire_daemon_lock(runtime_dir)?;
+    #[cfg(target_os = "macos")]
+    platform::remove_stale_executable_pins(runtime_dir)?;
 
     if socket_path.exists() {
         fs::remove_file(&socket_path)?;
@@ -418,6 +420,8 @@ fn run_daemon(
     committed: Option<&mut UnixStream>,
     notification_settings: NotificationDeliverySettings,
 ) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let _executable_pin = platform::running_executable_pin()?;
     validate_notification_delivery_settings(&notification_settings)?;
     let live_handoff = committed.is_some();
     let mut registry = DaemonService::restore(store, live_handoff, transferred.events)?;
@@ -1271,7 +1275,7 @@ fn resolve_executable(
     executable: &str,
 ) -> Option<PathBuf> {
     let path = environment_value(environment, b"PATH")?;
-    let current_executable = env::current_exe()
+    let current_executable = platform::current_executable()
         .ok()
         .and_then(|path| path.canonicalize().ok());
     env::split_paths(&path).find_map(|directory| {
@@ -1392,7 +1396,7 @@ fn inject_opencode_shim_environment(
     let real_claude = resolve_executable(environment, Some(&shim_dir), "claude");
     let real_codex = resolve_codex_executable(environment, Some(&shim_dir));
     let real_kiro = resolve_kiro_executable(environment, Some(&shim_dir));
-    let boomux = env::current_exe()?.canonicalize()?;
+    let boomux = platform::current_executable()?.canonicalize()?;
     let boomux_metadata = fs::metadata(&boomux)?;
     if !boomux.is_absolute()
         || !boomux_metadata.is_file()
@@ -1728,15 +1732,29 @@ fn launch_replacement_process(
         claude_remote_control_bindings,
         kiro_launch_holders,
     } = options;
+    #[cfg(target_os = "macos")]
+    let executable = Some(match executable {
+        Some(file) => file,
+        None => pin_replacement_executable(&replacement_executable()?)?,
+    });
+    #[cfg(target_os = "macos")]
+    let mut executable_pin = platform::ExecutablePin::prepare(
+        executable.as_ref().expect("Darwin replacement is pinned"),
+    )?;
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
     // Keep the inspected executable open through exec. The descriptor is above
     // CHANNEL_FD so the handoff channel duplication cannot overwrite it.
+    #[cfg(target_os = "linux")]
     let replacement_path = match executable.as_ref() {
         Some(file) => platform::executable_path(file)?,
         None => replacement_executable()?,
     };
+    #[cfg(target_os = "macos")]
+    let replacement_path = &executable_pin.path;
     let mut command = Command::new(replacement_path);
+    #[cfg(target_os = "macos")]
+    command.arg0(&executable_pin.original);
     if let Some(environment) = startup_environment {
         command.env_clear();
         for variable in environment.variables {
@@ -1838,6 +1856,10 @@ fn launch_replacement_process(
         let _ = replacement.kill();
         let _ = replacement.wait();
     }
+    #[cfg(target_os = "macos")]
+    if result.is_ok() {
+        executable_pin.commit();
+    }
     result
 }
 
@@ -1885,7 +1907,7 @@ fn pin_replacement_executable(path: &Path) -> io::Result<File> {
 }
 
 fn replacement_executable() -> io::Result<PathBuf> {
-    let current = env::current_exe()?;
+    let current = platform::current_executable()?;
     Ok(select_replacement_executable(
         current,
         env::args_os().next().map(PathBuf::from),

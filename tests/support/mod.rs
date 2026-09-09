@@ -118,6 +118,9 @@ impl TestDaemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if std::env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+            command.stderr(Stdio::inherit());
+        }
         remove_boomux_shim_environment(&mut command);
         configure(&mut command, &runtime_dir);
         let child = command.spawn().unwrap();

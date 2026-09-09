@@ -3507,7 +3507,7 @@ fn daemon_process_identity(client: &client::Client) -> Option<DaemonProcessIdent
         return None;
     }
     let process = boomux::platform::process_snapshot(credentials.pid).ok()?;
-    let executable = boomux::platform::process_executable(credentials.pid)
+    let executable = boomux::platform::daemon_executable_path(credentials.pid)
         .ok()?
         .into_os_string()
         .into_string()
