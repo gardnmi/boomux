@@ -264,6 +264,11 @@ system clipboard when you release the left mouse button. It defaults to on and
 changes take effect immediately. Disable it to copy only with the manual copy
 shortcut. Middle-click paste continues to use the primary selection either way.
 The preference is saved as `copy_on_select = true` in Desktop's settings file.
+Desktop shows a brief **Copied** indicator in the source pane after automatic or
+manual selection copying. It does not watch the clipboard or add notifications
+for copies performed by a harness. Left-drag selection is currently local to
+Desktop; mouse-wheel reporting is separate, so the same selection gesture does
+not also invoke a harness's mouse-based copy handler.
 
 ### Themes And Saved Preferences
 

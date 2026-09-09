@@ -49,6 +49,12 @@ The preference applies immediately and is saved in Desktop settings. Disabling
 it preserves manual copying and primary-selection paste. Pending clipboard work
 is a single pane ID, cleared on completion, window deactivation, or Workspace
 replacement; no polling or additional terminal snapshots are retained.
+Desktop-initiated automatic and manual copies show a source-pane “Copied” badge
+for 1.5 seconds, using one replaceable cleanup task per window. Clipboard changes
+and terminal output never trigger the badge. Left-button selection gestures are
+not forwarded to the harness (current mouse reporting covers wheel events only),
+so a Desktop selection cannot simultaneously invoke a harness copy-on-select
+handler. Future button forwarding must preserve exclusive gesture ownership.
 
 ### Input And Layout Mode
 

@@ -1480,6 +1480,8 @@ struct Workspace {
     pointer_drag: Option<PointerDrag>,
     terminal_scrollbar_drag: Option<TerminalScrollbarPointerDrag>,
     terminal_selection_release: Option<usize>,
+    copied_pane: Option<usize>,
+    copied_cleanup: Option<gpui::Task<()>>,
     layout_animation: Option<LayoutAnimation>,
     workspace_order_animation: Option<WorkspaceOrderAnimation>,
     floating_animation: Option<FloatingAnimation>,
@@ -1675,6 +1677,8 @@ impl Workspace {
             pointer_drag: None,
             terminal_scrollbar_drag: None,
             terminal_selection_release: None,
+            copied_pane: None,
+            copied_cleanup: None,
             layout_animation: None,
             workspace_order_animation: None,
             floating_animation: None,
@@ -3941,6 +3945,25 @@ impl Workspace {
         cx.notify();
     }
 
+    fn copy_terminal_text(&mut self, pane_id: usize, text: String, cx: &mut Context<Self>) {
+        // Feedback belongs only to Desktop-initiated copies. Do not observe the
+        // clipboard or react to harness output: those applications own their UI.
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.copied_pane = Some(pane_id);
+        // Replacing the task cancels the old timeout, keeping rapid copies to a
+        // single indicator and one timer, with no clipboard content retained.
+        self.copied_cleanup = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.copied_pane = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = self.terminals.get(&self.focused).and_then(|pane| {
             Some(terminal_selected_text(
@@ -3951,7 +3974,7 @@ impl Workspace {
             return;
         };
         if !text.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.copy_terminal_text(self.focused, text, cx);
             cx.stop_propagation();
         }
     }
@@ -4189,13 +4212,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if event.button == MouseButton::Left {
+            let source_pane = self.terminal_selection_release;
             let enabled = self.copy_on_select && !self.layout_mode && self.pointer_drag.is_none();
             if let Some(text) = take_terminal_selection_copy(
                 &mut self.terminal_selection_release,
                 &self.terminals,
                 enabled,
-            ) {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            ) && let Some(pane_id) = source_pane
+            {
+                self.copy_terminal_text(pane_id, text, cx);
             }
         }
         if self.sidebar_resizing {
@@ -9171,6 +9196,21 @@ impl Workspace {
                     }))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::paste_primary))
                     .child(self.boomux_body(id, cx))
+                    .when(self.copied_pane == Some(id), |body| {
+                        body.child(
+                            div()
+                                .absolute()
+                                .bottom(px(12.0))
+                                .right(px(20.0))
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x313244))
+                                .text_color(rgb(0xa6e3a1))
+                                .text_sm()
+                                .child("Copied"),
+                        )
+                    })
                     .when(
                         self.layout_overlay_visible
                             && (self.layout_mode
