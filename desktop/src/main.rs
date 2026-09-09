@@ -8424,6 +8424,8 @@ impl Workspace {
         div()
             .id(SharedString::from(format!("sidebar-agent-{}", agent.id)))
             .h(px(56.0))
+            .flex_none()
+            .overflow_hidden()
             .px_2()
             .flex()
             .items_center()
@@ -8442,7 +8444,13 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.activate_sidebar_shell(&shell_id, window, cx);
             }))
-            .child(div().w(px(14.0)).text_color(rgb(glyph_color)).child(glyph))
+            .child(
+                div()
+                    .w(px(14.0))
+                    .flex_none()
+                    .text_color(rgb(glyph_color))
+                    .child(glyph),
+            )
             .child(
                 div()
                     .min_w_0()
@@ -8451,11 +8459,17 @@ impl Workspace {
                     .flex_col()
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap_2()
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
                                     .text_sm()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(0xcdd6f4))
@@ -8463,6 +8477,8 @@ impl Workspace {
                             )
                             .child(
                                 div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
                                     .text_xs()
                                     .text_color(rgb(0x6c7086))
                                     .child(relative_time(agent.updated_at_ms)),
@@ -8470,6 +8486,8 @@ impl Workspace {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .truncate()
                             .text_xs()
                             .text_color(if agent.needs_attention {
                                 rgb(0xf38ba8)
