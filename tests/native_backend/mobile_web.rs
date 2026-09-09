@@ -387,8 +387,10 @@ fn current_local_agent_from_any_harness_can_collaborate_from_web_terminal() {
     drop(pty.slave);
     let mut native_reader = pty.master.try_clone_reader().unwrap();
     let mut native_writer = pty.master.take_writer().unwrap();
+    // Match executed output, not input echoed before __attach enters raw mode.
+    // Input is forwarded only after the initial resize nudge has settled.
     native_writer
-        .write_all(b"printf 'native-before-web\\n'\n")
+        .write_all(b"printf 'native-%s-web\\n' before\n")
         .unwrap();
     read_terminal_until(native_reader.as_mut(), b"native-before-web");
 
