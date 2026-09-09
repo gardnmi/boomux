@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import stat
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -27,7 +29,7 @@ class DevelopmentLaunchTests(unittest.TestCase):
             "XDG_CACHE_HOME": "/ordinary/cache-home",
             "HOME": "/ordinary/home", "KIRO_HOME": "/explicit/kiro",
             **({"GH_CONFIG_DIR": gh_config} if gh_config else {}),
-        }, clear=True), patch.object(Path, "mkdir"), \
+        }, clear=True), patch.object(Path, "mkdir"), patch.object(Path, "lstat", return_value=Mock(st_mode=stat.S_IFDIR | 0o700, st_uid=os.getuid())), \
                 patch("subprocess.run", side_effect=[Mock(), status, failure or Mock()]) as run, \
                 patch("os.execve") as execute:
             if failure:
@@ -45,7 +47,8 @@ class DevelopmentLaunchTests(unittest.TestCase):
             self.assertEqual(calls[1].args[0], [cli, "daemon", "status", "--json"])
             for call in calls[1:]:
                 env = call.kwargs["env"]
-                for name in ["RUNTIME_DIR", "CONFIG_HOME", "STATE_HOME"]:
+                self.assertEqual(env["BOOMUX_RUNTIME_DIR"], str(DEV["runtime_directory"](ROOT)))
+                for name in ["CONFIG_HOME", "STATE_HOME"]:
                     self.assertEqual(env[f"BOOMUX_{name}"], str(ROOT / "target/desktop-dev" / name.lower()))
                 self.assertEqual(env["XDG_RUNTIME_DIR"], "/ordinary/runtime")
                 for name in ["CONFIG", "STATE", "DATA", "CACHE"]:
@@ -59,6 +62,39 @@ class DevelopmentLaunchTests(unittest.TestCase):
                 self.assertTrue(call.kwargs["check"])
                 self.assertEqual(call.kwargs["timeout"], 30)
             return calls[-1].args[0]
+
+    def test_long_worktrees_get_short_stable_distinct_runtime_paths(self):
+        root = Path("/home/developer/Worktrees/boomux") / ("long-branch-" * 20)
+        path = DEV["runtime_directory"](root)
+        self.assertLess(len(os.fsencode(path / "boomux/daemon.sock")), 108)
+        self.assertEqual(path, DEV["runtime_directory"](root))
+        self.assertNotEqual(path, DEV["runtime_directory"](root / "other"))
+        self.assertEqual(DEV["runtime_directory"](Path("/short")),
+                         Path("/short/target/desktop-dev/runtime_dir"))
+
+    def test_status_failure_exposes_the_underlying_error(self):
+        failure = subprocess.CalledProcessError(1, "status", stderr="socket error details")
+        with patch("sys.argv", ["run-dev.py"]), patch.object(Path, "mkdir"), \
+                patch.object(Path, "lstat", return_value=Mock(st_mode=stat.S_IFDIR | 0o700, st_uid=os.getuid())), \
+                patch("subprocess.run", side_effect=[Mock(), failure]), \
+                patch("os.execve") as execute:
+            with self.assertRaisesRegex(RuntimeError, "socket error details"):
+                DEV["main"]()
+            execute.assert_not_called()
+
+    def test_runtime_rejects_symlinks_and_nonprivate_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            private = root / "private"
+            DEV["prepare_runtime_directory"](private)
+            DEV["prepare_runtime_directory"](private)
+            link = root / "link"
+            link.symlink_to(private, target_is_directory=True)
+            with self.assertRaises(RuntimeError):
+                DEV["prepare_runtime_directory"](link)
+            private.chmod(0o755)
+            with self.assertRaises(RuntimeError):
+                DEV["prepare_runtime_directory"](private)
 
     def test_running_daemon_hands_off_to_the_exact_rebuilt_executable(self):
         self.assertEqual(self.launch("running"), [CLI, "daemon", "restart", "--executable", str(CLI), "--refresh-environment"])
