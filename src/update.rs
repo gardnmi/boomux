@@ -252,7 +252,29 @@ pub(crate) fn guided_update() -> Result<(), Box<dyn std::error::Error>> {
 pub(crate) fn uninstall_target() -> io::Result<UninstallTarget> {
     let path = env::current_exe()?;
     let home = env::var_os("HOME").map(PathBuf::from);
-    let (kind, baseline) = classify_installation(&path, home.as_deref(), DISTRIBUTION);
+    uninstall_target_at(&path, home.as_deref(), DISTRIBUTION)
+}
+
+fn uninstall_target_at(
+    path: &Path,
+    home: Option<&Path>,
+    distribution: Option<&str>,
+) -> io::Result<UninstallTarget> {
+    // Presentation only: recognizing a bundle never authorizes its removal.
+    if let Some(root) = desktop_installation_root(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "this Boomux executable is included with Boomux Desktop at {}. \
+                 `boomux uninstall` supports standalone CLI installations only. \
+                 Close Desktop and follow the Desktop uninstall instructions: \
+                 https://github.com/gardnmi/boomux/blob/main/docs/desktop/releases.md#uninstall\n\
+                 Nothing was removed; running Shells and user data are unchanged.",
+                root.display()
+            ),
+        ));
+    }
+    let (kind, baseline) = classify_installation(path, home, distribution);
     if kind != InstallKind::GithubRelease {
         let message = match kind {
             InstallKind::PackageManaged | InstallKind::RootOwned => {
@@ -268,9 +290,38 @@ pub(crate) fn uninstall_target() -> io::Result<UninstallTarget> {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
     }
     Ok(UninstallTarget {
-        path,
+        path: path.to_owned(),
         baseline: baseline.expect("eligible uninstall has a baseline"),
     })
+}
+
+fn desktop_installation_root(executable: &Path) -> Option<&Path> {
+    let release = executable.parent()?.parent()?;
+    let releases = release.parent()?;
+    if executable != release.join("bin/boomux") || releases.file_name()? != "releases" {
+        return None;
+    }
+    let marker = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(release.join("release.txt"))
+        .ok()?;
+    let metadata = marker.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return None;
+    }
+    let mut contents = String::new();
+    marker.take(4097).read_to_string(&mut contents).ok()?;
+    if contents.len() > 4096 {
+        return None;
+    }
+    let mut lines = contents.lines();
+    let desktop_version = lines.next()?.strip_prefix("boomux-desktop ")?;
+    let cli_version = lines.next()?.strip_prefix("boomux ")?;
+    if desktop_version != cli_version || Version::parse(cli_version).is_err() {
+        return None;
+    }
+    releases.parent()
 }
 
 /// Remote bootstrap may install a pinned development executable. Build flavor
@@ -1321,6 +1372,63 @@ mod tests {
     }
 
     #[test]
+    fn desktop_uninstall_explains_bundle_removal_without_authorizing_mutation() {
+        let home = temporary_directory();
+        for relative in [".local/share/boomux-desktop", "custom desktop location"] {
+            let root = home.join(relative);
+            let release = root.join("releases/v1.11.0-digest");
+            fs::create_dir_all(release.join("bin")).unwrap();
+            let executable = release.join("bin/boomux");
+            fs::write(&executable, b"bundled binary").unwrap();
+            fs::write(
+                release.join("release.txt"),
+                "boomux-desktop 1.11.0\nboomux 1.11.0\nsource example\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&release, root.join("current")).unwrap();
+            let resolved = fs::canonicalize(root.join("current/bin/boomux")).unwrap();
+            let error = uninstall_target_at(&resolved, Some(&home), Some("github-release"))
+                .err()
+                .expect("Desktop uninstall must not authorize standalone removal");
+            let message = error.to_string();
+            assert!(message.contains("included with Boomux Desktop"));
+            assert!(message.contains(root.to_str().unwrap()));
+            assert!(message.contains("docs/desktop/releases.md#uninstall"));
+            assert!(message.contains("Nothing was removed"));
+            assert_eq!(fs::read(&executable).unwrap(), b"bundled binary");
+            assert_eq!(fs::read_link(root.join("current")).unwrap(), release);
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn desktop_detection_rejects_missing_invalid_oversized_and_symlinked_metadata() {
+        let root = temporary_directory();
+        let release = root.join("releases/example");
+        fs::create_dir_all(release.join("bin")).unwrap();
+        let executable = release.join("bin/boomux");
+        let marker = release.join("release.txt");
+        assert!(desktop_installation_root(&executable).is_none());
+        for contents in [
+            "unrelated metadata".to_owned(),
+            "boomux-desktop 1.11.0\nboomux 1.10.0\n".to_owned(),
+            "boomux-desktop invalid\nboomux invalid\n".to_owned(),
+            format!("boomux-desktop 1.11.0\nboomux 1.11.0\n{}", "x".repeat(4096)),
+        ] {
+            fs::write(&marker, contents).unwrap();
+            assert!(desktop_installation_root(&executable).is_none());
+        }
+        let valid = "boomux-desktop 1.11.0\nboomux 1.11.0\n";
+        fs::write(&marker, valid).unwrap();
+        assert!(desktop_installation_root(&release.join("boomux")).is_none());
+        fs::remove_file(&marker).unwrap();
+        fs::write(root.join("other"), valid).unwrap();
+        std::os::unix::fs::symlink(root.join("other"), &marker).unwrap();
+        assert!(desktop_installation_root(&executable).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn official_canonical_owner_installation_is_eligible() {
         let home = temporary_directory();
         let bin = home.join(".local/bin");
@@ -1332,6 +1440,7 @@ mod tests {
             classify_installation(&executable, Some(&home), Some("github-release")).0,
             InstallKind::GithubRelease
         );
+        assert!(uninstall_target_at(&executable, Some(&home), Some("github-release")).is_ok());
         fs::remove_dir_all(home).unwrap();
     }
 

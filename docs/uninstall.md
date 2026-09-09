@@ -5,6 +5,11 @@
 
 ## Surface
 
+When run from an installed Desktop bundle, `boomux uninstall` identifies the
+bundle location and directs users to the
+[Desktop uninstall instructions](desktop/releases.md#uninstall) before making
+any changes. The standalone removal flow below does not remove Desktop bundles.
+
 `boomux uninstall` is human-only and requires an interactive terminal. It shows
 the exact executable, process impact, owned assets, modified assets that will be
 preserved, and data policy before requiring explicit confirmation. It has no
