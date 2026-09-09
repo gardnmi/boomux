@@ -14,7 +14,6 @@ mod updates;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use boomux::protocol::AgentState;
@@ -937,7 +936,6 @@ struct TerminalScrollbarPointerDrag {
 #[derive(Clone)]
 struct TerminalSelectionDrag {
     pane_id: usize,
-    started: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -968,6 +966,34 @@ impl Render for WorkspaceRowDrag {
                     .text_color(rgb(0xcdd6f4))
                     .child(self.workspace_name.clone()),
             )
+    }
+}
+
+impl TerminalSelectionDrag {
+    fn selection(
+        &self,
+        pane_id: usize,
+        anchor: Option<gpui::Point<gpui::Pixels>>,
+        position: gpui::Point<gpui::Pixels>,
+        bounds: Bounds<gpui::Pixels>,
+        screen: &TerminalScreen,
+    ) -> Option<TerminalSelection> {
+        // GPUI dispatches drag moves to every listener of this type, including
+        // other panes. Only the source pane's bounds describe this selection.
+        if pane_id != self.pane_id {
+            return None;
+        }
+        let cell = |position: gpui::Point<gpui::Pixels>| {
+            terminal_cell_from_offset(
+                f32::from(position.x - bounds.left()),
+                f32::from(position.y - bounds.top()),
+                screen,
+            )
+        };
+        Some(TerminalSelection {
+            anchor: cell(anchor?),
+            head: cell(position),
+        })
     }
 }
 
@@ -1544,6 +1570,7 @@ struct TerminalPane {
     scrollbar_hovered: bool,
     scrollbar_fade_generation: u64,
     selection: Option<TerminalSelection>,
+    selection_anchor_position: Option<gpui::Point<gpui::Pixels>>,
     render_images: HashMap<u64, Arc<RenderImage>>,
     render_image_screen: Option<Arc<TerminalScreen>>,
     paint_cache: Option<Arc<TerminalPaintCache>>,
@@ -3834,8 +3861,25 @@ impl Workspace {
         cx.notify();
     }
 
+    fn begin_terminal_selection(
+        &mut self,
+        pane_id: usize,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.layout_mode || self.pointer_drag.is_some() || event.modifiers.control {
+            return;
+        }
+        if let Some(pane) = self.terminals.get_mut(&pane_id) {
+            pane.selection_anchor_position = Some(event.position);
+            pane.selection = None;
+            cx.notify();
+        }
+    }
+
     fn drag_terminal_selection(
         &mut self,
+        pane_id: usize,
         event: &DragMoveEvent<TerminalSelectionDrag>,
         _: &mut Window,
         cx: &mut Context<Self>,
@@ -3843,7 +3887,7 @@ impl Workspace {
         // The terminal surface also owns ordinary left-drag selection. Let a
         // compositor drag bubble to the workspace-level pointer handler instead
         // of consuming its mouse moves as selection updates.
-        if self.pointer_drag.is_some() || event.event.modifiers.control {
+        if self.layout_mode || self.pointer_drag.is_some() || event.event.modifiers.control {
             return;
         }
         let drag = event.drag(cx).clone();
@@ -3853,17 +3897,16 @@ impl Workspace {
         let Some(screen) = pane.screen.as_ref() else {
             return;
         };
-        let offset_x = f32::from(event.event.position.x - event.bounds.left());
-        let offset_y = f32::from(event.event.position.y - event.bounds.top());
-        let cell = terminal_cell_from_offset(offset_x, offset_y, screen);
-        if !drag.started.swap(true, Ordering::AcqRel) {
-            pane.selection = Some(TerminalSelection {
-                anchor: cell,
-                head: cell,
-            });
-        } else if let Some(selection) = &mut pane.selection {
-            selection.head = cell;
-        }
+        let Some(selection) = drag.selection(
+            pane_id,
+            pane.selection_anchor_position,
+            event.event.position,
+            event.bounds,
+            screen,
+        ) else {
+            return;
+        };
+        pane.selection = Some(selection);
         let selected = pane
             .selection
             .map(|selection| terminal_selected_text(screen, selection));
@@ -9066,19 +9109,18 @@ impl Workspace {
                     .overflow_hidden()
                     .flex_1()
                     .min_h_0()
-                    .on_drag(
-                        TerminalSelectionDrag {
-                            pane_id: id,
-                            started: Arc::new(AtomicBool::new(false)),
-                        },
-                        move |_, _, _, cx| {
-                            cx.new(move |_| TerminalSelectionDrag {
-                                pane_id: id,
-                                started: Arc::new(AtomicBool::new(true)),
-                            })
-                        },
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, _, cx| {
+                            this.begin_terminal_selection(id, event, cx);
+                        }),
                     )
-                    .on_drag_move(cx.listener(Self::drag_terminal_selection))
+                    .on_drag(TerminalSelectionDrag { pane_id: id }, move |_, _, _, cx| {
+                        cx.new(move |_| TerminalSelectionDrag { pane_id: id })
+                    })
+                    .on_drag_move(cx.listener(move |this, event, window, cx| {
+                        this.drag_terminal_selection(id, event, window, cx);
+                    }))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::paste_primary))
                     .child(self.boomux_body(id, cx))
                     .when(
@@ -10938,6 +10980,73 @@ mod pointer_tests {
         assert_eq!(cycled_workspace_id(&order, None, false), Some("alpha"));
         assert_eq!(cycled_workspace_id(&order, None, true), Some("charlie"));
         assert_eq!(cycled_workspace_id(&[], None, false), None);
+    }
+
+    #[test]
+    fn terminal_selection_drag_uses_only_source_pane_bounds_and_mouse_down_anchor() {
+        let screen = TerminalScreen {
+            rows: 24,
+            cols: 80,
+            cells: Vec::new(),
+            scroll_total: 24,
+            scroll_offset: 0,
+            scroll_len: 24,
+            images: Vec::new(),
+            image_placements: Vec::new(),
+        };
+        let bounds = Bounds::new(point(px(600.0), px(100.0)), size(px(700.0), px(430.0)));
+        let position = |row: usize, col: usize| {
+            bounds.origin
+                + point(
+                    px(8.0 + (col as f32 + 0.5) * TERMINAL_CELL_WIDTH),
+                    px(8.0 + (row as f32 + 0.5) * TERMINAL_CELL_HEIGHT),
+                )
+        };
+        let drag = TerminalSelectionDrag { pane_id: 2 };
+        let anchor = Some(position(3, 20));
+        for head in [(3, 30), (3, 10), (2, 40), (5, 10)] {
+            assert_eq!(
+                drag.selection(2, anchor, position(head.0, head.1), bounds, &screen),
+                Some(TerminalSelection {
+                    anchor: (3, 20),
+                    head
+                }),
+            );
+            // A neighboring pane receives the same move with different bounds.
+            // It must neither move the anchor nor consume the source's update.
+            let neighbor = Bounds::new(point(px(0.0), px(0.0)), bounds.size);
+            assert_eq!(
+                drag.selection(1, anchor, position(head.0, head.1), neighbor, &screen),
+                None,
+            );
+        }
+        assert_eq!(
+            drag.selection(2, anchor, point(px(0.0), px(0.0)), bounds, &screen),
+            Some(TerminalSelection {
+                anchor: (3, 20),
+                head: (0, 0)
+            }),
+        );
+        assert_eq!(
+            drag.selection(2, anchor, point(px(2000.0), px(2000.0)), bounds, &screen),
+            Some(TerminalSelection {
+                anchor: (3, 20),
+                head: (23, 79)
+            }),
+        );
+        assert_eq!(
+            drag.selection(2, None, position(3, 30), bounds, &screen),
+            None
+        );
+        // A new gesture uses its own mouse-down position, even before the first
+        // delivered drag move and regardless of the previous selection.
+        assert_eq!(
+            drag.selection(2, Some(position(7, 50)), position(7, 45), bounds, &screen),
+            Some(TerminalSelection {
+                anchor: (7, 50),
+                head: (7, 45)
+            }),
+        );
     }
 
     #[test]
