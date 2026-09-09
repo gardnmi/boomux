@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.13.0](https://github.com/gardnmi/boomux/compare/v1.12.0...v1.13.0) (2026-09-09)
+
+
+### Features
+
+* **desktop:** remove workspaces with no shells ([#391](https://github.com/gardnmi/boomux/issues/391)) ([35f4b25](https://github.com/gardnmi/boomux/commit/35f4b2518b08e55b657526411dfe4f23187aba37))
+
+
+### Bug Fixes
+
+* **desktop:** contain agent row text beside dismiss buttons ([#390](https://github.com/gardnmi/boomux/issues/390)) ([3008da0](https://github.com/gardnmi/boomux/commit/3008da095838cef6eaac26e4f608c1501738eb60))
+
 ## [1.12.0](https://github.com/gardnmi/boomux/compare/v1.11.1...v1.12.0) (2026-09-09)
 
 
