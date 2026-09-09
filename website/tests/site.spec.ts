@@ -48,6 +48,11 @@ test("demonstrations support keyboard selection and pause hidden clips", async (
   expect(await page.locator("#motion-move video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true);
   await expect.poll(() => page.locator("#motion-resize video").evaluate((v: HTMLVideoElement) => v.videoWidth)).toBe(1280);
   await page.keyboard.press("End");
+  await expect(page.locator("#motion-tabs")).toBeVisible();
+  await expect.poll(() => page.locator("#motion-tabs video").evaluate((v: HTMLVideoElement) => v.videoWidth)).toBe(1280);
+  await expect(page.locator("#motion-tabs a[download]")).toHaveAttribute("href", "/boomux/demos/tabs.gif");
+  await page.keyboard.press("ArrowLeft");
+  expect(await page.locator("#motion-tabs video").evaluate((v: HTMLVideoElement) => v.paused)).toBe(true);
   await expect(page.locator("#motion-keyboard")).toBeVisible();
   await expect.poll(() => page.locator("#motion-keyboard video").evaluate((v: HTMLVideoElement) => v.videoWidth)).toBe(1280);
   await expect(page.locator("#motion-keyboard a[download]")).toHaveAttribute("href", "/boomux/demos/keyboard.gif");
@@ -150,7 +155,7 @@ test("Desktop installation and navigation work without JavaScript", async ({
   await expect(page.locator("#command-desktop")).toBeVisible();
   await expect(page.locator("#install code")).toHaveCount(1);
   await expect(page.locator(".motion-tabs")).toBeHidden();
-  for (const clip of ["move", "resize", "keyboard"]) {
+  for (const clip of ["move", "resize", "keyboard", "tabs"]) {
     await expect(page.locator(`#motion-${clip} video`)).toBeVisible();
     await expect(page.locator(`#motion-${clip} video`)).toHaveAttribute("controls", "");
   }

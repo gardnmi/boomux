@@ -1,5 +1,10 @@
 # Daemon Event Stream
 
+**Jump to:** [Cursors](#cursors) · [Events](#events) · [Revision reads](#revision-reads)
+
+For one Agent, prefer a revision read. Use the event stream for registry-wide
+changes; the compatibility history below explains older-reader behavior.
+
 Protocol 54's local `CreateStartedShell` publishes the existing `shell_created`
 and `run_started` events in order as one batch after the single durable commit.
 Its reader remains paused until that commit, so output cannot precede creation.
@@ -9,6 +14,8 @@ event filtering for this operation.
 > **Status: Current protocol contract.** Source and compatibility tests are
 > authoritative for exact version gates; this document defines event and cursor
 > semantics.
+
+## Compatibility History
 
 Boomux protocol 7 added bounded long polling for daemon events and atomic,
 revision-aware terminal reads. Protocol 9 adds run-scoped agent snapshots and
@@ -22,6 +29,7 @@ snapshots and Agent events; protocol-12 clients receive the same records without
 that additive source context. Protocol 14 adds revision-conditional Agent reads
 that reuse the event condition variable for wakeups without consuming or
 depending on the retained global event cursor.
+
 Protocol 15 adds durable blocked/completed attention and conditional
 acknowledgment. Protocol-14 clients receive Agent snapshots without attention
 and do not receive acknowledgment events, while cursors still advance across
@@ -32,6 +40,7 @@ Protocol 21 adds a targeted focused-terminal read for clients that use events as
 registry invalidation while refreshing ephemeral focus independently. Running
 shell reads refresh foreground-process hints from a daemon-side one-second cache
 shared by concurrent clients.
+
 Protocol 26 adds exact-run attachment.
 Protocol 32 adds owner-side reduced Node projection cuts and the local
 `node_projection_changed` cache invalidation event.
@@ -42,6 +51,7 @@ local presentation clients without carrying the focused identity; clients read
 the combined snapshot for the current value. It is not copied into another
 Node's projection transitions or persisted projection cache. A one-second
 ephemeral refresh remains the fallback for legacy or missed invalidations.
+
 Remote notification presentation adds no protocol or event kind. It consumes the
 protocol-32 reduced transition batch at the projection-cache boundary and never
 copies owner events into the presenting Node's domain journal.
@@ -52,6 +62,7 @@ Protocol 47 removes Agent Schedules and Scheduled Executions. Current snapshots
 and event streams contain no schedule definitions, execution records, scheduler
 health, or schedule events. Historical schedule request and event shapes are not
 part of the protocol-47 wire contract.
+
 Protocol 49 adds `workspace_default_cwd_changed` after the owner Workspace and
 its revision are durably persisted. Protocol-48 clients do not receive the new
 event, but their returned cursor still advances across it.
@@ -65,6 +76,7 @@ Workspace metadata and incremented revision are durable. It also adds
 is durable. Protocol-49 clients receive neither event, but their cursor still
 advances. Reduced remote projection cuts similarly filter the corresponding
 `session_context` transition without rewinding their cursor.
+
 Protocol 51 adds `agent_session_hidden` only after the owning Workspace
 tombstone and incremented revision are durable. Protocol-50 clients do not
 receive the event, but their returned cursor still advances across it. Latest

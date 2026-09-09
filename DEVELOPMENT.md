@@ -1,5 +1,7 @@
 # Development Guide
 
+**Jump to:** [Build](#build-locally) · [Desktop development](#native-desktop-development) · [Isolation](#use-an-isolated-daemon) · [Validation](#local-feedback-and-pr-validation) · [Releases](#release-lifecycle)
+
 This guide describes the supported local development loop from repository setup
 through release. Product terminology and implementation contracts remain
 authoritative in the documents listed under [Repository Orientation](#repository-orientation).
@@ -99,6 +101,8 @@ isolated development runtime. The first optimized build takes longer; keep the
 default debug build for routine iteration. Close the previous Desktop window
 before comparing the same workload.
 
+### What The Helper Isolates
+
 The helper builds both executables, sets a matching CLI PATH, and uses Boomux-only
 runtime/config/state directories under `target/desktop-dev/`. It sets
 `BOOMUX_RUNTIME_DIR`, `BOOMUX_CONFIG_HOME`, and `BOOMUX_STATE_HOME` instead of
@@ -109,12 +113,15 @@ keeps these development sessions alive. After rebuilding, the helper starts an
 absent development daemon or gracefully restarts an existing one with the rebuilt
 CLI's explicit executable path, preserving compatible live Shells. A failed
 handoff aborts the launch rather than falling back to a destructive stop.
+
 After executable handoff, `--refresh-environment` performs an additional graceful
 handoff using the launcher's environment, so daemon-owned sound delivery also
 uses the normal desktop audio socket. Existing Shell and shared-harness processes
 keep their original environments and PIDs.
 The helper prints the isolated runtime
 path; it does not replace installed binaries or use the ordinary daemon.
+### Harness Configuration Is Shared
+
 This isolation does not cover harness configuration under XDG directories, the
 user's `HOME`, or explicit harness overrides. Core's automatic integration maintenance can update
 those shared integration files. Before testing integration maintenance, use a

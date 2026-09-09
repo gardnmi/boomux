@@ -1,5 +1,10 @@
 # Domain Glossary
 
+**Common terms:** [Workspace](#workspace) · [Remote Workspace](#remote-workspace-desktop) · [Shell](#shell) · [Agent](#agent-instance)
+
+This glossary defines product terms. For everyday controls, start with the
+[Desktop guide](desktop/README.md).
+
 > **Status: Canonical terminology.** These product distinctions govern naming
 > and semantics even when implementation names are less precise.
 
@@ -180,6 +185,7 @@ server lifecycle plugin to resolve reports; it is not an Agent Instance, Agent
 Session, process, controller, projection, event, or durable identity.
 Expiry, final-holder release, ShellRun replacement, or runtime-generation
 replacement removes authority without deleting or moving durable Agent history.
+
 Final-holder release also records the resumable Agent Instance as Inactive so it
 no longer decorates the ShellRun after the TUI exits.
 Claims are not persisted, projected, event-published, or transferred during

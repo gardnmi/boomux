@@ -1,5 +1,10 @@
 # Live PTY Handoff
 
+**Jump to:** [Invariants](#invariants) · [Executable selection](#selecting-a-release-executable) · [Transfer manifest](#transfer-manifest) · [Acceptance test](#first-acceptance-test)
+
+For user-facing update steps, see [Desktop updates](../desktop/README.md#updates).
+This document specifies process-preserving daemon replacement.
+
 > **Status: Current invariant reference and completed delivery record.** The
 > invariants and transfer behavior are current; all delivery slices below are
 > implemented.

@@ -1,5 +1,9 @@
 # Lifecycle Integration Validation
 
+This is dated compatibility evidence, not a setup guide or a guarantee about
+untested host versions. For current integration policy, see
+[automatic integration management](install.md#automatic-integration-management).
+
 > **Status: Version-specific validation record.** This is observed compatibility
 > evidence for the named host and Boomux versions, not a timeless host contract.
 
@@ -84,6 +88,7 @@ both returned the updated title `Ticket 300765 complete`, while preserving that
 same external ID and Boomux lifecycle occurrence. Repository tests validate the
 exact command vector, normalized-directory matching, bounded parsing, title
 sanitization, malformed and oversized fail-open behavior, and exact-ID merge.
+
 They also prove that an unmatched Kiro listing record creates no historical
 Session and that exact durable inspection does not wait for host title discovery.
 This establishes local title compatibility only; it adds no cloud or historical
