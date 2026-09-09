@@ -2020,6 +2020,9 @@ fn handle_connection_inner(
     mut permit: ConnectionPermit,
     federation_lease: Option<NodeIdentityLease>,
 ) -> io::Result<()> {
+    // Darwin accept inherits O_NONBLOCK from the listening socket. Connection
+    // handlers use blocking I/O with a bounded handshake on every platform.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let request: Envelope<Request> = protocol::read_message(&mut stream)?;
     stream.set_read_timeout(None)?;

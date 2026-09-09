@@ -97,6 +97,7 @@ pub fn launch(program: &OsStr, args: &[OsString], cwd: Option<&Path>) -> io::Res
                 if uid != unsafe { libc::geteuid() } {
                     continue;
                 }
+                stream.set_nonblocking(false)?;
                 stream.set_write_timeout(Some(Duration::from_secs(2)))?;
                 stream.write_all(&bytes)?;
                 return Ok(());
