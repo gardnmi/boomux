@@ -826,7 +826,7 @@ fn explicit_executable_handoff_preserves_live_runs_and_rolls_back_on_failure() {
         assert_ne!(pid, previous_pid);
         previous_pid = pid;
         assert_eq!(
-            fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+            boomux::platform::process_executable(pid).unwrap(),
             *executable
         );
         assert_eq!(
@@ -966,14 +966,7 @@ fn send_descriptor(stream: &UnixStream, descriptor: RawFd, marker: u8) {
     let descriptors = [descriptor];
     let control = [ControlMessage::ScmRights(&descriptors)];
     assert_eq!(
-        sendmsg::<()>(
-            stream.as_raw_fd(),
-            &data,
-            &control,
-            MsgFlags::MSG_NOSIGNAL,
-            None,
-        )
-        .unwrap(),
+        sendmsg::<()>(stream.as_raw_fd(), &data, &control, MsgFlags::empty(), None,).unwrap(),
         1
     );
 }

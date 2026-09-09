@@ -584,6 +584,34 @@ impl Client {
         expect_ok(self.request(Request::Ping)?, Response::Pong)
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn daemon_peer_credentials(&self) -> Result<DaemonPeerCredentials> {
+        let (stream, protocol_version, response) = self.send(Request::Ping)?;
+        expect_ok(response, Response::Pong)?;
+        let (pid, uid) =
+            crate::platform::peer_credentials(&stream).map_err(ClientError::Transport)?;
+        Ok(DaemonPeerCredentials {
+            pid,
+            uid,
+            protocol_version,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn daemon_process_credentials(&self) -> Result<DaemonPeerCredentials> {
+        let before = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
+        let mut peer = self.daemon_peer_credentials()?;
+        peer.pid = crate::platform::daemon_listener_holder(&self.socket_path, peer.uid)
+            .map_err(ClientError::Transport)?;
+        let after = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(ClientError::Transport(io::Error::other(
+                "daemon socket changed during inspection",
+            )));
+        }
+        Ok(peer)
+    }
+
     #[cfg(target_os = "linux")]
     pub fn daemon_peer_credentials(&self) -> Result<DaemonPeerCredentials> {
         let (stream, protocol_version, response) = self.send(Request::Ping)?;

@@ -447,3 +447,62 @@ pub fn rename_noreplace(from_dir: i32, from: &CStr, to_dir: i32, to: &CStr) -> i
         Ok(())
     }
 }
+
+pub fn peer_credentials(stream: &std::os::unix::net::UnixStream) -> io::Result<(u32, u32)> {
+    let mut uid = 0;
+    let mut gid = 0;
+    let mut pid = 0i32;
+    let mut size = size_of::<i32>() as libc::socklen_t;
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } < 0
+        || unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut i32).cast(),
+                &mut size,
+            )
+        } < 0
+        || size as usize != size_of::<i32>()
+        || pid <= 0
+    {
+        return Err(io::Error::other("cannot verify daemon socket peer"));
+    }
+    Ok((pid as u32, uid))
+}
+
+pub fn daemon_listener_holder(path: &std::path::Path, uid: u32) -> io::Result<u32> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| io::Error::other("invalid socket path"))?;
+    let bytes = lsof(&["-nP", "-a", "-U", "-Fpn", "--", path])?;
+    let mut candidates = Vec::new();
+    for pid in bytes.split(|b| *b == b'\n').filter_map(|line| {
+        std::str::from_utf8(line.strip_prefix(b"p")?)
+            .ok()?
+            .parse::<u32>()
+            .ok()
+    }) {
+        let Ok(info) = pid_info::<libc::proc_bsdinfo>(pid, libc::PROC_PIDTBSDINFO) else {
+            continue;
+        };
+        if info.pbi_uid != uid {
+            continue;
+        }
+        let Ok(args) = process_argv(pid) else {
+            continue;
+        };
+        if args
+            .windows(2)
+            .any(|a| a[0] == b"daemon" && (a[1] == b"run" || a[1] == b"receive-handoff"))
+        {
+            candidates.push(pid);
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    if candidates.len() != 1 {
+        return Err(io::Error::other("daemon listener has no unique owner"));
+    }
+    Ok(candidates[0])
+}

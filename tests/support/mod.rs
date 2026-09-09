@@ -95,7 +95,7 @@ impl TestDaemon {
 
     pub(crate) fn start_with(configure: impl FnOnce(&mut Command, &Path)) -> Self {
         let executable = PathBuf::from(env!("CARGO_BIN_EXE_boomux"));
-        let runtime_dir = std::env::temp_dir().join(format!(
+        let runtime_dir = PathBuf::from("/tmp").join(format!(
             "boomux-integration-{}-{}",
             std::process::id(),
             Uuid::new_v4()

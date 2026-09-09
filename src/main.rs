@@ -3493,9 +3493,38 @@ fn normalize_daemon_executable(path: &[u8]) -> Option<String> {
     Some(executable)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn daemon_process_identity(_client: &client::Client) -> Option<DaemonProcessIdentity> {
-    None
+#[cfg(target_os = "macos")]
+fn daemon_process_identity(client: &client::Client) -> Option<DaemonProcessIdentity> {
+    let before = fs::metadata(client.socket_path()).ok()?;
+    let credentials = client.daemon_process_credentials().ok()?;
+    if credentials.uid != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let process = boomux::platform::process_snapshot(credentials.pid).ok()?;
+    let executable = boomux::platform::process_executable(credentials.pid)
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()?;
+    let confirmed = client.daemon_process_credentials().ok()?;
+    let after = fs::metadata(client.socket_path()).ok()?;
+    if confirmed != credentials
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || boomux::platform::process_snapshot(credentials.pid)
+            .ok()?
+            .start_time
+            != process.start_time
+    {
+        return None;
+    }
+    Some(DaemonProcessIdentity {
+        pid: credentials.pid,
+        protocol_version: credentials.protocol_version,
+        executable: Some(executable),
+        socket_device: after.dev(),
+        socket_inode: after.ino(),
+    })
 }
 
 fn bootstrap_activate(
@@ -3506,22 +3535,6 @@ fn bootstrap_activate(
     expected_socket_device: u64,
     expected_socket_inode: u64,
 ) -> io::Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (
-            transaction,
-            expected_pid,
-            expected_protocol,
-            expected_executable,
-            expected_socket_device,
-            expected_socket_inode,
-        );
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "proof-bound bootstrap activation is unsupported on this platform",
-        ));
-    }
-    #[cfg(target_os = "linux")]
     {
         let suffix = transaction
             .strip_prefix(".boomux.bootstrap.")
@@ -12923,8 +12936,8 @@ mod tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -12943,7 +12956,8 @@ mod tests {
             .stderr(stderr);
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(())
@@ -13007,8 +13021,8 @@ mod tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -13025,7 +13039,8 @@ mod tests {
             .stderr(Stdio::from(slave));
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(())

@@ -243,8 +243,8 @@ fn run_interactive_with_timeout(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0
@@ -263,7 +263,7 @@ fn run_interactive_with_timeout(
         .stderr(Stdio::from(slave));
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                 Err(std::io::Error::last_os_error())
             } else {
                 Ok(())
@@ -958,8 +958,8 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0
@@ -978,7 +978,7 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
         .stderr(Stdio::from(slave));
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                 Err(std::io::Error::last_os_error())
             } else {
                 Ok(())

@@ -103,7 +103,7 @@ mod tests {
     use std::os::fd::AsFd;
 
     use super::*;
-    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+    use nix::sys::socket::{ControlMessage, sendmsg};
 
     const MARKER: u8 = 0x42;
 
