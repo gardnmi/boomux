@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.0](https://github.com/gardnmi/boomux/compare/v1.13.0...v1.14.0) (2026-09-09)
+
+
+### Features
+
+* **desktop:** add configurable copy on select and fix selection anchoring ([#393](https://github.com/gardnmi/boomux/issues/393)) ([fd6b541](https://github.com/gardnmi/boomux/commit/fd6b541b61f1d000e635d633fa7a4f671fa3e8ea))
+
 ## [1.13.0](https://github.com/gardnmi/boomux/compare/v1.12.0...v1.13.0) (2026-09-09)
 
 
