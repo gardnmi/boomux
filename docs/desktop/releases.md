@@ -207,6 +207,7 @@ Example preferences (omitted keys use defaults):
 ```toml
 pane_gap = 8
 motion_speed = "smooth" # instant, fast, smooth
+layout_overlay_visible = true # dim terminals and show tiles in layout mode
 pane_corner_style = "rounded" # rounded, square, mixed
 pane_headings_visible = true
 confirm_destructive_actions = true
