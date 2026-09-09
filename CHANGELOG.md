@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.11.0](https://github.com/gardnmi/boomux/compare/v1.10.0...v1.11.0) (2026-09-09)
+
+
+### Features
+
+* add remote workspaces and refine desktop experience ([#378](https://github.com/gardnmi/boomux/issues/378)) ([df8ff5a](https://github.com/gardnmi/boomux/commit/df8ff5ac74f48a2302e4e3ef21c2ed4bc91b450c))
+* **desktop:** add git work overview and draggable pane resizing ([#376](https://github.com/gardnmi/boomux/issues/376)) ([0981559](https://github.com/gardnmi/boomux/commit/09815592a24efd8418dad68f19c8e7f4308d1da6))
+* **desktop:** add node controls and harness integration discovery ([#374](https://github.com/gardnmi/boomux/issues/374)) ([313359d](https://github.com/gardnmi/boomux/commit/313359d59a36067340f8ca1c38ee4fe73cb873fa))
+* streamline desktop navigation and automatic integrations ([#377](https://github.com/gardnmi/boomux/issues/377)) ([610fe68](https://github.com/gardnmi/boomux/commit/610fe682985cd0e8aba924d18ec9942ec1df304d))
+
 ## [1.10.0](https://github.com/gardnmi/boomux/compare/v1.9.8...v1.10.0) (2026-09-07)
 
 
