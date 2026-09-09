@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.14.1](https://github.com/gardnmi/boomux/compare/v1.14.0...v1.14.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **desktop:** outline the cursor in unfocused terminals ([#395](https://github.com/gardnmi/boomux/issues/395)) ([e1195fe](https://github.com/gardnmi/boomux/commit/e1195fe83182f569f66c87a79d631fdad45c61ca))
+
 ## [1.14.0](https://github.com/gardnmi/boomux/compare/v1.13.0...v1.14.0) (2026-09-09)
 
 
