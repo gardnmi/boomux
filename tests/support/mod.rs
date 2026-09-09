@@ -101,6 +101,7 @@ impl TestDaemon {
             Uuid::new_v4()
         ));
         fs::create_dir(&runtime_dir).unwrap();
+        let runtime_dir = runtime_dir.canonicalize().unwrap();
         let mut command = Command::new(&executable);
         command
             .args(["daemon", "run"])

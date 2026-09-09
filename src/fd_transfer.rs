@@ -32,7 +32,14 @@ pub(crate) fn send_descriptor(
 pub(crate) fn receive_descriptor(stream: &UnixStream, expected_marker: u8) -> io::Result<OwnedFd> {
     let mut marker = [0_u8];
     let mut data = [IoSliceMut::new(&mut marker)];
+    #[cfg(target_os = "linux")]
     let mut control = nix::cmsg_space!([RawFd; 1]);
+    // Darwin externalizes every descriptor before truncating the control bytes,
+    // retaining the original cmsg_len. Reserve the kernel's complete 512-FD
+    // limit so malformed multi-FD sends can be closed without reading past the
+    // control buffer (or leaking descriptors omitted by truncation).
+    #[cfg(target_os = "macos")]
+    let mut control = nix::cmsg_space!([RawFd; 512]);
     let (bytes, flags, descriptors) = loop {
         match recvmsg::<()>(
             stream.as_raw_fd(),

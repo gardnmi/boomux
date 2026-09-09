@@ -1,7 +1,11 @@
 use std::env;
 use std::error::Error;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+#[cfg(target_os = "linux")]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -12,7 +16,9 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentState,

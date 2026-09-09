@@ -890,9 +890,7 @@ fn kiro_holder_process_evidence(
             "Kiro launch holder process was not found",
         )
     })?;
-    let start_time = Some(stat.start_time).ok_or_else(|| {
-        DaemonError::validation("Kiro launch holder process has invalid start identity")
-    })?;
+    let start_time = stat.start_time;
     let argv = process_argv(pid).map_err(|_| {
         DaemonError::lifecycle(
             ErrorCode::NotFound,
@@ -916,7 +914,7 @@ fn kiro_holder_process_evidence(
 fn kiro_holder_is_live(holder: &KiroLaunchHolder) -> bool {
     platform::process_snapshot(holder.pid)
         .ok()
-        .and_then(|stat| Some(stat.start_time))
+        .map(|stat| stat.start_time)
         == Some(holder.start_time)
 }
 
@@ -936,10 +934,7 @@ fn terminate_dead_kiro_holder_group(holder_id: &str, holder: &KiroLaunchHolder) 
     let group = holder.pid as libc::pid_t;
     let authorized = platform::process_ids().is_ok_and(|entries| {
         entries.into_iter().any(|pid| {
-            platform::process_snapshot(pid)
-                .ok()
-                .and_then(|stat| Some(stat.group))
-                == Some(group)
+            platform::process_snapshot(pid).ok().map(|stat| stat.group) == Some(group)
                 && process_has_environment(pid, b"BOOMUX_KIRO_LAUNCH_HOLDER", holder_id.as_bytes())
                     .unwrap_or(false)
         })
@@ -985,8 +980,7 @@ fn prune_dead_kiro_holders(
 
 fn opencode_process_evidence(pid: u32) -> io::Result<(u64, Vec<u8>, Vec<Vec<u8>>)> {
     let stat = platform::process_snapshot(pid)?;
-    let start_time = Some(stat.start_time)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))?;
+    let start_time = stat.start_time;
     let executable = platform::process_executable(pid)?
         .as_os_str()
         .as_bytes()
@@ -17682,7 +17676,7 @@ fn proc_foreground_process_group(stat: &str) -> Option<libc::pid_t> {
 
 fn foreground_process_for_session_leader(pid: u32) -> Option<String> {
     let stat = platform::process_snapshot(pid).ok()?;
-    let process_group = Some(stat.foreground_group)?;
+    let process_group = stat.foreground_group;
     (process_group > 0)
         .then(|| read_process_name(process_group as u32))
         .flatten()
@@ -19639,7 +19633,7 @@ mod tests {
             holder_id.clone(),
             KiroLaunchHolder {
                 pid,
-                start_time: Some(stat.start_time).unwrap(),
+                start_time: stat.start_time,
                 process_group_leader: Some(stat.group) == Some(pid as libc::pid_t),
                 shell_id: shell_id.into(),
                 run_id: run_id.into(),

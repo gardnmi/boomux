@@ -10306,7 +10306,22 @@ fn main() {
         Ok(saved) => (saved, None),
         Err(error) => (settings::Settings::default(), Some(error)),
     };
-    gpui_platform::application().run(move |cx: &mut App| {
+    let application = gpui_platform::application();
+    #[cfg(target_os = "macos")]
+    application.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            let loaded = settings::path()
+                .ok_or_else(|| "Cannot resolve Desktop settings".to_string())
+                .and_then(|path| settings::Settings::load(&path));
+            let (saved, error) = match loaded {
+                Ok(saved) => (saved, None),
+                Err(error) => (settings::Settings::default(), Some(error)),
+            };
+            open_desktop_window(cx, saved, error);
+        }
+        cx.activate(true);
+    });
+    application.run(move |cx: &mut App| {
         #[cfg(target_os = "macos")]
         cx.bind_keys([
             KeyBinding::new("cmd-c", CopySelection, Some("Terminal")),
@@ -10471,18 +10486,7 @@ fn main() {
             KeyBinding::new("shift-insert", PasteClipboard, Some("SidebarLayout")),
         ]);
 
-        let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // Omarchy tags org.omarchy.* windows as terminals, which makes
-                // its universal clipboard binding choose Ctrl/Shift+Insert.
-                app_id: Some("org.omarchy.boomux-desktop".into()),
-                ..Default::default()
-            },
-            move |window, cx| cx.new(|cx| Workspace::new(window, cx, saved, settings_error)),
-        )
-        .unwrap();
+        open_desktop_window(cx, saved, settings_error);
         cx.activate(true);
         if let Some(path) = update_ready {
             bundle_update::signal_ready(path);
@@ -11968,3 +11972,18 @@ mod pointer_tests {
 
 #[cfg(target_os = "macos")]
 gpui::actions!(macos, [Quit]);
+
+fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: Option<String>) {
+    let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Omarchy tags org.omarchy.* windows as terminals, which makes
+            // its universal clipboard binding choose Ctrl/Shift+Insert.
+            app_id: Some("org.omarchy.boomux-desktop".into()),
+            ..Default::default()
+        },
+        move |window, cx| cx.new(|cx| Workspace::new(window, cx, saved, settings_error)),
+    )
+    .unwrap();
+}

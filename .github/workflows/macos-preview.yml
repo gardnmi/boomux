@@ -47,14 +47,14 @@ jobs:
           PYCODE
       - name: Check backend
         run: cargo +stable check --locked --all-targets
-      - name: Check Desktop
-        run: cargo +stable check --locked -p boomux-desktop
       - name: Test descriptor transfer
         run: cargo +stable test --locked --lib fd_transfer -- --test-threads=1
       - name: Test native process identity
         run: cargo +stable test --locked --lib platform::macos::tests -- --test-threads=1 --nocapture
       - name: Test detached handoff
         run: cargo +stable test --locked --test native_backend native_daemon_handoffs_multiple_detached_shells -- --test-threads=1 --nocapture
+      - name: Check Desktop
+        run: cargo +stable check --locked -p boomux-desktop
       - name: Build preview executables
         run: cargo +stable build --release --locked -p boomux -p boomux-desktop
       - name: Package preview

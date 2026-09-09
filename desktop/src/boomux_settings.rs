@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 use toml_edit::{Array, DocumentMut, Item, Value};
 
