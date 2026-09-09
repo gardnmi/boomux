@@ -69,6 +69,14 @@ shows a dimming overlay and animated tile icon by default. The saved
 when disabled, while retaining the mode badge and input behavior. Overlay removal
 shares the badge’s single cancelable exit task; it does not delay restoring input.
 
+Desktop's existing background overview refresh removes Workspaces with no Shells,
+including entries found on startup. Read-only discovery remains separate. Each
+pass considers at most eight candidates, skips unavailable remote Nodes, reads
+the exact Workspace from its owner, and closes it at that observed revision.
+Concurrent changes reject the close without an unguarded fallback. Exited and
+pending Shells prevent cleanup. This Desktop policy removes Workspace metadata
+and history but does not remove project shortcuts or filesystem contents.
+
 ## Module Map
 
 - `src/main.rs`: application model, Boomux sidebar projection, input routing,
