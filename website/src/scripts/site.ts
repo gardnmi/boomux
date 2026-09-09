@@ -23,48 +23,6 @@ if (themeButton) {
   });
 }
 
-const tabs = [
-  ...document.querySelectorAll<HTMLButtonElement>("[data-install]"),
-];
-function selectInstall(selected: HTMLButtonElement) {
-  for (const tab of tabs) {
-    const active = tab === selected;
-    tab.setAttribute("aria-selected", String(active));
-    tab.tabIndex = active ? 0 : -1;
-    const panel = document.getElementById(tab.getAttribute("aria-controls")!);
-    if (panel) panel.hidden = !active;
-  }
-  document.getElementById("copy-status")!.textContent = "";
-}
-const tablist = document.getElementById("install-tabs");
-if (tablist && tabs.length) {
-  tablist.hidden = false;
-  document.querySelectorAll<HTMLElement>("[data-panel]").forEach((panel) => {
-    panel.setAttribute("role", "tabpanel");
-    panel.setAttribute("aria-labelledby", `tab-${panel.dataset.panel}`);
-    panel.tabIndex = 0;
-  });
-  selectInstall(tabs[0]);
-  tabs.forEach((tab, index) => {
-    tab.addEventListener("click", () => selectInstall(tab));
-    tab.addEventListener("keydown", (event) => {
-      const next =
-        event.key === "ArrowRight"
-          ? (index + 1) % tabs.length
-          : event.key === "ArrowLeft"
-            ? (index + tabs.length - 1) % tabs.length
-            : event.key === "Home"
-              ? 0
-              : event.key === "End"
-                ? tabs.length - 1
-                : -1;
-      if (next < 0) return;
-      event.preventDefault();
-      selectInstall(tabs[next]);
-      tabs[next].focus();
-    });
-  });
-}
 document
   .querySelectorAll<HTMLButtonElement>("[data-copy]")
   .forEach((button) => {

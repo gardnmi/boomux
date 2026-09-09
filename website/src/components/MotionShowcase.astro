@@ -1,0 +1,27 @@
+---
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const clips = [
+  { id: 'move', label: 'Move', title: 'Grab it. Put it where you want it.', description: 'Drag a pane by its heading. It follows your pointer, then settles into the new layout.' },
+  { id: 'resize', label: 'Resize', title: 'Make room for what matters.', description: 'Drag a pane edge to give your editor more space, or keep your server and tests in view.' },
+  { id: 'keyboard', label: 'Keyboard', title: 'Stay on the keys.', description: 'Tap Ctrl + Space for layout mode. Arrow keys change focus; F expands a pane and brings it back. Escape returns to the terminal. You can also hold Ctrl + Space for a quick adjustment.' },
+];
+---
+<section id="in-motion" class="motion-showcase" aria-label="Boomux Desktop in motion">
+  <div class="motion-bar">
+    <span>BOOMUX / IN MOTION</span>
+    <div class="motion-tabs" role="tablist" aria-label="Desktop demonstrations" hidden>
+      {clips.map((clip, index) => <button type="button" id={`motion-tab-${clip.id}`} role="tab" aria-controls={`motion-${clip.id}`} aria-selected={index === 0 ? 'true' : 'false'} tabindex={index === 0 ? 0 : -1} data-motion-tab={clip.id}><span aria-hidden="true">0{index + 1}</span> {clip.label}</button>)}
+    </div>
+  </div>
+  {clips.map(clip => <figure id={`motion-${clip.id}`} class="motion-panel" data-motion-panel={clip.id}>
+    <video width="1280" height="800" controls muted loop playsinline preload="none" poster={`${base}/demos/poster.webp`} aria-label={`${clip.label}: real Boomux Desktop demonstration`} aria-describedby={`motion-description-${clip.id}`}>
+      <source src={`${base}/demos/${clip.id}.mp4`} type="video/mp4" />
+      <a href={`${base}/demos/${clip.id}.mp4`}>Download the {clip.label.toLowerCase()} demonstration</a>
+    </video>
+    <figcaption>
+      <div><h2>{clip.title}</h2><p id={`motion-description-${clip.id}`}>{clip.description}</p></div>
+      <a class="text-link" href={`${base}/demos/${clip.id}.gif`} download>Download GIF <span aria-hidden="true">↓</span></a>
+    </figcaption>
+  </figure>)}
+  <p class="motion-note">Real Desktop recordings · Tree layout · Fictional demo terminal content · No audio</p>
+</section>
