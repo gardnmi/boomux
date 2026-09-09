@@ -60,7 +60,14 @@ done
 [[ $(<"$root/updates") == 1 ]]
 grep -F 'Generated release notes' "$root/body" >/dev/null
 grep -F 'releases/latest/download/boomux-installer.sh' "$root/body" >/dev/null
-grep -F '`~/.local/bin/boomux setup`' "$root/body" >/dev/null
+grep -F 'sh -s -- --desktop' "$root/body" >/dev/null
+grep -Fx 'boomux-desktop' "$root/body" >/dev/null
+[[ $(head -n 1 "$root/body") == '<!-- boomux-install-handoff -->' ]]
+[[ $(tail -n 1 "$root/body") == 'Generated release notes' ]]
+if grep -Fq 'boomux setup' "$root/body"; then
+  printf 'Desktop release notes should not require CLI setup\n' >&2
+  exit 1
+fi
 grep -F '<!-- /boomux-install-handoff -->' "$root/body" >/dev/null
 
 for malformed in \

@@ -27,25 +27,33 @@ if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
 fi
 read -r -d '' handoff <<'EOF' || true
 <!-- boomux-install-handoff -->
-## Install Boomux
+## Boomux Desktop
+
+A native terminal workspace with Hyprland-inspired pane movement, persistent
+shells, agent status, and remote workspaces.
+
+### Install
 
 ```console
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh
+  https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh -s -- --desktop
 ```
 
-The verified installer offers to run `boomux setup` immediately. If setup is
-deferred or interrupted, run `~/.local/bin/boomux setup` to continue.
+Installs Desktop and the matching Boomux service together.
+Available for GNU/Linux x86_64.
 
-## Install Boomux Desktop (Boomux included)
+### Launch
+
+Open **Boomux Desktop** from your application launcher, or run:
 
 ```console
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/gardnmi/boomux/releases/latest/download/boomux-desktop-installer.sh | sh
+boomux-desktop
 ```
 
-Desktop is experimental and currently available for GNU/Linux x86_64. Both
-executables share this release; the Desktop installer updates them together.
+The service starts automatically; no separate CLI setup is needed for Desktop.
+
+[See it in motion](https://gardnmi.github.io/boomux/#in-motion) ·
+[Desktop guide](https://github.com/gardnmi/boomux/blob/main/desktop/README.md)
 <!-- /boomux-install-handoff -->
 EOF
 
@@ -66,7 +74,7 @@ for attempt in 1 2 3; do
   marker_count=$(count_occurrences "$body" "$marker")
   end_marker_count=$(count_occurrences "$body" "$end_marker")
   if [[ "$marker_count" != 0 || "$end_marker_count" != 0 ]]; then
-    if [[ "$marker_count" != 1 || "$end_marker_count" != 1 || "$body" != *"$handoff" ]]; then
+    if [[ "$marker_count" != 1 || "$end_marker_count" != 1 || "$body" != "$handoff"* ]]; then
       printf 'release notes contain a malformed installation handoff\n' >&2
       exit 1
     fi
@@ -78,16 +86,15 @@ for attempt in 1 2 3; do
     continue
   fi
 
-  updated=$body
-  if [[ -n "$updated" ]]; then
-    updated+=$'\n\n'
+  updated=$handoff
+  if [[ -n "$body" ]]; then
+    updated+=$'\n\n'"$body"
   fi
-  updated+=$handoff
   if gh api --method PATCH "$endpoint" -f tag_name="$tag" -f body="$updated" >/dev/null; then
     verified=$(gh api "$endpoint" --jq '.body // ""')
     marker_count=$(count_occurrences "$verified" "$marker")
     end_marker_count=$(count_occurrences "$verified" "$end_marker")
-    if [[ "$marker_count" == 1 && "$end_marker_count" == 1 && "$verified" == *"$handoff" ]]; then
+    if [[ "$marker_count" == 1 && "$end_marker_count" == 1 && "$verified" == "$updated" ]]; then
       exit 0
     fi
   fi
