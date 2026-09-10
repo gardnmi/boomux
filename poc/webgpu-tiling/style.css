@@ -42,3 +42,26 @@
 .workspace-icon.remote-icon{height:15px;margin-bottom:3px}
 .workspace-icon.remote-icon:before{left:7px;top:14px;bottom:auto;width:2px;height:3px;border:0;background:#878d9b}
 .workspace-icon.remote-icon:after{left:4px;right:auto;top:17px;width:8px;height:1px;border:0;background:#878d9b}
+/* Give the main canvas the full height; controls live in the sidebar. */
+aside,.daemon-mode aside{display:flex;flex-direction:column;padding:18px 14px 10px}
+.brand{margin:0 8px 26px}.brand small{display:none}
+.section-label{align-items:center;gap:8px}.section-label span{margin-left:auto}
+#add{padding:4px 7px;font-size:11px;background:transparent;border-color:#3a404a;white-space:nowrap}
+#stage{margin:0 8px; border-radius:0}
+#keyboard-help{position:absolute;top:10px;right:18px;z-index:50;max-width:600px;box-shadow:0 5px 20px #0009}
+#workspace-list{padding-bottom:12px;flex:1;min-height:80px}
+#pane-list{overflow:auto;min-height:0}
+.sidebar-tools{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-shrink:0;margin-top:6px}
+.sidebar-tools .sidebar-bottom,.daemon-mode .sidebar-tools .sidebar-bottom{position:static;margin:0 8px;font-size:10px;line-height:1.4}
+#settings{position:relative}#settings>summary{list-style:none;cursor:pointer;font-size:23px;padding:2px 7px;color:#a4acba;border-radius:5px}#settings>summary:hover{background:#ffffff12}#settings>summary::-webkit-details-marker{display:none}
+.settings-menu{position:absolute;bottom:36px;left:0;width:270px;z-index:60;padding:16px;background:#242830;border:1px solid #444b59;box-shadow:0 10px 35px #0009;border-radius:8px;display:flex;flex-direction:column;gap:12px}
+.settings-menu label{display:flex;justify-content:space-between;align-items:center}.settings-menu small{font-size:11px;line-height:1.6;color:#909aaf;white-space:normal!important}
+#settings:focus-within>summary{outline:1px solid #9fafff}
+#activity{height:260px;max-height:65vh;min-height:36px;flex-shrink:0;display:flex;flex-direction:column;overflow:hidden;border-top:1px solid #363b45}
+#activity.collapsed{height:36px!important}#activity.collapsed #activity-content{display:none}
+#activity-resize{height:5px;flex-shrink:0;cursor:ns-resize;touch-action:none}#activity-resize:hover,#activity-resize:focus-visible{background:#8cafd7}
+.activity-tabs{display:flex;align-items:center;gap:9px;flex-shrink:0;padding:0 5px 5px}.activity-tabs button{padding:4px 0;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;font-size:12px}.activity-tabs [aria-selected=true]{color:#d4d9e3;border-bottom-color:#8cafd7}#activity-refresh{margin-left:auto;font-size:17px}#activity-toggle{font-size:17px}
+#activity-content{overflow:auto;min-height:0;padding:6px 3px;scrollbar-width:thin}#activity-content select{width:100%;padding:6px;margin-bottom:8px;background:#252932;border:1px solid #3c4351;border-radius:4px;color:#cad0dc}
+.activity-row{width:100%;display:flex;flex-direction:column;gap:4px;text-align:left;padding:9px 8px;border:0;border-radius:5px;background:transparent;color:#bfc8d7;overflow-wrap:anywhere}.activity-row strong{font-size:12px;font-weight:550}.activity-row small{font-size:11px;color:#8e99ab;line-height:1.5}.activity-empty{font-size:11px;line-height:1.6;color:#919caf;padding:4px 8px;margin:4px 0}
+.git-worktree{border-bottom:1px solid #ffffff0b;padding:8px 4px}.git-worktree summary{cursor:pointer;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+@media(max-width:650px){aside,.daemon-mode aside{display:none}}

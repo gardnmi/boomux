@@ -12,10 +12,12 @@ let tree,panes=new Map(),floating=new Map(),active=1,next=5,expanded=null,drag=n
 let targets=new Map(),shown=new Map(),tween=null,draw=null,frame=0,width=1,height=1;
 let layoutMode=false,fitTimer=null;
 let daemon=null,workspaceId=null,loading=true,creating=false;
+let activityTab='agents',activityCollapsed=false,gitOwner=null,gitResult=null,gitRequest=null;
 const savedKey='boomux.webgpu.layout.v1';
 const escapeHtml=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let lastHoverPoint=null;
 const motion=$('#motion');motion.checked=!matchMedia('(prefers-reduced-motion: reduce)').matches;
+try{const savedMotion=localStorage.getItem('boomux.webgpu.motion');if(savedMotion!==null)motion.checked=savedMotion==='true';}catch{}
 const clone=value=>structuredClone(value);
 function schedule(){if(!frame)frame=requestAnimationFrame(paint);}
 function syncSidebar(){
@@ -61,6 +63,94 @@ function showError(error){
   $('#gateway-status').textContent=message;$('#gateway-status').hidden=false;
 }
 function currentWorkspace(){return daemon?.snapshot.workspaces.find(w=>w.id===workspaceId);}
+function activityRow(title,detail,action){
+  const row=document.createElement(action?'button':'div');row.className='activity-row';
+  const name=document.createElement('strong');name.textContent=title;
+  const text=document.createElement('small');text.textContent=detail;row.append(name,text);
+  if(action)row.onclick=action;return row;
+}
+function activityMessage(text){const p=document.createElement('p');p.className='activity-empty';p.textContent=text;return p;}
+function renderActivity(){
+  const content=$('#activity-content');content.replaceChildren();
+  $('#activity').classList.toggle('collapsed',activityCollapsed);
+  $('#activity-toggle').setAttribute('aria-expanded',String(!activityCollapsed));
+  $('#activity-toggle').setAttribute('aria-label',activityCollapsed?'Expand activity':'Collapse activity');
+  $('#activity-toggle').textContent=activityCollapsed?'⌃':'⌄';
+  for(const tab of document.querySelectorAll('[data-panel]'))tab.setAttribute('aria-selected',String(tab.dataset.panel===activityTab));
+  content.setAttribute('aria-labelledby',`tab-${activityTab}`);
+  if(activityCollapsed)return;
+  if(!daemon){content.append(activityMessage('Activity is available when connected to Boomux.'));return;}
+  if(activityTab==='agents'){
+    const entries=[];
+    for(const workspace of daemon.snapshot.workspaces)for(const agent of workspace.agents||[]){
+      const shell=workspace.shells.find(s=>s.id===agent.shell_id&&s.run?.id===agent.run_id);
+      if(!agent.attention&&(!shell||['inactive','done'].includes(agent.observation.state)))continue;
+      entries.push({agent,workspace,shell});
+    }
+    entries.sort((a,b)=>Number(!!b.agent.attention)-Number(!!a.agent.attention));
+    for(const {agent,workspace,shell}of entries.slice(0,200)){
+      const state=agent.attention?`Attention: ${agent.attention.reason}`:agent.observation.state;
+      content.append(activityRow(agent.name||agent.integration,`${workspace.name} · ${state}${shell?'':' · previous run'}`,shell?()=>{selectWorkspace(workspace.id);openShell(shell);}:null));
+    }
+    if(!entries.length)content.append(activityMessage('No active Agents or attention to review.'));
+    if(entries.length>200)content.append(activityMessage('Showing the first 200 Agents.'));
+  }else if(activityTab==='remotes'){
+    const nodes=(daemon.nodes||[]).filter(n=>!n.local);
+    for(const node of nodes){
+      const workspace=daemon.snapshot.workspaces.find(w=>w.remote?.node_id===node.id);
+      content.append(activityRow(node.alias,`${node.current&&!node.stale?'Connected':node.health}${node.stale?' · stale':''}${node.route?' · '+node.route:''}`,workspace?()=>selectWorkspace(workspace.id):null));
+    }
+    if(!nodes.length)content.append(activityMessage('No remote Nodes connected. Add a remote in Boomux Desktop.'));
+  }else{
+    const select=document.createElement('select');select.setAttribute('aria-label','Git Node');
+    for(const node of (daemon.nodes?.length?daemon.nodes:[{id:daemon.node_id,alias:'This computer',local:true}])){const option=document.createElement('option');option.value=node.local?'':node.id;option.textContent=node.local?'This computer':node.alias;select.append(option);}
+    select.value=gitOwner||'';select.onchange=()=>{gitOwner=select.value||null;gitResult=null;loadGit();};content.append(select);
+    if(gitRequest){content.append(activityMessage('Loading Git status…'));return;}
+    if(!gitResult){content.append(activityMessage('Select Refresh to load Git status.'));return;}
+    if(gitResult.error){content.append(activityMessage(gitResult.error));return;}
+    for(const warning of gitResult.warnings||[])content.append(activityMessage(warning));
+    if(gitResult.refreshing)content.append(activityMessage('Git scan is running. Refresh to see the latest results.'));
+    for(const worktree of (gitResult.worktrees||[]).slice(0,200)){
+      const status=worktree.status;
+      const changes=status?`${status.staged} staged · ${status.unstaged} modified · ${status.untracked} untracked${status.conflicts?' · '+status.conflicts+' conflicts':''}${status.divergence_known?' · ↑'+status.ahead+' ↓'+status.behind:''}`:'Status unavailable';
+      const details=document.createElement('details');details.className='git-worktree';
+      const summary=document.createElement('summary');summary.textContent=`${worktree.repository} · ${worktree.branch||'detached HEAD'}`;details.append(summary,activityRow(worktree.root,worktree.error||changes));
+      if(worktree.last_commit)details.append(activityMessage(worktree.last_commit));
+      if(worktree.pr?.summary)details.append(activityMessage(worktree.pr.summary));
+      for(const link of worktree.shells||[]){
+        const id=gitOwner?`remote:${gitOwner}:${link.id}`:link.id;
+        const workspace=daemon.snapshot.workspaces.find(w=>w.shells.some(s=>s.id===id&&s.run?.id===link.run_id));
+        const shell=workspace?.shells.find(s=>s.id===id&&s.run?.id===link.run_id);
+        if(shell)details.append(activityRow(link.name,'Open Shell',()=>{selectWorkspace(workspace.id);openShell(shell);}));
+      }
+      content.append(details);
+    }
+    if(!gitResult.worktrees?.length)content.append(activityMessage('No Git worktrees observed on this Node.'));
+  }
+}
+async function loadGit(refresh=false){
+  gitRequest?.abort();const request=new AbortController();gitRequest=request;renderActivity();
+  try{
+    const response=await fetch('/api/git',{method:'POST',headers:{'Content-Type':'application/json'},signal:request.signal,body:JSON.stringify({node_id:daemon.node_id,owner:gitOwner,refresh})});
+    const result=await response.json();if(!response.ok)throw Error(result.error||'Git status unavailable');
+    if(gitRequest===request)gitResult=result;
+  }catch(error){if(error.name!=='AbortError'&&gitRequest===request)gitResult={error:error.message};}
+  finally{if(gitRequest===request){gitRequest=null;if(activityTab==='git')renderActivity();}}
+}
+for(const tab of document.querySelectorAll('[data-panel]'))tab.onclick=()=>{
+  activityTab=tab.dataset.panel;activityCollapsed=false;renderActivity();
+  if(activityTab==='git'&&daemon&&!gitResult&&!gitRequest)loadGit();
+};
+$('#activity-toggle').onclick=()=>{activityCollapsed=!activityCollapsed;renderActivity();};
+$('#activity-refresh').onclick=()=>{if(!daemon)return;if(activityTab==='git')loadGit(true);else refreshDaemon().catch(showError);};
+const activityResize=$('#activity-resize');let activityDrag=null;
+function activityHeight(height){$('#activity').style.height=`${Math.max(110,Math.min(innerHeight*.65,height))}px`;}
+activityResize.onpointerdown=e=>{e.preventDefault();activityCollapsed=false;renderActivity();activityDrag={y:e.clientY,height:$('#activity').offsetHeight};activityResize.setPointerCapture(e.pointerId);};
+activityResize.onpointermove=e=>{if(activityDrag)activityHeight(activityDrag.height+activityDrag.y-e.clientY);};
+activityResize.onpointerup=activityResize.onpointercancel=()=>{activityDrag=null;};
+activityResize.onkeydown=e=>{if(['ArrowUp','ArrowDown'].includes(e.key)){e.preventDefault();activityHeight($('#activity').offsetHeight+(e.key==='ArrowUp'?20:-20));}};
+document.addEventListener('pointerdown',e=>{if(!$('#settings').contains(e.target))$('#settings').open=false;});
+
 function sidebarMenu(label,actions){
   const menu=document.createElement('details');menu.className='sidebar-menu';
   const toggle=document.createElement('summary');toggle.textContent='⋮';toggle.setAttribute('aria-label',label);menu.append(toggle);
@@ -140,7 +230,7 @@ async function refreshDaemon(){
   const response=await fetch('/api/snapshot'),info=await response.json();
   if(!response.ok)throw Error(info.error||'Daemon unavailable');
   if(info.node_id!==daemon.node_id)throw Error('Owning Node changed; reopen the gateway explicitly.');
-  daemon=info;if(info.warning)showError(info.warning);syncSidebar();
+  daemon=info;if(info.warning)showError(info.warning);syncSidebar();renderActivity();
 }
 async function createDaemonShell(){
   if(creating||panes.size>=24)return;creating=true;syncSidebar();
@@ -192,7 +282,7 @@ async function initializeDaemon(info){
   }else{
     tree=null;for(const shell of workspace.shells.filter(s=>s.run).slice(0,4))openShell(shell);
   }
-  loading=false;reflow();
+  loading=false;reflow();renderActivity();
   if(!saved&&!workspace.shells.length)await createDaemonShell();
 
 }
@@ -345,7 +435,7 @@ function paint(now){
 }
 $('#reset').onclick=()=>{if(daemon)refreshDaemon().catch(showError);else reset();};
 $('#add').onclick=()=>{if(daemon){createDaemonShell().catch(showError);return;}if(panes.size>=24||drag||resize)return;expanded=null;const id=next++;addPane(id,templates[(id-1)%4]);tree=tree?insert(tree,layout(tree,bounds()).panes.has(active)?active:layout(tree,bounds()).panes.keys().next().value,id,'right'):leaf(id);active=id;reflow();};
-motion.onchange=()=>reflow(false);
+motion.onchange=()=>{try{localStorage.setItem('boomux.webgpu.motion',String(motion.checked));}catch{}reflow(false);};
 new ResizeObserver(()=>{width=stage.clientWidth;height=stage.clientHeight;if(drag||resize)finish(true);reflow(false);}).observe(stage);
 width=stage.clientWidth;height=stage.clientHeight;
 try{
@@ -354,6 +444,7 @@ try{
   else {const info=await response.json();if(!response.ok)throw Error(info.error||'Daemon unavailable');await initializeDaemon(info);}
 }catch(error){showError(error);$('#add').disabled=true;}
 
+renderActivity();
 draw=await createRenderer($('#scene'),$('#renderer'),schedule);schedule();
 
 window.addEventListener('pagehide',()=>{clearTimeout(fitTimer);for(const p of panes.values())p.terminal?.dispose();});

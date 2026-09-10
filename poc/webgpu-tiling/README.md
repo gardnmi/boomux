@@ -73,7 +73,7 @@ No asset build is required. The footer reports whether WebGPU initialized;
 - Click inside a terminal to type commands. Ctrl+C, ANSI colors, terminal modes,
   selection, paste, and scrollback are handled by Ghostty.
 
-Click **Layout mode** or press **Ctrl+Space** to enable keyboard arrangement.
+Open the sidebar **Settings** gear and click **Layout mode**, or press **Ctrl+Space** to enable keyboard arrangement.
 The visible guide indicates when shortcuts are active:
 
 | Shortcut | Action in layout mode |
@@ -192,3 +192,30 @@ terminal, and 40 alternating pointer movements: the previous layout scheduler se
 and four on commit. Both runs used the same machine, fixture, and Canvas fallback.
 Neither recorded a browser long task; this demonstrates reduced resize work, not
 reproduction of every reported freeze or a CPU/memory performance benchmark.
+
+The main canvas uses the full available height. **New Shell** stays beside the
+Workspace heading; the bottom sidebar gear contains refresh, layout mode, the
+saved animation preference, and renderer details. The Agents/Git/Remotes section
+below the Workspace list can be collapsed or resized by dragging its top divider
+(or focusing the divider and using the arrow keys).
+
+- **Agents** lists current-run Agents and explicit attention, with Shell navigation;
+  historical attention never opens a replacement run. Display is capped at 200 rows.
+- **Git** reads the selected Node's daemon Git overview on demand. Expand a worktree
+  for its path, staged/modified/untracked counts, upstream divergence, PR summary,
+  and associated current Shells. Refresh requests a new observation; an in-progress
+  scan is labeled explicitly. One response is retained, with at most 200 worktree rows.
+- **Remotes** shows registered remote Nodes, connection health, and route, with
+  navigation to a discovered Workspace. Remote registration remains in Desktop.
+
+Activity refresh is explicit; inactive tabs do not poll. The Git endpoint uses the
+same bounded operation pool, local Origin validation, and owner-routed host service
+as the gateway's other operations, with a two-second response timeout.
+
+Focused activity/settings checks use intercepted fixture data and never attach to
+real terminals:
+
+```sh
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
+  node poc/webgpu-tiling/panels.test.mjs
+```

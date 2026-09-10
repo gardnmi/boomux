@@ -8,20 +8,41 @@
 <body>
 <aside>
   <div class="brand"><span class="logo">▦</span> boomux <small>LAB</small></div>
-  <div class="section-label">WORKSPACES <span>01</span></div>
+  <div class="section-label">WORKSPACES <span>01</span><button id="add" title="New Shell">+ New Shell</button></div>
   <div class="workspace"><span>◈</span> WebGPU playground <b>4</b></div>
   <nav id="workspace-list" aria-label="Workspaces" hidden></nav>
   <div class="sidebar-copy">A little room to move.</div>
   <div id="pane-list"></div>
-  <div class="sidebar-bottom"><span class="dot"></span> Local terminal sessions<br><small>Ghostty WASM · standalone PTYs</small></div>
+  <section id="activity" aria-label="Workspace activity">
+    <div id="activity-resize" role="separator" aria-label="Resize activity panel" aria-orientation="horizontal" tabindex="0"></div>
+    <div class="activity-tabs" role="tablist" aria-label="Activity">
+      <button role="tab" id="tab-agents" aria-controls="activity-content" aria-selected="true" data-panel="agents">Agents</button>
+      <button role="tab" id="tab-git" aria-controls="activity-content" aria-selected="false" data-panel="git">Git</button>
+      <button role="tab" id="tab-remotes" aria-controls="activity-content" aria-selected="false" data-panel="remotes">Remotes</button>
+      <button id="activity-refresh" title="Refresh activity" aria-label="Refresh activity">↻</button>
+      <button id="activity-toggle" title="Collapse activity" aria-label="Collapse activity" aria-expanded="true">⌄</button>
+    </div>
+    <div id="activity-content" role="tabpanel" aria-labelledby="tab-agents"></div>
+  </section>
+  <div class="sidebar-tools">
+    <div class="sidebar-bottom">Connected to Boomux</div>
+    <details id="settings"><summary aria-label="Settings" title="Settings"><svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20.00,12.00 L21.91,13.31 L21.66,14.59 L21.24,15.83 L20.66,17.00 L18.35,16.87 L17.66,17.66 L18.09,19.93 L17.00,20.66 L15.83,21.24 L14.59,21.66 L13.04,19.93 L12.00,20.00 L10.69,21.91 L9.41,21.66 L8.17,21.24 L7.00,20.66 L7.13,18.35 L6.34,17.66 L4.07,18.09 L3.34,17.00 L2.76,15.83 L2.34,14.59 L4.07,13.04 L4.00,12.00 L2.09,10.69 L2.34,9.41 L2.76,8.17 L3.34,7.00 L5.65,7.13 L6.34,6.34 L5.91,4.07 L7.00,3.34 L8.17,2.76 L9.41,2.34 L10.96,4.07 L12.00,4.00 L13.31,2.09 L14.59,2.34 L15.83,2.76 L17.00,3.34 L16.87,5.65 L17.66,6.34 L19.93,5.91 L20.66,7.00 L21.24,8.17 L21.66,9.41 L19.93,10.96 Z"/><circle cx="12" cy="12" r="3.5"/></svg></summary>
+      <div class="settings-menu"><strong>Settings</strong>
+        <button id="reset">Refresh Shells</button>
+        <button id="layout-mode" aria-pressed="false">Layout mode <kbd>Ctrl Space</kbd></button>
+        <label>Animate layout <input id="motion" type="checkbox" checked></label>
+        <small id="count">0 panes</small>
+        <small id="renderer">Starting renderer…</small>
+        <small id="hint">Drag a heading to rearrange</small>
+      </div>
+    </details>
+  </div>
 </aside>
 <main>
   <div id="gateway-status" role="status" hidden></div>
-  <header><div><span class="breadcrumb">Playground /</span> Tiling lab <span class="tag">PROOF OF CONCEPT</span></div><div class="actions"><button id="reset">Restart demo</button><button id="add" class="primary">+ New pane</button></div></header>
-  <div class="toolbar"><span><span class="dot"></span> <strong id="count">4 panes</strong> <span class="muted">· drag a heading to rearrange</span></span><div class="actions"><button id="layout-mode" aria-pressed="false" title="Ctrl + Space toggles layout mode">Layout mode <kbd>Ctrl Space</kbd></button><label>Motion <input id="motion" type="checkbox" checked></label></div></div>
   <div id="keyboard-help" hidden><strong>LAYOUT MODE</strong><span>Arrows: focus · Shift + arrows: move · Alt + arrows: resize · Tab: cycle · S: rotate split · E: equalize · R: swap split · O: float · F: expand · Esc: exit</span></div>
   <div id="stage"><canvas id="scene" aria-hidden="true"></canvas><div id="panes"></div><div id="dividers"></div><div id="drop-overlay" aria-hidden="true"></div><div id="drop-label"></div><div id="empty">Your canvas is clear.<br><small>Add a pane to start tiling.</small></div></div>
-  <footer><span id="hint">Drag to an edge to split · Hold Shift while dropping to float · Double-click a heading to expand</span><span id="renderer">Starting renderer…</span></footer>
+
 </main>
 <script type="module" src="app.js"></script>
 </body>

@@ -107,7 +107,7 @@ fn remote_workspaces(node: &boomux::protocol::CombinedNode) -> Vec<Value> {
         agents.entry(&agent.workspace_id).or_default().push(json!({
             "id":remote::key(&node.node_id,&agent.id),
             "shell_id":remote::key(&node.node_id,&agent.shell_id),
-            "run_id":agent.run_id,"observation":{"state":agent.state},"attention":agent.attention,
+            "name":agent.name,"integration":agent.integration,"run_id":agent.run_id,"observation":{"state":agent.state},"attention":agent.attention,
         }));
     }
     projection
@@ -128,8 +128,10 @@ async fn snapshot(State(app): State<App>) -> ApiResult {
     operation(app, |app| {
         let mut snapshot = serde_json::to_value(app.client.snapshot().map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
+        let mut nodes = Vec::new();
         let warning = match app.client.combined_node_snapshot(None) {
             Ok(combined) => {
+                nodes = combined.nodes.iter().map(|n|json!({"id":n.node_id,"alias":n.alias,"local":n.local,"route":n.route,"health":n.health,"current":n.current,"stale":n.stale})).collect();
                 let workspaces = snapshot["workspaces"]
                     .as_array_mut()
                     .ok_or("Invalid local snapshot")?;
@@ -142,8 +144,33 @@ async fn snapshot(State(app): State<App>) -> ApiResult {
         };
         Ok(
             json!({"mode":"daemon","node_id":app.node_id,"workspace_id":app.workspace_id,
-            "snapshot":snapshot,"warning":warning}),
+            "snapshot":snapshot,"warning":warning,"nodes":nodes}),
         )
+    })
+    .await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitRequest {
+    node_id: String,
+    owner: Option<String>,
+    #[serde(default)]
+    refresh: bool,
+}
+async fn git_overview(State(app): State<App>, Json(request): Json<GitRequest>) -> ApiResult {
+    operation(app, move |app| {
+        if request.node_id != app.node_id {
+            return Err("Wrong gateway Node".into());
+        }
+        let overview = app
+            .client
+            .git_overview(
+                request.owner.as_deref(),
+                request.refresh,
+                Duration::from_secs(2),
+            )
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(overview).map_err(|e| e.to_string())
     })
     .await
 }
@@ -396,6 +423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let router = Router::new()
         .route("/api/snapshot", get(snapshot))
+        .route("/api/git", post(git_overview))
         .route("/api/shell", post(create_shell))
         .route("/api/attach", post(grant))
         .route("/pty", get(terminal))
