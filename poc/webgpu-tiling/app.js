@@ -11,6 +11,9 @@ const templates=[
 let tree,panes=new Map(),floating=new Map(),active=1,next=5,expanded=null,drag=null,resize=null,drop=null;
 let targets=new Map(),shown=new Map(),tween=null,draw=null,frame=0,width=1,height=1;
 let layoutMode=false;
+let daemon=null,workspaceId=null,loading=true,creating=false;
+const savedKey='boomux.webgpu.layout.v1';
+const escapeHtml=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let lastHoverPoint=null;
 const motion=$('#motion');motion.checked=!matchMedia('(prefers-reduced-motion: reduce)').matches;
 const clone=value=>structuredClone(value);
@@ -18,14 +21,15 @@ function schedule(){if(!frame)frame=requestAnimationFrame(paint);}
 function syncSidebar(){
   $('#count').textContent=`${panes.size} pane${panes.size===1?'':'s'}`;
   $('.workspace b').textContent=panes.size;
-  $('#add').disabled=panes.size>=24;
+  $('#add').disabled=panes.size>=24||creating;
   $('#pane-list').replaceChildren();
-  for(const [id,p] of panes){const b=document.createElement('button');b.className='sidebar-pane'+(id===active?' selected':'');b.innerHTML=`<span style="color:${p.color}">▣</span> ${p.name}<small>${floating.has(id)?'float':String(id).padStart(2,'0')}</small>`;b.onclick=()=>{active=id;if(expanded)expanded=id;reflow();};$('#pane-list').append(b);}
-  for(const [id,p] of panes)p.el.setAttribute('aria-label',`${p.name} pane ${id}${id===active?', selected':''}`);
+  if(daemon){syncDaemonSidebar();saveLayout();return;}
+  for(const [id,p] of panes){const b=document.createElement('button');b.className='sidebar-pane'+(id===active?' selected':'');b.innerHTML=`<span style="color:${p.color}">▣</span> ${escapeHtml(p.name)}<small>${floating.has(id)?'float':String(id).padStart(2,'0')}</small>`;b.onclick=()=>{active=id;if(expanded)expanded=id;reflow();};$('#pane-list').append(b);}
+  for(const [id,p] of panes)p.el.setAttribute('aria-label',`${escapeHtml(p.name)} pane ${id}${id===active?', selected':''}`);
 }
 function addPane(id,template){
   const p={...template},el=document.createElement('section');p.el=el;el.className='pane';el.dataset.id=id;
-  el.innerHTML=`<div class="pane-heading"><span style="color:${p.color}">●</span><span class="pane-name">${p.name}</span><span class="pane-index">${String(id).padStart(2,'0')}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">◇</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">⛶</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${p.path}</span><span class="terminal-status">Starting…</span></div>`;
+  el.innerHTML=`<div class="pane-heading"><span style="color:${p.color}">●</span><span class="pane-name">${escapeHtml(p.name)}</span><span class="pane-index">${String(id).padStart(2,'0')}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">◇</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">⛶</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${escapeHtml(p.path)}</span><span class="terminal-status">Starting…</span></div>`;
   el.addEventListener('pointerdown',e=>{
     active=id;syncSidebar();schedule();
     if(e.button!==0||e.target.closest('button')||expanded)return;
@@ -44,7 +48,7 @@ function addPane(id,template){
     reflow();
   });
   panes.set(id,p);paneLayer.append(el);
-  p.terminal=createTerminal(el.querySelector('.pane-body'),el.querySelector('.terminal-status'),()=>layoutMode);
+  connectPane(id,p);
   p.terminal.ready.then(()=>{if(panes.get(id)===p){p.terminal.fit();panes.get(active)?.terminal?.focus();}});
 }
 function reset(){
@@ -52,6 +56,119 @@ function reset(){
   templates.forEach((t,i)=>addPane(i+1,t));tree=split(split(leaf(1),leaf(2),'y',.59),split(leaf(3),leaf(4),'y',.48),'x',.58);reflow();
 }
 function bounds(){return {x:8,y:8,w:Math.max(1,width-16),h:Math.max(1,height-16)};}
+function showError(error){
+  const message=error?.message||String(error);
+  $('#gateway-status').textContent=message;$('#gateway-status').hidden=false;
+}
+function currentWorkspace(){return daemon?.snapshot.workspaces.find(w=>w.id===workspaceId);}
+function syncDaemonSidebar(){
+  const workspace=currentWorkspace();
+  for(const shell of workspace?.shells||[]){
+    const entry=[...panes].find(([,p])=>p.shell?.id===shell.id);
+    const button=document.createElement('button');button.className='sidebar-pane'+(entry?.[0]===active?' selected':'');
+    button.innerHTML=`<span>▣</span> ${escapeHtml(shell.name)}<small>${entry?'open':shell.status==='running'?'running':'ended'}</small>`;
+    button.title=shell.cwd;button.disabled=!shell.run;
+    button.onclick=()=>openShell(shell);
+    $('#pane-list').append(button);
+  }
+  for(const [id,p]of panes)p.el.setAttribute('aria-label',`${p.name} pane ${id}${id===active?', selected':''}`);
+}
+function connectPane(id,p,takeover=false){
+  if(p.shell){const close=p.el.querySelector('[data-action="close"]');close.title='Detach pane; leave the Shell running';close.setAttribute('aria-label','Detach pane');}
+  p.el.querySelector('.attachment-error')?.remove();
+  p.terminal?.dispose();
+  p.terminal=createTerminal(p.el.querySelector('.pane-body'),p.el.querySelector('.terminal-status'),()=>layoutMode,
+    p.shell?{nodeId:daemon.node_id,shell:p.shell,takeover,onError(code,message){
+      if(panes.get(id)!==p)return;
+      const panel=document.createElement('div');panel.className='attachment-error';
+      const text=document.createElement('p');text.textContent=message;panel.append(text);
+      if(code==='busy'){
+        const button=document.createElement('button');button.textContent='Take control';button.onclick=()=>{
+          if(confirm('Take control of this Shell? Its current terminal controller will be detached.'))connectPane(id,p,true);
+        };panel.append(button);
+      }
+      p.el.append(panel);
+    }}:{});
+  p.terminal.ready.then(()=>{if(panes.get(id)===p){p.terminal.fit();if(id===active)p.terminal.focus();}});
+}
+function openShell(shell,id=next++,saved=false){
+  const existing=[...panes].find(([,p])=>p.shell?.id===shell.id&&p.shell?.run?.id===shell.run?.id);
+  if(existing){active=existing[0];if(existing[1].el.querySelector('.pane-body').dataset.connected!=='true')connectPane(existing[0],existing[1]);else existing[1].terminal.focus();syncSidebar();schedule();return;}
+  if(!shell.run){showError('This Shell has not started. Start it through Boomux first.');return;}
+  if(panes.size>=24){showError('Detach a pane before opening another (24 pane limit).');return;}
+  addPane(id,{...templates[(id-1)%4],name:shell.name,path:shell.cwd,shell});active=id;
+  if(!saved)tree=tree?split(tree,leaf(id),'x'):leaf(id);
+  if(!saved)reflow();
+}
+async function refreshDaemon(){
+  const response=await fetch('/api/snapshot'),info=await response.json();
+  if(!response.ok)throw Error(info.error||'Daemon unavailable');
+  if(info.node_id!==daemon.node_id)throw Error('Owning Node changed; reopen the gateway explicitly.');
+  daemon=info;renderWorkspaceSelector();syncSidebar();
+}
+async function createDaemonShell(){
+  if(creating||panes.size>=24)return;creating=true;syncSidebar();
+  try{
+    const response=await fetch('/api/shell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({node_id:daemon.node_id,workspace_id:workspaceId})});
+    const result=await response.json();if(!response.ok)throw Error(result.error||'Shell creation failed; refresh before retrying.');
+    await refreshDaemon();openShell(result.shell);
+  }finally{creating=false;syncSidebar();}
+}
+function saveLayout(){
+  if(!daemon||loading||drag||resize)return;
+  const saved={version:1,node_id:daemon.node_id,workspace_id:workspaceId,tree,floating:[...floating],active,
+    panes:[...panes].map(([id,p])=>({id,shell_id:p.shell.id,run_id:p.shell.run.id}))};
+  try{localStorage.setItem(savedKey,JSON.stringify(saved));}catch{showError('Browser storage unavailable; this layout will not survive refresh.');}
+}
+function readLayout(){
+  try{
+    const raw=localStorage.getItem(savedKey);if(!raw||raw.length>65536)return null;
+    const saved=JSON.parse(raw);
+    if(saved.version!==1||saved.node_id!==daemon.node_id||!daemon.snapshot.workspaces.some(w=>w.id===saved.workspace_id))return null;
+    if(!Array.isArray(saved.panes)||saved.panes.length>24||!Array.isArray(saved.floating)||saved.floating.length>24)return null;
+    const ids=new Set();
+    for(const p of saved.panes){if(!Number.isInteger(p.id)||p.id<1||p.id>1000000||ids.has(p.id)||typeof p.shell_id!=='string'||typeof p.run_id!=='string')return null;ids.add(p.id);}
+    const seen=new Set();let budget=48;
+    function visit(node){
+      if(!node)return true;if(--budget<0)return false;
+      if('id'in node){if(!ids.has(node.id)||seen.has(node.id))return false;seen.add(node.id);return true;}
+      return ['x','y'].includes(node.axis)&&Number.isFinite(node.ratio)&&node.ratio>=.1&&node.ratio<=.9&&!!node.a&&!!node.b&&visit(node.a)&&visit(node.b);
+    }
+    if(!visit(saved.tree))return null;
+    for(const entry of saved.floating){if(!Array.isArray(entry)||entry.length!==2)return null;const [id,r]=entry;if(!ids.has(id)||seen.has(id)||!r||!['x','y','w','h'].every(k=>Number.isFinite(r[k]))||r.w<1||r.h<1)return null;seen.add(id);}
+    return seen.size===ids.size?saved:null;
+  }catch{return null;}
+}
+function renderWorkspaceSelector(){
+  const select=$('#workspace-select');select.replaceChildren();
+  for(const workspace of daemon.snapshot.workspaces){const option=document.createElement('option');option.value=workspace.id;option.textContent=workspace.name;select.append(option);}
+  select.value=workspaceId;
+}
+async function initializeDaemon(info){
+  daemon=info;const saved=readLayout();workspaceId=saved?.workspace_id||info.workspace_id;
+  $('#workspace-select').hidden=false;$('.workspace').hidden=true;renderWorkspaceSelector();
+  $('#reset').textContent='Refresh Shells';$('#add').textContent='+ New Shell';
+  $('.sidebar-copy').textContent='Daemon-owned Shells';$('.sidebar-bottom').textContent='Connected to Boomux · local Node';
+  $('#empty').innerHTML='No open panes.<br><small>Open a Shell from the sidebar or create one.</small>';
+  const workspace=currentWorkspace();if(!workspace)throw Error('Workspace no longer exists. Select another Workspace.');
+  if(saved){
+    tree=saved.tree;floating=new Map(saved.floating);next=Math.max(1,...saved.panes.map(p=>p.id))+1;
+    for(const entry of saved.panes){
+      const shell=workspace.shells.find(s=>s.id===entry.shell_id&&s.run?.id===entry.run_id);
+      if(shell)openShell(shell,entry.id,true);else{tree=remove(tree,entry.id);floating.delete(entry.id);showError('A saved ShellRun changed or was removed. Open its current run from the sidebar.');}
+    }
+    active=panes.has(saved.active)?saved.active:panes.keys().next().value;
+  }else{
+    tree=null;for(const shell of workspace.shells.filter(s=>s.run).slice(0,4))openShell(shell);
+  }
+  loading=false;reflow();
+  if(!saved&&!workspace.shells.length)await createDaemonShell();
+  $('#workspace-select').onchange=()=>{
+    loading=true;for(const p of panes.values())p.terminal.dispose();panes.clear();shown.clear();paneLayer.replaceChildren();floating.clear();tree=null;
+    expanded=null;drag=null;resize=null;active=null;workspaceId=$('#workspace-select').value;for(const shell of currentWorkspace()?.shells.filter(s=>s.run).slice(0,4)||[])openShell(shell);
+    loading=false;reflow();
+  };
+}
 function reflow(animate=true){
   const result=layout(tree,bounds());targets=result.panes;
   for(const [id,r] of floating){r.w=Math.min(r.w,width-16);r.h=Math.min(r.h,height-16);r.x=Math.max(8,Math.min(r.x,width-r.w-8));r.y=Math.max(8,Math.min(r.y,height-r.h-8));targets.set(id,{...r});}
@@ -183,11 +300,17 @@ function paint(now){
   draw?.(rects,width,height);
   if(t<1)schedule();else {tween=null;for(const [id,p]of panes)if(targets.has(id))p.terminal?.fit();}
 }
-$('#reset').onclick=reset;
-$('#add').onclick=()=>{if(panes.size>=24||drag||resize)return;expanded=null;const id=next++;addPane(id,templates[(id-1)%4]);tree=tree?insert(tree,layout(tree,bounds()).panes.has(active)?active:layout(tree,bounds()).panes.keys().next().value,id,'right'):leaf(id);active=id;reflow();};
+$('#reset').onclick=()=>{if(daemon)refreshDaemon().catch(showError);else reset();};
+$('#add').onclick=()=>{if(daemon){createDaemonShell().catch(showError);return;}if(panes.size>=24||drag||resize)return;expanded=null;const id=next++;addPane(id,templates[(id-1)%4]);tree=tree?insert(tree,layout(tree,bounds()).panes.has(active)?active:layout(tree,bounds()).panes.keys().next().value,id,'right'):leaf(id);active=id;reflow();};
 motion.onchange=()=>reflow(false);
 new ResizeObserver(()=>{width=stage.clientWidth;height=stage.clientHeight;if(drag||resize)finish(true);reflow(false);}).observe(stage);
-width=stage.clientWidth;height=stage.clientHeight;reset();
+width=stage.clientWidth;height=stage.clientHeight;
+try{
+  const response=await fetch('/api/snapshot');
+  if(response.status===404){loading=false;reset();}
+  else {const info=await response.json();if(!response.ok)throw Error(info.error||'Daemon unavailable');await initializeDaemon(info);}
+}catch(error){showError(error);$('#add').disabled=true;}
+
 draw=await createRenderer($('#scene'),$('#renderer'),schedule);schedule();
 
 window.addEventListener('pagehide',()=>{for(const p of panes.values())p.terminal?.dispose();});

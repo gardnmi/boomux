@@ -10,11 +10,13 @@
   <div class="brand"><span class="logo">▦</span> boomux <small>LAB</small></div>
   <div class="section-label">WORKSPACES <span>01</span></div>
   <div class="workspace"><span>◈</span> WebGPU playground <b>4</b></div>
+  <select id="workspace-select" aria-label="Workspace" hidden></select>
   <div class="sidebar-copy">A little room to move.</div>
   <div id="pane-list"></div>
   <div class="sidebar-bottom"><span class="dot"></span> Local terminal sessions<br><small>Ghostty WASM · standalone PTYs</small></div>
 </aside>
 <main>
+  <div id="gateway-status" role="status" hidden></div>
   <header><div><span class="breadcrumb">Playground /</span> Tiling lab <span class="tag">PROOF OF CONCEPT</span></div><div class="actions"><button id="reset">Restart demo</button><button id="add" class="primary">+ New pane</button></div></header>
   <div class="toolbar"><span><span class="dot"></span> <strong id="count">4 panes</strong> <span class="muted">· drag a heading to rearrange</span></span><div class="actions"><button id="layout-mode" aria-pressed="false" title="Ctrl + Space toggles layout mode">Layout mode <kbd>Ctrl Space</kbd></button><label>Motion <input id="motion" type="checkbox" checked></label></div></div>
   <div id="keyboard-help" hidden><strong>LAYOUT MODE</strong><span>Arrows: focus · Shift + arrows: move · Alt + arrows: resize · Tab: cycle · S: rotate split · E: equalize · R: swap split · O: float · F: expand · Esc: exit</span></div>

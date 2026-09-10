@@ -1,26 +1,57 @@
 # Browser tiling proof of concept
 
-A standalone movement experiment for Boomux Desktop. It uses the same basic
-binary split-tree approach as `desktop/src/layout.rs`, with browser pointer
-events and an event-driven WebGPU pane compositor. Each pane runs a real local
-Bash PTY through a loopback WebSocket bridge. The repository-pinned
-`ghostty-web` uses Ghostty's WASM VT engine with a Canvas 2D terminal renderer;
-WebGPU draws the surrounding pane surfaces and previews. It does not connect to
-the Boomux daemon or attach to existing Boomux Shells.
+A browser client for the local Boomux daemon, using a binary split tree for
+layout, WebGPU for pane surfaces and previews, and the repository-pinned
+Ghostty WASM VT engine with Canvas 2D terminal rendering. The daemon owns the
+Shell processes; the browser owns its layout and terminal attachments.
 
-From the repository root:
+From the repository root, install assets and start the gateway:
 
 ```sh
 bun install --frozen-lockfile
-bun poc/webgpu-tiling/server.js
+poc/webgpu-tiling/run-daemon.sh --current
 ```
 
-Use Bun 1.3.14 or later on Linux/macOS. Open <http://127.0.0.1:4387>.
-No asset build is required: the server exposes only an explicit list of PoC files,
-the installed pinned Ghostty JS/WASM, and the installed terminal font.
-The footer reports whether WebGPU initialized. If unavailable, the same demo
-uses Canvas 2D; `?fallback` explicitly exercises that path. WebGPU API use is
-based on the [official samples](https://webgpu.github.io/webgpu-samples/).
+This connects to an already-running daemon (protocol 54 or newer) without
+restarting it. It creates a dedicated **WebGPU playground** Workspace on first
+launch and remembers its exact identity under `target/webgpu-poc/`. Set
+`POC_WORKSPACE_ID` to select an existing Workspace explicitly. Open
+<http://127.0.0.1:4389>; set `POC_PORT` to use another port.
+
+For development without touching your normal daemon, use
+`poc/webgpu-tiling/run-daemon.sh --isolated` instead. It starts a separate daemon
+with runtime, configuration, and state directories under `target/webgpu-poc/`.
+Both modes build the debug gateway and CLI; `CARGO_TARGET_DIR` is supported.
+Use Bun 1.3.14 or later for asset installation.
+
+Choose a local Workspace in the dropdown, then click a Shell in the sidebar to
+attach. **New Shell** creates a daemon-owned Bash Shell in the Workspace's default
+working directory; its minimal prompt shows the path. **Refresh Shells** updates
+the listing. A Shell without a current run must first be started through Boomux.
+The pane close button detaches; terminate Shells through the normal Boomux UI or CLI.
+
+Reloading or closing the page keeps Shell processes running. The most recent
+Workspace layout is stored in localStorage with exact Node, Shell, and run IDs;
+stale runs are never silently replaced. Reattachment restores terminal output.
+Compatible graceful daemon restart preserves processes and reconnects attachments;
+this does not promise process survival across a machine crash.
+
+Attachments are primary controllers, so browser dimensions resize the actual PTY.
+If another terminal controls a Shell, the pane offers **Take control** with an
+explicit confirmation. Taking control detaches the previous controller.
+
+The gateway binds only to `127.0.0.1`, validates Host and mutation/WebSocket
+Origin, and uses short-lived, one-use attachment grants. It caps active attachments
+at 24, pending grants at 64, and concurrent API operations at 8. Transport queues,
+frames, and write buffers are bounded; stalled connections detach without killing
+Shells. Terminal grids are limited to 500 columns by 200 rows. No terminal output
+or attachment environments are saved in browser storage. This is a local-use PoC,
+not a remote-access service. It currently exposes local Workspaces and Shells;
+federation, Agent projections, and full Desktop lifecycle controls are not included.
+
+No asset build is required. The footer reports whether WebGPU initialized;
+`?fallback` exercises Canvas 2D pane rendering. WebGPU API use is based on the
+[official samples](https://webgpu.github.io/webgpu-samples/).
 
 - Drag a heading (or Ctrl-drag a pane) to lift it; other panes reflow.
 - Move the pointer over a pane to focus its terminal. Hover focus is suspended
@@ -33,7 +64,7 @@ based on the [official samples](https://webgpu.github.io/webgpu-samples/).
 - Double-click a heading or use its expand button to expand/restore.
 - Escape cancels a drag/resize or exits expansion in layout mode.
   Outside layout mode, a focused terminal receives Escape normally.
-- Add panes (up to 24), close terminal sessions, restart the demo, or turn motion off.
+- Add panes (up to 24), detach panes, refresh the Shell listing, or turn motion off.
 - Click inside a terminal to type commands. Ctrl+C, ANSI colors, terminal modes,
   selection, paste, and scrollback are handled by Ghostty.
 
@@ -57,22 +88,16 @@ These follow Desktop's basic layout bindings. The prototype uses a toggle only;
 Desktop's hold-to-enter and double-tap terminal forwarding are not implemented.
 If the OS intercepts Ctrl+Space, use the button. Form inputs retain their keys.
 
-The prototype intentionally keeps everything in memory. Closing a pane, reloading,
-closing the page, or **Restart demo** closes the associated PTYs and terminates
-their ordinary shell jobs. Moving, resizing, floating, or expanding keeps the
-same session. This lifetime is deliberately different from Boomux Desktop's
-persistent daemon-owned Shells. Explicitly detached jobs are not supervised.
-Bash starts without startup files or inherited Boomux/agent identity variables;
-the working directory is this worktree. These are real local commands, not a sandbox.
+The original standalone PTY experiment is still available:
 
-The bridge binds only to `127.0.0.1` and validates both Host and WebSocket Origin.
-It caps total sessions at 48, unacknowledged output at 1 MiB per session, input at
-64 KiB per message/second, and the grid at 500 columns by 200 rows. A stalled or
-overloaded connection closes its session rather than dropping arbitrary terminal
-bytes. Output acknowledgments happen after synchronous WASM ingestion, so they
-do not depend on animation frames in background tabs. Scrollback is capped at
-2,000 lines per pane. No session credentials or attachment environments are stored.
-The gateway is an experiment for local use, not a remote-access service.
+```sh
+bun poc/webgpu-tiling/server.js
+```
+
+Open <http://127.0.0.1:4387>. This mode creates private Bun-owned Bash PTYs.
+Unlike daemon mode, closing panes, reloading, or **Restart demo** terminates their
+ordinary jobs. Its existing lifecycle and cleanup tests apply only to that server.
+Commands in both modes execute locally and are not sandboxed.
 
 Floating panes move and resize through keyboard shortcuts but do not yet have
 independent pointer resize handles. Desktop's full keyboard layout mode, native
@@ -82,7 +107,7 @@ are future work. The demo does not establish performance parity with GPUI.
 The pane compositor renders on changes and during 180 ms reflow animations;
 the pinned Ghostty wrapper retains its own per-terminal animation-frame loop.
 That idle cost needs measurement and optimization before scaling this design.
-GPU storage is fixed-size, and terminal disposal reclaims the emulator and PTY.
+GPU storage is fixed-size, and terminal disposal reclaims the emulator and detaches its daemon connection.
 
 Focused model checks:
 
@@ -125,3 +150,20 @@ Add `HEADED=1` to exercise a normal Chromium window and `SCREENSHOT=/tmp/poc.png
 to capture the live terminal result. Terminal API behavior follows the pinned
 package source; in particular its custom-key handler returns **true** to consume
 an event. PTY transport uses [Bun Terminal](https://bun.com/reference/bun/Terminal).
+
+Daemon integration checks require the isolated gateway running on port 4389:
+
+```sh
+BOOMUX_RUNTIME_DIR="$PWD/target/webgpu-poc/runtime" \
+BOOMUX_CONFIG_HOME="$PWD/target/webgpu-poc/config" \
+BOOMUX_STATE_HOME="$PWD/target/webgpu-poc/state" \
+POC_BOOMUX_BIN="${CARGO_TARGET_DIR:-$PWD/target}/debug/boomux" \
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
+POC_RESTART=1 node poc/webgpu-tiling/daemon.test.mjs
+cargo test --example webgpu_gateway --locked
+```
+
+The browser fixture checks process/variable and layout preservation across refresh,
+PTY resizing, busy attachments and explicit takeover, detach persistence, rejected
+stale identities/Origins, and optionally graceful daemon handoff. It creates and
+cleans up only its own Shells and refuses to run against the ordinary runtime.

@@ -6,3 +6,5 @@
 
 /* Ghostty draws the terminal cursor; suppress the native editable caret. */
 .pane-body,.pane-body textarea{caret-color:transparent}
+#workspace-select{width:100%;padding:10px;background:#282f43;border:1px solid #3b4564;border-radius:7px;color:#dae1ff}#gateway-status{padding:10px 24px;background:#493727;color:#f2d3a0}.attachment-error{position:absolute;inset:40px 0 26px;background:#161b24f5;padding:24px;z-index:2;color:#bbc9e2}.terminal-status{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pane-foot>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:62%}
+.workspace[hidden]{display:none}
