@@ -109,6 +109,12 @@ and history but does not remove project shortcuts or filesystem contents.
   from the daemon's combined snapshot.
 - `src/boomux_settings.rs`: active-layer settings editor and bounded CLI bridge;
   Boomux retains configuration validation and commit authority.
+- `src/layout_state.rs`: versioned, bounded Desktop arrangement storage with atomic
+  background writes and revision checks preventing stale-instance overwrites.
+- `src/layout_persistence.rs`: pane-ID remapping, per-Workspace/Mixed arrangement
+  capture/restore, debounced saves, and deferred exact-run attachments. Local
+  references are scoped to the verified coordinator Node; remote keys retain
+  owner and resource identity. No terminal data or attachment environment is saved.
 - `src/settings.rs`: bounded preference loading, validation, and atomic background
   saves of Desktop-owned settings; shared Boomux configuration remains separate.
 - `src/layout_badge.rs`: shared animated Layout-mode icons and pane overlays.
@@ -444,3 +450,22 @@ Twelve-pixel corner targets paint above side handles and resize both axes with
 diagonal cursors. Tiled corner targets require adjoining dividers on both axes.
 Maximized and transitioning panes omit edge handles. Terminal body selection
 and Ctrl-drag behavior retain their existing input paths.
+
+## Internal layout restoration
+
+Layout mutations retain one 250 ms debounce task and one pending writer request;
+terminal output and rendering do not generate persistence snapshots. Active drag
+state is excluded. Workspace switching captures the outgoing committed tree;
+inactive arrangements retain metadata only, not sessions or emulator state.
+Files cap at 2 MiB, 256 arrangements, 4096 total panes and depth 64. Invalid or
+unsupported files remain untouched and disable writes with a visible notice.
+
+Desktop startup restores the tree and floating geometry before exact-running
+attachments. Stopped Shells require explicit user action. Deferred attachments reuse the
+existing overview refresh, attempt at most four panes per refresh, and back off
+failed attempts up to 30 seconds without per-pane timers. This also allows an
+update replacement to attach after the old window releases its terminals. Restoration never authorizes
+Shell creation, restart, or attachment takeover. Updates freeze saving and await
+the durable snapshot before launching the replacement; failure permits retry.
+A per-file lock plus revision comparison prevents stale windows from replacing
+newer state. Outer OS window placement remains outside this feature.
