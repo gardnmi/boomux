@@ -35,7 +35,7 @@ try {
     await page.mouse.move(d.x+4,d.y+70);await page.mouse.down();await page.mouse.move(d.x-100,d.y+70,{steps:8});await page.mouse.up();await settle();
     assert.ok((await box(1)).width<before.width-50,'divider should resize columns');
     await page.locator('#add').click();await settle();assert.equal(await page.locator('.pane').count(),5);
-    await pane(5).getByRole('button',{name:'Remove demo pane',exact:true}).click();assert.equal(await page.locator('.pane').count(),4);
+    await pane(5).getByRole('button',{name:'Close terminal session',exact:true}).click();assert.equal(await page.locator('.pane').count(),4);
     await page.setViewportSize({width:1100,height:750});await settle();
     for(const el of await page.locator('.pane').all()){const r=await el.boundingBox();assert.ok(r.x>=0&&r.x+r.width<=1100&&r.y+r.height<=750);}
     await page.locator('#reset').click();await settle();

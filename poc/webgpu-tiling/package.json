@@ -2,5 +2,5 @@
   "name": "boomux-webgpu-tiling-poc",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node --test layout.test.mjs" }
+  "scripts": { "start": "bun server.js", "test": "node --test layout.test.mjs" }
 }
