@@ -3,6 +3,13 @@ name: macOS preview
 on:
   push:
     branches: [feature/macos]
+    paths-ignore:
+      - docs/architecture.md
+      - docs/live-pty-handoff.md
+      - docs/platforms/macos.md
+      - docs/lifecycle-validation.md
+      - docs/adr/**
+      - DEVELOPMENT.md
   workflow_dispatch:
 
 permissions:
@@ -54,20 +61,15 @@ jobs:
       - name: Test native lifecycle and recovery
         env:
           BOOMUX_TEST_DIAGNOSTICS: "1"
-        run: |
-          failed=0
-          for scenario in \
-            native_daemon_handoffs_multiple_detached_shells \
-            daemon_bounds_stalled_connections_and_recovers_capacity \
-            explicit_executable_handoff_preserves_live_runs_and_rolls_back_on_failure \
-            attachment_client_reconnects_across_daemon_restart \
-            graceful_restart_preserves_exited_run_and_terminal_state \
-            native_daemon_recovers_reproducible_metadata_after_restart \
-            graceful_restart_preserves_opencode_shared_runtime_and_stop_cleans_it_up \
-            graceful_restart_transfers_live_kiro_holder_authority_and_rolls_back_safely; do
-            cargo +stable test --locked --test native_backend "$scenario" -- --test-threads=1 --nocapture || failed=1
-          done
-          exit "$failed"
+        run: python3 .github/scripts/test-macos-native.py
+      - name: Upload native diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boomux-macos-native
+          path: dist/macos/native/
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Check Desktop
         run: cargo +stable check --locked -p boomux-desktop
       - name: Build preview executables

@@ -1857,9 +1857,19 @@ fn launch_replacement_process(
         Ok(())
     })();
     if result.is_err() {
+        if env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "boomux: replacement {} exited: {:?}",
+                replacement.id(),
+                replacement.try_wait()
+            );
+        }
         let _ = channel.write_all(&[handoff::ABORT]);
         let _ = replacement.kill();
-        let _ = replacement.wait();
+        let status = replacement.wait();
+        if env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+            eprintln!("boomux: replacement cleanup: {status:?}");
+        }
     }
     #[cfg(target_os = "macos")]
     if result.is_ok() {

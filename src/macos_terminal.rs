@@ -93,7 +93,7 @@ pub fn launch(program: &OsStr, args: &[OsString], cwd: Option<&Path>) -> io::Res
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let (_, uid) = boomux::platform::peer_credentials(&stream)?;
+                let uid = boomux::platform::peer_uid(&stream)?;
                 if uid != unsafe { libc::geteuid() } {
                     continue;
                 }
@@ -126,7 +126,7 @@ pub fn dispatch() -> Option<ExitCode> {
             .nth(2)
             .ok_or_else(|| io::Error::other("missing terminal rendezvous"))?;
         let stream = UnixStream::connect(path)?;
-        let (_, uid) = boomux::platform::peer_credentials(&stream)?;
+        let uid = boomux::platform::peer_uid(&stream)?;
         if uid != unsafe { libc::geteuid() } {
             return Err(io::Error::other("terminal rendezvous owner mismatch"));
         }

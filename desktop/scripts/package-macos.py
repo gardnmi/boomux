@@ -31,6 +31,14 @@ def main():
         actual = subprocess.check_output([source, "--version"], text=True).strip()
         if actual != f"{name} {version}":
             raise RuntimeError(f"Unexpected version: {actual}")
+        architecture = subprocess.check_output(["lipo", "-archs", source], text=True).strip()
+        if architecture != platform.machine():
+            raise RuntimeError(f"Unexpected architecture for {name}: {architecture}")
+        dependencies = subprocess.check_output(["otool", "-L", source], text=True)
+        for line in dependencies.splitlines()[1:]:
+            library = line.strip().split(" (", 1)[0]
+            if not library.startswith(("/System/Library/", "/usr/lib/")):
+                raise RuntimeError(f"Unbundled runtime dependency in {name}: {library}")
         shutil.copy2(source, binaries / name)
     shutil.copy2(ROOT / "desktop/packaging/macos/boomux-launcher", binaries / "boomux-launcher")
     (binaries / "boomux-launcher").chmod(0o755)

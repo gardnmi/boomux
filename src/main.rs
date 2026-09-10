@@ -47,6 +47,8 @@ mod hyprland;
 mod integration_management;
 mod kiro_hooks;
 #[cfg(target_os = "macos")]
+mod macos_parent_guard;
+#[cfg(target_os = "macos")]
 mod macos_terminal;
 mod mobile_web;
 mod process_adapter;
@@ -1678,6 +1680,10 @@ impl CliExit {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(code) = macos_parent_guard::dispatch() {
+        return code;
+    }
     #[cfg(target_os = "macos")]
     if let Some(code) = macos_terminal::dispatch() {
         return code;
@@ -10299,6 +10305,8 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit,
         command.env_remove("BOOMUX_KIRO_LAUNCH_HOLDER");
     }
     command.args(&argv[1..]);
+    #[cfg(target_os = "macos")]
+    let mut command = macos_parent_guard::wrap(command)?;
     let holder_pid = std::process::id() as libc::pid_t;
     // The child stays in the foreground process group for ordinary terminal
     // signals. A direct holder death also terminates the exact managed child.

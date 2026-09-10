@@ -552,9 +552,13 @@ mod tests {
     }
 
     #[test]
-    fn only_h8_bootstrap_header_is_accepted() {
+    fn only_host_bootstrap_header_is_accepted() {
         assert!(supported_header(HEADER));
         assert!(!supported_header(b"BOOMUXH7"));
+        #[cfg(target_os = "linux")]
+        assert!(!supported_header(b"BOOMUXM1"));
+        #[cfg(target_os = "macos")]
+        assert!(!supported_header(b"BOOMUXH8"));
     }
 
     #[test]

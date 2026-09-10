@@ -594,8 +594,11 @@ impl Client {
     pub fn daemon_peer_credentials(&self) -> Result<DaemonPeerCredentials> {
         let (stream, protocol_version, response) = self.send(Request::Ping)?;
         expect_ok(response, Response::Pong)?;
-        let (pid, uid) =
-            crate::platform::peer_credentials(&stream).map_err(ClientError::Transport)?;
+        // getpeereid is cached after disconnect; LOCAL_PEERPID is not. The
+        // one-response handler may already have closed its endpoint here.
+        let uid = crate::platform::peer_uid(&stream).map_err(ClientError::Transport)?;
+        let pid = crate::platform::daemon_listener_holder(&self.socket_path, uid)
+            .map_err(ClientError::Transport)?;
         Ok(DaemonPeerCredentials {
             pid,
             uid,
@@ -606,9 +609,7 @@ impl Client {
     #[cfg(target_os = "macos")]
     pub fn daemon_process_credentials(&self) -> Result<DaemonPeerCredentials> {
         let before = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
-        let mut peer = self.daemon_peer_credentials()?;
-        peer.pid = crate::platform::daemon_listener_holder(&self.socket_path, peer.uid)
-            .map_err(ClientError::Transport)?;
+        let peer = self.daemon_peer_credentials()?;
         let after = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
         if before.dev() != after.dev() || before.ino() != after.ino() {
             return Err(ClientError::Transport(io::Error::other(

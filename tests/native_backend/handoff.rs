@@ -97,7 +97,10 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
 
     parent_channel.set_read_timeout(Some(TIMEOUT)).unwrap();
     parent_channel.set_write_timeout(Some(TIMEOUT)).unwrap();
+    #[cfg(target_os = "linux")]
     parent_channel.write_all(b"BOOMUXH8").unwrap();
+    #[cfg(target_os = "macos")]
+    parent_channel.write_all(b"BOOMUXM1").unwrap();
     protocol::write_message(
         &mut parent_channel,
         &serde_json::json!({

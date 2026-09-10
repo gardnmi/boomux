@@ -469,6 +469,15 @@ pub fn rename_noreplace(from_dir: i32, from: &CStr, to_dir: i32, to: &CStr) -> i
     }
 }
 
+pub fn peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<u32> {
+    let mut uid = 0;
+    let mut gid = 0;
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(uid)
+}
+
 pub fn peer_credentials(stream: &std::os::unix::net::UnixStream) -> io::Result<(u32, u32)> {
     let mut uid = 0;
     let mut gid = 0;
@@ -531,6 +540,27 @@ pub fn daemon_listener_holder(path: &std::path::Path, uid: u32) -> io::Result<u3
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn executable_alias_runs_the_pinned_mach_o() {
+        prepare_default_runtime_root().unwrap();
+        let root = super::super::runtime_root().unwrap().join("boomux");
+        fs::create_dir_all(root).unwrap();
+        let executable = File::open(std::env::current_exe().unwrap()).unwrap();
+        let pin = ExecutablePin::prepare(&executable).unwrap();
+        let output = std::process::Command::new(&pin.path)
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "pinned executable: {:?}; {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let alias = pin.path.clone();
+        drop(pin);
+        assert!(!alias.exists());
+    }
     #[test]
     fn identity_transfer_and_signaling_preserve_exact_process() {
         prepare_default_runtime_root().unwrap();
