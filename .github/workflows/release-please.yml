@@ -54,6 +54,8 @@ jobs:
             exit 1
           fi
 
+      # Development preview drafts belong to their own publisher and must not
+      # block stable proposals while their artifacts are being uploaded.
       - name: Check for pending draft release
         if: ${{ github.event_name == 'workflow_run' }}
         id: pending-draft
@@ -62,11 +64,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           draft_ids=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
-            --jq '.[] | select(.draft == true) | .id' \
+            --jq '.[] | select(.draft == true) | select(.prerelease != true or (.tag_name | startswith("preview-macos-") | not)) | .id' \
             | sed -n '/^[0-9][0-9]*$/p')
           if [[ -n "$draft_ids" ]]; then
             printf 'exists=true\n' >> "$GITHUB_OUTPUT"
-            printf 'An unpublished draft release exists; deferring the next release proposal.\n' >> "$GITHUB_STEP_SUMMARY"
+            printf 'An unpublished stable draft release exists; deferring the next release proposal.\n' >> "$GITHUB_STEP_SUMMARY"
           else
             printf 'exists=false\n' >> "$GITHUB_OUTPUT"
           fi
