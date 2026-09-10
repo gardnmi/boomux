@@ -4,6 +4,29 @@ use crate::{
     *,
 };
 
+/// Ignore synthetic/stationary pointer enters while restoring keyboard focus.
+pub(super) enum PointerGuard {
+    Inactive,
+    Waiting,
+    Anchored((f32, f32)),
+}
+impl PointerGuard {
+    pub(super) fn allows_focus(&mut self, position: (f32, f32)) -> bool {
+        match *self {
+            Self::Inactive => true,
+            Self::Waiting => {
+                *self = Self::Anchored(position);
+                false
+            }
+            Self::Anchored(anchor) if !pointer_moved_from(anchor, position) => false,
+            Self::Anchored(_) => {
+                *self = Self::Inactive;
+                true
+            }
+        }
+    }
+}
+
 fn encode_tree(node: &Node) -> Tree {
     match node {
         Node::Pane(id) => Tree::Pane(*id as u64),
@@ -65,6 +88,19 @@ impl Workspace {
         } else {
             self.layout_document.active.clear();
         }
+        cx.observe_window_bounds(window, |this, window, cx| {
+            this.sidebar_viewport_width = f32::from(window.viewport_size().width);
+            let canvas = this.panel_size(window);
+            if canvas.0 > 0.0 && canvas.1 > 0.0 {
+                this.layout_canvas = canvas;
+                for pane in &mut this.floating {
+                    *pane = clamp_floating_to_panel(pane.clone(), canvas);
+                }
+                this.layout_changed(cx);
+                cx.notify();
+            }
+        })
+        .detach();
         let entity = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             entity
@@ -235,6 +271,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.layout_restoring = true;
+        self.restore_pointer_guard = PointerGuard::Waiting;
         self.finish_current_workspace_transition(window);
         self.detach_all_panes(window);
         let mut ids = HashMap::new();
@@ -254,7 +291,12 @@ impl Workspace {
             });
         }
         self.layout = saved.tree.as_ref().map(|node| decode_tree(node, &ids));
-        let canvas = self.panel_size(window);
+        let actual_canvas = self.panel_size(window);
+        let canvas = if actual_canvas.0 > 0.0 && actual_canvas.1 > 0.0 {
+            actual_canvas
+        } else {
+            (saved.canvas[0], saved.canvas[1])
+        };
         self.floating = saved
             .floating
             .iter()
@@ -501,6 +543,15 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layout_restore_keeps_focus_until_the_pointer_actually_moves() {
+        let mut guard = PointerGuard::Waiting;
+        assert!(!guard.allows_focus((640.0, 400.0)));
+        assert!(!guard.allows_focus((640.0, 400.0)));
+        assert!(guard.allows_focus((650.0, 400.0)));
+        assert!(guard.allows_focus((650.0, 400.0)));
+    }
+
     #[test]
     fn layout_tree_remaps_ephemeral_ids_without_changing_split_sizes() {
         let tree = Node::Split {

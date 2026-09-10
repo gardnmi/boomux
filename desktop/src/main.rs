@@ -1484,6 +1484,7 @@ struct Workspace {
     layout_generation: u64,
     layout_frozen: bool,
     layout_closing: bool,
+    restore_pointer_guard: layout_persistence::PointerGuard,
     layout_restoring: bool,
     git_panel: git_panel::Model,
     layout: Option<Node>,
@@ -1697,6 +1698,7 @@ impl Workspace {
             layout_generation: 0,
             layout_frozen: false,
             layout_closing: false,
+            restore_pointer_guard: layout_persistence::PointerGuard::Inactive,
             layout_restoring: false,
             layout: Some(layout),
             floating: Vec::new(),
@@ -3803,6 +3805,15 @@ impl Workspace {
             return;
         }
         // Keep the dragged pane focused even while it crosses other panes.
+        if self.fullscreen.is_some_and(|expanded| expanded != id) {
+            return;
+        }
+        if !self
+            .restore_pointer_guard
+            .allows_focus((f32::from(event.position.x), f32::from(event.position.y)))
+        {
+            return;
+        }
         if self.pointer_drag.is_some()
             || self.terminal_scrollbar_drag.is_some()
             || self.sidebar_resizing
