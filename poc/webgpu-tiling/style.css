@@ -3,3 +3,6 @@
 @font-face{font-family:'JetBrains Mono';src:url('/vendor/jetbrains-mono.woff2') format('woff2');font-weight:400;font-display:swap}.pane-body{padding:0;position:relative;min-height:0;overflow:hidden;white-space:normal;background:#161b24}.pane-body canvas{display:block}.pane-body textarea{font-size:16px}#keyboard-help:not([hidden])~#stage .pane-body{pointer-events:none}
 .pane-body{padding:8px}
 #drop-overlay{display:none;position:absolute;pointer-events:none;z-index:25;border:2px solid #9eb7f3;background:#7295e040;border-radius:7px}
+
+/* Ghostty draws the terminal cursor; suppress the native editable caret. */
+.pane-body,.pane-body textarea{caret-color:transparent}

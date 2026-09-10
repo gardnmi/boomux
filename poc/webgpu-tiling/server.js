@@ -46,7 +46,7 @@ const server=Bun.serve({hostname:'127.0.0.1',port,
       try{
         // No startup files: the experiment must not inherit automatic agent
         // registration hooks from the parent or the user's interactive rc.
-        const env={...process.env,TERM:'xterm-256color',COLORTERM:'truecolor',PS1:'tiling-lab $ ',HISTFILE:'/dev/null'};
+        const env={...process.env,TERM:'xterm-256color',COLORTERM:'truecolor',PS1:'\\w \\$ ',HISTFILE:'/dev/null'};
         for(const key of Object.keys(env))if(/^(BOOMUX_|OPENCODE_|CLAUDE_CODE_|CODEX_|BASH_FUNC_)/.test(key)||['BASH_ENV','ENV','PROMPT_COMMAND'].includes(key))delete env[key];
         s.proc=Bun.spawn(['bash','--noprofile','--norc','-i'],{cwd:repo,env,terminal:{cols:s.cols,rows:s.rows,
           data(_terminal,bytes){
