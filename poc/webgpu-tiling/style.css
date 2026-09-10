@@ -37,3 +37,8 @@
 .sidebar-menu-items{position:absolute;right:0;top:32px;z-index:40;width:184px;padding:5px;background:#292d35;border:1px solid #4a505d;border-radius:6px;box-shadow:0 8px 25px #0008}.sidebar-menu-items button{width:100%;text-align:left;background:transparent;border:0;font-size:12px}.sidebar-menu-items button:hover{background:#ffffff12}
 .sidebar-empty{font-size:12px;color:#9198a5;margin:12px 8px}
 @media(max-width:950px){.daemon-mode aside{width:250px}}@media(max-width:650px){.daemon-mode aside{display:none}}
+
+/* Desktop distinguishes remote Workspaces with a monitor and stand. */
+.workspace-icon.remote-icon{height:15px;margin-bottom:3px}
+.workspace-icon.remote-icon:before{left:7px;top:14px;bottom:auto;width:2px;height:3px;border:0;background:#878d9b}
+.workspace-icon.remote-icon:after{left:4px;right:auto;top:17px;width:8px;height:1px;border:0;background:#878d9b}

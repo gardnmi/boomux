@@ -85,7 +85,7 @@ function syncDaemonSidebar(){
     const group=document.createElement('section');group.className='workspace-group'+(selected?' current':'');group.dataset.workspaceId=workspace.id;
     const heading=document.createElement('div');heading.className='workspace-heading';
     const button=document.createElement('button');button.className='workspace-button';button.setAttribute('aria-expanded',String(selected));
-    button.innerHTML=`<span class="workspace-icon" aria-hidden="true"></span><span class="sidebar-text"><strong>${escapeHtml(workspace.name)}</strong><small>${workspace.remote?`${escapeHtml(workspace.remote.alias)} · ${workspace.remote.current&&!workspace.remote.stale?'connected':'stale / '+escapeHtml(workspace.remote.health)} · `:''}${workspace.shells.length} ${workspace.shells.length===1?'shell':'shells'} · ${agents} ${agents===1?'agent':'agents'}</small></span>`;
+    button.innerHTML=`<span class="workspace-icon${workspace.remote?' remote-icon':''}" aria-hidden="true"></span><span class="sidebar-text"><strong>${escapeHtml(workspace.name)}</strong><small>${workspace.remote?`${escapeHtml(workspace.remote.alias)} · ${workspace.remote.current&&!workspace.remote.stale?'connected':'stale / '+escapeHtml(workspace.remote.health)} · `:''}${workspace.shells.length} ${workspace.shells.length===1?'shell':'shells'} · ${agents} ${agents===1?'agent':'agents'}</small></span>`;
     button.onclick=()=>selectWorkspace(workspace.id);heading.append(button);
     heading.append(sidebarMenu(`Actions for ${workspace.name}`, [['New Shell',()=>{selectWorkspace(workspace.id);return createDaemonShell();}],['Refresh Shells',refreshDaemon]]));group.append(heading);
     if(selected){
