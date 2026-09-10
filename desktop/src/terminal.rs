@@ -170,10 +170,13 @@ struct SharedTerminal {
     revision: AtomicU64,
     bracketed_paste: AtomicBool,
     mouse_tracking: AtomicBool,
+    pending_resize: Mutex<Option<(u16, u16, u16, u16)>>,
+    pending_focus: AtomicBool,
     pending_scroll_row: AtomicU64,
     pending_scroll_wakeup: AtomicBool,
     pending_theme: Mutex<Option<TerminalTheme>>,
     closed: AtomicBool,
+    cancelled: AtomicBool,
 }
 
 impl SharedTerminal {
@@ -191,10 +194,13 @@ impl SharedTerminal {
             revision: AtomicU64::new(1),
             bracketed_paste: AtomicBool::new(false),
             mouse_tracking: AtomicBool::new(false),
+            pending_resize: Mutex::new(None),
+            pending_focus: AtomicBool::new(false),
             pending_scroll_row: AtomicU64::new(0),
             pending_scroll_wakeup: AtomicBool::new(false),
             pending_theme: Mutex::new(Some(theme)),
             closed: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         }
     }
 
@@ -203,13 +209,26 @@ impl SharedTerminal {
     }
 
     fn emulator_command(&self, command: EmulatorCommand) -> Result<(), String> {
-        self.emulator
+        // Output producers may wait for queue capacity, but must never keep
+        // the sender mutex locked while waiting: UI input and teardown use it.
+        let sender = self
+            .emulator
             .lock()
             .unwrap()
             .as_ref()
-            .ok_or_else(|| "Ghostty terminal core is not running".to_string())?
+            .cloned()
+            .ok_or_else(|| "Ghostty terminal core is not running".to_string())?;
+        sender
             .send(command)
             .map_err(|_| "Ghostty terminal core stopped".to_string())
+    }
+
+    fn cancel_emulator(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        // Disconnect instead of enqueueing Stop into a potentially full queue.
+        // The worker sees cancellation between replay chunks and drops its
+        // receiver, releasing any blocked output producer.
+        self.emulator.lock().unwrap().take();
     }
 
     fn try_emulator_command(&self, command: EmulatorCommand) -> Result<(), String> {
@@ -221,6 +240,57 @@ impl SharedTerminal {
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
         }
+    }
+
+    fn request_resize(&self, size: (u16, u16, u16, u16)) -> Result<(), String> {
+        let wake = self.pending_resize.lock().unwrap().replace(size).is_none();
+        if wake {
+            self.try_emulator_command(EmulatorCommand::ResizeLatest)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_resize(&self, core: &mut EmulatorCore) -> Result<(), String> {
+        let pending = self.pending_resize.lock().unwrap().take();
+        if let Some((rows, cols, pixel_width, pixel_height)) = pending {
+            {
+                let mut profile = self.profile.lock().unwrap();
+                profile.rows = rows;
+                profile.cols = cols;
+                profile.pixel_width = pixel_width;
+                profile.pixel_height = pixel_height;
+            }
+            core.apply(EmulatorCommand::Resize {
+                rows,
+                cols,
+                cell_width: cell_dimension(pixel_width, cols),
+                cell_height: cell_dimension(pixel_height, rows),
+            })?;
+            self.send(AttachFrame::Resize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            })?;
+            self.bump_revision();
+        }
+        Ok(())
+    }
+
+    fn request_focus(&self) -> Result<(), String> {
+        if self.pending_focus.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // A full queue already wakes the worker. The pending flag retains the
+        // notification until that worker can write it, without blocking GPUI.
+        self.try_emulator_command(EmulatorCommand::FocusLatest)
+    }
+
+    fn flush_pending_focus(&self) -> Result<(), String> {
+        if self.pending_focus.swap(false, Ordering::AcqRel) {
+            self.send(AttachFrame::FocusGained)?;
+        }
+        Ok(())
     }
 
     fn try_key_command(&self, keystroke: Keystroke, action: KeyAction) -> Result<(), String> {
@@ -341,9 +411,9 @@ impl SharedTerminal {
             return;
         }
         *self.writer.lock().unwrap() = None;
-        if let Some(emulator) = self.emulator.lock().unwrap().take() {
-            let _ = emulator.send(EmulatorCommand::Stop);
-        }
+        // Transport closure still drains queued output and publishes the final
+        // screen. Disconnecting the sender does not require queue capacity.
+        self.emulator.lock().unwrap().take();
         self.replace_status(status);
     }
 }
@@ -363,6 +433,8 @@ enum EmulatorCommand {
     Scroll(ScrollViewport),
     ScrollLatest,
     ThemeLatest,
+    FocusLatest,
+    ResizeLatest,
     MouseWheel {
         lines: isize,
         x: f32,
@@ -371,7 +443,6 @@ enum EmulatorCommand {
         screen_height: u32,
         modifiers: Modifiers,
     },
-    Stop,
 }
 
 pub struct TerminalSession {
@@ -594,30 +665,17 @@ impl TerminalSession {
             return false;
         }
         *last_size = (rows, cols);
+        if let Err(error) = self
+            .shared
+            .request_resize((rows, cols, pixel_width, pixel_height))
         {
-            let mut profile = self.shared.profile.lock().unwrap();
-            profile.rows = rows;
-            profile.cols = cols;
-            profile.pixel_width = pixel_width;
-            profile.pixel_height = pixel_height;
-        }
-        self.shared
-            .resize_emulator(rows, cols, pixel_width, pixel_height);
-        if let Err(error) = self.shared.send(AttachFrame::Resize {
-            rows,
-            cols,
-            pixel_width,
-            pixel_height,
-        }) {
             self.shared.set_status(error);
-        } else {
-            self.shared.bump_revision();
         }
         true
     }
 
     pub fn focus(&self) {
-        if let Err(error) = self.shared.send(AttachFrame::FocusGained) {
+        if let Err(error) = self.shared.request_focus() {
             self.shared.set_status(error);
         }
     }
@@ -639,9 +697,7 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = self.shared.send(AttachFrame::Detached);
         self.shared.closed.store(true, Ordering::Release);
-        if let Some(emulator) = self.shared.emulator.lock().unwrap().take() {
-            let _ = emulator.send(EmulatorCommand::Stop);
-        }
+        self.shared.cancel_emulator();
     }
 }
 
@@ -1557,10 +1613,15 @@ impl EmulatorCore {
             EmulatorCommand::ThemeLatest => {
                 unreachable!("latest theme requests are resolved by the emulator worker")
             }
+            EmulatorCommand::FocusLatest => {
+                unreachable!("focus notifications are resolved by the emulator worker")
+            }
+            EmulatorCommand::ResizeLatest => {
+                unreachable!("UI resize requests are resolved by the emulator worker")
+            }
             EmulatorCommand::MouseWheel { .. } => {
                 unreachable!("mouse events are resolved by the emulator worker")
             }
-            EmulatorCommand::Stop => return Ok(false),
         }
         Ok(true)
     }
@@ -1674,7 +1735,26 @@ fn apply_emulator_command(
     shared: &SharedTerminal,
     command: EmulatorCommand,
 ) -> Result<bool, String> {
+    if shared.cancelled.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    shared.flush_pending_resize(core)?;
+    shared.flush_pending_focus()?;
     match command {
+        EmulatorCommand::FocusLatest | EmulatorCommand::ResizeLatest => Ok(true),
+        EmulatorCommand::Output(bytes) => {
+            // A reconstruction can contain a large transcript. Yield to pane
+            // cancellation between chunks without changing byte ordering.
+            for chunk in bytes.chunks(16 * 1024) {
+                if shared.cancelled.load(Ordering::Acquire) {
+                    return Ok(false);
+                }
+                shared.flush_pending_resize(core)?;
+                shared.flush_pending_focus()?;
+                core.terminal.vt_write(chunk);
+            }
+            Ok(true)
+        }
         EmulatorCommand::Key { keystroke, action } => {
             // Typing follows conventional terminal behavior and returns the
             // viewport to the live prompt before the PTY produces more output.
@@ -2017,9 +2097,11 @@ fn run_emulator(
             return;
         }
     }
-    // Stop may share a batch with final output, or end synchronized output.
-    // Preserve those bytes in the detached pane before releasing the core.
-    if let Err(error) = publish_screen(core, worker_shared) {
+    // Transport closure may end synchronized output. Preserve the final screen
+    // unless the pane itself was discarded and cancelled its replay.
+    if !worker_shared.cancelled.load(Ordering::Acquire)
+        && let Err(error) = publish_screen(core, worker_shared)
+    {
         worker_shared.close(error);
     }
 }
@@ -3200,9 +3282,10 @@ mod tests {
 
     use super::{
         AgentChoice, EMULATOR_QUEUE_CAPACITY, EmulatorCommand, EmulatorCore, SharedTerminal,
-        agent_is_visible, blank_screen, configure_terminal, distinguish_agent_rows, encode_key,
-        encode_mouse_wheel, encode_paste, image_bgra, indexed_color, resynchronize_terminal_size,
-        run_emulator, spawn_reader, start_emulator, terminal_profile,
+        agent_is_visible, apply_emulator_command, blank_screen, configure_terminal,
+        distinguish_agent_rows, encode_key, encode_mouse_wheel, encode_paste, image_bgra,
+        indexed_color, resynchronize_terminal_size, run_emulator, spawn_reader, start_emulator,
+        terminal_profile,
     };
     use crate::theme::TerminalTheme;
     use std::sync::{Arc, mpsc};
@@ -3930,6 +4013,208 @@ mod tests {
             panic!("expected a keyboard enhancement response");
         };
         assert_eq!(bytes, b"\x1b[?0u");
+    }
+
+    #[test]
+    fn terminal_resize_coalesces_without_waiting_for_output_or_socket_capacity() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        shared.install_writer(&client).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared
+            .emulator_command(EmulatorCommand::Output(vec![b'a']))
+            .unwrap();
+        let writer = shared.writer.lock().unwrap();
+        let profile = shared.profile.lock().unwrap();
+        let (done, completed) = mpsc::channel();
+        let pending = shared.clone();
+        let requester = std::thread::spawn(move || {
+            for cols in 10..=109 {
+                pending.request_resize((6, cols, cols * 10, 120)).unwrap();
+            }
+            let _ = done.send(());
+        });
+        let result = completed.recv_timeout(Duration::from_millis(250));
+        drop(profile);
+        drop(writer);
+        requester.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "resize waited on a worker lock or full queue"
+        );
+        assert_eq!(
+            *shared.pending_resize.lock().unwrap(),
+            Some((6, 109, 1090, 120))
+        );
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        assert!(apply_emulator_command(&mut core, &shared, receiver.recv().unwrap()).unwrap());
+        assert!(matches!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 6,
+                cols: 109,
+                pixel_width: 1090,
+                pixel_height: 120
+            }
+        ));
+        assert_eq!(
+            (core.screen().unwrap().rows, core.screen().unwrap().cols),
+            (6, 109)
+        );
+        assert!(shared.pending_resize.lock().unwrap().is_none());
+        assert!(receiver.try_recv().is_err(), "resize flood grew the queue");
+        shared.request_resize((3, 10, 100, 60)).unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            EmulatorCommand::ResizeLatest
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual native terminal replay and fullscreen resize measurement"]
+    fn terminal_replay_resize_measurement() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(40, 120, 1200, 800)));
+        let mut core = EmulatorCore::new(&shared, 40, 120, 1200, 800).unwrap();
+        let bytes = b"\x1b[32mterminal replay fixture with colored output and normal line wrapping\x1b[0m\r\n".repeat(2048);
+        let replay = std::time::Instant::now();
+        core.apply(EmulatorCommand::Output(bytes.clone())).unwrap();
+        let replay_elapsed = replay.elapsed();
+        let resize = std::time::Instant::now();
+        for (rows, cols) in [(80, 200), (40, 120), (80, 200), (40, 120)] {
+            core.apply(EmulatorCommand::Resize {
+                rows,
+                cols,
+                cell_width: 10,
+                cell_height: 20,
+            })
+            .unwrap();
+            let _ = core.screen().unwrap();
+        }
+        eprintln!(
+            "native replay/resize: bytes={} replay_ms={:.3} resize_ms={:.3}",
+            bytes.len(),
+            replay_elapsed.as_secs_f64() * 1000.0,
+            resize.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    #[test]
+    fn terminal_focus_does_not_wait_for_the_socket_writer_or_queue_capacity() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        shared.install_writer(&client).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared
+            .emulator_command(EmulatorCommand::Output(vec![b'a']))
+            .unwrap();
+        let writer = shared.writer.lock().unwrap();
+        let (done, completed) = mpsc::channel();
+        let pending = shared.clone();
+        let requester = std::thread::spawn(move || {
+            for _ in 0..100 {
+                pending.request_focus().unwrap();
+            }
+            let _ = done.send(());
+        });
+        let result = completed.recv_timeout(Duration::from_millis(250));
+        drop(writer);
+        requester.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "focus blocked the UI on the socket or full queue"
+        );
+        assert!(shared.pending_focus.load(Ordering::Acquire));
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        assert!(apply_emulator_command(&mut core, &shared, receiver.recv().unwrap()).unwrap());
+        assert!(matches!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::FocusGained
+        ));
+        assert!(!shared.pending_focus.load(Ordering::Acquire));
+        assert!(
+            receiver.try_recv().is_err(),
+            "focus requests grew the full queue"
+        );
+        // On an idle queue, one marker wakes the worker and duplicate requests coalesce.
+        shared.request_focus().unwrap();
+        shared.request_focus().unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            EmulatorCommand::FocusLatest
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_full_output_queue_does_not_block_pane_cancellation_or_transport_close() {
+        for cancel in [true, false] {
+            let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+            let (sender, receiver) = mpsc::sync_channel(1);
+            shared.install_emulator(sender);
+            shared
+                .emulator_command(EmulatorCommand::Output(vec![b'a']))
+                .unwrap();
+            let (started, ready) = mpsc::channel();
+            let producer_shared = shared.clone();
+            let producer = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                producer_shared.emulator_command(EmulatorCommand::Output(vec![b'b']))
+            });
+            ready.recv().unwrap();
+            // Let the producer block behind the deliberately full queue.
+            std::thread::sleep(Duration::from_millis(20));
+            let (done, completed) = mpsc::channel();
+            let cleanup_shared = shared.clone();
+            let cleanup = std::thread::spawn(move || {
+                if cancel {
+                    cleanup_shared.cancel_emulator();
+                } else {
+                    cleanup_shared.close("detached");
+                }
+                let _ = done.send(());
+            });
+            let result = completed.recv_timeout(Duration::from_millis(250));
+            // Always release the blocked producer, including on regression.
+            drop(receiver);
+            assert!(producer.join().unwrap().is_err());
+            cleanup.join().unwrap();
+            assert!(result.is_ok(), "cleanup waited for output queue capacity");
+            assert!(shared.emulator.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_replay_chunking_preserves_escape_sequences_and_honors_cancellation() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 80, 800, 60)));
+        let mut chunked = EmulatorCore::new(&shared, 3, 80, 800, 60).unwrap();
+        let whole_shared = Arc::new(SharedTerminal::new(terminal_profile(3, 80, 800, 60)));
+        let mut whole = EmulatorCore::new(&whole_shared, 3, 80, 800, 60).unwrap();
+        let mut bytes = vec![b'\r'; 16 * 1024 - 1];
+        bytes.extend_from_slice("\x1b[31mhello 世界".as_bytes());
+        whole.apply(EmulatorCommand::Output(bytes.clone())).unwrap();
+        assert!(
+            apply_emulator_command(&mut chunked, &shared, EmulatorCommand::Output(bytes)).unwrap()
+        );
+        assert_eq!(whole.screen().unwrap(), chunked.screen().unwrap());
+        let before = chunked.screen().unwrap();
+        shared.cancel_emulator();
+        assert!(
+            !apply_emulator_command(
+                &mut chunked,
+                &shared,
+                EmulatorCommand::Output(b"discarded".to_vec())
+            )
+            .unwrap()
+        );
+        assert_eq!(before, chunked.screen().unwrap());
     }
 
     #[test]

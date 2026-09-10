@@ -128,7 +128,25 @@ terminal parser. Each attached pane has a socket reader and one terminal worker.
 The reader sends byte chunks through a bounded queue. When decoding falls behind,
 pressure propagates back through the Boomux socket to the PTY producer; arbitrary
 terminal bytes are never discarded because doing so could corrupt escape or
-Kitty graphics sequences.
+Kitty graphics sequences. A producer clones the queue sender under its mutex,
+then releases the mutex before waiting for capacity. Queue saturation must not
+prevent GPUI from accessing the sender or cancelling a discarded pane.
+Pane focus notifications use a single pending flag and a nonblocking wake marker.
+The terminal worker sends the notification, including between replay chunks;
+click and hover handlers never acquire the attachment writer or write a focus
+frame themselves. Repeated focus requests coalesce while the queue is full.
+
+Pane resize requests likewise retain only one latest set of dimensions per pane
+and use a nonblocking wake marker. The worker updates the terminal profile,
+resizes the emulator, and sends the daemon resize frame between replay chunks.
+Fullscreen and window resize handlers do not wait for queue capacity or socket
+writes.
+
+Discarding a pane cancels its local replay and disconnects the queue sender;
+it does not enqueue a blocking stop command. The worker checks cancellation
+between 16 KiB decode chunks and releases pending replay data when it exits.
+This discards only presentation work for a closed pane, not daemon-owned Shell
+output or processes.
 
 After initial attachment and daemon reconnect, the reader requests one redraw
 by briefly changing the PTY width and restoring the latest pane dimensions after
@@ -142,7 +160,7 @@ new snapshot or terminal status exists; bursts collapse into one wakeup because
 the consumer always reads the newest snapshot. Synchronized-output mode delays
 publication until the terminal frame is complete.
 When an attachment ends, the worker publishes its final decoded screen before
-stopping, including output batched with the stop command. Detachment itself does
+stopping, including output queued before transport closure. Detachment itself does
 not establish command success. The UI watches until the worker closes its update
 stream after final publication, rather than stopping at transport closure.
 

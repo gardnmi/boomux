@@ -1,0 +1,4 @@
+# Keep Rust debug builds debuggable without Ghostty's expensive debug page scans.
+# Set LIBGHOSTTY_VT_SYS_OPTIMIZE=Debug explicitly to debug the native terminal core.
+[env]
+LIBGHOSTTY_VT_SYS_OPTIMIZE = { value = "ReleaseFast", force = false }
