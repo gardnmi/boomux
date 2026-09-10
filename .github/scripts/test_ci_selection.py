@@ -249,6 +249,90 @@ class SelectionTests(unittest.TestCase):
             with patch.object(selection.subprocess, "check_output", side_effect=responses):
                 self.assertFalse(selection.validated_base(self.base))
 
+    def test_release_pr_defers_artifacts_until_merge(self):
+        self.write_version("1.2.4")
+        head = self.commit()
+        for event in ["pull_request", "merge_group"]:
+            with self.subTest(event=event):
+                result, _ = selection.classify(self.base, head, lambda sha: True, event=event)
+                self.assertEqual(result, dict.fromkeys(selection.FULL, False))
+                result, _ = selection.classify(self.base, head, lambda sha: False, event=event)
+                self.assertEqual(result, selection.FULL)
+        for event in ["push", "workflow_dispatch", ""]:
+            self.assertTrue(selection.classify(self.base, head, lambda sha: True, event=event)[0]["run_package"])
+
+    def jobs(self, components):
+        return {"jobs": [{"name": selection.COMPONENT_STEPS[c][0], "conclusion": "success", "steps": [
+            {"name": step, "conclusion": "success"} for step in selection.COMPONENT_STEPS[c][1]]}
+            for c in components]}
+
+    def evidence(self, target, candidates):
+        runs = [{"id": i + 1, "head_sha": sha, "event": "push", "conclusion": "success",
+                 "head_branch": "main", "head_repository": {"full_name": "owner/repo"}}
+                for i, (sha, _) in enumerate(candidates)]
+        original = subprocess.check_output
+        calls = []
+        def request(command, **kwargs):
+            if command[0] != "gh":
+                return original(command, **kwargs)
+            calls.append(command[-1])
+            if "/workflows/" in command[-1]:
+                return json.dumps({"workflow_runs": runs}).encode()
+            run_id = int(command[-1].split("/runs/")[1].split("/")[0])
+            return json.dumps(self.jobs(candidates[run_id - 1][1])).encode()
+        with patch.dict(os.environ, GITHUB_REPOSITORY="owner/repo", DEFAULT_BRANCH="main"), patch.object(
+                selection.subprocess, "check_output", side_effect=request):
+            result = selection.validated_base(target)
+        return result, calls
+
+    def test_desktop_run_inherits_unchanged_backend_components(self):
+        self.write("desktop/src/main.rs", "new Desktop")
+        desktop = self.commit()
+        result, _ = self.evidence(desktop, [(desktop, {"desktop"}), (self.base, set(selection.COMPONENT_STEPS))])
+        self.assertTrue(result)
+
+    def test_docs_runs_can_inherit_actual_ancestor_checks(self):
+        self.write("docs/ci.md", "new guidance")
+        docs = self.commit()
+        self.assertTrue(self.evidence(docs, [(docs, set()), (self.base, set(selection.COMPONENT_STEPS))])[0])
+
+    def test_combined_version_and_desktop_changes_preserve_backend_evidence(self):
+        self.write_version("1.2.4")
+        self.write("desktop/src/main.rs", "new Desktop")
+        self.write("docs/ci.md", "guidance")
+        head = self.commit()
+        self.assertTrue(self.evidence(head, [(head, {"desktop"}), (self.base, set(selection.COMPONENT_STEPS))])[0])
+
+    def test_shared_changes_and_missing_components_cannot_inherit(self):
+        self.write("src/lib.rs", "backend change")
+        head = self.commit()
+        self.assertFalse(self.evidence(head, [(head, {"desktop"}), (self.base, set(selection.COMPONENT_STEPS))])[0])
+        self.assertFalse(self.evidence(self.base, [(self.base, {"desktop", "backend"})])[0])
+
+    def test_dependency_change_cannot_hide_behind_version_bump(self):
+        self.write_version("1.2.4")
+        lock = Path("Cargo.lock")
+        lock.write_text(lock.read_text().replace('"2.0.0"', '"2.0.1"'))
+        head = self.commit()
+        self.assertEqual(selection.reusable_components(self.base, head), set())
+
+    def test_renamed_core_file_invalidates_inheritance(self):
+        Path("desktop/src").mkdir(parents=True)
+        self.git("mv", "src/lib.rs", "desktop/src/lib.rs")
+        head = self.commit()
+        self.assertEqual(selection.reusable_components(self.base, head), set())
+
+    def test_unrelated_successful_commit_is_not_evidence(self):
+        self.git("checkout", "--orphan", "other")
+        self.write("unrelated", "other root")
+        other = self.commit()
+        self.assertEqual(selection.reusable_components(other, self.base), set())
+
+    def test_evidence_queries_are_bounded(self):
+        result, calls = self.evidence(self.base, [(self.base, set())] * 20)
+        self.assertFalse(result)
+        self.assertEqual(len(calls), 7)  # one run list, at most six job lists
+
 
 if __name__ == "__main__":
     unittest.main()
