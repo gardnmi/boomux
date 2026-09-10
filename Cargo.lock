@@ -839,6 +839,7 @@ dependencies = [
  "libghostty-vt",
  "notify",
  "semver",
+ "serde",
  "serde_json",
  "smallvec",
  "toml 0.9.12+spec-1.1.0",

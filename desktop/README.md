@@ -10,8 +10,8 @@ Ghostty’s terminal core, backed by persistent Boomux Shells.
 > [!NOTE]
 > Stable Desktop releases support GNU/Linux x86_64 with glibc 2.39+, X11 or
 > Wayland, and a working Vulkan driver. Ubuntu 24.04+ and current Arch are the
-> runtime baseline. Shells persist when you close Desktop; pane arrangements
-> and window geometry are not yet saved. See [current limitations](#current-limitations).
+> runtime baseline. Shells persist when you close Desktop; internal pane arrangements are saved across restarts. Outer window geometry
+> is not saved. See [current limitations](#current-limitations).
 
 ## Install Release Builds
 
@@ -283,7 +283,24 @@ Desktop preferences live in
 Service configuration is separate; the Advanced config action opens its
 validated editor.
 
-**Pane arrangements and window geometry are not yet saved.**
+**Internal pane arrangements are saved automatically.** Desktop remembers split
+ratios, floating positions/sizes and stacking, focus, expanded panes, minimized
+Shells, Workspace ordering, and separate Workspace/Mixed arrangements. Switching
+Workspaces restores each saved arrangement.
+
+State lives in `~/.local/state/boomux-desktop/layout-state.json`, respecting
+`XDG_STATE_HOME` and the development-only `BOOMUX_STATE_HOME` override. Writes are
+atomic and debounced by 250 ms; normal quit and update restart flush the final
+snapshot. A crash may lose the most recent unsaved adjustment. Corrupt state is
+retained and a notice explains why saving is disabled; close Desktop and move
+that file aside to reset layouts. Concurrent Desktop instances cannot overwrite
+one another's newer saved state; reopen the older instance if a conflict appears.
+
+Restoration reconnects running Shells without taking over another attachment.
+Stopped or unavailable Shells keep a placeholder with an explicit reconnect/start
+button. Restoration does not start or restart processes. Floating panes are fit
+to the available canvas if its dimensions changed. Outer application window
+geometry, terminal selections, and in-progress drag animations are not saved.
 See [preferences](../docs/desktop/releases.md#desktop-integration-and-preferences).
 
 ### Optional Advanced Setup
@@ -328,7 +345,7 @@ See [update ownership and older-install migration](../docs/desktop/releases.md#d
 - IME, hyperlinks, ligatures, and selection across unloaded scrollback remain
   incomplete.
 - Animation curves are not freely configurable.
-- Pane arrangements and window geometry are not persisted.
+- Outer application window geometry is not persisted.
 
 Per-pane scrollback uses a 4 MiB Ghostty page-memory budget, allocated as output
 arrives. Retained line count varies with terminal width and content. This is
