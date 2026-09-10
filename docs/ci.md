@@ -162,7 +162,9 @@ promotes the Apple Silicon macOS preview artifact.
    the app. Both native and package jobs must pass.
 2. Manually run `Publish development preview` with that Mac workflow run ID.
    The workflow becomes available for manual dispatch once its definition lands
-   on the default branch. No schedule or automatic publication is enabled.
+   on the default branch. Before then, use the local commands below from the
+   experimental worktree; no merge into `main` is required. No schedule or
+   automatic publication is enabled.
 3. The read-only prepare job requires a completed successful Mac run and
    successful general CI for the same source revision, including `CI result`.
    It rejects fork/PR-triggered Mac builds, expired/missing artifacts, wrong
@@ -194,5 +196,21 @@ GITHUB_REPOSITORY=gardnmi/boomux python3 .github/scripts/development-release.py 
 ```
 
 Use a fresh output directory. The explicit `publish` subcommand performs the
-remote mutations and repeats validation. Routine publication should use Actions
-so its result and permissions are recorded with the workflow run.
+remote mutations and repeats validation. To publish from an experimental branch
+without adding a workflow to `main`, authenticate `gh` with release-write access
+and run both steps against the same fresh directory:
+
+```sh
+GITHUB_REPOSITORY=gardnmi/boomux python3 .github/scripts/development-release.py prepare "<run-id>" /tmp/boomux-preview-publication
+GITHUB_REPOSITORY=gardnmi/boomux python3 .github/scripts/development-release.py publish "<run-id>" /tmp/boomux-preview-publication
+```
+
+The resulting prerelease and its assets are publicly downloadable. The first
+preview also has `.github/scripts/install-macos-preview.sh`: it pins the release,
+archive checksum, and installation directory to build `66bca02a`. Share its raw
+URL pinned to the installer commit, never a moving branch URL. It installs into
+`~/Applications`, verifies the archive and ad-hoc signature, and refuses to
+replace an existing app. A newer preview needs an explicitly updated installer.
+It does not alter Gatekeeper settings; testers may need to approve the app in
+Privacy & Security. Once the dispatcher reaches the default branch, routine
+publication can use Actions to record its result and permissions with the run.
