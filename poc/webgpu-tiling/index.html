@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Boomux · Tiling lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+<body>
+<aside>
+  <div class="brand"><span class="logo">▦</span> boomux <small>LAB</small></div>
+  <div class="section-label">WORKSPACES <span>01</span></div>
+  <div class="workspace"><span>◈</span> WebGPU playground <b>4</b></div>
+  <div class="sidebar-copy">A little room to move.</div>
+  <div id="pane-list"></div>
+  <div class="sidebar-bottom"><span class="dot"></span> Local interaction demo<br><small>Simulated terminals · no daemon connection</small></div>
+</aside>
+<main>
+  <header><div><span class="breadcrumb">Playground /</span> Tiling lab <span class="tag">PROOF OF CONCEPT</span></div><div class="actions"><button id="reset">Reset layout</button><button id="add" class="primary">+ New pane</button></div></header>
+  <div class="toolbar"><span><span class="dot"></span> <strong id="count">4 panes</strong> <span class="muted">· drag a heading to rearrange</span></span><label>Motion <input id="motion" type="checkbox" checked></label></div>
+  <div id="stage"><canvas id="scene" aria-hidden="true"></canvas><div id="panes"></div><div id="dividers"></div><div id="drop-label"></div><div id="empty">Your canvas is clear.<br><small>Add a pane to start tiling.</small></div></div>
+  <footer><span id="hint">Drag to an edge to split · Hold Shift while dropping to float · Double-click a heading to expand</span><span id="renderer">Starting renderer…</span></footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>
