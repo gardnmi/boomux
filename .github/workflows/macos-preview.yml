@@ -70,8 +70,22 @@ jobs:
           path: dist/macos/native/
           if-no-files-found: ignore
           retention-days: 14
-      - name: Check Desktop
-        run: cargo +stable check --locked -p boomux-desktop
+  package:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-preview-release-v1
+          cache-on-failure: true
       - name: Build preview executables
         run: cargo +stable build --release --locked -p boomux -p boomux-desktop
       - name: Package preview
