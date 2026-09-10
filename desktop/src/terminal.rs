@@ -170,6 +170,7 @@ struct SharedTerminal {
     revision: AtomicU64,
     bracketed_paste: AtomicBool,
     mouse_tracking: AtomicBool,
+    pending_focus: AtomicBool,
     pending_scroll_row: AtomicU64,
     pending_scroll_wakeup: AtomicBool,
     pending_theme: Mutex<Option<TerminalTheme>>,
@@ -192,6 +193,7 @@ impl SharedTerminal {
             revision: AtomicU64::new(1),
             bracketed_paste: AtomicBool::new(false),
             mouse_tracking: AtomicBool::new(false),
+            pending_focus: AtomicBool::new(false),
             pending_scroll_row: AtomicU64::new(0),
             pending_scroll_wakeup: AtomicBool::new(false),
             pending_theme: Mutex::new(Some(theme)),
@@ -236,6 +238,22 @@ impl SharedTerminal {
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
         }
+    }
+
+    fn request_focus(&self) -> Result<(), String> {
+        if self.pending_focus.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // A full queue already wakes the worker. The pending flag retains the
+        // notification until that worker can write it, without blocking GPUI.
+        self.try_emulator_command(EmulatorCommand::FocusLatest)
+    }
+
+    fn flush_pending_focus(&self) -> Result<(), String> {
+        if self.pending_focus.swap(false, Ordering::AcqRel) {
+            self.send(AttachFrame::FocusGained)?;
+        }
+        Ok(())
     }
 
     fn try_key_command(&self, keystroke: Keystroke, action: KeyAction) -> Result<(), String> {
@@ -378,6 +396,7 @@ enum EmulatorCommand {
     Scroll(ScrollViewport),
     ScrollLatest,
     ThemeLatest,
+    FocusLatest,
     MouseWheel {
         lines: isize,
         x: f32,
@@ -631,7 +650,7 @@ impl TerminalSession {
     }
 
     pub fn focus(&self) {
-        if let Err(error) = self.shared.send(AttachFrame::FocusGained) {
+        if let Err(error) = self.shared.request_focus() {
             self.shared.set_status(error);
         }
     }
@@ -1569,6 +1588,9 @@ impl EmulatorCore {
             EmulatorCommand::ThemeLatest => {
                 unreachable!("latest theme requests are resolved by the emulator worker")
             }
+            EmulatorCommand::FocusLatest => {
+                unreachable!("focus notifications are resolved by the emulator worker")
+            }
             EmulatorCommand::MouseWheel { .. } => {
                 unreachable!("mouse events are resolved by the emulator worker")
             }
@@ -1688,7 +1710,9 @@ fn apply_emulator_command(
     if shared.cancelled.load(Ordering::Acquire) {
         return Ok(false);
     }
+    shared.flush_pending_focus()?;
     match command {
+        EmulatorCommand::FocusLatest => Ok(true),
         EmulatorCommand::Output(bytes) => {
             // A reconstruction can contain a large transcript. Yield to pane
             // cancellation between chunks without changing byte ordering.
@@ -1696,6 +1720,7 @@ fn apply_emulator_command(
                 if shared.cancelled.load(Ordering::Acquire) {
                     return Ok(false);
                 }
+                shared.flush_pending_focus()?;
                 core.terminal.vt_write(chunk);
             }
             Ok(true)
@@ -3957,6 +3982,57 @@ mod tests {
             panic!("expected a keyboard enhancement response");
         };
         assert_eq!(bytes, b"\x1b[?0u");
+    }
+
+    #[test]
+    fn terminal_focus_does_not_wait_for_the_socket_writer_or_queue_capacity() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        shared.install_writer(&client).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared
+            .emulator_command(EmulatorCommand::Output(vec![b'a']))
+            .unwrap();
+        let writer = shared.writer.lock().unwrap();
+        let (done, completed) = mpsc::channel();
+        let pending = shared.clone();
+        let requester = std::thread::spawn(move || {
+            for _ in 0..100 {
+                pending.request_focus().unwrap();
+            }
+            let _ = done.send(());
+        });
+        let result = completed.recv_timeout(Duration::from_millis(250));
+        drop(writer);
+        requester.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "focus blocked the UI on the socket or full queue"
+        );
+        assert!(shared.pending_focus.load(Ordering::Acquire));
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        assert!(apply_emulator_command(&mut core, &shared, receiver.recv().unwrap()).unwrap());
+        assert!(matches!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::FocusGained
+        ));
+        assert!(!shared.pending_focus.load(Ordering::Acquire));
+        assert!(
+            receiver.try_recv().is_err(),
+            "focus requests grew the full queue"
+        );
+        // On an idle queue, one marker wakes the worker and duplicate requests coalesce.
+        shared.request_focus().unwrap();
+        shared.request_focus().unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            EmulatorCommand::FocusLatest
+        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
