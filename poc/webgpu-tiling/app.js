@@ -10,7 +10,7 @@ const templates=[
 ];
 let tree,panes=new Map(),floating=new Map(),active=1,next=5,expanded=null,drag=null,resize=null,drop=null;
 let targets=new Map(),shown=new Map(),tween=null,draw=null,frame=0,width=1,height=1;
-let layoutMode=false;
+let layoutMode=false,fitTimer=null;
 let daemon=null,workspaceId=null,loading=true,creating=false;
 const savedKey='boomux.webgpu.layout.v1';
 const escapeHtml=value=>String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -197,6 +197,7 @@ async function initializeDaemon(info){
 
 }
 function reflow(animate=true){
+  clearTimeout(fitTimer);
   const result=layout(tree,bounds());targets=result.panes;
   for(const [id,r] of floating){r.w=Math.min(r.w,width-16);r.h=Math.min(r.h,height-16);r.x=Math.max(8,Math.min(r.x,width-r.w-8));r.y=Math.max(8,Math.min(r.y,height-r.h-8));targets.set(id,{...r});}
   if(expanded)targets=new Map([[expanded,bounds()]]);
@@ -206,7 +207,7 @@ function reflow(animate=true){
   if(!expanded&&!drag?.lifted)for(const d of result.dividers){
     const el=document.createElement('button');el.className=`divider ${d.node.axis}`;el.setAttribute('aria-label',`Resize ${d.node.axis==='x'?'columns':'rows'}`);
     Object.assign(el.style,{left:`${d.rect.x}px`,top:`${d.rect.y}px`,width:`${d.rect.w}px`,height:`${d.rect.h}px`});
-    el.onpointerdown=e=>{if(e.button!==0)return;e.preventDefault();resize={...d,ratio:d.node.ratio};el.setPointerCapture(e.pointerId);};
+    el.onpointerdown=e=>{if(e.button!==0)return;e.preventDefault();clearTimeout(fitTimer);resize={...d,ratio:d.node.ratio};el.setPointerCapture(e.pointerId);};
     el.onkeydown=e=>{const delta=['ArrowRight','ArrowDown'].includes(e.key)?.04:['ArrowLeft','ArrowUp'].includes(e.key)?-.04:0;if(delta){e.preventDefault();d.node.ratio=Math.max(.15,Math.min(.85,d.node.ratio+delta));reflow();}};
     $('#dividers').append(el);
   }
@@ -304,6 +305,13 @@ window.addEventListener('keydown',e=>{
   if(action){consume();panes.get(active).el.querySelector(`[data-action="${action}"]`).click();}
 },true);
 function paint(now){
+  // Retain the captured divider element while moving all split hit targets.
+  if(resize){
+    const dividers=layout(tree,bounds()).dividers;
+    for(const [index,el]of [...$('#dividers').children].entries()){
+      const r=dividers[index]?.rect;if(r)Object.assign(el.style,{left:`${r.x}px`,top:`${r.y}px`,width:`${r.w}px`,height:`${r.h}px`});
+    }
+  }
   frame=0;const t=tween?Math.min(1,(now-tween.start)/180):1,ease=1-(1-t)**3,rects=[];
   const surface=(r,color)=>rects.push({...r,color});
   const ordered=[...targets].sort(([a],[b])=>(a===drag?.id?2:floating.has(a)?1:0)-(b===drag?.id?2:floating.has(b)?1:0));
@@ -325,7 +333,15 @@ function paint(now){
     $('#hint').textContent=drag.float?'Release to float · Escape to cancel':'Release on a preview to tile · Shift to float · Escape to cancel';
   }else $('#hint').textContent='Drag to an edge to split · Hold Shift while dropping to float · Double-click a heading to expand';
   draw?.(rects,width,height);
-  if(t<1)schedule();else {tween=null;for(const [id,p]of panes)if(targets.has(id))p.terminal?.fit();}
+  if(t<1)schedule();else {
+    tween=null;clearTimeout(fitTimer);
+    // Geometry previews stay live. Reflow scrollback and resize the PTY only
+    // after the gesture/animation settles, coalescing window resize bursts too.
+    if(!resize&&!drag)fitTimer=setTimeout(()=>{
+      fitTimer=null;if(resize||drag)return;
+      for(const [id,p]of panes)if(targets.has(id))p.terminal?.fit();
+    },100);
+  }
 }
 $('#reset').onclick=()=>{if(daemon)refreshDaemon().catch(showError);else reset();};
 $('#add').onclick=()=>{if(daemon){createDaemonShell().catch(showError);return;}if(panes.size>=24||drag||resize)return;expanded=null;const id=next++;addPane(id,templates[(id-1)%4]);tree=tree?insert(tree,layout(tree,bounds()).panes.has(active)?active:layout(tree,bounds()).panes.keys().next().value,id,'right'):leaf(id);active=id;reflow();};
@@ -340,4 +356,4 @@ try{
 
 draw=await createRenderer($('#scene'),$('#renderer'),schedule);schedule();
 
-window.addEventListener('pagehide',()=>{for(const p of panes.values())p.terminal?.dispose();});
+window.addEventListener('pagehide',()=>{clearTimeout(fitTimer);for(const p of panes.values())p.terminal?.dispose();});

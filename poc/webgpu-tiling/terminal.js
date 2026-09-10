@@ -48,7 +48,11 @@ export function createTerminal(container,status,isLayoutMode,options={}){
   window.addEventListener('blur',updateFocus);
   function fitTerminal(){
     if(disposed||!terminal||container.offsetWidth<=0||container.offsetHeight<=0)return;
-    const dims=fit.proposeDimensions();if(dims)terminal.resize(Math.max(2,Math.min(500,dims.cols)),Math.max(1,Math.min(200,dims.rows)));
+    const dims=fit.proposeDimensions();
+    if(dims){
+      const cols=Math.max(2,Math.min(500,dims.cols)),rows=Math.max(1,Math.min(200,dims.rows));
+      if(cols!==terminal.cols||rows!==terminal.rows)terminal.resize(cols,rows);
+    }
     container.dataset.cols=terminal.cols;container.dataset.rows=terminal.rows;
   }
   const ready=(async()=>{

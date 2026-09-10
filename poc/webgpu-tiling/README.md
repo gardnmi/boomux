@@ -167,3 +167,23 @@ The browser fixture checks process/variable and layout preservation across refre
 PTY resizing, busy attachments and explicit takeover, detach persistence, rejected
 stale identities/Origins, and optionally graceful daemon handoff. It creates and
 cleans up only its own Shells and refuses to run against the ordinary runtime.
+
+During pointer resizing, pane geometry and divider hit targets update every frame;
+the terminal keeps its current grid until release. Terminal reflow and PTY sizing
+commit after layout settles (100 ms debounce), avoiding repeated scrollback reflow
+and application redraws while dragging. Escape restores the original split.
+
+Focused resize regression, using synthetic output and intercepted WebSockets so
+it never attaches to real Shells (either gateway may serve the page):
+
+```sh
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
+  node poc/webgpu-tiling/resize.test.mjs
+```
+
+Local headless Chromium evidence with four terminals, 2,000 long output lines per
+terminal, and 40 alternating pointer movements: the previous layout scheduler sent
+164 resize messages during the gesture; the updated scheduler sent zero during it
+and four on commit. Both runs used the same machine, fixture, and Canvas fallback.
+Neither recorded a browser long task; this demonstrates reduced resize work, not
+reproduction of every reported freeze or a CPU/memory performance benchmark.
