@@ -10516,6 +10516,24 @@ fn main() {
     });
 }
 
+#[cfg(target_os = "macos")]
+gpui::actions!(macos, [Quit]);
+
+fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: Option<String>) {
+    let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Omarchy tags org.omarchy.* windows as terminals, which makes
+            // its universal clipboard binding choose Ctrl/Shift+Insert.
+            app_id: Some("org.omarchy.boomux-desktop".into()),
+            ..Default::default()
+        },
+        move |window, cx| cx.new(|cx| Workspace::new(window, cx, saved, settings_error)),
+    )
+    .unwrap();
+}
+
 #[cfg(test)]
 mod pointer_tests {
     use super::*;
@@ -11990,22 +12008,4 @@ mod pointer_tests {
             );
         }
     }
-}
-
-#[cfg(target_os = "macos")]
-gpui::actions!(macos, [Quit]);
-
-fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: Option<String>) {
-    let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            // Omarchy tags org.omarchy.* windows as terminals, which makes
-            // its universal clipboard binding choose Ctrl/Shift+Insert.
-            app_id: Some("org.omarchy.boomux-desktop".into()),
-            ..Default::default()
-        },
-        move |window, cx| cx.new(|cx| Workspace::new(window, cx, saved, settings_error)),
-    )
-    .unwrap();
 }

@@ -5474,14 +5474,16 @@ mod tests {
     }
 
     #[test]
-    fn macos_runtime_discovery_preserves_explicit_runtime_and_rejects_absence() {
+    fn macos_runtime_discovery_preserves_explicit_runtime_and_creates_private_default() {
         let root = runtime_directory();
         let runtime = root.join("runtime");
         fs::create_dir_all(&root).unwrap();
         fs::create_dir(&runtime).unwrap();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
         let uid = unsafe { libc::geteuid() };
+        let default_runtime = root.join("default");
         let macos_prefix = REMOTE_RUNTIME_PREFIX
+            .replace("/tmp/boomux-$boomux_uid", default_runtime.to_str().unwrap())
             .replace("/usr/bin/uname -s", "printf 'Darwin\\n'")
             .replace("/usr/bin/stat -f '%u'", &format!("printf '{uid}\\n'"))
             .replace("/usr/bin/stat -f '%Lp'", "printf '700\\n'");
@@ -5489,9 +5491,20 @@ mod tests {
         assert!(supplied.status.success());
         assert_eq!(supplied.stdout, runtime.as_os_str().as_bytes());
 
-        let missing = run_runtime_prefix_text(&macos_prefix, None, None);
-        assert_eq!(missing.status.code(), Some(88));
-        assert_eq!(missing.stderr, b"boomux-runtime-v1:missing:88\n");
+        for _ in 0..2 {
+            let default = run_runtime_prefix_text(&macos_prefix, None, None);
+            assert!(default.status.success());
+            assert_eq!(default.stdout, default_runtime.as_os_str().as_bytes());
+            let metadata = fs::metadata(&default_runtime).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            assert_eq!(metadata.uid(), uid);
+        }
+
+        fs::remove_dir(&default_runtime).unwrap();
+        std::os::unix::fs::symlink(&runtime, &default_runtime).unwrap();
+        let unsafe_default = run_runtime_prefix_text(&macos_prefix, None, None);
+        assert_eq!(unsafe_default.status.code(), Some(90));
+        assert_eq!(unsafe_default.stderr, b"boomux-runtime-v1:unsafe:90\n");
         fs::remove_dir_all(root).unwrap();
     }
 
