@@ -1121,7 +1121,7 @@ fn discover_unregistered_opencode_runtime(port: u16) -> io::Result<Option<OpenCo
     };
     let mut discovered = None;
     for pid in entries {
-        let Ok(stat) = platform::process_snapshot(pid as u32) else {
+        let Ok(stat) = platform::process_snapshot(pid) else {
             continue;
         };
         if Some(stat.session) != Some(pid as libc::pid_t)
@@ -17642,7 +17642,7 @@ fn session_processes(session_id: libc::pid_t) -> Vec<libc::pid_t> {
     };
     let mut processes = Vec::new();
     for pid in entries {
-        let Ok(stat) = platform::process_snapshot(pid as u32) else {
+        let Ok(stat) = platform::process_snapshot(pid) else {
             continue;
         };
         if Some(stat.session) == Some(session_id) {

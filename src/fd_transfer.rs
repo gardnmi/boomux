@@ -104,6 +104,27 @@ fn errno(error: Errno) -> io::Error {
     io::Error::from_raw_os_error(error as i32)
 }
 
+fn send_flags() -> MsgFlags {
+    #[cfg(target_os = "linux")]
+    {
+        MsgFlags::MSG_NOSIGNAL
+    }
+    #[cfg(target_os = "macos")]
+    {
+        MsgFlags::empty()
+    }
+}
+fn receive_flags() -> MsgFlags {
+    #[cfg(target_os = "linux")]
+    {
+        MsgFlags::MSG_CMSG_CLOEXEC
+    }
+    #[cfg(target_os = "macos")]
+    {
+        MsgFlags::empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -168,26 +189,5 @@ mod tests {
         let error = receive_descriptor(&receiver, MARKER).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-}
-
-fn send_flags() -> MsgFlags {
-    #[cfg(target_os = "linux")]
-    {
-        MsgFlags::MSG_NOSIGNAL
-    }
-    #[cfg(target_os = "macos")]
-    {
-        MsgFlags::empty()
-    }
-}
-fn receive_flags() -> MsgFlags {
-    #[cfg(target_os = "linux")]
-    {
-        MsgFlags::MSG_CMSG_CLOEXEC
-    }
-    #[cfg(target_os = "macos")]
-    {
-        MsgFlags::empty()
     }
 }

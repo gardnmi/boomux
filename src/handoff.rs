@@ -507,9 +507,13 @@ fn validate_lock(descriptor: &OwnedFd, path: &Path) -> io::Result<()> {
     }
     // fstat succeeded, so the structure is initialized.
     let descriptor_metadata = unsafe { descriptor_metadata.assume_init() };
+    #[cfg(target_os = "linux")]
+    let descriptor_device = descriptor_metadata.st_dev;
+    #[cfg(target_os = "macos")]
+    let descriptor_device = descriptor_metadata.st_dev as u64;
     if !path_metadata.file_type().is_file()
         || path_metadata.uid() != unsafe { libc::geteuid() }
-        || path_metadata.dev() != descriptor_metadata.st_dev as u64
+        || path_metadata.dev() != descriptor_device
         || path_metadata.ino() != descriptor_metadata.st_ino
     {
         return Err(io::Error::new(
