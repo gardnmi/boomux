@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.15.1](https://github.com/gardnmi/boomux/compare/v1.15.0...v1.15.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* **desktop:** restore workspace animations and prevent UI stalls ([#401](https://github.com/gardnmi/boomux/issues/401)) ([f3d6870](https://github.com/gardnmi/boomux/commit/f3d687080e90f185d4734ca1084fd4ad9f6d3902))
+
 ## [1.15.0](https://github.com/gardnmi/boomux/compare/v1.14.1...v1.15.0) (2026-09-10)
 
 
