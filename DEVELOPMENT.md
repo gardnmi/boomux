@@ -97,6 +97,12 @@ cargo check -p boomux-desktop --locked
 cargo test -p boomux-desktop <test-name> --locked -- --test-threads=1
 ```
 
+Cargo development builds keep Rust debug information but compile the native
+Ghostty terminal core with `ReleaseFast`, avoiding expensive debug integrity
+scans during transcript replay. To debug the native core itself, explicitly set
+`LIBGHOSTTY_VT_SYS_OPTIMIZE=Debug` when building or running. Changing this setting
+rebuilds the native library.
+
 For a performance comparison, run `python3 desktop/scripts/run-dev.py --release`.
 This builds and launches optimized Desktop and daemon binaries against the same
 isolated development runtime. The first optimized build takes longer; keep the
