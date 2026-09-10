@@ -396,6 +396,22 @@ impl TerminalSession {
         Self::attach_with_client(client, shell, rows, cols, pixel_width, pixel_height)
     }
 
+    pub fn restore(
+        shell: ShellChoice,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<Self, String> {
+        if !matches!(shell.status, ShellStatus::Running) || shell.run_id.is_none() {
+            return Err("Saved Shell is stopped; start it explicitly".into());
+        }
+        let client = client::connect_if_running()
+            .map_err(|e| e.to_string())?
+            .ok_or("Boomux is not running")?;
+        Self::attach_with_policy(client, shell, rows, cols, pixel_width, pixel_height, false)
+    }
+
     fn attach_with_client(
         client: Client,
         shell: ShellChoice,
@@ -404,8 +420,21 @@ impl TerminalSession {
         pixel_width: u16,
         pixel_height: u16,
     ) -> Result<Self, String> {
+        Self::attach_with_policy(client, shell, rows, cols, pixel_width, pixel_height, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attach_with_policy(
+        client: Client,
+        shell: ShellChoice,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+        takeover: bool,
+    ) -> Result<Self, String> {
         let profile = terminal_profile(rows, cols, pixel_width, pixel_height);
-        let attachment = attach_shell(&client, &shell, profile.clone(), true)?;
+        let attachment = attach_shell(&client, &shell, profile.clone(), takeover)?;
         let shared = Arc::new(SharedTerminal::new(profile));
         let stream = attachment.stream;
         shared.install_writer(&stream)?;
@@ -2690,6 +2719,89 @@ mod tests {
             boomux::protocol::ShellStatus::Running
         );
         assert!(first.shells[0].cwd.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn layout_restore_requests_exact_run_without_restart_or_takeover() {
+        use boomux::protocol::{self, Envelope, Request, Response, ShellStatus};
+        use std::os::unix::net::UnixListener;
+        let directory =
+            std::env::temp_dir().join(format!("layout-attach-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let envelope: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            let Request::Attach {
+                shell_id,
+                expected_run_id,
+                takeover,
+                restart_exited,
+                ..
+            } = envelope.message
+            else {
+                panic!("expected exact attachment")
+            };
+            assert_eq!(shell_id, "saved-shell");
+            assert_eq!(expected_run_id.as_deref(), Some("saved-run"));
+            assert!(!takeover && !restart_exited);
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    envelope.version,
+                    Response::Error {
+                        code: None,
+                        message: "run exited during restore".into(),
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let shell = super::ShellChoice {
+            id: "saved-shell".into(),
+            name: "saved".into(),
+            workspace_id: "w".into(),
+            cwd: directory.clone(),
+            status: ShellStatus::Running,
+            run_id: Some("saved-run".into()),
+            desktop_setup: false,
+        };
+        let result = super::TerminalSession::attach_with_policy(
+            boomux::client::Client::from_socket_path(socket),
+            shell,
+            24,
+            80,
+            800,
+            480,
+            false,
+        );
+        assert!(result.is_err());
+        server.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn layout_restore_never_starts_pending_or_exited_shells() {
+        use boomux::protocol::ShellStatus;
+        for status in [ShellStatus::Pending, ShellStatus::Exited { code: Some(0) }] {
+            let shell = super::ShellChoice {
+                id: "saved".into(),
+                name: "saved".into(),
+                workspace_id: "workspace".into(),
+                cwd: std::path::PathBuf::new(),
+                status,
+                run_id: None,
+                desktop_setup: false,
+            };
+            let error = super::TerminalSession::restore(shell, 24, 80, 800, 480)
+                .err()
+                .unwrap();
+            assert!(error.contains("start it explicitly"));
+        }
     }
 
     #[test]

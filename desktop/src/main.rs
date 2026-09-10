@@ -4,6 +4,8 @@ use boomux::generated_names;
 mod git_panel;
 mod layout;
 mod layout_badge;
+mod layout_persistence;
+mod layout_state;
 mod nodes;
 mod remote;
 mod runtime;
@@ -1474,6 +1476,15 @@ fn desktop_window_title(workspace_name: Option<&str>) -> String {
 }
 
 struct Workspace {
+    layout_document: layout_state::Document,
+    layout_writer: Option<async_channel::Sender<layout_state::Write>>,
+    layout_save_task: Option<gpui::Task<()>>,
+    layout_error: Option<String>,
+    layout_canvas: (f32, f32),
+    layout_generation: u64,
+    layout_frozen: bool,
+    layout_closing: bool,
+    layout_restoring: bool,
     git_panel: git_panel::Model,
     layout: Option<Node>,
     floating: Vec<FloatingPane>,
@@ -1582,6 +1593,10 @@ struct Workspace {
 #[derive(Default)]
 struct TerminalPane {
     shell: Option<ShellChoice>,
+    restored: Option<layout_state::Pane>,
+    restore_attempt: Option<String>,
+    restore_retry_after: Option<Instant>,
+    restore_failures: u8,
     session: Option<TerminalSession>,
     screen: Option<Arc<TerminalScreen>>,
     attaching: bool,
@@ -1618,6 +1633,7 @@ impl Workspace {
         cx: &mut Context<Self>,
         saved: settings::Settings,
         settings_error: Option<String>,
+        layout_session: layout_state::Session,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
@@ -1673,6 +1689,15 @@ impl Workspace {
         let minimized_tab_scroll_handle = ScrollHandle::new();
         let help_scroll_handle = ScrollHandle::new();
         let mut workspace = Self {
+            layout_document: layout_session.document,
+            layout_writer: layout_session.writer,
+            layout_save_task: None,
+            layout_error: layout_session.error,
+            layout_canvas: (1.0, 1.0),
+            layout_generation: 0,
+            layout_frozen: false,
+            layout_closing: false,
+            layout_restoring: false,
             layout: Some(layout),
             floating: Vec::new(),
             git_panel: git_panel::Model::default(),
@@ -1781,7 +1806,10 @@ impl Workspace {
             next_id: 2,
             focus_handle,
         };
-        if let Some(shell) = initial_shell {
+        workspace.initialize_layout(window, cx);
+        if workspace.layout_document.active.is_empty()
+            && let Some(shell) = initial_shell
+        {
             let workspace_id = shell.workspace_id.clone();
             let shell_id = shell.id.clone();
             workspace.open_workspace(&workspace_id, Some(&shell_id), window, cx);
@@ -1815,6 +1843,9 @@ impl Workspace {
                 }
             })
             .detach();
+        }
+        if let Some(requested) = requested_shell_id.as_deref() {
+            workspace.activate_sidebar_shell(requested, window, cx);
         }
         workspace.watch_updates(cx);
         cx.observe_window_activation(window, |this, window, cx| {
@@ -1954,15 +1985,33 @@ impl Workspace {
         let Some(prepared) = self.prepared_update.clone() else {
             return;
         };
+        self.capture_arrangement();
+        self.layout_save_task.take();
+        self.layout_frozen = true;
+        let layout_flush = self
+            .layout_writer
+            .as_ref()
+            .map(|writer| layout_state::submit(writer, self.layout_document.clone()));
         self.update_busy = true;
         self.updates_status = Some("Restarting Boomux and reopening Desktop…".into());
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { prepared.restart() }).await;
+            let saved = match layout_flush {
+                Some(flush) => flush
+                    .recv()
+                    .await
+                    .unwrap_or_else(|_| Err("Layout save was interrupted".into())),
+                None => Ok(()),
+            };
+            let result = match saved {
+                Ok(()) => cx.background_spawn(async move { prepared.restart() }).await,
+                Err(error) => Err(format!("Could not save layout before restart: {error}")),
+            };
             this.update(cx, |this, cx| {
                 this.update_busy = false;
                 match result {
                     Ok(()) => cx.quit(),
                     Err(error) => {
+                        this.layout_frozen = false;
                         this.updates_status = Some(error);
                         cx.notify();
                     }
@@ -2185,6 +2234,7 @@ impl Workspace {
             .and_then(|layout| layout.neighbor(self.focused, direction))
         {
             self.focused = id;
+            self.layout_changed(cx);
             cx.notify();
         } else if direction == Direction::Left {
             self.enter_sidebar(window, cx);
@@ -2258,6 +2308,7 @@ impl Workspace {
         {
             terminal.focus();
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -2312,7 +2363,6 @@ impl Workspace {
             .iter()
             .flat_map(|workspace| workspace.shells.iter().cloned())
             .collect();
-        self.retain_known_minimized_shells(&overview);
         self.boomux_overview = overview;
     }
 
@@ -2396,6 +2446,7 @@ impl Workspace {
             } else {
                 self.workspace_order_animation = None;
             }
+            self.layout_changed(cx);
             cx.notify();
         }
     }
@@ -2658,6 +2709,7 @@ impl Workspace {
         if self.pane_layout_mode == mode {
             return;
         }
+        self.capture_arrangement();
         self.pane_layout_mode = mode;
         if mode == PaneLayoutMode::Tabbed {
             self.workspace_pane_mode = WorkspacePaneMode::Workspace;
@@ -2672,6 +2724,7 @@ impl Workspace {
         }
         self.save_settings();
         self.reconcile_sidebar_item();
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3004,6 +3057,7 @@ impl Workspace {
         {
             self.begin_layout_animation(previous_rects);
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3037,6 +3091,7 @@ impl Workspace {
                 layout.resize(self.focused, direction, tiled_amount);
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3054,6 +3109,7 @@ impl Workspace {
         let previous = layout.rects().into_iter().collect::<HashMap<_, _>>();
         if transform(layout, self.focused) {
             self.begin_layout_animation(previous);
+            self.layout_changed(cx);
             cx.notify();
         }
     }
@@ -3088,6 +3144,7 @@ impl Workspace {
                 generation: self.animation_generation,
             });
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3115,6 +3172,7 @@ impl Workspace {
             self.create_and_attach_terminal(id, anchor, window, cx);
         } else if let Some(pane) = self.terminals.get_mut(&id) {
             pane.error = Some("No Boomux workspace is available for a new terminal".into());
+            self.layout_changed(cx);
             cx.notify();
         }
     }
@@ -3152,6 +3210,14 @@ impl Workspace {
             .any(|animation| animation.pane_id == pane_id)
         {
             return;
+        }
+        if let Some(shell) = self.terminals.get(&pane_id).and_then(|p| {
+            p.shell
+                .as_ref()
+                .map(|s| s.id.clone())
+                .or_else(|| p.restored.as_ref().and_then(|r| r.shell.clone()))
+        }) {
+            self.minimized_shells.insert(shell);
         }
         let from = self.pane_bounds_in_panel(pane_id, window);
         let previous_rects = self
@@ -3213,6 +3279,7 @@ impl Workspace {
                 *pane = clamp_floating_to_panel(pane.clone(), panel_size);
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3236,6 +3303,7 @@ impl Workspace {
                 *pane = clamp_floating_to_panel(pane.clone(), panel_size);
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3343,6 +3411,7 @@ impl Workspace {
                 }
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3383,6 +3452,7 @@ impl Workspace {
                     self.floating_animation = None;
                 }
             }
+            self.layout_changed(cx);
             cx.notify();
             return;
         }
@@ -3407,6 +3477,7 @@ impl Workspace {
                 self.floating_animation = None;
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3662,6 +3733,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.capture_arrangement();
+        self.layout_changed(cx);
         self.git_panel.search_focused = false;
         self.floating_animation = None;
         self.focused = id;
@@ -3756,6 +3829,7 @@ impl Workspace {
         {
             terminal.focus();
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -4252,6 +4326,7 @@ impl Workspace {
         let pointer =
             self.window_position_in_panel(f32::from(event.position.x), f32::from(event.position.y));
         self.finish_pointer_drag(pointer, window);
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -4875,6 +4950,7 @@ impl Workspace {
         pane.shell = Some(shell.clone());
         pane.attaching = true;
         pane.error = None;
+        self.layout_changed(cx);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -4899,6 +4975,7 @@ impl Workspace {
                     }
                     Err(error) => pane.error = Some(error),
                 }
+                this.layout_changed(cx);
                 cx.notify();
             })
             .ok();
@@ -4918,6 +4995,7 @@ impl Workspace {
             pane.attaching = true;
             pane.error = None;
         }
+        self.layout_changed(cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -4956,6 +5034,7 @@ impl Workspace {
                     }
                     Err(error) => pane.error = Some(error),
                 }
+                this.layout_changed(cx);
                 cx.notify();
             })
             .ok();
@@ -5006,6 +5085,7 @@ impl Workspace {
         if let Some(pane) = self.terminals.get_mut(&pane_id) {
             pane.attaching = true;
         }
+        self.layout_changed(cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -5044,6 +5124,7 @@ impl Workspace {
                     }
                     Err(error) => pane.error = Some(error),
                 }
+                this.layout_changed(cx);
                 cx.notify();
             })
             .ok();
@@ -5076,6 +5157,7 @@ impl Workspace {
             pane.attaching = true;
             pane.error = None;
         }
+        self.layout_changed(cx);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -5129,6 +5211,7 @@ impl Workspace {
                     }
                     Err(error) => pane.error = Some(error),
                 }
+                this.layout_changed(cx);
                 cx.notify();
             })
             .ok();
@@ -5216,6 +5299,9 @@ impl Workspace {
                 if !keep_watching {
                     return;
                 }
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| this.reconnect_saved_panes(window, cx))
+                });
                 if !removed_setup_shells.is_empty() {
                     let _ = window_handle.update(cx, |_, window, cx| {
                         this.update(cx, |this, cx| {
@@ -5256,17 +5342,8 @@ impl Workspace {
         if !self.expanded_workspaces.remove(workspace_id) {
             self.expanded_workspaces.insert(workspace_id.to_string());
         }
+        self.layout_changed(cx);
         cx.notify();
-    }
-
-    fn retain_known_minimized_shells(&mut self, overview: &BoomuxOverview) {
-        let known_shells = overview
-            .workspaces
-            .iter()
-            .flat_map(|workspace| workspace.shells.iter().map(|shell| shell.id.as_str()))
-            .collect::<HashSet<_>>();
-        self.minimized_shells
-            .retain(|shell_id| known_shells.contains(shell_id.as_str()));
     }
 
     fn minimized_tab_shells(&self) -> Vec<ShellChoice> {
@@ -5278,7 +5355,8 @@ impl Workspace {
             .get(&self.focused)
             .and_then(|pane| pane.shell.as_ref())
             .map(|shell| shell.workspace_id.as_str());
-        self.boomux_overview
+        let mut shells = self
+            .boomux_overview
             .workspaces
             .iter()
             .filter(|workspace| {
@@ -5289,7 +5367,15 @@ impl Workspace {
             .flat_map(|workspace| workspace.shells.iter())
             .filter(|shell| self.minimized_shells.contains(&shell.id))
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        shells.sort_by_key(|s| {
+            self.layout_document
+                .minimized
+                .iter()
+                .position(|id| id == &s.id)
+                .unwrap_or(usize::MAX)
+        });
+        shells
     }
 
     fn has_minimized_tabs(&self) -> bool {
@@ -5313,6 +5399,7 @@ impl Workspace {
     }
 
     fn detach_all_panes(&mut self, window: &mut Window) {
+        self.capture_arrangement();
         for (_, pane) in self.terminals.drain() {
             for image in pane.render_images.into_values() {
                 let _ = window.drop_image(image);
@@ -5376,6 +5463,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.restore_workspace_layout(workspace_id, preferred_shell_id, window, cx) {
+            return;
+        }
         self.project_menu_open = false;
         let Some(shells) = self
             .boomux_overview
@@ -5546,6 +5636,7 @@ impl Workspace {
             let size = self.terminal_grid_size(pane_id, window);
             self.start_terminal_attachment(pane_id, shell, size, cx);
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -5562,6 +5653,15 @@ impl Workspace {
                 .filter(|shell| shell.id == shell_id)
                 .map(|_| *pane_id)
         }) {
+            let retry = self
+                .terminals
+                .get(&pane_id)
+                .filter(|pane| pane.session.is_none() && !pane.attaching)
+                .and_then(|pane| pane.shell.clone());
+            if let Some(shell) = retry {
+                let size = self.terminal_grid_size(pane_id, window);
+                self.start_terminal_attachment(pane_id, shell, size, cx);
+            }
             self.navigation_region = NavigationRegion::Terminal;
             self.focused = pane_id;
             self.raise_floating_pane(pane_id);
@@ -5573,6 +5673,7 @@ impl Workspace {
                 terminal.focus();
             }
             window.focus(&self.focus_handle, cx);
+            self.layout_changed(cx);
             cx.notify();
             return;
         }
@@ -5584,6 +5685,7 @@ impl Workspace {
             .cloned()
         else {
             self.boomux_error = Some("That Boomux shell is no longer available".into());
+            self.layout_changed(cx);
             cx.notify();
             return;
         };
@@ -5598,6 +5700,9 @@ impl Workspace {
             &open_workspace_ids,
             &shell.workspace_id,
         ) {
+            if self.restore_workspace_layout(&shell.workspace_id, Some(&shell.id), window, cx) {
+                return;
+            }
             self.detach_all_panes(window);
         }
         self.navigation_region = NavigationRegion::Terminal;
@@ -7848,6 +7953,7 @@ impl Workspace {
                                     )
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
+                                            this.capture_arrangement();
                                             this.workspace_pane_mode = WorkspacePaneMode::Workspace;
                                             let workspace_id = this
                                                 .terminals
@@ -7879,12 +7985,23 @@ impl Workspace {
                                         ),
                                     )
                                     .on_click(cx.listener(
-                                        |this, _, _, cx| {
+                                        |this, _, window, cx| {
                                             if pane_layout_supports_scope(
                                                 this.pane_layout_mode,
                                                 WorkspacePaneMode::Mixed,
                                             ) {
+                                                this.capture_arrangement();
                                                 this.workspace_pane_mode = WorkspacePaneMode::Mixed;
+                                                if let Some(saved) = this
+                                                    .layout_document
+                                                    .arrangements
+                                                    .get("mixed")
+                                                    .cloned()
+                                                {
+                                                    this.layout_document.active = "mixed".into();
+                                                    this.restore_arrangement(saved, window, cx);
+                                                }
+                                                this.layout_changed(cx);
                                                 this.save_settings();
                                                 cx.notify();
                                             }
@@ -8774,6 +8891,25 @@ impl Workspace {
                     "No Boomux terminal is available."
                 },
             ))
+            .when(
+                pane.is_some_and(|pane| {
+                    pane.restored.is_some() && !pane.attaching && pane.session.is_none()
+                }),
+                |element| {
+                    element.child(
+                        Self::settings_option(
+                            ("reconnect-saved-pane", pane_id),
+                            "Reconnect / start Shell",
+                            false,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.reconnect_saved_pane(pane_id, window, cx)
+                            },
+                        )),
+                    )
+                },
+            )
             .when_some(
                 pane.and_then(|pane| pane.error.clone())
                     .or_else(|| self.boomux_error.clone()),
@@ -9445,6 +9581,7 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.layout_canvas = self.panel_size(window);
         self.sidebar_viewport_width = f32::from(window.viewport_size().width);
         let workspace_name = self
             .terminals
@@ -9797,6 +9934,18 @@ impl Render for Workspace {
 
         div()
             .id("workspace")
+            .when_some(self.layout_error.clone(), |element, error| {
+                element.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .text_xs()
+                        .bg(rgb(0x313244))
+                        .text_color(rgb(0xf38ba8))
+                        .child(format!("Layout not saved: {error}")),
+                )
+            })
             .track_focus(&self.focus_handle)
             .key_context(
                 if (self.nodes_open && self.navigation_region == NavigationRegion::Sidebar)
@@ -10291,6 +10440,26 @@ fn main() {
         Ok(saved) => (saved, None),
         Err(error) => (settings::Settings::default(), Some(error)),
     };
+    let mut layout_session = layout_state::Session::load();
+    match boomux::client::connect_if_running()
+        .ok()
+        .flatten()
+        .and_then(|client| client.node_identity().ok())
+    {
+        Some(owner)
+            if layout_session.document.owner.is_empty()
+                || layout_session.document.owner == owner =>
+        {
+            layout_session.document.owner = owner
+        }
+        _ => {
+            layout_session.error = Some(
+                "Saved layout belongs to an unavailable or different Node; it was retained.".into(),
+            );
+            layout_session.writer = None;
+            layout_session.document = layout_state::Document::default();
+        }
+    }
     gpui_platform::application().run(move |cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("BoomuxSettingsInput")),
@@ -10454,7 +10623,9 @@ fn main() {
                 app_id: Some("org.omarchy.boomux-desktop".into()),
                 ..Default::default()
             },
-            move |window, cx| cx.new(|cx| Workspace::new(window, cx, saved, settings_error)),
+            move |window, cx| {
+                cx.new(|cx| Workspace::new(window, cx, saved, settings_error, layout_session))
+            },
         )
         .unwrap();
         cx.activate(true);
