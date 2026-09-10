@@ -6948,6 +6948,17 @@ impl ShellRuntimeManager {
             if let Some(session_id) = child_pid {
                 signal_session(session_id, libc::SIGKILL);
             }
+            // Darwin session leaders can block in ttywait during kernel exit,
+            // even after SIGKILL, while the paused reader leaves output queued.
+            // This is destructive shutdown: discard only the unread tail after
+            // killing the session. Handoff and rollback never flush the PTY.
+            #[cfg(target_os = "macos")]
+            {
+                let master = lock(&runtime.master)?;
+                if unsafe { libc::tcflush(master.descriptor.as_raw_fd(), libc::TCOFLUSH) } < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
             if env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
                 eprintln!(
                     "BOOMUX_TEST_CHILD_WAIT pid={child_pid:?} kill={kill_result:?} status={:?}",
