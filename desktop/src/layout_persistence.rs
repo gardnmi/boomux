@@ -270,10 +270,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.restore_arrangement_with_transition(saved, None, window, cx);
+    }
+
+    fn restore_arrangement_with_transition(
+        &mut self,
+        saved: Arrangement,
+        direction: Option<f32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.layout_restoring = true;
         self.restore_pointer_guard = PointerGuard::Waiting;
-        self.finish_current_workspace_transition(window);
-        self.detach_all_panes(window);
+        if let Some(direction) = direction {
+            self.begin_workspace_transition(direction, window, cx);
+        } else {
+            self.finish_current_workspace_transition(window);
+            self.detach_all_panes(window);
+        }
         let mut ids = HashMap::new();
         for (saved_id, reference) in &saved.panes {
             let id = self.next_id;
@@ -319,6 +333,7 @@ impl Workspace {
             .or_else(|| ids.values().copied().min())
             .unwrap_or(0);
         self.fullscreen = saved.expanded.and_then(|id| ids.get(&id).copied());
+        self.animate_workspace_arrival();
         self.reconnect_saved_panes(window, cx);
         self.layout_restoring = false;
         cx.notify();
@@ -343,9 +358,13 @@ impl Workspace {
             return false;
         }
         if let Some(saved) = self.layout_document.arrangements.get(&key).cloned() {
+            let current = self.layout_document.active.strip_prefix("workspace:");
+            let direction = workspace_slide_direction(&self.workspace_order, current, workspace);
             self.layout_document.active = key;
+            self.project_menu_open = false;
+            self.sidebar_menu = None;
             self.expanded_workspaces = HashSet::from([workspace.to_owned()]);
-            self.restore_arrangement(saved, window, cx);
+            self.restore_arrangement_with_transition(saved, Some(direction), window, cx);
             if let Some(preferred) = preferred {
                 self.activate_sidebar_shell(preferred, window, cx);
             }
