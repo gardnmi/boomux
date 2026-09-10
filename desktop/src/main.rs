@@ -5505,6 +5505,84 @@ impl Workspace {
         cx.notify();
     }
 
+    // Retain outgoing terminals and their paint state until the slide completes.
+    // Both newly opened and persisted arrangements use this lifecycle.
+    fn begin_workspace_transition(
+        &mut self,
+        slide_direction: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_current_workspace_transition(window);
+        let mut outgoing = self
+            .layout
+            .as_ref()
+            .map(Node::pane_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .chain(self.floating.iter().map(|pane| pane.id))
+            .filter_map(|pane_id| self.pane_bounds_in_panel(pane_id, window))
+            .collect::<Vec<_>>();
+        for animation in &self.minimizing_panes {
+            if !outgoing.iter().any(|pane| pane.id == animation.pane_id) {
+                outgoing.push(animation.from.clone());
+            }
+        }
+        let outgoing_ids = outgoing.iter().map(|pane| pane.id).collect::<Vec<_>>();
+        let should_animate = !outgoing.is_empty();
+
+        self.layout = None;
+        self.floating.clear();
+        self.pointer_drag = None;
+        self.terminal_scrollbar_drag = None;
+        self.terminal_selection_release = None;
+        self.layout_animation = None;
+        self.floating_animation = None;
+        self.minimizing_panes.clear();
+        self.fullscreen = None;
+
+        if let Some(duration) = self.motion_speed.duration().filter(|_| should_animate) {
+            self.animation_generation = self.animation_generation.wrapping_add(1);
+            let generation = self.animation_generation;
+            self.workspace_transition = Some(WorkspaceTransition {
+                outgoing,
+                direction: slide_direction,
+                generation,
+                duration,
+            });
+            let window_handle = window.window_handle();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(duration).await;
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.finish_workspace_transition(generation, window, cx);
+                    })
+                });
+            })
+            .detach();
+        } else {
+            self.detach_terminal_ids(&outgoing_ids, window);
+        }
+    }
+
+    fn animate_workspace_arrival(&mut self) {
+        let Some(transition) = &self.workspace_transition else {
+            return;
+        };
+        let direction = transition.direction;
+        let incoming = self
+            .layout
+            .as_ref()
+            .map(|layout| {
+                workspace_layout_rects(layout, self.fullscreen)
+                    .into_iter()
+                    .map(|(id, rect)| (id, shifted_workspace_rect(rect, direction)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.begin_layout_animation(incoming);
+    }
+
     fn open_workspace(
         &mut self,
         workspace_id: &str,
@@ -5562,56 +5640,7 @@ impl Workspace {
                 .filter_map(|pane| pane.shell.as_ref().map(|shell| shell.id.clone()))
                 .collect::<HashSet<_>>();
             if workspace_open_replaces_panes(self.workspace_pane_mode, &current, &desired) {
-                self.finish_current_workspace_transition(window);
-                let mut outgoing = self
-                    .layout
-                    .as_ref()
-                    .map(Node::pane_ids)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .chain(self.floating.iter().map(|pane| pane.id))
-                    .filter_map(|pane_id| self.pane_bounds_in_panel(pane_id, window))
-                    .collect::<Vec<_>>();
-                for animation in &self.minimizing_panes {
-                    if !outgoing.iter().any(|pane| pane.id == animation.pane_id) {
-                        outgoing.push(animation.from.clone());
-                    }
-                }
-                let outgoing_ids = outgoing.iter().map(|pane| pane.id).collect::<Vec<_>>();
-                let should_animate = !current.is_empty() && !outgoing.is_empty();
-
-                self.layout = None;
-                self.floating.clear();
-                self.pointer_drag = None;
-                self.terminal_scrollbar_drag = None;
-                self.terminal_selection_release = None;
-                self.layout_animation = None;
-                self.floating_animation = None;
-                self.minimizing_panes.clear();
-                self.fullscreen = None;
-
-                if let Some(duration) = self.motion_speed.duration().filter(|_| should_animate) {
-                    self.animation_generation = self.animation_generation.wrapping_add(1);
-                    let generation = self.animation_generation;
-                    self.workspace_transition = Some(WorkspaceTransition {
-                        outgoing,
-                        direction: slide_direction,
-                        generation,
-                        duration,
-                    });
-                    let window_handle = window.window_handle();
-                    cx.spawn(async move |this, cx| {
-                        cx.background_executor().timer(duration).await;
-                        let _ = window_handle.update(cx, |_, window, cx| {
-                            this.update(cx, |this, cx| {
-                                this.finish_workspace_transition(generation, window, cx);
-                            })
-                        });
-                    })
-                    .detach();
-                } else {
-                    self.detach_terminal_ids(&outgoing_ids, window);
-                }
+                self.begin_workspace_transition(slide_direction, window, cx);
             }
         }
 
@@ -5647,22 +5676,7 @@ impl Workspace {
             pending.push((pane_id, shell));
         }
 
-        if self.workspace_transition.is_some() {
-            let incoming = self
-                .layout
-                .as_ref()
-                .map(|layout| {
-                    layout
-                        .rects()
-                        .into_iter()
-                        .map(|(pane_id, rect)| {
-                            (pane_id, shifted_workspace_rect(rect, slide_direction))
-                        })
-                        .collect::<HashMap<_, _>>()
-                })
-                .unwrap_or_default();
-            self.begin_layout_animation(incoming);
-        }
+        self.animate_workspace_arrival();
 
         let preferred_pane = preferred_shell_id
             .and_then(|shell_id| pane_ids.get(shell_id).copied())
@@ -5697,6 +5711,18 @@ impl Workspace {
     ) {
         self.project_menu_open = false;
         if let Some(pane_id) = self.terminals.iter().find_map(|(pane_id, pane)| {
+            if self
+                .workspace_transition
+                .as_ref()
+                .is_some_and(|transition| {
+                    transition
+                        .outgoing
+                        .iter()
+                        .any(|outgoing| outgoing.id == *pane_id)
+                })
+            {
+                return None;
+            }
             pane.shell
                 .as_ref()
                 .filter(|shell| shell.id == shell_id)
@@ -5741,8 +5767,16 @@ impl Workspace {
         self.minimized_shells.remove(&shell.id);
         let open_workspace_ids = self
             .terminals
-            .values()
-            .filter_map(|pane| pane.shell.as_ref().map(|shell| shell.workspace_id.clone()))
+            .iter()
+            .filter(|(id, _)| {
+                self.workspace_transition.as_ref().is_none_or(|transition| {
+                    !transition
+                        .outgoing
+                        .iter()
+                        .any(|outgoing| outgoing.id == **id)
+                })
+            })
+            .filter_map(|(_, pane)| pane.shell.as_ref().map(|shell| shell.workspace_id.clone()))
             .collect::<HashSet<_>>();
         if shell_open_replaces_panes(
             self.workspace_pane_mode,
@@ -9726,7 +9760,30 @@ impl Render for Workspace {
                     )
                     .when(lifted_id == Some(pane.id), |element| element.opacity(0.92))
                     .child(self.pane(pane.id, cx));
-                if let (Some(animation), Some(duration)) = (
+                if let Some(transition) = &self.workspace_transition {
+                    let target = pane.clone();
+                    let from = FloatingPane {
+                        x: target.x + transition.direction * self.panel_size(window).0,
+                        ..target.clone()
+                    };
+                    let animation_id = SharedString::from(format!(
+                        "workspace-enter-{}-{}",
+                        transition.generation, pane.id
+                    ));
+                    base.with_animation(
+                        animation_id,
+                        Animation::new(transition.duration).with_easing(ease_out_quint()),
+                        move |element, progress| {
+                            let bounds = interpolate_floating_pane(&from, &target, progress);
+                            element
+                                .left(px(bounds.x))
+                                .top(px(bounds.y))
+                                .w(px(bounds.width))
+                                .h(px(bounds.height))
+                        },
+                    )
+                    .into_any_element()
+                } else if let (Some(animation), Some(duration)) = (
                     floating_animation
                         .as_ref()
                         .filter(|animation| animation.pane_id == pane.id),
