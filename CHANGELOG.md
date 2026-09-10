@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.15.0](https://github.com/gardnmi/boomux/compare/v1.14.1...v1.15.0) (2026-09-10)
+
+
+### Features
+
+* **desktop:** persist internal pane arrangements across restarts ([#399](https://github.com/gardnmi/boomux/issues/399)) ([efa3de7](https://github.com/gardnmi/boomux/commit/efa3de79eb11961a331e08d20e42decee9f8ef2d))
+
 ## [1.14.1](https://github.com/gardnmi/boomux/compare/v1.14.0...v1.14.1) (2026-09-09)
 
 
