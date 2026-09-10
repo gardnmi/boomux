@@ -98,7 +98,7 @@ export function createTerminal(container,status,isLayoutMode,options={}){
           send({type:'resize',cols:terminal.cols,rows:terminal.rows});if(cursor.focused)send({type:'focus'});
         }
         if(message.type==='reconnecting'){reconstructing=true;status.textContent='Reconnecting…';container.dataset.connected='false';}
-        if(message.type==='closed'){connectionError=true;status.textContent='Detached';container.dataset.connected='false';}
+        if(message.type==='closed'){connectionError=true;status.textContent='Detached';container.dataset.connected='false';options.onError?.(message.reason==='detached'?'busy':'disconnected',message.reason==='detached'?'This terminal was detached. Take control to attach again.':'The terminal connection was lost. Reopen this Shell from the sidebar.');}
         if(message.type==='error'){connectionError=true;status.textContent=message.message;container.dataset.connected='false';options.onError?.(message.code,message.message);}
         if(message.type==='ready'){container.dataset.pid=message.pid;container.dataset.cols=terminal.cols;container.dataset.rows=terminal.rows;}
         if(message.type==='exit'){status.textContent=`Exited · ${message.code}`;terminal.write(`\r\n\x1b[90m[Process exited: ${message.code}]\x1b[0m\r\n`);}

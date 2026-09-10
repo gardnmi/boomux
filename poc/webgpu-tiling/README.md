@@ -38,7 +38,8 @@ this does not promise process survival across a machine crash.
 
 Attachments are primary controllers, so browser dimensions resize the actual PTY.
 If another terminal controls a Shell, the pane offers **Take control** with an
-explicit confirmation. Taking control detaches the previous controller.
+explicit confirmation. Taking control detaches the previous controller. An already-open browser pane
+shows **Take control** as soon as it receives detachment; no page refresh is needed.
 
 The gateway binds only to `127.0.0.1`, validates Host and mutation/WebSocket
 Origin, and uses short-lived, one-use attachment grants. It caps active attachments

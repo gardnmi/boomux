@@ -54,7 +54,10 @@ try{
   peer.once('dialog',dialog=>dialog.accept());await peer.getByRole('button',{name:'Take control',exact:true}).first().click();
   await peer.waitForSelector('.pane-body[data-connected="true"]');
   await eventually(()=>page.locator('.pane-body').first().getAttribute('data-connected').then(v=>v==='false'),'explicit takeover detaches previous controller');
-  await peer.close();await page.reload();await page.waitForFunction(()=>document.querySelectorAll('.pane-body[data-connected="true"]').length===2);
+  await page.locator('.pane').first().getByRole('button',{name:'Take control',exact:true}).waitFor();
+  page.once('dialog',dialog=>dialog.accept());await page.locator('.pane').first().getByRole('button',{name:'Take control',exact:true}).click();
+  await peer.locator('.pane').first().getByRole('button',{name:'Take control',exact:true}).waitFor();
+  await peer.close();await page.waitForFunction(()=>document.querySelectorAll('.pane-body[data-connected="true"]').length===2);
   if(process.env.POC_RESTART==='1'){
     await exec(cli,['daemon','restart','--executable',cli]);
     await eventually(()=>streams.some(s=>s.messages.some(m=>m.type==='reconnecting')),'daemon reconnect handshake');

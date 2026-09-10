@@ -29,6 +29,9 @@ where Ghostty's reusable key encoder reads the current terminal modes before
 encoding and forwarding them; this keeps Kitty keyboard, modifyOtherKeys,
 cursor, keypad, and backarrow negotiation ordered with terminal output.
 Detaching a pane never implies closing its Boomux Shell.
+When another client takes control, Desktop publishes the detached status before
+draining the terminal worker and shows **Take control** in the pane heading.
+That action attaches to the same ShellRun; workspace switching is not required.
 
 New terminal creation publishes the attachment before any sidebar overview refresh;
 the existing overview worker refreshes resource rows independently. New local

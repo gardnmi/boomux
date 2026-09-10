@@ -9074,6 +9074,44 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .gap_1()
+                                .when(
+                                    status_message.as_deref() == Some("detached")
+                                        && !pane.is_some_and(|pane| pane.attaching),
+                                    |controls| {
+                                        controls.child(
+                                            div()
+                                                .id(("take-control", id))
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .bg(rgb(0x45475a))
+                                                .child("Take control")
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                })
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        let Some(shell) = this
+                                                            .terminals
+                                                            .get(&id)
+                                                            .filter(|pane| !pane.attaching)
+                                                            .and_then(|pane| pane.shell.clone())
+                                                        else {
+                                                            return;
+                                                        };
+                                                        let size =
+                                                            this.terminal_grid_size(id, window);
+                                                        this.start_terminal_attachment(
+                                                            id, shell, size, cx,
+                                                        );
+                                                    },
+                                                )),
+                                        )
+                                    },
+                                )
                                 .when_some(status_message, |controls, status| {
                                     controls.child(
                                         div()
