@@ -24,6 +24,12 @@ absolute argv[0] for subsequent restart and integration paths. A cross-filesyste
 pin fails before transfer. The replacement removes its alias on exit; cold
 startup under the daemon lock reclaims stale aliases.
 
+Darwin session-leader exit can wait for queued terminal output to drain even
+following SIGKILL. During destructive shutdown, after signaling the session,
+Boomux flushes the unread PTY output tail before waiting for the child. The
+reader remains paused to preserve the lifecycle transaction's lock ordering.
+Live handoff and failed-preparation rollback never flush terminal output.
+
 macOS uses a distinct private `BOOMUXM1` handoff header. Linux retains H8. The
 public protocol and persisted registry schema do not change simply because a
 new host is supported. Process identity descriptors contain no environment.
