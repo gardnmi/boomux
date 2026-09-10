@@ -38,3 +38,35 @@ export function dropAt(rects,x,y) {
   }
   return null;
 }
+// Prefer panes sharing the requested edge over diagonally nearby panes.
+export function neighbor(rects, id, direction) {
+  const source=rects.get(id);if(!source)return null;
+  const horizontal=direction==='left'||direction==='right',positive=direction==='right'||direction==='bottom';
+  const axis=horizontal?'x':'y',size=horizontal?'w':'h',cross=horizontal?'y':'x',span=horizontal?'h':'w';
+  let best=null,score=Infinity;
+  for(const [candidate,r] of rects){
+    if(candidate===id)continue;
+    const distance=(r[axis]+r[size]/2-source[axis]-source[size]/2)*(positive?1:-1);
+    if(distance<=0)continue;
+    const overlap=Math.min(source[cross]+source[span],r[cross]+r[span])-Math.max(source[cross],r[cross]);
+    const rank=(overlap>0?0:1000000)+distance+Math.abs(r[cross]+r[span]/2-source[cross]-source[span]/2)*.25;
+    if(rank<score){best=candidate;score=rank;}
+  }
+  return best;
+}
+export function swap(node, first, second) {
+  if(!node)return node;
+  if('id' in node)return leaf(node.id===first?second:node.id===second?first:node.id);
+  return {...node,a:swap(node.a,first,second),b:swap(node.b,first,second)};
+}
+export function ancestors(node,id) {
+  function visit(current){
+    if(!current)return null;
+    if('id' in current)return current.id===id?[]:null;
+    for(const side of ['a','b']){
+      const path=visit(current[side]);if(path)return [{node:current,side},...path];
+    }
+    return null;
+  }
+  return visit(node)||[];
+}

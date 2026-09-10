@@ -38,8 +38,29 @@ try {
     await pane(5).getByRole('button',{name:'Remove demo pane',exact:true}).click();assert.equal(await page.locator('.pane').count(),4);
     await page.setViewportSize({width:1100,height:750});await settle();
     for(const el of await page.locator('.pane').all()){const r=await el.boundingBox();assert.ok(r.x>=0&&r.x+r.width<=1100&&r.y+r.height<=750);}
+    await page.locator('#reset').click();await settle();
+    await page.keyboard.press('Control+Space');await settle();
+    assert.equal(await page.locator('#layout-mode').getAttribute('aria-pressed'),'true');
+    const first=await box(1),right=await box(3);
+    await page.keyboard.press('Shift+ArrowRight');await settle();
+    assert.deepEqual(await box(1),right,'keyboard swap moves the active identity');
+    assert.deepEqual(await box(3),first);
+    await page.keyboard.press('ArrowLeft');await settle();
+    assert.equal(await page.locator('.sidebar-pane.selected small').textContent(),'03');
+    const priorWidth=(await box(3)).width;
+    await page.keyboard.press('Alt+ArrowRight');await settle();
+    assert.ok((await box(3)).width>priorWidth,'keyboard resize changes the active split');
+    await page.keyboard.press('f');await settle();assert.equal(await page.locator('.pane:visible').count(),1);
+    await page.keyboard.press('Escape');await settle();assert.equal(await page.locator('.pane:visible').count(),4);
+    await page.keyboard.press('o');await settle();const floated=await box(3);
+    await page.keyboard.press('Shift+ArrowRight');await settle();assert.ok((await box(3)).x>floated.x);
+    await page.keyboard.press('o');await settle();
+    await page.keyboard.press('Escape');await settle();
+    assert.equal(await page.locator('#layout-mode').getAttribute('aria-pressed'),'false');
+    const inactive=await box(3);await page.keyboard.press('Shift+ArrowLeft');await settle();assert.deepEqual(await box(3),inactive,'layout shortcuts stay scoped to layout mode');
+    await page.locator('#layout-mode').click();await settle();assert.equal(await page.locator('#layout-mode').getAttribute('aria-pressed'),'true');
     assert.deepEqual(errors,[]);
-    console.log(`${suffix||'default'}: ${await page.locator('#renderer').textContent()}; drag, cancel, float, expand, resize, add/remove, viewport passed`);
+    console.log(`${suffix||'default'}: ${await page.locator('#renderer').textContent()}; pointer and keyboard layout scenarios passed`);
     await page.close();
   }
 } finally {await browser.close();}

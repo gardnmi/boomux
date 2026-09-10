@@ -1,4 +1,4 @@
-import {leaf,split,remove,insert,layout,dropAt} from './layout.js';
+import {leaf,split,remove,insert,layout,dropAt,neighbor,swap,ancestors} from './layout.js';
 import {createRenderer} from './renderer.js';
 const $=s=>document.querySelector(s), stage=$('#stage'), paneLayer=$('#panes');
 const templates=[
@@ -9,6 +9,7 @@ const templates=[
 ];
 let tree,panes=new Map(),floating=new Map(),active=1,next=5,expanded=null,drag=null,resize=null,drop=null;
 let targets=new Map(),shown=new Map(),tween=null,draw=null,frame=0,width=1,height=1;
+let layoutMode=false;
 const motion=$('#motion');motion.checked=!matchMedia('(prefers-reduced-motion: reduce)').matches;
 const clone=value=>structuredClone(value);
 function schedule(){if(!frame)frame=requestAnimationFrame(paint);}
@@ -90,8 +91,57 @@ function finish(cancel=false){
 }
 window.addEventListener('pointerup',e=>{if(drag?.lifted){drag.float=e.shiftKey;if(e.shiftKey)drop=null;}finish();});
 window.addEventListener('pointercancel',()=>finish(true));
-window.addEventListener('blur',()=>finish(true));
-window.addEventListener('keydown',e=>{if(e.key==='Escape'){if(drag||resize)finish(true);else{expanded=null;reflow();}}});
+window.addEventListener('blur',()=>{finish(true);setLayoutMode(false);});
+function setLayoutMode(enabled){
+  layoutMode=enabled;$('#layout-mode').setAttribute('aria-pressed',String(enabled));$('#keyboard-help').hidden=!enabled;
+  if(enabled)document.activeElement?.blur();
+}
+$('#layout-mode').onclick=()=>setLayoutMode(!layoutMode);
+window.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){
+    e.preventDefault();if(drag||resize)finish(true);else if(expanded){expanded=null;reflow();}else setLayoutMode(false);return;
+  }
+  if(e.target.closest('input,textarea,select,[contenteditable="true"]'))return;
+  if(e.ctrlKey&&e.code==='Space'&&!e.altKey&&!e.metaKey){e.preventDefault();if(!e.repeat)setLayoutMode(!layoutMode);return;}
+  if(!layoutMode||drag||resize||e.metaKey||e.ctrlKey)return;
+  const key=e.key.toLowerCase(),direction={arrowleft:'left',arrowright:'right',arrowup:'top',arrowdown:'bottom',h:'left',j:'bottom',k:'top',l:'right'}[key];
+  const path=ancestors(tree,active).reverse();
+  if(key==='tab'){
+    e.preventDefault();const ids=[...panes.keys()],i=ids.indexOf(active);active=ids[(i+(e.shiftKey?-1:1)+ids.length)%ids.length];if(expanded)expanded=active;reflow();return;
+  }
+  if(!panes.has(active))return;
+  // Desktop reserves unmodified J for rotating the nearest split.
+  if(direction&&!(key==='j'&&!e.shiftKey&&!e.altKey)){
+    e.preventDefault();
+    const horizontal=direction==='left'||direction==='right',positive=direction==='right'||direction==='bottom';
+    const axis=horizontal?'x':'y',sign=positive?1:-1;
+    if(e.altKey){
+      const step=e.shiftKey?48:key.startsWith('arrow')?24:8;
+      if(floating.has(active)){
+        const r=floating.get(active);if(e.shiftKey&&key.startsWith('arrow'))r[axis]=positive?(horizontal?width-r.w-8:height-r.h-8):8;
+        else {const size=horizontal?'w':'h';r[size]=Math.max(100,r[size]+sign*step);}
+      }else{
+        const matching=path.filter(p=>p.node.axis===axis);
+        const p=matching.find(p=>p.side===(positive?'a':'b'))||matching[0];
+        if(p){const d=layout(tree,bounds()).dividers.find(d=>d.node===p.node);p.node.ratio=Math.max(.15,Math.min(.85,p.node.ratio+sign*step/(horizontal?d.parent.w:d.parent.h)));}
+      }
+    }else if(e.shiftKey&&floating.has(active)){
+      floating.get(active)[axis]+=sign*32;
+    }else{
+      const rects=layout(tree,bounds()).panes;if(!e.shiftKey)for(const [id,r]of floating)rects.set(id,r);
+      const other=neighbor(rects,active,direction);
+      if(other!==null){if(e.shiftKey)tree=swap(tree,active,other);else active=other;}
+    }
+    if(expanded)expanded=active;reflow();return;
+  }
+  if(e.altKey||e.shiftKey)return;
+  if(['s','j','e','r'].includes(key)){
+    e.preventDefault();const parent=path[0]?.node;
+    if(parent){if(key==='s'||key==='j')parent.axis=parent.axis==='x'?'y':'x';if(key==='e')parent.ratio=.5;if(key==='r')[parent.a,parent.b]=[parent.b,parent.a];reflow();}return;
+  }
+  const action={o:'float',f:'expand'}[key];
+  if(action){e.preventDefault();panes.get(active).el.querySelector(`[data-action="${action}"]`).click();}
+});
 function paint(now){
   frame=0;const t=tween?Math.min(1,(now-tween.start)/180):1,ease=1-(1-t)**3,rects=[];
   const surface=(r,color)=>rects.push({...r,color});

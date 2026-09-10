@@ -25,6 +25,26 @@ based on the [official samples](https://webgpu.github.io/webgpu-samples/).
 - Escape cancels a drag/resize or exits expansion.
 - Add panes (up to 24), remove them, reset, or turn motion off.
 
+Click **Layout mode** or press **Ctrl+Space** to enable keyboard arrangement.
+The visible guide indicates when shortcuts are active:
+
+| Shortcut | Action in layout mode |
+| --- | --- |
+| Arrows, H/K/L | Focus a neighbor (Down focuses below) |
+| Shift+arrows or Shift+H/J/K/L | Swap with a neighboring tile; move floating panes |
+| Alt+arrows | Resize by 24 pixels |
+| Alt+H/J/K/L / Alt+Shift+H/J/K/L | Resize by 8 / 48 pixels |
+| Alt+Shift+arrows | Align a floating pane to the canvas edge |
+| Tab / Shift+Tab | Cycle selected pane |
+| S or J | Rotate the nearest split |
+| E / R | Equalize / swap the nearest split |
+| O / F | Toggle floating / expansion |
+| Escape | Cancel a gesture, restore expansion, or leave layout mode |
+
+These follow Desktop's basic layout bindings. The prototype uses a toggle only;
+Desktop's hold-to-enter and double-tap terminal forwarding are not implemented.
+If the OS intercepts Ctrl+Space, use the button. Form inputs retain their keys.
+
 The prototype intentionally keeps everything in memory. Reload resets the
 layout. Floating panes move but do not yet have independent resize handles.
 It does not implement terminal input, Desktop's full keyboard layout mode,
@@ -54,7 +74,8 @@ fallback. Set `CHROMIUM` if Chromium is installed elsewhere. Omit `HEADED` and
 `REQUIRE_WEBGPU` for headless interaction checks, where the adapter may be
 unavailable. This does not change the user's browser configuration.
 
-Validated locally: three model tests and browser scenarios for moving, canceling,
+Validated locally: four model tests and browser scenarios for moving, canceling,
 floating/retiling, double-click expansion, divider resizing, adding/removing,
-and viewport resize, in both WebGPU and Canvas modes. This is interaction and
+viewport resize, and keyboard mode, focus, swaps, resizing, floating movement,
+expansion, and exit scoping, in both WebGPU and Canvas modes. This is interaction and
 rendering-path evidence, not a frame-time or GPU performance benchmark.
