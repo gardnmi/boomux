@@ -24,7 +24,7 @@ with runtime, configuration, and state directories under `target/webgpu-poc/`.
 Both modes build the debug gateway and CLI; `CARGO_TARGET_DIR` is supported.
 Use Bun 1.3.14 or later for asset installation.
 
-Choose a local Workspace in the dropdown, then click a Shell in the sidebar to
+Choose a local Workspace in the sidebar to reveal its Shells, then click a Shell to
 attach. **New Shell** creates a daemon-owned Bash Shell in the Workspace's default
 working directory; its minimal prompt shows the path. **Refresh Shells** updates
 the listing. A Shell without a current run must first be started through Boomux.

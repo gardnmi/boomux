@@ -61,15 +61,51 @@ function showError(error){
   $('#gateway-status').textContent=message;$('#gateway-status').hidden=false;
 }
 function currentWorkspace(){return daemon?.snapshot.workspaces.find(w=>w.id===workspaceId);}
+function sidebarMenu(label,actions){
+  const menu=document.createElement('details');menu.className='sidebar-menu';
+  const toggle=document.createElement('summary');toggle.textContent='⋮';toggle.setAttribute('aria-label',label);menu.append(toggle);
+  const items=document.createElement('div');items.className='sidebar-menu-items';
+  for(const [name,action]of actions){const button=document.createElement('button');button.textContent=name;button.onclick=()=>{menu.open=false;Promise.resolve().then(action).catch(showError);};items.append(button);}
+  menu.append(items);return menu;
+}
+function selectWorkspace(id){
+  if(id===workspaceId)return;
+  loading=true;for(const p of panes.values())p.terminal.dispose();panes.clear();shown.clear();paneLayer.replaceChildren();floating.clear();tree=null;
+  expanded=null;drag=null;resize=null;drop=null;active=null;workspaceId=id;
+  for(const shell of currentWorkspace()?.shells.filter(s=>s.run).slice(0,4)||[])openShell(shell);
+  loading=false;reflow();
+}
 function syncDaemonSidebar(){
-  const workspace=currentWorkspace();
-  for(const shell of workspace?.shells||[]){
-    const entry=[...panes].find(([,p])=>p.shell?.id===shell.id);
-    const button=document.createElement('button');button.className='sidebar-pane'+(entry?.[0]===active?' selected':'');
-    button.innerHTML=`<span>▣</span> ${escapeHtml(shell.name)}<small>${entry?'open':shell.status==='running'?'running':'ended'}</small>`;
-    button.title=shell.cwd;button.disabled=!shell.run;
-    button.onclick=()=>openShell(shell);
-    $('#pane-list').append(button);
+  const list=$('#workspace-list');list.replaceChildren();
+  $('.section-label span').textContent=String(daemon.snapshot.workspaces.length).padStart(2,'0');
+  for(const workspace of [...daemon.snapshot.workspaces].sort((a,b)=>a.name.localeCompare(b.name))){
+    const selected=workspace.id===workspaceId;
+    const agents=(workspace.agents||[]).filter(agent=>agent.attention||
+      (workspace.shells.some(shell=>shell.id===agent.shell_id&&shell.run?.id===agent.run_id)&&!['inactive','done'].includes(agent.observation.state))).length;
+    const group=document.createElement('section');group.className='workspace-group'+(selected?' current':'');group.dataset.workspaceId=workspace.id;
+    const heading=document.createElement('div');heading.className='workspace-heading';
+    const button=document.createElement('button');button.className='workspace-button';button.setAttribute('aria-expanded',String(selected));
+    button.innerHTML=`<span class="workspace-icon" aria-hidden="true"></span><span class="sidebar-text"><strong>${escapeHtml(workspace.name)}</strong><small>${workspace.shells.length} ${workspace.shells.length===1?'shell':'shells'} · ${agents} ${agents===1?'agent':'agents'}</small></span>`;
+    button.onclick=()=>selectWorkspace(workspace.id);heading.append(button);
+    heading.append(sidebarMenu(`Actions for ${workspace.name}`, [['New Shell',()=>{selectWorkspace(workspace.id);return createDaemonShell();}],['Refresh Shells',refreshDaemon]]));group.append(heading);
+    if(selected){
+      const children=document.createElement('div');children.className='workspace-shells';
+      for(const shell of workspace.shells){
+        const entry=[...panes].find(([,p])=>p.shell?.id===shell.id&&p.shell.run?.id===shell.run?.id);
+        const row=document.createElement('div');row.className='shell-row'+(entry?.[0]===active?' selected':'');
+        const item=document.createElement('button');item.className='shell-button';item.disabled=!shell.run;item.title=shell.cwd;
+        item.innerHTML=`<span class="shell-dot ${shell.status==='running'?'running':'ended'}" aria-hidden="true"></span><span class="sidebar-text"><strong>${escapeHtml(shell.name)}</strong><small>${entry?'open':'detached'} · ${escapeHtml(shell.status)}</small></span>`;
+        item.onclick=()=>openShell(shell);row.append(item);
+        const actions=[];
+        if(shell.run)actions.push(['Open Shell',()=>openShell(shell)]);
+        if(entry)actions.push(['Detach pane',()=>entry[1].el.querySelector('[data-action="close"]').click()]);
+        actions.push(['Copy working directory',()=>navigator.clipboard.writeText(shell.cwd)]);
+        row.append(sidebarMenu(`Actions for ${shell.name}`,actions));children.append(row);
+      }
+      if(!workspace.shells.length){const empty=document.createElement('p');empty.className='sidebar-empty';empty.textContent='No Shells yet';children.append(empty);}
+      group.append(children);
+    }
+    list.append(group);
   }
   for(const [id,p]of panes)p.el.setAttribute('aria-label',`${p.name} pane ${id}${id===active?', selected':''}`);
 }
@@ -104,7 +140,7 @@ async function refreshDaemon(){
   const response=await fetch('/api/snapshot'),info=await response.json();
   if(!response.ok)throw Error(info.error||'Daemon unavailable');
   if(info.node_id!==daemon.node_id)throw Error('Owning Node changed; reopen the gateway explicitly.');
-  daemon=info;renderWorkspaceSelector();syncSidebar();
+  daemon=info;syncSidebar();
 }
 async function createDaemonShell(){
   if(creating||panes.size>=24)return;creating=true;syncSidebar();
@@ -139,16 +175,11 @@ function readLayout(){
     return seen.size===ids.size?saved:null;
   }catch{return null;}
 }
-function renderWorkspaceSelector(){
-  const select=$('#workspace-select');select.replaceChildren();
-  for(const workspace of daemon.snapshot.workspaces){const option=document.createElement('option');option.value=workspace.id;option.textContent=workspace.name;select.append(option);}
-  select.value=workspaceId;
-}
 async function initializeDaemon(info){
   daemon=info;const saved=readLayout();workspaceId=saved?.workspace_id||info.workspace_id;
-  $('#workspace-select').hidden=false;$('.workspace').hidden=true;renderWorkspaceSelector();
+  document.body.classList.add('daemon-mode');$('.workspace').hidden=true;$('#workspace-list').hidden=false;
   $('#reset').textContent='Refresh Shells';$('#add').textContent='+ New Shell';
-  $('.sidebar-copy').textContent='Daemon-owned Shells';$('.sidebar-bottom').textContent='Connected to Boomux · local Node';
+  $('.sidebar-copy').hidden=true;$('.sidebar-bottom').textContent='Connected to Boomux · local Node';
   $('#empty').innerHTML='No open panes.<br><small>Open a Shell from the sidebar or create one.</small>';
   const workspace=currentWorkspace();if(!workspace)throw Error('Workspace no longer exists. Select another Workspace.');
   if(saved){
@@ -163,11 +194,7 @@ async function initializeDaemon(info){
   }
   loading=false;reflow();
   if(!saved&&!workspace.shells.length)await createDaemonShell();
-  $('#workspace-select').onchange=()=>{
-    loading=true;for(const p of panes.values())p.terminal.dispose();panes.clear();shown.clear();paneLayer.replaceChildren();floating.clear();tree=null;
-    expanded=null;drag=null;resize=null;active=null;workspaceId=$('#workspace-select').value;for(const shell of currentWorkspace()?.shells.filter(s=>s.run).slice(0,4)||[])openShell(shell);
-    loading=false;reflow();
-  };
+
 }
 function reflow(animate=true){
   const result=layout(tree,bounds());targets=result.panes;

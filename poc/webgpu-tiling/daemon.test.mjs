@@ -27,7 +27,7 @@ try{
     ws.on('framereceived',({payload})=>{if(typeof payload==='string')stream.messages.push(JSON.parse(payload));else stream.output=(stream.output+payload.toString()).slice(-200000);});
     ws.on('framesent',({payload})=>{if(typeof payload!=='string')stream.input.push(payload.toString());});
   });
-  await page.goto(base);await page.waitForSelector('#workspace-select');
+  await page.goto(base);await page.waitForSelector('#workspace-list');
   assert.equal(await page.locator('.pane').count(),0);
   await page.locator('#add').click();await page.waitForSelector('.pane-body[data-connected="true"]');
   let body=page.locator('.pane-body').first();const shell=await body.getAttribute('data-shell-id'),run=await body.getAttribute('data-run-id');created.push(shell);
