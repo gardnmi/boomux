@@ -353,7 +353,9 @@ See [`docs/ci.md`](docs/ci.md) for the full selection and evidence contract.
 
 Use a GitHub prerelease to distribute a tested development build before the
 feature joins the stable release. Previews are manually published, not nightly.
-The initial publisher supports the macOS Apple Silicon ZIP.
+The initial publisher supports the macOS Apple Silicon ZIP. The publishing
+workflow can live on `main` while the Mac build workflow and application port
+remain on `feature/macos`; publishing does not require merging that port.
 
 After both general CI for the source revision and the `macOS preview` workflow
 pass, run **Actions → Publish development preview → Run workflow**, supplying the
