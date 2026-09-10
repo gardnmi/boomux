@@ -1,0 +1,64 @@
+name: Publish development preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful macOS preview run ID to publish (no rebuild)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: development-preview-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Verify development candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify source run and downloaded bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_RUN_ID: ${{ inputs.run_id }}
+        run: python3 .github/scripts/development-release.py prepare "$PREVIEW_RUN_ID" prepared
+      - name: Show publication details
+        run: cat prepared/release-notes.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-development-preview
+          path: prepared/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub prerelease
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified-development-preview
+          path: prepared
+      - name: Revalidate and publish exact candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          python3 .github/scripts/development-release.py publish "$PREVIEW_RUN_ID" prepared > preview-url.txt
+          cat preview-url.txt >> "$GITHUB_STEP_SUMMARY"

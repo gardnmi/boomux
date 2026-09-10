@@ -335,15 +335,34 @@ title becomes the squash commit consumed by Release Please.
 ## Release Lifecycle
 
 After CI succeeds for the exact current `main` commit, Release Please creates or
-updates the release pull request. Merging that pull request updates the package
-version and changelog. CI builds and smoke tests x86_64 and aarch64 artifacts
-for that exact commit. When only release metadata changed and the base has
-successful push CI, it reuses that validation instead of rerunning the test
-suites. The release workflow downloads the exact CI artifacts, checks their
-source metadata and checksums, validates consumer compatibility, renders the
-installer, and publishes the completed release. Manual tag dispatch is reserved
-for explicit recovery, including rebuilding when the CI artifacts have expired.
-See [`docs/ci.md`](docs/ci.md) for the stage-by-stage contract.
+updates the release pull request. For strict version-only PRs, CI checks shared
+version metadata and verifies reusable component evidence from successful main
+runs; it defers artifact builds until merge. Missing evidence or mixed source
+changes select full validation. A Desktop-only main run can inherit unchanged
+backend evidence from an earlier main run.
+
+Merging the release PR updates the version and changelog. CI builds and smoke
+tests x86_64 and aarch64 artifacts and the Desktop bundle for that exact commit.
+It reuses proven correctness checks. The release workflow downloads those exact
+artifacts, verifies source metadata and checksums, checks consumer compatibility,
+renders installers, and publishes. Packaging failures after merge block
+publication. Manual tag dispatch remains reserved for explicit recovery.
+See [`docs/ci.md`](docs/ci.md) for the full selection and evidence contract.
+
+### Development previews
+
+Use a GitHub prerelease to distribute a tested development build before the
+feature joins the stable release. Previews are manually published, not nightly.
+The initial publisher supports the macOS Apple Silicon ZIP.
+
+After both general CI for the source revision and the `macOS preview` workflow
+pass, run **Actions → Publish development preview → Run workflow**, supplying the
+Mac build run ID. This entry becomes available after the workflow is merged to
+the default branch. It promotes the exact tested bytes without rebuilding, uses
+a unique `preview-macos-YYYYMMDD.<run-id>` tag, and keeps stable updates unchanged.
+The release contains requirements, testing instructions, checksums, and source
+information. New previews use new tags; retries cannot replace published bytes.
+
 
 ## Clean Up
 
