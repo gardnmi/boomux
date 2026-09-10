@@ -185,13 +185,23 @@ async fn attach_exact(
                     "Node identity changed",
                 )));
             }
-            let result = client.attach_exact_run_with_timeout(
-                grant.shell_id,
-                grant.run_id,
-                grant.takeover,
-                grant.profile,
-                ATTACH_TIMEOUT,
-            );
+            let result = if let Some(identity) = crate::remote::identity(&grant.shell_id) {
+                client.attach_node(
+                    identity,
+                    grant.takeover,
+                    false,
+                    Some(grant.run_id),
+                    grant.profile,
+                )
+            } else {
+                client.attach_exact_run_with_timeout(
+                    grant.shell_id,
+                    grant.run_id,
+                    grant.takeover,
+                    grant.profile,
+                    ATTACH_TIMEOUT,
+                )
+            };
             if attempt_cancellation.load(Ordering::Acquire) {
                 return match result {
                     Ok(mut attachment) => {

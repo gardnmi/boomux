@@ -2,6 +2,10 @@
 //! explicitly selected Boomux runtime; this executable never starts a daemon.
 #[path = "../poc/webgpu-tiling/daemon_bridge.rs"]
 mod daemon_bridge;
+// Reuse Desktop's qualified resource IDs and owner-routed operations.
+#[allow(dead_code)]
+#[path = "../desktop/src/remote.rs"]
+mod remote;
 
 use axum::{
     Json, Router,
@@ -85,11 +89,60 @@ async fn guard(State(app): State<App>, req: Request, next: Next) -> Response {
     response.headers_mut().insert("content-security-policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'".parse().unwrap());
     response
 }
+fn remote_workspaces(node: &boomux::protocol::CombinedNode) -> Vec<Value> {
+    let Some(projection) = &node.remote_projection else {
+        return vec![];
+    };
+    let mut shells = HashMap::<&str, Vec<Value>>::new();
+    let mut agents = HashMap::<&str, Vec<Value>>::new();
+    for shell in &projection.shells {
+        shells.entry(&shell.workspace_id).or_default().push(json!({
+            "id":remote::key(&node.node_id,&shell.id),
+            "workspace_id":remote::key(&node.node_id,&shell.workspace_id),
+            "name":shell.name,"cwd":null,
+            "status":shell.status,"run":shell.run_id.as_ref().map(|id|json!({"id":id})),
+        }));
+    }
+    for agent in &projection.agents {
+        agents.entry(&agent.workspace_id).or_default().push(json!({
+            "id":remote::key(&node.node_id,&agent.id),
+            "shell_id":remote::key(&node.node_id,&agent.shell_id),
+            "run_id":agent.run_id,"observation":{"state":agent.state},"attention":agent.attention,
+        }));
+    }
+    projection
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            json!({
+                "id":remote::key(&node.node_id,&workspace.id),"name":workspace.name,
+                "remote":{"node_id":node.node_id,"alias":node.alias,"health":node.health,
+                    "stale":node.stale,"current":node.current},
+                "shells":shells.remove(workspace.id.as_str()).unwrap_or_default(),
+                "agents":agents.remove(workspace.id.as_str()).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
 async fn snapshot(State(app): State<App>) -> ApiResult {
     operation(app, |app| {
+        let mut snapshot = serde_json::to_value(app.client.snapshot().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let warning = match app.client.combined_node_snapshot(None) {
+            Ok(combined) => {
+                let workspaces = snapshot["workspaces"]
+                    .as_array_mut()
+                    .ok_or("Invalid local snapshot")?;
+                for node in combined.nodes.iter().filter(|node| !node.local) {
+                    workspaces.extend(remote_workspaces(node));
+                }
+                None
+            }
+            Err(error) => Some(format!("Remote discovery unavailable: {error}")),
+        };
         Ok(
             json!({"mode":"daemon","node_id":app.node_id,"workspace_id":app.workspace_id,
-        "snapshot":app.client.snapshot().map_err(|e|e.to_string())?}),
+            "snapshot":snapshot,"warning":warning}),
         )
     })
     .await
@@ -132,6 +185,30 @@ async fn create_shell(State(app): State<App>, Json(request): Json<CreateShell>) 
         if request.node_id != app.node_id {
             return Err("Wrong owning Node".into());
         }
+        if remote::identity(&request.workspace_id).is_some() {
+            let workspace =
+                remote::workspace(&app.client, &request.workspace_id).map_err(|e| e.to_string())?;
+            if workspace.shells.len() >= 64 {
+                return Err("PoC limit: 64 Shells per Workspace".into());
+            }
+            let shell = remote::create_shell(&app.client, &request.workspace_id)?;
+            let identity = remote::identity(&shell.id).ok_or("Remote Shell identity missing")?;
+            // This is the newly created Shell, never an existing user run.
+            drop(
+                app.client
+                    .attach_node(
+                        identity.clone(),
+                        false,
+                        false,
+                        shell.run.as_ref().map(|r| r.id.clone()),
+                        profile(24, 80),
+                    )
+                    .map_err(|e| e.to_string())?,
+            );
+            let mut shell = remote::shell(&app.client, &shell.id).map_err(|e| e.to_string())?;
+            remote::qualify_shell(&identity.node_id, &mut shell);
+            return Ok(json!({"node_id":app.node_id,"shell":shell}));
+        }
         let workspace = app
             .client
             .get_workspace(&request.workspace_id)
@@ -173,10 +250,7 @@ async fn grant(State(app): State<App>, Json(request): Json<Attach>) -> ApiResult
         if !(1..=200).contains(&request.rows) || !(2..=500).contains(&request.cols) {
             return Err("Invalid grid dimensions".into());
         }
-        let shell = app
-            .client
-            .get_shell(&request.shell_id)
-            .map_err(|e| e.to_string())?;
+        let shell = remote::shell(&app.client, &request.shell_id).map_err(|e| e.to_string())?;
         if shell.run.as_ref().map(|r| r.id.as_str()) != Some(&request.run_id) {
             return Err("ShellRun changed; select its current run explicitly".into());
         }
@@ -333,4 +407,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Daemon-backed WebGPU playground: {origin}");
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_projection_retains_owner_run_and_staleness() {
+        let mut node: boomux::protocol::CombinedNode = serde_json::from_value(json!({
+            "node_id":"owner-a","alias":"remote","local":false,"health":"unreachable",
+            "current":false,"stale":true,"observed_at_ms":0,
+            "remote_projection":{"node_id":"owner-a",
+                "workspaces":[{"id":"workspace","name":"same name","item_count":1,"attention_count":0}],
+                "shells":[{"id":"shell","workspace_id":"workspace","name":"shell","status":"running","run_id":"exact-run"}],
+                "agents":[],"launchers":[]}
+        })).unwrap();
+        let first = remote_workspaces(&node).remove(0);
+        assert_eq!(first["id"], "remote:owner-a:workspace");
+        assert_eq!(first["shells"][0]["id"], "remote:owner-a:shell");
+        assert_eq!(first["shells"][0]["run"]["id"], "exact-run");
+        assert_eq!(first["remote"]["stale"], true);
+        node.node_id = "owner-b".into();
+        let second = remote_workspaces(&node).remove(0);
+        assert_ne!(first["id"], second["id"]);
+        assert_ne!(first["shells"][0]["id"], second["shells"][0]["id"]);
+        node.remote_projection = None;
+        assert!(remote_workspaces(&node).is_empty());
+    }
 }

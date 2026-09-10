@@ -24,7 +24,7 @@ with runtime, configuration, and state directories under `target/webgpu-poc/`.
 Both modes build the debug gateway and CLI; `CARGO_TARGET_DIR` is supported.
 Use Bun 1.3.14 or later for asset installation.
 
-Choose a local Workspace in the sidebar to reveal its Shells, then click a Shell to
+Choose a Workspace in the sidebar to reveal its Shells, then click a Shell to
 attach. **New Shell** creates a daemon-owned Bash Shell in the Workspace's default
 working directory; its minimal prompt shows the path. **Refresh Shells** updates
 the listing. A Shell without a current run must first be started through Boomux.
@@ -47,8 +47,12 @@ at 24, pending grants at 64, and concurrent API operations at 8. Transport queue
 frames, and write buffers are bounded; stalled connections detach without killing
 Shells. Terminal grids are limited to 500 columns by 200 rows. No terminal output
 or attachment environments are saved in browser storage. This is a local-use PoC,
-not a remote-access service. It currently exposes local Workspaces and Shells;
-federation, Agent projections, and full Desktop lifecycle controls are not included.
+not a remote-access service. It exposes local and registered remote Node Workspaces and Shells. Remote rows
+show the owning Node and connection health; cached rows remain visible when stale.
+Attachments revalidate the exact ShellRun on the owner, and remote creation uses
+the owner's login shell and directory. Discovery failures retain local Workspaces
+and show a warning. Full coordinated Workspace placement controls and Desktop
+lifecycle controls are not included.
 
 No asset build is required. The footer reports whether WebGPU initialized;
 `?fallback` exercises Canvas 2D pane rendering. WebGPU API use is based on the
