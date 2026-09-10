@@ -131,6 +131,10 @@ terminal bytes are never discarded because doing so could corrupt escape or
 Kitty graphics sequences. A producer clones the queue sender under its mutex,
 then releases the mutex before waiting for capacity. Queue saturation must not
 prevent GPUI from accessing the sender or cancelling a discarded pane.
+Pane focus notifications use a single pending flag and a nonblocking wake marker.
+The terminal worker sends the notification, including between replay chunks;
+click and hover handlers never acquire the attachment writer or write a focus
+frame themselves. Repeated focus requests coalesce while the queue is full.
 
 Discarding a pane cancels its local replay and disconnects the queue sender;
 it does not enqueue a blocking stop command. The worker checks cancellation
