@@ -715,3 +715,59 @@ pub fn remove_stale_executable_pins(root: &std::path::Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Darwin exposes SO_ACCEPTCONN through proc_pidfdinfo, not getsockopt.
+/// The public proc_info.h prefix is sufficient; reserve bounded space for its
+/// trailing protocol union and reject short/incompatible replies.
+pub fn validate_listener(fd: BorrowedFd<'_>) -> io::Result<()> {
+    #[repr(C)]
+    struct FileInfo {
+        open_flags: u32,
+        status: u32,
+        offset: i64,
+        kind: i32,
+        guard_flags: u32,
+    }
+    #[repr(C)]
+    struct SocketPrefix {
+        file: FileInfo,
+        stat: libc::vinfo_stat,
+        socket: u64,
+        pcb: u64,
+        kind: i32,
+        protocol: i32,
+        family: i32,
+        options: i16,
+        linger: i16,
+    }
+    #[repr(C)]
+    struct Buffer {
+        prefix: SocketPrefix,
+        remaining: [u64; 256],
+    }
+    let mut buffer = MaybeUninit::<Buffer>::zeroed();
+    let count = unsafe {
+        libc::proc_pidfdinfo(
+            libc::getpid(),
+            fd.as_raw_fd(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            size_of::<Buffer>() as i32,
+        )
+    };
+    if count < size_of::<SocketPrefix>() as i32 {
+        return Err(io::Error::other(
+            "cannot inspect transferred listener state",
+        ));
+    }
+    let buffer = unsafe { buffer.assume_init() };
+    if buffer.prefix.kind != libc::SOCK_STREAM
+        || buffer.prefix.family != libc::AF_UNIX
+        || i32::from(buffer.prefix.options) & libc::SO_ACCEPTCONN == 0
+    {
+        return Err(io::Error::other(
+            "transferred descriptor is not a Unix listener",
+        ));
+    }
+    Ok(())
+}

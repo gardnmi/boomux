@@ -39,6 +39,14 @@ file. The exact command argv, cwd, and ephemeral startup environment travel over
 an owner-verified, bounded Unix socket request. Command arguments are never
 converted into shell source and environments are never written to disk.
 
+Darwin lacks `PR_SET_PDEATHSIG`. A Kiro launch therefore uses one small helper
+process that inherits the terminal descriptors and exact command environment.
+It watches the originating launcher and the actual child with one kqueue,
+terminates and reaps its unreaped child if the launcher dies, and otherwise
+returns the child's status. This works independently of the daemon. The helper
+has no polling loop, PTY, terminal model, or output forwarding queue; its cost is
+one process and one kqueue per Kiro launch, not per Shell or attachment.
+
 Desktop keeps GPUI and Ghostty, uses a macOS filesystem watcher and system Menlo
 font, and bundles a matching CLI. The preview requires macOS 15+, starts on
 Apple Silicon, and uses ad-hoc signing. Notarization, official release assets,

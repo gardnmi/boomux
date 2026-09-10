@@ -124,6 +124,9 @@ impl TestDaemon {
         remove_boomux_shim_environment(&mut command);
         configure(&mut command, &runtime_dir);
         let child = command.spawn().unwrap();
+        if std::env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+            eprintln!("BOOMUX_TEST_DAEMON_PID={}", child.id());
+        }
         let client = Client::from_socket_path(runtime_dir.join("boomux/daemon.sock"));
         wait_until(|| client.ping().is_ok(), "daemon did not accept requests");
         Self {
@@ -176,12 +179,18 @@ impl TestDaemon {
     }
 
     pub(crate) fn stop_with_cli(&mut self) {
+        if std::env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+            eprintln!("BOOMUX_TEST_STOP_BEGIN");
+        }
         let output = self.command().args(["daemon", "stop"]).output().unwrap();
         assert!(
             output.status.success(),
             "daemon stop failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if std::env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+            eprintln!("BOOMUX_TEST_STOP_RETURNED");
+        }
         assert!(String::from_utf8_lossy(&output.stdout).contains("Stopped Boomux daemon"));
         let mut child = self.child.take().unwrap();
         wait_until(

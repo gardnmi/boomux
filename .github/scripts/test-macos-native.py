@@ -1,11 +1,13 @@
 """Run each selected native scenario with a process-group deadline and durable logs."""
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
 
 SCENARIOS = [
+    "macos_parent_guard_reaps_exact_child_without_daemon",
     "replacement_bootstrap_receives_listener_and_lock_ownership",
     "native_daemon_handoffs_multiple_detached_shells",
     "daemon_bounds_stalled_connections_and_recovers_capacity",
@@ -31,6 +33,13 @@ def main():
             try:
                 code = process.wait(timeout=90)
             except subprocess.TimeoutExpired:
+                pids = re.findall(r"BOOMUX_TEST_DAEMON_PID=(\d+)", path.read_text())
+                for pid in pids[-2:]:
+                    try:
+                        subprocess.run(["/usr/bin/sample", pid, "1", "1", "-file", str(output / f"{scenario}-{pid}.sample")],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
                 code = 124

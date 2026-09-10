@@ -457,26 +457,31 @@ fn adopt_channel(channel: RawFd) -> io::Result<UnixStream> {
 }
 
 fn validate_listener(listener: &UnixListener) -> io::Result<()> {
-    let mut accepting = 0_i32;
-    let mut length = std::mem::size_of_val(&accepting) as libc::socklen_t;
-    // The output pointer and length describe a writable integer.
-    if unsafe {
-        libc::getsockopt(
-            listener.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_ACCEPTCONN,
-            (&mut accepting as *mut i32).cast(),
-            &mut length,
-        )
-    } == -1
+    #[cfg(target_os = "macos")]
+    crate::platform::validate_listener(std::os::fd::AsFd::as_fd(listener))?;
+    #[cfg(target_os = "linux")]
     {
-        return Err(io::Error::last_os_error());
-    }
-    if accepting != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "transferred descriptor is not a listening socket",
-        ));
+        let mut accepting = 0_i32;
+        let mut length = std::mem::size_of_val(&accepting) as libc::socklen_t;
+        // The output pointer and length describe a writable integer.
+        if unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                (&mut accepting as *mut i32).cast(),
+                &mut length,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if accepting != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transferred descriptor is not a listening socket",
+            ));
+        }
     }
     let flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) };
     if flags == -1
