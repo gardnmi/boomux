@@ -33,8 +33,12 @@ def main():
             try:
                 code = process.wait(timeout=90)
             except subprocess.TimeoutExpired:
+                snapshot = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,pgid=,state=,wchan=,comm="],
+                                          capture_output=True, text=True, timeout=5)
+                (output / f"{scenario}.processes").write_text(snapshot.stdout)
                 pids = re.findall(r"BOOMUX_TEST_DAEMON_PID=(\d+)", path.read_text())
-                for pid in pids[-2:]:
+                pids.extend(re.findall(r"BOOMUX_TEST_CHILD_WAIT pid=Some\((\d+)\)", path.read_text()))
+                for pid in pids[-3:]:
                     try:
                         subprocess.run(["/usr/bin/sample", pid, "1", "1", "-file", str(output / f"{scenario}-{pid}.sample")],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)

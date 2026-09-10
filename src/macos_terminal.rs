@@ -21,6 +21,16 @@ struct Launch {
     cwd: Option<Vec<u8>>,
     environment: Vec<(Vec<u8>, Vec<u8>)>,
 }
+struct Opener(std::process::Child);
+impl Drop for Opener {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
 struct Files {
     socket: PathBuf,
     script: PathBuf,
@@ -77,16 +87,18 @@ pub fn launch(program: &OsStr, args: &[OsString], cwd: Option<&Path>) -> io::Res
             "terminal startup environment exceeds bound",
         ));
     }
-    let mut opener = Command::new("/usr/bin/open")
-        .args(["-a", "Terminal"])
-        .arg(&files.script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut opener = Opener(
+        Command::new("/usr/bin/open")
+            .args(["-a", "Terminal"])
+            .arg(&files.script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(status) = opener.try_wait()?
+        if let Some(status) = opener.0.try_wait()?
             && !status.success()
         {
             return Err(io::Error::other("Terminal.app could not be opened"));
@@ -106,8 +118,6 @@ pub fn launch(program: &OsStr, args: &[OsString], cwd: Option<&Path>) -> io::Res
             Err(e) => return Err(e),
         }
         if Instant::now() >= deadline {
-            let _ = opener.kill();
-            let _ = opener.wait();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "Terminal.app did not connect",

@@ -349,17 +349,29 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Enter",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Enter"
+        } else {
+            "Ctrl + Enter"
+        },
         description: "Create a Shell in the focused terminal's Workspace",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + W",
+        keys: if cfg!(target_os = "macos") {
+            "Command + W"
+        } else {
+            "Ctrl + W"
+        },
         description: "Minimize and detach; preserve its Boomux Shell",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Shift + W",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Shift + W"
+        } else {
+            "Ctrl + Shift + W"
+        },
         description: "Permanently remove the selected Shell",
     },
     ShortcutSpec {
@@ -424,7 +436,11 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Terminal,
-        keys: "Ctrl + Shift + C / V",
+        keys: if cfg!(target_os = "macos") {
+            "Command + C / V"
+        } else {
+            "Ctrl + Shift + C / V"
+        },
         description: "Copy selection or paste clipboard",
     },
     ShortcutSpec {
@@ -474,12 +490,20 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Sidebar,
-        keys: "Ctrl + Enter",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Enter"
+        } else {
+            "Ctrl + Enter"
+        },
         description: "Create a Shell in the selected row's Workspace",
     },
     ShortcutSpec {
         section: ShortcutSection::Sidebar,
-        keys: "Ctrl + Shift + Up / Down",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Shift + Up / Down"
+        } else {
+            "Ctrl + Shift + Up / Down"
+        },
         description: "Move the selected Workspace",
     },
     ShortcutSpec {
@@ -10327,8 +10351,6 @@ fn main() {
             KeyBinding::new("cmd-c", CopySelection, Some("Terminal")),
             KeyBinding::new("cmd-v", PasteClipboard, Some("Terminal")),
             KeyBinding::new("cmd-v", PasteClipboard, Some("BoomuxSettingsInput")),
-            KeyBinding::new("cmd-w", ClosePane, Some("Terminal")),
-            KeyBinding::new("cmd-enter", NewPane, Some("Terminal")),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         #[cfg(target_os = "macos")]

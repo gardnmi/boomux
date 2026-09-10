@@ -6948,6 +6948,12 @@ impl ShellRuntimeManager {
             if let Some(session_id) = child_pid {
                 signal_session(session_id, libc::SIGKILL);
             }
+            if env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "BOOMUX_TEST_CHILD_WAIT pid={child_pid:?} kill={kill_result:?} status={:?}",
+                    process.try_wait_code()
+                );
+            }
             let wait_result = if exited { Ok(()) } else { process.wait() };
             match (kill_result, wait_result) {
                 (_, Ok(())) => Ok(()),
