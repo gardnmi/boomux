@@ -27,6 +27,20 @@ impl PointerGuard {
     }
 }
 
+// Reuse is restricted to the same owner-scoped Shell and exact running instance.
+fn same_running_shell(current: Option<&ShellChoice>, target: Option<&ShellChoice>) -> bool {
+    match (current, target) {
+        (Some(current), Some(target)) => {
+            matches!(current.status, boomux::protocol::ShellStatus::Running)
+                && matches!(target.status, boomux::protocol::ShellStatus::Running)
+                && current.id == target.id
+                && current.run_id.is_some()
+                && current.run_id == target.run_id
+        }
+        _ => false,
+    }
+}
+
 fn encode_tree(node: &Node) -> Tree {
     match node {
         Node::Pane(id) => Tree::Pane(*id as u64),
@@ -282,6 +296,52 @@ impl Workspace {
     ) {
         self.layout_restoring = true;
         self.restore_pointer_guard = PointerGuard::Waiting;
+        // A quick return can find this Workspace still sliding out. Preserve
+        // those sessions, screens, and pane IDs before finishing the old slide;
+        // detaching and immediately reattaching races the owner's controller.
+        let mut reusable = HashMap::new();
+        if direction.is_some() {
+            let outgoing = self
+                .workspace_transition
+                .as_ref()
+                .map(|transition| {
+                    transition
+                        .outgoing
+                        .iter()
+                        .filter_map(|outgoing| {
+                            self.terminals
+                                .get(&outgoing.id)
+                                .and_then(|pane| pane.shell.as_ref())
+                                .map(|shell| (shell.id.clone(), outgoing.id))
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            for (saved_id, reference) in &saved.panes {
+                let target = reference
+                    .shell
+                    .as_ref()
+                    .and_then(|key| self.boomux_shells.iter().find(|shell| &shell.id == key));
+                let candidate = reference
+                    .shell
+                    .as_ref()
+                    .and_then(|key| outgoing.get(key))
+                    .copied()
+                    .filter(|id| {
+                        self.terminals.get(id).is_some_and(|pane| {
+                            (pane.attaching
+                                || pane
+                                    .session
+                                    .as_ref()
+                                    .is_some_and(|session| session.status_message().is_none()))
+                                && same_running_shell(pane.shell.as_ref(), target)
+                        })
+                    });
+                if let Some(id) = candidate {
+                    reusable.insert(*saved_id, (id, self.terminals.remove(&id).unwrap()));
+                }
+            }
+        }
         if let Some(direction) = direction {
             self.begin_workspace_transition(direction, window, cx);
         } else {
@@ -290,6 +350,12 @@ impl Workspace {
         }
         let mut ids = HashMap::new();
         for (saved_id, reference) in &saved.panes {
+            if let Some((id, mut pane)) = reusable.remove(saved_id) {
+                pane.restored = Some(reference.clone());
+                ids.insert(*saved_id, id);
+                self.terminals.insert(id, pane);
+                continue;
+            }
             let id = self.next_id;
             self.next_id += 1;
             ids.insert(*saved_id, id);
@@ -562,6 +628,32 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layout_reuse_requires_the_same_owner_shell_and_running_instance() {
+        let current = ShellChoice {
+            id: "remote:owner-a:shell".into(),
+            name: "same label".into(),
+            workspace_id: "workspace".into(),
+            cwd: Default::default(),
+            status: boomux::protocol::ShellStatus::Running,
+            run_id: Some("run-a".into()),
+            desktop_setup: false,
+        };
+        assert!(same_running_shell(Some(&current), Some(&current)));
+        let mut changed = current.clone();
+        changed.id = "remote:owner-b:shell".into();
+        assert!(!same_running_shell(Some(&current), Some(&changed)));
+        changed = current.clone();
+        changed.run_id = Some("run-b".into());
+        assert!(!same_running_shell(Some(&current), Some(&changed)));
+        changed.run_id = None;
+        assert!(!same_running_shell(Some(&changed), Some(&changed)));
+        changed = current.clone();
+        changed.status = boomux::protocol::ShellStatus::Pending;
+        assert!(!same_running_shell(Some(&current), Some(&changed)));
+        assert!(!same_running_shell(None, Some(&current)));
+    }
+
     #[test]
     fn layout_restore_keeps_focus_until_the_pointer_actually_moves() {
         let mut guard = PointerGuard::Waiting;
