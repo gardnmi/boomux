@@ -42,6 +42,7 @@ fn decode_tree(node: &Tree, ids: &HashMap<u64, usize>) -> Node {
 }
 impl Workspace {
     pub(super) fn initialize_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_viewport_width = f32::from(window.viewport_size().width);
         self.layout_canvas = self.panel_size(window);
         self.workspace_order = if self.layout_document.workspace_order.is_empty() {
             self.workspace_order.clone()
@@ -385,6 +386,12 @@ impl Workspace {
     }
 
     pub(super) fn reconnect_saved_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let available = 4usize.saturating_sub(
+            self.terminals
+                .values()
+                .filter(|p| p.restored.is_some() && p.attaching)
+                .count(),
+        );
         let mut pending = Vec::new();
         for (id, pane) in &mut self.terminals {
             if pane.session.is_some() || pane.attaching {
@@ -411,7 +418,7 @@ impl Workspace {
             let retry_due = pane
                 .restore_retry_after
                 .is_some_and(|deadline| Instant::now() >= deadline);
-            if pending.len() < 4
+            if pending.len() < available
                 && matches!(shell.status, boomux::protocol::ShellStatus::Running)
                 && (pane.restore_attempt.as_ref() != Some(run) || retry_due)
             {

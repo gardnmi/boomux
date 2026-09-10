@@ -9581,8 +9581,8 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.layout_canvas = self.panel_size(window);
         self.sidebar_viewport_width = f32::from(window.viewport_size().width);
+        self.layout_canvas = self.panel_size(window);
         let workspace_name = self
             .terminals
             .get(&self.focused)

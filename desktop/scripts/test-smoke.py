@@ -21,7 +21,7 @@ class SmokeEvidenceTests(unittest.TestCase):
         document = {"active": "workspace:w", "minimized": ["minimized-missing"], "arrangements": {
             "workspace:w": {"tree": {"Split": {"ratio": 0.31, "horizontal": True, "first": {"Pane": 101}, "second": {"Pane": 202}}},
                 "panes": {"101": {"shell": "running"}, "202": {"shell": "pending"}, "303": {"shell": "remote:offline:missing"}},
-                "focused": 101, "expanded": 101, "floating": [{"pane": 303}]}}}
+                "focused": 101, "expanded": 101, "floating": [{"pane": 303, "rect": [80.0, 60.0, 300.0, 200.0]}]}}}
         self.assertTrue(SMOKE["restored_layout_matches"](document, "running", "pending"))
         for field, value in [("focused", 202), ("expanded", None), ("floating", [])]:
             broken = copy.deepcopy(document)

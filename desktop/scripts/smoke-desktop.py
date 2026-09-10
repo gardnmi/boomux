@@ -137,6 +137,7 @@ def restored_layout_matches(document, shell_id, pending_id):
             and arrangement["focused"] == left
             and arrangement["expanded"] == left
             and len(arrangement["floating"]) == 1
+            and arrangement["floating"][0]["rect"][2:] == [300.0, 200.0]
             and panes[str(arrangement["floating"][0]["pane"])]["shell"] == "remote:offline:missing"
             and "minimized-missing" in document["minimized"])
 
