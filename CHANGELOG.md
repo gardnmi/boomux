@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.15.2](https://github.com/gardnmi/boomux/compare/v1.15.1...v1.15.2) (2026-09-10)
+
+
+### Bug Fixes
+
+* **desktop:** discard unbound saved pane placeholders ([#403](https://github.com/gardnmi/boomux/issues/403)) ([fb4fce5](https://github.com/gardnmi/boomux/commit/fb4fce5f99ec85c0897f674195d3fe0704322509))
+
 ## [1.15.1](https://github.com/gardnmi/boomux/compare/v1.15.0...v1.15.1) (2026-09-10)
 
 
