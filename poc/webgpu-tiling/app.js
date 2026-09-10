@@ -11,6 +11,7 @@ const templates=[
 let tree,panes=new Map(),floating=new Map(),active=1,next=5,expanded=null,drag=null,resize=null,drop=null;
 let targets=new Map(),shown=new Map(),tween=null,draw=null,frame=0,width=1,height=1;
 let layoutMode=false;
+let lastHoverPoint=null;
 const motion=$('#motion');motion.checked=!matchMedia('(prefers-reduced-motion: reduce)').matches;
 const clone=value=>structuredClone(value);
 function schedule(){if(!frame)frame=requestAnimationFrame(paint);}
@@ -69,6 +70,17 @@ function reflow(animate=true){
 }
 function point(e){const r=stage.getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top};}
 window.addEventListener('pointermove',e=>{
+  const moved=!lastHoverPoint||e.clientX!==lastHoverPoint.x||e.clientY!==lastHoverPoint.y;
+  lastHoverPoint={x:e.clientX,y:e.clientY};
+  // Follow genuine pointer movement, not pane reflow beneath a stationary
+  // pointer. Selection, drag/resize, and keyboard layout mode retain focus.
+  if(moved&&e.pointerType!=='touch'&&!e.buttons&&!drag&&!resize&&!layoutMode&&document.hasFocus()){
+    const hovered=e.target.closest('.pane'),id=Number(hovered?.dataset.id),p=panes.get(id);
+    if(p){
+      if(active!==id){active=id;syncSidebar();schedule();}
+      if(!hovered.querySelector('.pane-body').contains(document.activeElement))p.terminal?.focus();
+    }
+  }
   const pos=point(e);
   if(resize){const {node,parent}=resize;const size=node.axis==='x'?parent.w:parent.h;node.ratio=Math.max(.15,Math.min(.85,((node.axis==='x'?pos.x-parent.x:pos.y-parent.y)-4)/(size-8)));targets=layout(tree,bounds()).panes;for(const [id,r]of floating)targets.set(id,r);tween=null;schedule();return;}
   if(!drag)return;

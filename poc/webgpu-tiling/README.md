@@ -23,6 +23,9 @@ uses Canvas 2D; `?fallback` explicitly exercises that path. WebGPU API use is
 based on the [official samples](https://webgpu.github.io/webgpu-samples/).
 
 - Drag a heading (or Ctrl-drag a pane) to lift it; other panes reflow.
+- Move the pointer over a pane to focus its terminal. Hover focus is suspended
+  during layout mode, dragging, resizing, and text selection; a stationary
+  pointer does not override keyboard focus when the layout changes.
 - Drop near a pane edge to split left, right, above, or below. The preview
   shows the resulting allocation. Dropping outside a target restores the layout.
 - Hold Shift when dropping to float. The diamond button toggles floating/tiling.
