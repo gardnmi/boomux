@@ -1986,6 +1986,12 @@ impl Workspace {
             return;
         };
         self.capture_arrangement();
+        if self.layout_error.as_deref() == Some("Saved layout limit reached") {
+            self.updates_status =
+                Some("Reduce the saved layout before restarting; its limit was reached.".into());
+            cx.notify();
+            return;
+        }
         self.layout_save_task.take();
         self.layout_frozen = true;
         let layout_flush = self

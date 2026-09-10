@@ -96,9 +96,9 @@ impl Workspace {
         .detach();
     }
 
-    pub(super) fn capture_arrangement(&mut self) {
+    pub(super) fn capture_arrangement(&mut self) -> bool {
         if self.layout_frozen || self.layout_restoring || self.pointer_drag.is_some() {
-            return;
+            return false;
         }
         let key = if self.workspace_pane_mode == WorkspacePaneMode::Mixed {
             "mixed".to_string()
@@ -115,7 +115,7 @@ impl Workspace {
                 .unwrap_or_else(|| self.layout_document.active.clone())
         };
         if key.is_empty() {
-            return;
+            return false;
         }
         let ids = ordered_pane_ids(self.layout.as_ref(), &self.floating);
         let panes = ids
@@ -168,7 +168,10 @@ impl Workspace {
             || retained_panes + arrangement.panes.len() > 4096
         {
             self.layout_error = Some("Saved layout limit reached".into());
-            return;
+            return false;
+        }
+        if self.layout_error.as_deref() == Some("Saved layout limit reached") {
+            self.layout_error = None;
         }
         self.layout_document.active = key.clone();
         self.layout_document.arrangements.insert(key, arrangement);
@@ -185,6 +188,7 @@ impl Workspace {
                 }
             }
         }
+        true
     }
 
     pub(super) fn layout_changed(&mut self, cx: &mut Context<Self>) {
@@ -198,11 +202,14 @@ impl Workspace {
                 .timer(Duration::from_millis(250))
                 .await;
             let pending = this
-                .update(cx, |this, _| {
+                .update(cx, |this, cx| {
                     if this.layout_generation != generation || this.pointer_drag.is_some() {
                         return None;
                     }
-                    this.capture_arrangement();
+                    if !this.capture_arrangement() {
+                        cx.notify();
+                        return None;
+                    }
                     this.layout_writer
                         .as_ref()
                         .map(|writer| layout_state::submit(writer, this.layout_document.clone()))
@@ -451,6 +458,12 @@ impl Workspace {
             return true;
         }
         self.capture_arrangement();
+        if self.layout_error.as_deref() == Some("Saved layout limit reached") {
+            self.layout_error =
+                Some("Saved layout limit reached. Close again to exit without saving.".into());
+            cx.notify();
+            return false;
+        }
         self.layout_save_task.take();
         self.layout_closing = true;
         self.layout_frozen = true;

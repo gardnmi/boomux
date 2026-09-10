@@ -346,6 +346,7 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
             app = launch("shell-reattach")
             def layout_restored():
                 document = json.loads(layout_path.read_text())
+                (output / "restored-layout.json").write_text(json.dumps(document, indent=2))
                 return (document["revision"] != saved_layout["revision"]
                         and restored_layout_matches(document, shell_id, pending_id))
             wait_for("internal layout restoration and durable recapture", layout_restored, [*servers, app])
