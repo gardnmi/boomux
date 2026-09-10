@@ -11115,7 +11115,8 @@ mod pointer_tests {
             key: "c".into(),
             key_char: Some("c".into()),
             modifiers: gpui::Modifiers {
-                control: true,
+                control: !cfg!(target_os = "macos"),
+                platform: cfg!(target_os = "macos"),
                 shift: true,
                 ..Default::default()
             },
