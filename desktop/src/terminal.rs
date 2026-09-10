@@ -170,6 +170,7 @@ struct SharedTerminal {
     revision: AtomicU64,
     bracketed_paste: AtomicBool,
     mouse_tracking: AtomicBool,
+    pending_resize: Mutex<Option<(u16, u16, u16, u16)>>,
     pending_focus: AtomicBool,
     pending_scroll_row: AtomicU64,
     pending_scroll_wakeup: AtomicBool,
@@ -193,6 +194,7 @@ impl SharedTerminal {
             revision: AtomicU64::new(1),
             bracketed_paste: AtomicBool::new(false),
             mouse_tracking: AtomicBool::new(false),
+            pending_resize: Mutex::new(None),
             pending_focus: AtomicBool::new(false),
             pending_scroll_row: AtomicU64::new(0),
             pending_scroll_wakeup: AtomicBool::new(false),
@@ -238,6 +240,41 @@ impl SharedTerminal {
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
         }
+    }
+
+    fn request_resize(&self, size: (u16, u16, u16, u16)) -> Result<(), String> {
+        let wake = self.pending_resize.lock().unwrap().replace(size).is_none();
+        if wake {
+            self.try_emulator_command(EmulatorCommand::ResizeLatest)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_resize(&self, core: &mut EmulatorCore) -> Result<(), String> {
+        let pending = self.pending_resize.lock().unwrap().take();
+        if let Some((rows, cols, pixel_width, pixel_height)) = pending {
+            {
+                let mut profile = self.profile.lock().unwrap();
+                profile.rows = rows;
+                profile.cols = cols;
+                profile.pixel_width = pixel_width;
+                profile.pixel_height = pixel_height;
+            }
+            core.apply(EmulatorCommand::Resize {
+                rows,
+                cols,
+                cell_width: cell_dimension(pixel_width, cols),
+                cell_height: cell_dimension(pixel_height, rows),
+            })?;
+            self.send(AttachFrame::Resize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            })?;
+            self.bump_revision();
+        }
+        Ok(())
     }
 
     fn request_focus(&self) -> Result<(), String> {
@@ -397,6 +434,7 @@ enum EmulatorCommand {
     ScrollLatest,
     ThemeLatest,
     FocusLatest,
+    ResizeLatest,
     MouseWheel {
         lines: isize,
         x: f32,
@@ -627,24 +665,11 @@ impl TerminalSession {
             return false;
         }
         *last_size = (rows, cols);
+        if let Err(error) = self
+            .shared
+            .request_resize((rows, cols, pixel_width, pixel_height))
         {
-            let mut profile = self.shared.profile.lock().unwrap();
-            profile.rows = rows;
-            profile.cols = cols;
-            profile.pixel_width = pixel_width;
-            profile.pixel_height = pixel_height;
-        }
-        self.shared
-            .resize_emulator(rows, cols, pixel_width, pixel_height);
-        if let Err(error) = self.shared.send(AttachFrame::Resize {
-            rows,
-            cols,
-            pixel_width,
-            pixel_height,
-        }) {
             self.shared.set_status(error);
-        } else {
-            self.shared.bump_revision();
         }
         true
     }
@@ -1591,6 +1616,9 @@ impl EmulatorCore {
             EmulatorCommand::FocusLatest => {
                 unreachable!("focus notifications are resolved by the emulator worker")
             }
+            EmulatorCommand::ResizeLatest => {
+                unreachable!("UI resize requests are resolved by the emulator worker")
+            }
             EmulatorCommand::MouseWheel { .. } => {
                 unreachable!("mouse events are resolved by the emulator worker")
             }
@@ -1710,9 +1738,10 @@ fn apply_emulator_command(
     if shared.cancelled.load(Ordering::Acquire) {
         return Ok(false);
     }
+    shared.flush_pending_resize(core)?;
     shared.flush_pending_focus()?;
     match command {
-        EmulatorCommand::FocusLatest => Ok(true),
+        EmulatorCommand::FocusLatest | EmulatorCommand::ResizeLatest => Ok(true),
         EmulatorCommand::Output(bytes) => {
             // A reconstruction can contain a large transcript. Yield to pane
             // cancellation between chunks without changing byte ordering.
@@ -1720,6 +1749,7 @@ fn apply_emulator_command(
                 if shared.cancelled.load(Ordering::Acquire) {
                     return Ok(false);
                 }
+                shared.flush_pending_resize(core)?;
                 shared.flush_pending_focus()?;
                 core.terminal.vt_write(chunk);
             }
@@ -3983,6 +4013,93 @@ mod tests {
             panic!("expected a keyboard enhancement response");
         };
         assert_eq!(bytes, b"\x1b[?0u");
+    }
+
+    #[test]
+    fn terminal_resize_coalesces_without_waiting_for_output_or_socket_capacity() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        shared.install_writer(&client).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared
+            .emulator_command(EmulatorCommand::Output(vec![b'a']))
+            .unwrap();
+        let writer = shared.writer.lock().unwrap();
+        let profile = shared.profile.lock().unwrap();
+        let (done, completed) = mpsc::channel();
+        let pending = shared.clone();
+        let requester = std::thread::spawn(move || {
+            for cols in 10..=109 {
+                pending.request_resize((6, cols, cols * 10, 120)).unwrap();
+            }
+            let _ = done.send(());
+        });
+        let result = completed.recv_timeout(Duration::from_millis(250));
+        drop(profile);
+        drop(writer);
+        requester.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "resize waited on a worker lock or full queue"
+        );
+        assert_eq!(
+            *shared.pending_resize.lock().unwrap(),
+            Some((6, 109, 1090, 120))
+        );
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        assert!(apply_emulator_command(&mut core, &shared, receiver.recv().unwrap()).unwrap());
+        assert!(matches!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 6,
+                cols: 109,
+                pixel_width: 1090,
+                pixel_height: 120
+            }
+        ));
+        assert_eq!(
+            (core.screen().unwrap().rows, core.screen().unwrap().cols),
+            (6, 109)
+        );
+        assert!(shared.pending_resize.lock().unwrap().is_none());
+        assert!(receiver.try_recv().is_err(), "resize flood grew the queue");
+        shared.request_resize((3, 10, 100, 60)).unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            EmulatorCommand::ResizeLatest
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual native terminal replay and fullscreen resize measurement"]
+    fn terminal_replay_resize_measurement() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(40, 120, 1200, 800)));
+        let mut core = EmulatorCore::new(&shared, 40, 120, 1200, 800).unwrap();
+        let bytes = b"\x1b[32mterminal replay fixture with colored output and normal line wrapping\x1b[0m\r\n".repeat(2048);
+        let replay = std::time::Instant::now();
+        core.apply(EmulatorCommand::Output(bytes.clone())).unwrap();
+        let replay_elapsed = replay.elapsed();
+        let resize = std::time::Instant::now();
+        for (rows, cols) in [(80, 200), (40, 120), (80, 200), (40, 120)] {
+            core.apply(EmulatorCommand::Resize {
+                rows,
+                cols,
+                cell_width: 10,
+                cell_height: 20,
+            })
+            .unwrap();
+            let _ = core.screen().unwrap();
+        }
+        eprintln!(
+            "native replay/resize: bytes={} replay_ms={:.3} resize_ms={:.3}",
+            bytes.len(),
+            replay_elapsed.as_secs_f64() * 1000.0,
+            resize.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     #[test]

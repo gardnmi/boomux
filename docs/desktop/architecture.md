@@ -136,6 +136,12 @@ The terminal worker sends the notification, including between replay chunks;
 click and hover handlers never acquire the attachment writer or write a focus
 frame themselves. Repeated focus requests coalesce while the queue is full.
 
+Pane resize requests likewise retain only one latest set of dimensions per pane
+and use a nonblocking wake marker. The worker updates the terminal profile,
+resizes the emulator, and sends the daemon resize frame between replay chunks.
+Fullscreen and window resize handlers do not wait for queue capacity or socket
+writes.
+
 Discarding a pane cancels its local replay and disconnects the queue sender;
 it does not enqueue a blocking stop command. The worker checks cancellation
 between 16 KiB decode chunks and releases pending replay data when it exits.
