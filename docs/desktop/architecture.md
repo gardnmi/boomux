@@ -29,6 +29,8 @@ where Ghostty's reusable key encoder reads the current terminal modes before
 encoding and forwarding them; this keeps Kitty keyboard, modifyOtherKeys,
 cursor, keypad, and backarrow negotiation ordered with terminal output.
 Detaching a pane never implies closing its Boomux Shell.
+Layout capture and restore discard unbound placeholders that have no Shell identity,
+collapsing their splits. Saved references to unavailable Shells remain reconnectable.
 
 New terminal creation publishes the attachment before any sidebar overview refresh;
 the existing overview worker refreshes resource rows independently. New local

@@ -8944,7 +8944,11 @@ impl Workspace {
             ))
             .when(
                 pane.is_some_and(|pane| {
-                    pane.restored.is_some() && !pane.attaching && pane.session.is_none()
+                    pane.restored
+                        .as_ref()
+                        .is_some_and(|saved| saved.shell.is_some())
+                        && !pane.attaching
+                        && pane.session.is_none()
                 }),
                 |element| {
                     element.child(
