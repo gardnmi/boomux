@@ -60,6 +60,7 @@ impl Workspace {
         }
         if let Some(arrangement) = self.layout_document.arrangements.get(&key).cloned() {
             self.restore_arrangement(arrangement, window, cx);
+            self.layout_changed(cx);
         } else {
             self.layout_document.active.clear();
         }
@@ -427,24 +428,6 @@ impl Workspace {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn layout_tree_remaps_ephemeral_ids_without_changing_split_sizes() {
-        let tree = Node::Split {
-            axis: Axis::Vertical,
-            ratio: 0.37,
-            first: Box::new(Node::Pane(17)),
-            second: Box::new(Node::Pane(42)),
-        };
-        let restored = decode_tree(&encode_tree(&tree), &HashMap::from([(17, 101), (42, 102)]));
-        assert_eq!(restored.pane_ids(), vec![101, 102]);
-        assert_eq!(restored.rects()[0].1.height, 0.37);
-        assert_eq!(restored.rects()[1].1.y, 0.37);
-    }
-}
-
 impl Workspace {
     fn close_after_layout_save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.layout_writer.is_none() || self.layout_frozen && !self.layout_closing {
@@ -492,5 +475,23 @@ impl Workspace {
         })
         .detach();
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn layout_tree_remaps_ephemeral_ids_without_changing_split_sizes() {
+        let tree = Node::Split {
+            axis: Axis::Vertical,
+            ratio: 0.37,
+            first: Box::new(Node::Pane(17)),
+            second: Box::new(Node::Pane(42)),
+        };
+        let restored = decode_tree(&encode_tree(&tree), &HashMap::from([(17, 101), (42, 102)]));
+        assert_eq!(restored.pane_ids(), vec![101, 102]);
+        assert_eq!(restored.rects()[0].1.height, 0.37);
+        assert_eq!(restored.rects()[1].1.y, 0.37);
     }
 }

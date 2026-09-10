@@ -124,6 +124,23 @@ def check_bundle_ownership(bundle, env, root):
     print("PASS: bundle-owned CLI and symlink are ineligible for self-update", flush=True)
 
 
+def restored_layout_matches(document, shell_id, pending_id):
+    """Require the saved live arrangement, independent of remapped pane IDs."""
+    arrangement = document["arrangements"][document["active"]]
+    split = arrangement.get("tree", {}).get("Split", {})
+    if split.get("ratio") != 0.31 or not split.get("horizontal"):
+        return False
+    panes = arrangement["panes"]
+    left, right = split["first"]["Pane"], split["second"]["Pane"]
+    return (panes[str(left)]["shell"] == shell_id
+            and panes[str(right)]["shell"] == pending_id
+            and arrangement["focused"] == left
+            and arrangement["expanded"] == left
+            and len(arrangement["floating"]) == 1
+            and panes[str(arrangement["floating"][0]["pane"])]["shell"] == "remote:offline:missing"
+            and "minimized-missing" in document["minimized"])
+
+
 def smoke(backend, archive, output, software_driver=None, cpu_model=None):
     output.mkdir(parents=True, exist_ok=True)
     expected = Path(str(archive) + ".sha256").read_text().split()[0]
@@ -309,7 +326,32 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
             after = inspect()
             if after["status"] != "running" or after["run"]["id"] != run_id:
                 raise RuntimeError("exiting Desktop did not preserve the exact ShellRun")
+            layout_path = Path(env["XDG_STATE_HOME"]) / "boomux-desktop/layout-state.json"
+            saved_layout = json.loads(layout_path.read_text())
+            pending_id = created_id(cli("shell", "create", workspace_id, "--name", "restore-must-not-start",
+                                        "--cwd", str(root), "--", "/bin/sh", "-c", "exit 99"))
+            key = "workspace:" + workspace_id
+            saved_layout["active"] = key
+            saved_layout["minimized"] = ["minimized-missing"]
+            saved_layout["arrangements"][key] = dict(
+                tree={"Split": {"horizontal": True, "ratio": 0.31, "first": {"Pane": 9}, "second": {"Pane": 13}}},
+                floating=[{"pane": 15, "rect": [80.0, 60.0, 300.0, 200.0]}],
+                panes={"9": {"shell": shell_id, "workspace": workspace_id},
+                       "13": {"shell": pending_id, "workspace": workspace_id},
+                       "15": {"shell": "remote:offline:missing", "workspace": workspace_id}},
+                focused=9, expanded=9, canvas=[1000.0, 700.0])
+            layout_path.write_text(json.dumps(saved_layout))
+            env.pop("BOOMUX_DESKTOP_SHELL_ID", None)
             app = launch("shell-reattach")
+            def layout_restored():
+                document = json.loads(layout_path.read_text())
+                return (document["revision"] != saved_layout["revision"]
+                        and restored_layout_matches(document, shell_id, pending_id))
+            wait_for("internal layout restoration and durable recapture", layout_restored, [*servers, app])
+            (output / "restored-layout.json").write_text(layout_path.read_text())
+            pending_shell = json.loads(cli("--json", "shell", "inspect", pending_id))["data"]["shell"]
+            if pending_shell["status"] != "pending":
+                raise RuntimeError("layout restoration started a pending Shell")
             after = inspect()
             if after["status"] != "running" or after["run"]["id"] != run_id:
                 raise RuntimeError("reopening Desktop changed the ShellRun")
@@ -319,7 +361,7 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
             if json.loads(cli("--json", "daemon", "status"))["data"]["pid"] != daemon_pid:
                 raise RuntimeError("reopening Desktop replaced the daemon")
             (output / "result.json").write_text(json.dumps(
-                dict(backend=backend, cpu_model=cpu_model, emulated_components=["desktop", "daemon", "cli"] if cpu_model else [], shell_id=shell_id, run_id=run_id, status="passed",
+                dict(backend=backend, cpu_model=cpu_model, emulated_components=["desktop", "daemon", "cli"] if cpu_model else [], shell_id=shell_id, run_id=run_id, status="passed", layout_restored=True,
                      archive_sha256=actual, boomux_version=cli("--version").strip()), indent=2))
             print(f"PASS: {backend} bundle startup, attachment, and ShellRun survival", flush=True)
         finally:
