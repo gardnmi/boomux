@@ -6740,7 +6740,7 @@ impl Workspace {
                             )
                             .h(px(52.0))
                             .rounded_md()
-                            .bg(if active { rgb(0x313244) } else { rgb(0x252536) })
+                            .bg(if active { rgb(0x313244) } else { rgb(0x181825) })
                             .px_2()
                             .flex()
                             .items_center()

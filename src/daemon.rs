@@ -150,19 +150,26 @@ exec "$BOOMUX_SHIM_EXECUTABLE" kiro launch -- "$@"
 const OPENCODE_BASH_RC: &[u8] = br#"if [ -r "${HOME}/.bashrc" ]; then
   . "${HOME}/.bashrc"
 fi
-_boomux_path=()
-IFS=: read -r -a _boomux_path <<< "${PATH-}"
-_boomux_filtered=()
-for _boomux_entry in "${_boomux_path[@]}"; do
-  if [ "$_boomux_entry" != "$BOOMUX_OPENCODE_SHIM_DIR" ]; then
-    _boomux_filtered+=("$_boomux_entry")
-  fi
-done
-BOOMUX_ORIGINAL_PATH="$(IFS=:; printf '%s' "${_boomux_filtered[*]}")"
-PATH="$BOOMUX_OPENCODE_SHIM_DIR${BOOMUX_ORIGINAL_PATH:+:$BOOMUX_ORIGINAL_PATH}"
-export BOOMUX_ORIGINAL_PATH PATH
-builtin hash -r 2>/dev/null || :
-unset _boomux_entry _boomux_filtered _boomux_path
+_boomux_refresh_path() {
+  local _boomux_status=$? _boomux_entry
+  local -a _boomux_path=() _boomux_filtered=()
+  IFS=: read -r -a _boomux_path <<< "${PATH-}"
+  for _boomux_entry in "${_boomux_path[@]}"; do
+    if [ "$_boomux_entry" != "$BOOMUX_OPENCODE_SHIM_DIR" ]; then
+      _boomux_filtered+=("$_boomux_entry")
+    fi
+  done
+  local IFS=:
+  BOOMUX_ORIGINAL_PATH="${_boomux_filtered[*]}"
+  PATH="$BOOMUX_OPENCODE_SHIM_DIR${BOOMUX_ORIGINAL_PATH:+:$BOOMUX_ORIGINAL_PATH}"
+  export BOOMUX_ORIGINAL_PATH PATH
+  builtin hash -r 2>/dev/null || :
+  return "$_boomux_status"
+}
+# Tool managers can change PATH in their prompt callbacks after startup.
+# Run last, retaining both scalar and array prompt callbacks and their status.
+PROMPT_COMMAND=("${PROMPT_COMMAND[@]}" _boomux_refresh_path)
+_boomux_refresh_path
 "#;
 const OPENCODE_ZSH_ENV: &[u8] = br#"if [[ -r "$BOOMUX_USER_ZDOTDIR/.zshenv" ]]; then
   source "$BOOMUX_USER_ZDOTDIR/.zshenv"
@@ -18714,6 +18721,41 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bash_prompt_refresh_preserves_callbacks_status_and_current_tool_path() {
+        let directory = env::temp_dir().join(format!("boomux-prompt-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let startup = directory.join("boomux.bashrc");
+        fs::write(&startup, OPENCODE_BASH_RC).unwrap();
+        for callbacks in [
+            "PROMPT_COMMAND='PATH=/selected/bin:$PATH; false'",
+            "PROMPT_COMMAND=('PATH=/selected/bin:$PATH' 'false')",
+        ] {
+            fs::write(directory.join(".bashrc"), callbacks).unwrap();
+            let output = Command::new("/bin/bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    r#". "$BOOMUX_TEST_RC"
+for callback in "${PROMPT_COMMAND[@]}"; do eval "$callback"; done
+status=$?
+[ "$status" = 1 ] || exit 10
+[ "$PATH" = /boomux/shims:/selected/bin:/usr/bin:/bin ] || exit 11
+[ "$BOOMUX_ORIGINAL_PATH" = /selected/bin:/usr/bin:/bin ] || exit 12
+"#,
+                ])
+                .env("HOME", &directory)
+                .env("PATH", "/usr/bin:/bin")
+                .env("BOOMUX_OPENCODE_SHIM_DIR", "/boomux/shims")
+                .env("BOOMUX_TEST_RC", &startup)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{callbacks}: {output:?}");
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
