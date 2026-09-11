@@ -65,3 +65,16 @@ aside,.daemon-mode aside{display:flex;flex-direction:column;padding:18px 14px 10
 .activity-row{width:100%;display:flex;flex-direction:column;gap:4px;text-align:left;padding:9px 8px;border:0;border-radius:5px;background:transparent;color:#bfc8d7;overflow-wrap:anywhere}.activity-row strong{font-size:12px;font-weight:550}.activity-row small{font-size:11px;color:#8e99ab;line-height:1.5}.activity-empty{font-size:11px;line-height:1.6;color:#919caf;padding:4px 8px;margin:4px 0}
 .git-worktree{border-bottom:1px solid #ffffff0b;padding:8px 4px}.git-worktree summary{cursor:pointer;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
 @media(max-width:650px){aside,.daemon-mode aside{display:none}}
+/* Quiet terminal surfaces: compact title rail, inline path, focus accent. */
+.pane{border-radius:0}
+.pane-heading{height:32px;padding:0 11px;gap:9px;border-bottom:1px solid #ffffff08;position:relative}
+.pane.focused .pane-heading:before{content:'';position:absolute;left:0;top:7px;bottom:7px;width:2px;background:#91c6ba;border-radius:1px}
+.terminal-mark{font:12px ui-monospace,monospace;color:#64767b;flex-shrink:0}.focused .terminal-mark{color:#91c6ba}
+.pane-name{font-size:12px;font-weight:550;color:#a7b1b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40%}.focused .pane-name{color:#dae3e5}
+.pane-location{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:10px 'JetBrains Mono',monospace;color:#606e79;margin-left:5px}
+.pane-controls{margin-left:auto;flex-shrink:0;opacity:0;transition:opacity .12s}.pane-heading:hover .pane-controls,.pane-controls:focus-within,.pane.focused .pane-controls{opacity:1}
+.pane-controls button{width:24px;height:24px;padding:0;color:#78868d;font-size:15px;border-radius:4px}.pane-controls button:hover{background:#ffffff10;color:#e2eeee}.pane-controls button[data-action=close]:hover{color:#f3a39d;background:#f3a39d14}
+.pane-body{background:#13171c;padding:12px}
+.pane-foot{position:absolute;right:8px;bottom:5px;max-width:55%;height:auto;border:0;padding:2px 5px;font-size:9px;color:#687b7b;pointer-events:none;opacity:0;background:#13171ce8;border-radius:3px}.pane:hover .pane-foot,.pane:focus-within .pane-foot{opacity:1}.pane-foot>span:first-child{display:none}
+.attachment-error{inset:32px 0 0;background:#13171cf5}
+@media(prefers-reduced-motion:reduce){.pane-controls{transition:none}}

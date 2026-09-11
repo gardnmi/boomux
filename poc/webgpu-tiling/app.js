@@ -31,7 +31,7 @@ function syncSidebar(){
 }
 function addPane(id,template){
   const p={...template},el=document.createElement('section');p.el=el;el.className='pane';el.dataset.id=id;
-  el.innerHTML=`<div class="pane-heading"><span style="color:${p.color}">●</span><span class="pane-name">${escapeHtml(p.name)}</span><span class="pane-index">${String(id).padStart(2,'0')}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">◇</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">⛶</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${escapeHtml(p.path)}</span><span class="terminal-status">Starting…</span></div>`;
+  el.innerHTML=`<div class="pane-heading"><span class="terminal-mark" aria-hidden="true">›_</span><span class="pane-name">${escapeHtml(p.name)}</span><span class="pane-location" title="${escapeHtml(p.path)}">${escapeHtml(p.path)}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">◇</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">⛶</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${escapeHtml(p.path)}</span><span class="terminal-status">Starting…</span></div>`;
   el.addEventListener('pointerdown',e=>{
     active=id;syncSidebar();schedule();
     if(e.button!==0||e.target.closest('button')||expanded)return;
@@ -405,14 +405,14 @@ function paint(now){
   frame=0;const t=tween?Math.min(1,(now-tween.start)/180):1,ease=1-(1-t)**3,rects=[];
   const surface=(r,color)=>rects.push({...r,color});
   const ordered=[...targets].sort(([a],[b])=>(a===drag?.id?2:floating.has(a)?1:0)-(b===drag?.id?2:floating.has(b)?1:0));
-  for(const [id,p]of panes)p.el.style.display=targets.has(id)?'flex':'none';
+  for(const [id,p]of panes){p.el.style.display=targets.has(id)?'flex':'none';p.el.classList.toggle('focused',id===active);}
   for(const [id,target]of ordered){
     const from=tween?.from.get(id)||target,r={};for(const k of ['x','y','w','h'])r[k]=(id===drag?.id)?target[k]:from[k]+(target[k]-from[k])*ease;
     shown.set(id,r);const p=panes.get(id);if(!p)continue;
     Object.assign(p.el.style,{transform:`translate3d(${r.x}px,${r.y}px,0)`,width:`${Math.max(1,r.w)}px`,height:`${Math.max(1,r.h)}px`,zIndex:id===drag?.id?'20':floating.has(id)?'10':'1'});
-    surface(r,id===active?[.49,.57,.76,1]:[.19,.23,.30,1]);
-    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.max(0,r.h-2)},[.085,.104,.14,1]);
-    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.min(39,r.h-2)},id===active?[.15,.185,.25,1]:[.115,.14,.185,1]);
+    surface(r,id===active?[.30,.40,.43,1]:[.15,.18,.20,1]);
+    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.max(0,r.h-2)},[.075,.090,.110,1]);
+    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.min(31,r.h-2)},id===active?[.105,.125,.14,1]:[.085,.10,.12,1]);
   }
   const label=$('#drop-label'),overlay=$('#drop-overlay');label.style.display='none';overlay.style.display='none';
   if(drag?.lifted){

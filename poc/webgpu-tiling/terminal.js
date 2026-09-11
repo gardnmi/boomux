@@ -59,7 +59,7 @@ export function createTerminal(container,status,isLayoutMode,options={}){
     const ghostty=await initialize();if(disposed)return;
     container.replaceChildren();
     terminal=new Terminal({ghostty,fontFamily:'"JetBrains Mono", monospace',fontSize:13,cursorBlink:false,scrollback:2000,
-      theme:{background:'#161b24',foreground:'#c9d4e8',cursor:'#a9b9ff',selectionBackground:'#405478',black:'#161b24',red:'#ed929b',green:'#8bc6ac',yellow:'#e1b889',blue:'#8cafd7',magenta:'#b4a2e5',cyan:'#83c6ce',white:'#c9d4e8',brightBlack:'#65738b'}});
+      theme:{background:'#13171c',foreground:'#c9d4e8',cursor:'#a9b9ff',selectionBackground:'#405478',black:'#161b24',red:'#ed929b',green:'#8bc6ac',yellow:'#e1b889',blue:'#8cafd7',magenta:'#b4a2e5',cyan:'#83c6ce',white:'#c9d4e8',brightBlack:'#65738b'}});
     terminalFocus.set(terminal,cursor);
     fit=new FitAddon();terminal.loadAddon(fit);terminal.open(container);updateFocus();
     // This pinned ghostty-web version returns true for a handled key (unlike
