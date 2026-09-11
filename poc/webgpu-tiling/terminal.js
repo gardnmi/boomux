@@ -37,6 +37,9 @@ CanvasRenderer.prototype.renderCursor=function(col,row){
   ctx.restore();
 };
 
+// Match Desktop's Nerd Font for Starship/Powerline glyphs when installed.
+// The bundled ordinary face remains a fallback on other clients.
+const terminalFont='"JetBrainsMono Nerd Font", "JetBrains Mono", monospace';
 let initialization;
 function initialize(){
   return initialization ||= (async()=>{
@@ -80,7 +83,7 @@ export function createTerminal(container,status,isLayoutMode,options={}){
   const ready=(async()=>{
     const ghostty=await initialize();if(disposed)return;
     container.replaceChildren();
-    terminal=new Terminal({ghostty,fontFamily:'"JetBrains Mono", monospace',fontSize:13,cursorBlink:false,scrollback:2000,
+    terminal=new Terminal({ghostty,fontFamily:terminalFont,fontSize:13,cursorBlink:false,scrollback:2000,
       theme:cursor.initialColors});
     terminalFocus.set(terminal,cursor);
     fit=new FitAddon();terminal.loadAddon(fit);terminal.open(container);updateFocus();
