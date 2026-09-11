@@ -508,6 +508,13 @@ fn bare_codex_typed_in_managed_login_shell_uses_run_scoped_hooks() {
         include_str!("../../integrations/codex/hooks.json"),
     )
     .unwrap();
+    // Model a tool manager that puts its selected executable ahead of the
+    // dispatch shim at every prompt, after Boomux's startup file has run.
+    fs::write(
+        home.join(".bashrc"),
+        format!("PROMPT_COMMAND='export PATH=\"{}:$PATH\"'\n", bin.display()),
+    )
+    .unwrap();
     let codex = bin.join("codex");
     fs::write(
         &codex,
