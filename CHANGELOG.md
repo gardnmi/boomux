@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.16.1](https://github.com/gardnmi/boomux/compare/v1.16.0...v1.16.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* preserve managed harness launches after prompt path changes ([#409](https://github.com/gardnmi/boomux/issues/409)) ([31bec82](https://github.com/gardnmi/boomux/commit/31bec82fe3494b7590af0905646ac465820d98b5))
+
 ## [1.16.0](https://github.com/gardnmi/boomux/compare/v1.15.2...v1.16.0) (2026-09-11)
 
 
