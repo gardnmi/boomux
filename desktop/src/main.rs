@@ -1,5 +1,6 @@
 mod boomux_settings;
 mod bundle_update;
+mod project_search;
 use boomux::generated_names;
 mod git_panel;
 mod layout;
@@ -1574,6 +1575,7 @@ struct Workspace {
     sidebar_menu: Option<SidebarMenu>,
     sidebar_header_menu_open: bool,
     project_menu_open: bool,
+    project_search: String,
     projects_loading: bool,
     projects_result: Option<Result<boomux::protocol::HostProjectDiscovery, String>>,
     project_folder_picker_pending: bool,
@@ -1795,6 +1797,7 @@ impl Workspace {
             sidebar_menu: None,
             sidebar_header_menu_open: false,
             project_menu_open: false,
+            project_search: String::new(),
             projects_loading: false,
             projects_result: None,
             project_folder_picker_pending: false,
@@ -4268,6 +4271,12 @@ impl Workspace {
 
     fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if self.project_menu_open {
+                project_search::append(&mut self.project_search, &text);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if let Some((_, value)) = &mut self.boomux_setting_input {
                 append_boomux_setting_text(value, &text);
                 cx.stop_propagation();
@@ -4907,6 +4916,32 @@ impl Workspace {
             return;
         } else if !event.is_held {
             self.layout_suppressed_keys.remove(&event.keystroke.key);
+        }
+        if self.project_menu_open {
+            match event.keystroke.key.as_str() {
+                "escape" => self.project_menu_open = false,
+                "backspace" => {
+                    self.project_search.pop();
+                }
+                "u" if event.keystroke.modifiers.control => self.project_search.clear(),
+                "v" if event.keystroke.modifiers.control && !cfg!(target_os = "macos") => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        project_search::append(&mut self.project_search, &text);
+                    }
+                }
+                _ if !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.alt =>
+                {
+                    if let Some(text) = &event.keystroke.key_char {
+                        project_search::append(&mut self.project_search, text);
+                    }
+                }
+                _ => (),
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
         if self.git_panel.search_focused {
             match event.keystroke.key.as_str() {
@@ -6426,6 +6461,8 @@ impl Workspace {
         self.project_menu_open = !self.project_menu_open;
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
+        self.project_search.clear();
+        self.git_panel.search_focused = false;
         window.focus(&self.focus_handle, cx);
         if self.project_menu_open && !self.projects_loading {
             self.projects_loading = true;
@@ -6513,6 +6550,7 @@ impl Workspace {
             .id("project-menu-list")
             .max_h(px(320.0))
             .overflow_y_scroll();
+        let query = self.project_search.trim().to_lowercase();
         let mut configured = false;
         if self.projects_loading {
             entries = entries.child(
@@ -6536,7 +6574,24 @@ impl Workspace {
                                 },
                             ));
                     }
-                    for (index, project) in discovery.projects.iter().enumerate() {
+                    let mut matches = discovery
+                        .projects
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, project)| {
+                            project_search::matches(&project.name, &project.path, &query)
+                        })
+                        .peekable();
+                    if !discovery.projects.is_empty() && matches.peek().is_none() {
+                        entries = entries.child(
+                            div()
+                                .p_3()
+                                .text_sm()
+                                .text_color(rgb(0x9399b2))
+                                .child("No projects match your search."),
+                        );
+                    }
+                    for (index, project) in matches {
                         let project = project.clone();
                         entries = entries.child(
                             sidebar_menu_row(("project-choice", index))
@@ -6644,6 +6699,59 @@ impl Workspace {
                         .text_xs()
                         .text_color(rgb(0x9399b2))
                         .child("LOCAL PROJECTS"),
+                )
+                .child(
+                    div()
+                        .id("project-search")
+                        .role(gpui::Role::SearchInput)
+                        .aria_label("Filter projects by name or path")
+                        .mx_2()
+                        .my_1()
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(0x89b4fa))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            window.focus(&this.focus_handle, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(rgb(if self.project_search.is_empty() {
+                                    0x9399b2
+                                } else {
+                                    0xcdd6f4
+                                }))
+                                .child(if self.project_search.is_empty() {
+                                    "Search projects…".to_string()
+                                } else {
+                                    self.project_search.clone()
+                                }),
+                        )
+                        .when(!self.project_search.is_empty(), |field| {
+                            field.child(
+                                div()
+                                    .id("project-search-clear")
+                                    .role(gpui::Role::Button)
+                                    .aria_label("Clear project search")
+                                    .cursor_pointer()
+                                    .px_1()
+                                    .child("×")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.project_search.clear();
+                                        window.focus(&this.focus_handle, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 )
                 .child(entries)
                 .child(div().mx_2().my_1().h(px(1.0)).bg(rgb(0x313244)))
@@ -10270,6 +10378,7 @@ impl Render for Workspace {
             .key_context(
                 if (self.nodes_open && self.navigation_region == NavigationRegion::Sidebar)
                     || self.git_panel.search_focused
+                    || self.project_menu_open
                     || self.boomux_setting_input.is_some()
                     || self.settings_restart_confirm
                 {
