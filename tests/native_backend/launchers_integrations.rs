@@ -541,7 +541,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
         ("pi", "0.84.1"),
         ("claude", "2.1.236"),
         ("codex", "0.147.0"),
-        ("kiro-cli", "2.18.0"),
+        ("kiro-cli", "2.21.1"),
     ] {
         let executable = bin.join(name);
         fs::write(
@@ -578,7 +578,7 @@ fn integration_management_reports_and_installs_bundled_hosts() {
             .iter()
             .map(|integration| integration["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["opencode", "pi", "claude", "codex", "kiro"]
+        ["opencode", "pi", "claude", "codex", "kiro-v2", "kiro-v3"]
     );
 
     let missing = command()
@@ -852,7 +852,7 @@ fn codex_hidden_launcher_scopes_chat_hooks_and_passes_service_commands_through()
 }
 
 #[test]
-fn kiro_hidden_launcher_selects_v3_and_preserves_explicit_arguments() {
+fn kiro_hidden_launcher_preserves_default_engine_and_explicit_arguments() {
     let root = std::env::temp_dir().join(format!(
         "boomux-kiro-launcher-{}-{}",
         std::process::id(),
@@ -864,13 +864,16 @@ fn kiro_hidden_launcher_selects_v3_and_preserves_explicit_arguments() {
     fs::create_dir_all(kiro_home.join("hooks")).unwrap();
     fs::write(
         kiro_home.join("hooks/boomux.json"),
-        include_str!("../../integrations/kiro/boomux.json"),
+        include_str!("../../integrations/kiro-v3/boomux.json"),
     )
     .unwrap();
+    let stale_boomux = bin.join("boomux");
+    fs::write(&stale_boomux, "#!/bin/sh\nexit 91\n").unwrap();
+    fs::set_permissions(&stale_boomux, fs::Permissions::from_mode(0o755)).unwrap();
     let kiro = bin.join("kiro-cli");
     fs::write(
         &kiro,
-        "#!/bin/sh\n: > \"$BOOMUX_KIRO_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$BOOMUX_KIRO_CAPTURE\"; done\nprintf '%s' \"${BOOMUX_KIRO_LAUNCH_HOLDER-unset}\" > \"$BOOMUX_KIRO_MARKER\"\n",
+        "#!/bin/sh\n: > \"$BOOMUX_KIRO_CAPTURE\"\nfor arg do printf '%s\\0' \"$arg\" >> \"$BOOMUX_KIRO_CAPTURE\"; done\nprintf '%s' \"${BOOMUX_KIRO_LAUNCH_HOLDER-unset}\" > \"$BOOMUX_KIRO_MARKER\"\ncommand -v boomux > \"$BOOMUX_KIRO_EXECUTABLE\"\n",
     )
     .unwrap();
     fs::set_permissions(&kiro, fs::Permissions::from_mode(0o755)).unwrap();
@@ -888,8 +891,12 @@ fn kiro_hidden_launcher_selects_v3_and_preserves_explicit_arguments() {
             .env("KIRO_HOME", &kiro_home)
             .env("BOOMUX_KIRO_CAPTURE", &capture)
             .env("BOOMUX_KIRO_MARKER", &marker)
-            .env("BOOMUX_SHELL_ID", "shell-1")
-            .env("BOOMUX_RUN_ID", "run-1");
+            .env(
+                "BOOMUX_KIRO_EXECUTABLE",
+                root.join(format!("{case}-executable")),
+            )
+            .env_remove("BOOMUX_SHELL_ID")
+            .env_remove("BOOMUX_RUN_ID");
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
@@ -903,7 +910,7 @@ fn kiro_hidden_launcher_selects_v3_and_preserves_explicit_arguments() {
     };
 
     let (argv, marker) = run(&[], "bare");
-    assert_eq!(argv, b"--v3\0");
+    assert!(argv.is_empty());
     assert_eq!(marker, "unset");
 
     let (argv, marker) = run(&["--v3", "chat", "two words", "semi;colon"], "v3");

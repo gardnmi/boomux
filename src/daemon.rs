@@ -1350,10 +1350,7 @@ fn kiro_launch_eligible(_shell: &Shell, effective_command: &[String]) -> bool {
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             == Some("kiro-cli")
-    }) && (effective_command.len() == 1
-        || effective_command
-            .get(1)
-            .is_some_and(|argument| argument == "--v3"))
+    })
 }
 
 fn claude_remote_control_command(
@@ -18527,7 +18524,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_launcher_accepts_only_bare_or_explicit_v3_shapes() {
+    fn kiro_launcher_accepts_chat_without_selecting_an_engine() {
         let shell = create_pending_shell(
             "workspace",
             ShellSpec {
@@ -18539,6 +18536,9 @@ mod tests {
         .unwrap();
         for argv in [
             vec!["/opt/kiro/bin/kiro-cli".into()],
+            vec!["kiro-cli".into(), "chat".into()],
+            vec!["kiro-cli".into(), "--agent".into(), "reviewer".into()],
+            vec!["kiro-cli".into(), "--version".into()],
             vec![
                 "/opt/kiro/bin/kiro-cli".into(),
                 "--v3".into(),
@@ -18547,13 +18547,7 @@ mod tests {
         ] {
             assert!(kiro_launch_eligible(&shell, &argv));
         }
-        for argv in [
-            vec!["kiro-cli".into(), "chat".into()],
-            vec!["kiro-cli".into(), "--version".into()],
-            vec!["kiro".into()],
-        ] {
-            assert!(!kiro_launch_eligible(&shell, &argv));
-        }
+        assert!(!kiro_launch_eligible(&shell, &["kiro".into()]));
     }
 
     #[test]

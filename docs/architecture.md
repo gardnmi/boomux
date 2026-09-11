@@ -1278,17 +1278,31 @@ phone-accessible Remote destination.
 
 ### Kiro CLI Lifecycle Integration
 
-The Kiro descriptor targets `kiro-cli` `2.18.0` with its opt-in v3 harness as a
-compatibility point. Installation owns the dedicated
+The `kiro-v2` descriptor explicitly has no automatic lifecycle installation.
+It remains discoverable with a limitation in inventory/capabilities. V2 embeds
+hooks in agent configurations but does not provide global hooks for the normal
+built-in agent. Boomux does not replace or select an agent profile to work around
+that host limitation. V2 terminal behavior and the generic foreground hint remain
+available; no automatic Session lifecycle, notification, resume, or title
+capability is claimed. See [Kiro usage](kiro.md).
+
+The `kiro-v3` descriptor (legacy install alias `kiro`) targets `kiro-cli`
+`2.21.1` with its opt-in v3 harness as a compatibility point. Installation owns
+the dedicated
 `${KIRO_HOME:-$HOME/.kiro}/hooks/boomux.json` file and registers non-deciding
 SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop command hooks.
 The ordinary bounded, symlink-safe, atomic integration installer applies because
 Boomux does not share that file with unrelated Kiro configuration.
 
 Eligible managed Kiro invocations pass through the common Shell-scoped shim and
-hidden launcher. A bare `kiro-cli` becomes `kiro-cli --v3`, while an explicit
-leading `--v3` is preserved. The launcher supervises the exact argument vector
-with the matching Boomux executable directory first on the sanitized child PATH,
+hidden launcher. A bare `kiro-cli` retains its exact empty argument vector and
+Kiro-selected default engine and agent. Package version and missing flags never
+establish the running engine. The wrapper accepts exact configured Kiro
+commands; eligible local chat launches, including bare and explicit custom-agent
+launches, may acquire a holder. Service and cloud launches remain untracked.
+When the v3 hook
+asset is current in a managed ShellRun, the launcher places the matching Boomux
+executable directory first on the sanitized child PATH,
 so bare lifecycle hook commands cannot select an older user installation instead
 of the launcher's CLI. Managed Codex launches use the same path priority; the
 selected harness executable and argument vector remain unchanged. Unmanaged
@@ -1296,18 +1310,25 @@ invocations retain their ordinary PATH. The launcher inherits terminal streams
 and foreground process-group behavior, and
 acquires a private daemon-owned Launch Holder
 only while the installed asset is current. Only that Kiro process tree receives
-the holder capability. Eligible login ShellRuns stage the delegating shim even
+the holder capability. A holder authorizes reporting from that launch without
+identifying the engine or creating an Agent. Only recognized PascalCase v3 hook events establish v3 Sessions; v2
+events are rejected. A silent v2 process holds no Session associations. Empty
+holders use the same bounded capacity and exact-process cleanup as v3 holders.
+Eligible login ShellRuns stage the delegating shim even
 when Kiro is not yet installed, so a later installation into their existing
-executable search path does not bypass lifecycle integration. Kiro v2 and
-service invocations, absolute paths typed in a login Shell,
+executable search path does not bypass v3 lifecycle integration. Service
+invocations, absolute paths typed in a login Shell,
 modified PATHs, absent or modified assets, and use outside Boomux execute stock
-Kiro unchanged and untracked. Exact configured executable paths are retained
+Kiro unchanged without holder tracking. Exact configured executable paths are
+retained
 through `BOOMUX_REAL_KIRO`; private launcher provenance is removed from unrelated
 children.
 
 Kiro hook `session_id` is the canonical Session identity and ensures the exact
-`(kiro, session, shell, run)` Agent key through its live Launch Holder. Prompt and
-tool events report Working. Kiro v3 documents Stop as the boundary where the
+`(kiro, session, shell, run)` Agent key through its live Launch Holder. This
+legacy v3 key and its existing asset path/receipt remain unchanged by the
+installation-name split; v2 declares its lifecycle limitation separately. Prompt
+and tool events report Working. Kiro v3 documents Stop as the boundary where the
 agent completed its turn and finished responding, so Stop reports Idle for that
 exact Session. Idle is resumable turn completion, not permanent Session
 completion. The documented hooks expose no authoritative permission-wait,

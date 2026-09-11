@@ -11,6 +11,34 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-09-10: Kiro engine selection and hook limitations
+
+Kiro CLI `2.21.1` was exercised in temporary projects with existing host
+authentication. No global agent profile, default engine, or installed Boomux
+binary was changed. Prompts requested a tool-free `OK` response.
+
+| Probe | Direct host evidence | Scope |
+| --- | --- | --- |
+| v2 with a temporary custom profile in a PTY | `agentSpawn` and `userPromptSubmit` carried the same canonical Session ID. | Demonstrates profile hooks only. The profile approach is not shipped because it changes which agent the user must select. |
+| v2 custom profile with `--no-interactive` | Successful response and `userPromptSubmit`; no startup event captured. | Not evidence for automatic default-agent integration. |
+| Normal built-in v2 agent | Agent editing rejects the built-in agent; an invocation-local agent-directory override did not attach the capture hook. | No safe transparent global lifecycle facility was established. |
+| v3 terminal UI | SessionStart, UserPromptSubmit, and Stop payloads carried the same canonical Session ID. | No tools, permission wait, subagents, or cloud execution exercised. |
+| v3 with `--no-interactive` | Successful response, but none of the temporary capture hooks fired. | No headless notification claim. |
+
+The official [2.x reference](https://kiro.dev/docs/cli/2x-reference/) places
+hooks inside agent configurations; [global hooks](https://kiro.dev/changelog/cli/2-13/)
+are documented for v3. Automatic v2 lifecycle reporting is therefore declared
+unavailable rather than installing or selecting a special agent profile.
+
+Focused native fixtures exercise an unchanged bare command whose host emits v3
+hooks, an unchanged bare command that emits no hooks and creates no Agent,
+current-run holder reporting, cleanup, handoff rollback, and exact v3 recovery.
+They do not infer engine from package version or flags. Installation fixtures
+preserve custom agent and default-agent settings and create no v2 profile.
+Host capture and Boomux reporting were checked separately; this is not a live
+end-to-end desktop notification test. The v3 legacy `kiro` Session key and
+installation receipt remain preserved. See [Kiro usage](kiro.md).
+
 ## 2026-09-10: macOS preview native fixtures
 
 Apple Silicon macOS 15.7.9 passed the selected native lifecycle tests at

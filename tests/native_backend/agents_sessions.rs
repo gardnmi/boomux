@@ -312,7 +312,7 @@ fn kiro_agent_without_live_holder_becomes_inactive() {
 }
 
 #[test]
-fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
+fn bare_kiro_uses_actual_v3_hooks_and_inactivates_only_the_exited_session() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
         .client
@@ -333,7 +333,7 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
     fs::create_dir_all(kiro_home.join("hooks")).unwrap();
     fs::write(
         kiro_home.join("hooks/boomux.json"),
-        include_str!("../../integrations/kiro/boomux.json"),
+        include_str!("../../integrations/kiro-v3/boomux.json"),
     )
     .unwrap();
     let kiro = daemon.runtime_dir.join("kiro-holder-cli");
@@ -699,7 +699,7 @@ fn cold_recovery_resumes_exact_kiro_v3_session_with_run_scoped_hooks() {
         fs::create_dir_all(kiro_home.join("hooks")).unwrap();
         fs::write(
             kiro_home.join("hooks/boomux.json"),
-            include_str!("../../integrations/kiro/boomux.json"),
+            include_str!("../../integrations/kiro-v3/boomux.json"),
         )
         .unwrap();
         let kiro = bin.join("kiro-cli");
@@ -738,9 +738,9 @@ fn cold_recovery_resumes_exact_kiro_v3_session_with_run_scoped_hooks() {
     wait_until(
         || {
             fs::read(daemon.runtime_dir.join("kiro-recovery-argv"))
-                .is_ok_and(|argv| argv == b"--v3\0")
+                .is_ok_and(|argv| argv.is_empty())
         },
-        "initial Kiro run did not launch v3",
+        "initial Kiro run changed its default engine",
     );
     Uuid::parse_str(&fs::read_to_string(daemon.runtime_dir.join("kiro-recovery-marker")).unwrap())
         .unwrap();

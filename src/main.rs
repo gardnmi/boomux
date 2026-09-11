@@ -6739,7 +6739,8 @@ fn format_ambiguous_verification_targets(
 }
 
 fn list_integrations(json: bool) -> Result<(), Box<dyn Error>> {
-    let integrations = integration_management::IntegrationId::all()
+    let integrations = boomux::integrations::ALL
+        .iter()
         .map(integration_management::IntegrationSummary::from)
         .collect::<Vec<_>>();
     if json {
@@ -6779,6 +6780,12 @@ fn format_integration_list(integrations: &[integration_management::IntegrationSu
             integration.name, integration.package, integration.validated_version
         )
         .expect("writing to a string cannot fail");
+    }
+    for integration in integrations {
+        if let Some(reason) = integration.lifecycle_limitation {
+            writeln!(output, "\n{}: {reason}", integration.name)
+                .expect("writing to a string cannot fail");
+        }
     }
     output
 }
@@ -6895,8 +6902,10 @@ fn format_recommended_action(
         integration_management::RecommendedAction::None => "none",
         integration_management::RecommendedAction::Install => "install integration",
         integration_management::RecommendedAction::Replace => "replace with --force",
-        integration_management::RecommendedAction::RestartHost if integration == "kiro" => {
-            "reopen managed ShellRun, then launch bare kiro-cli"
+        integration_management::RecommendedAction::RestartHost
+            if matches!(integration, "kiro" | "kiro-v3") =>
+        {
+            "reopen managed ShellRun, then launch kiro-cli normally"
         }
         integration_management::RecommendedAction::RestartHost => "restart host",
         integration_management::RecommendedAction::InspectError => "inspect reported error",
@@ -7165,15 +7174,12 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     ];
     let integration_hosts = boomux::integrations::ALL
         .iter()
-        .filter_map(|descriptor| {
-            let installation = descriptor.installation?;
-            Some((
-                descriptor.key.to_owned(),
-                serde_json::json!({
-                    "package": installation.package,
-                    "validated_version": installation.validated_version,
-                }),
-            ))
+        .map(|descriptor| {
+            (descriptor.key.to_owned(), serde_json::json!({
+                "package": descriptor.installation.map(|installation| installation.package),
+                "validated_version": descriptor.installation.map(|installation| installation.validated_version),
+                "lifecycle_limitation": descriptor.lifecycle_limitation,
+            }))
         })
         .collect::<serde_json::Map<_, _>>();
     if json {
@@ -10261,25 +10267,25 @@ fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
 
 fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     let executable = resolve_real_kiro()?;
-    let explicit_v3 = arguments.first().is_some_and(|argument| argument == "--v3")
-        && !arguments.iter().any(|argument| argument == "--cloud");
-    let managed_v3 = arguments.is_empty() || explicit_v3;
+    // Acquire only launch authority here. Hook payloads, not flags or the
+    // installed package version, establish that the running engine is v3.
+    let tracking_eligible = kiro_tracking_eligible(&arguments);
+    let integration = integration_management::IntegrationId::KIRO;
+    let managed_run = env::var("BOOMUX_SHELL_ID").is_ok_and(|value| !value.is_empty())
+        && env::var("BOOMUX_RUN_ID").is_ok_and(|value| !value.is_empty());
     let environment = integration_management::Environment::from_process();
-    let hooks_current = integration_management::inspect_without_host_probe(
-        integration_management::IntegrationId::KIRO,
-        &environment,
-        None,
-    )
-    .asset
-    .state
-        == integration_management::AssetState::Current;
-    let argv = kiro_argv(executable, arguments, managed_v3 && hooks_current);
+    let hooks_current =
+        integration_management::inspect_without_host_probe(integration, &environment, None)
+            .asset
+            .state
+            == integration_management::AssetState::Current;
+    let argv = kiro_argv(executable, arguments);
     let mut command = Command::new(&argv[0]);
     sanitize_inherited_opencode_shim(&mut command);
-    if managed_v3 && hooks_current {
+    if managed_run && hooks_current {
         prioritize_boomux_hook_executable(&mut command)?;
     }
-    let holder = if managed_v3 && hooks_current {
+    let holder = if managed_run && tracking_eligible && hooks_current {
         match (
             env::var("BOOMUX_SHELL_ID").ok(),
             env::var("BOOMUX_RUN_ID").ok(),
@@ -10336,11 +10342,31 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit,
     Ok(process_exit_from_status(status))
 }
 
-fn kiro_argv(executable: PathBuf, arguments: Vec<OsString>, managed_v3: bool) -> Vec<OsString> {
-    let mut argv = vec![executable.into_os_string()];
-    if managed_v3 && arguments.is_empty() {
-        argv.push("--v3".into());
+fn kiro_tracking_eligible(arguments: &[OsString]) -> bool {
+    if arguments.iter().any(|argument| argument == "--cloud") {
+        return false;
     }
+    arguments.first().is_none_or(|argument| {
+        matches!(
+            argument.to_str(),
+            Some(
+                "chat"
+                    | "--v3"
+                    | "--tui"
+                    | "--classic"
+                    | "--agent"
+                    | "--resume"
+                    | "-r"
+                    | "--resume-id"
+                    | "--resume-picker"
+                    | "--list"
+            )
+        )
+    })
+}
+
+fn kiro_argv(executable: PathBuf, arguments: Vec<OsString>) -> Vec<OsString> {
+    let mut argv = vec![executable.into_os_string()];
     argv.extend(arguments);
     argv
 }
@@ -11982,7 +12008,7 @@ fn print_integration_diagnostic(
     } else {
         if integration == integration_management::IntegrationId::KIRO {
             eprintln!(
-                "err {} integration: {} foreground process(es) are untracked; reopen the owning managed ShellRun, then launch bare kiro-cli and verify it loads {path}",
+                "err {} integration: {} foreground process(es) are untracked; reopen the owning managed ShellRun, then launch kiro-cli --v3 and verify it loads {path}",
                 spec.key, status.runtime.untracked_processes
             );
         } else {
@@ -14267,18 +14293,48 @@ mod tests {
     }
 
     #[test]
+    fn kiro_tracking_does_not_infer_engine_from_bare_or_custom_agent_launches() {
+        for arguments in [
+            vec![],
+            vec!["chat"],
+            vec!["--v3"],
+            vec!["--agent", "reviewer"],
+            vec!["chat", "--agent-engine", "v2"],
+        ] {
+            assert!(kiro_tracking_eligible(
+                &arguments
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        for arguments in [
+            vec!["--version"],
+            vec!["agent", "list"],
+            vec!["chat", "--cloud"],
+            vec!["--v3", "chat", "--cloud"],
+        ] {
+            assert!(!kiro_tracking_eligible(
+                &arguments
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    #[test]
     fn kiro_supervised_argv_and_exit_status_remain_exact() {
         assert_eq!(
             kiro_argv(
                 "/exact/kiro-cli".into(),
                 vec!["chat".into(), "literal; value".into()],
-                false,
             ),
             ["/exact/kiro-cli", "chat", "literal; value"].map(OsString::from)
         );
         assert_eq!(
-            kiro_argv("/exact/kiro-cli".into(), Vec::new(), true),
-            ["/exact/kiro-cli", "--v3"].map(OsString::from)
+            kiro_argv("/exact/kiro-cli".into(), Vec::new()),
+            ["/exact/kiro-cli"].map(OsString::from)
         );
         let status = Command::new("/bin/sh")
             .args(["-c", "exit 23"])
@@ -15550,7 +15606,8 @@ mod tests {
 
     #[test]
     fn formats_integration_output_without_tab_alignment() {
-        let integrations = integration_management::IntegrationId::all()
+        let integrations = boomux::integrations::ALL
+            .iter()
             .map(integration_management::IntegrationSummary::from)
             .collect::<Vec<_>>();
         assert_eq!(
@@ -15560,7 +15617,8 @@ mod tests {
              pi        @earendil-works/pi-coding-agent  0.84.1\n\
              claude    @anthropic-ai/claude-code        2.1.236\n\
              codex     @openai/codex                    0.147.0\n\
-             kiro      kiro-cli                         2.18.0\n"
+             kiro-v2   -                                -\n\
+             kiro-v3   kiro-cli                         2.21.1\n\nkiro-v2: automatic lifecycle reporting is unavailable for Kiro v2; normal kiro-cli launches keep the user's agent and engine\n"
         );
 
         let status = integration_management::IntegrationStatus {
@@ -15599,7 +15657,7 @@ mod tests {
                 "kiro",
                 integration_management::RecommendedAction::RestartHost
             ),
-            "reopen managed ShellRun, then launch bare kiro-cli"
+            "reopen managed ShellRun, then launch kiro-cli normally"
         );
     }
 

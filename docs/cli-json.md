@@ -447,8 +447,15 @@ Command payloads are:
   transaction across hosts, but every target is preflighted before the first
   write. Codex merges only exact Boomux handlers into
   `${CODEX_HOME:-$HOME/.codex}/hooks.json`, preserving unrelated fields and
-  handlers; modified Boomux handlers require `--force`. Kiro owns only the
-  dedicated `${KIRO_HOME:-$HOME/.kiro}/hooks/boomux.json` asset.
+  handlers; modified Boomux handlers require `--force`. `kiro-v3` (also accepted
+  as `kiro`) owns `${KIRO_HOME:-$HOME/.kiro}/hooks/boomux.json`. Inventory also
+  includes the non-installable `kiro-v2` descriptor with `lifecycle_limitation`;
+  its package and validated-version inventory placeholders are `-`. Capabilities
+  expose null package/version metadata for non-installable descriptors and an
+  additive `lifecycle_limitation` field (null when none is declared). Setup of a
+  non-installable descriptor reports its limitation rather than creating an
+  agent profile. Legacy v3 Agent records retain the `kiro` key. See
+  [Kiro behavior and limitations](kiro.md).
 - `integration.uninstall`: an `integrations` array containing `removed` or
   `not_installed` results, target paths, and whether a host restart is required.
   Every target is preflighted before the first removal.
