@@ -292,3 +292,10 @@ minimized panes retain their PTY and emulator, and their sidebar rows restore th
 Layout keyboard navigation skips minimized panes.
 
 The synthetic `minimize.test.mjs` check covers both paths and minimizing all panes.
+
+Terminal rendering uses Desktop’s 13px text and 8.4 × 17px cell geometry. The
+browser prefers the installed JetBrainsMono Nerd Font, with the bundled JetBrains
+Mono face as fallback. Cell backgrounds cover whole physical pixels to avoid
+seams between Starship/Powerline segments at fractional display scaling.
+`terminal-background.test.mjs` checks solid ANSI backgrounds at DPR 1, 1.25, and 2;
+`POC_DPR=1.25` runs the resize fixture with fractional scaling.

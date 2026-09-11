@@ -4,7 +4,7 @@ import {readFile} from 'node:fs/promises';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 const browser=await chromium.launch({executablePath:process.env.CHROMIUM||'/usr/bin/chromium',headless:true,args:['--no-sandbox']});
 try{
-  const page=await browser.newPage({viewport:{width:1440,height:950}}),resizes=[],errors=[];
+  const page=await browser.newPage({viewport:{width:1440,height:950},deviceScaleFactor:Number(process.env.POC_DPR||1)}),resizes=[],errors=[];
   page.on('pageerror',e=>errors.push(e.message));
   await page.route('**/api/snapshot',r=>r.fulfill({status:404,body:''}));
   if(process.env.POC_APP_SOURCE)await page.route('**/app.js',async r=>r.fulfill({contentType:'text/javascript',body:await readFile(process.env.POC_APP_SOURCE,'utf8')}));

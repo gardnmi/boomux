@@ -1,11 +1,33 @@
 import {getTheme,terminalTheme} from './themes.js';
-import {Ghostty,Terminal,FitAddon,CanvasRenderer} from '/vendor/ghostty-web.js';
+import {Ghostty,Terminal,FitAddon,CanvasRenderer,CellFlags} from '/vendor/ghostty-web.js';
 
 // The pinned ghostty-web renderer lacks an inactive cursor style. Keep this
 // adapter local to the PoC; its ctx/metrics/theme fields are version-specific.
 // Reuse the existing render loop and redraw once when focus changes so the old
 // filled cursor is erased, including when there is no new terminal output.
 const terminalFocus=new WeakMap(),rendererFocus=new WeakMap();
+// Desktop lays out 13px terminal text in fixed 8.4 × 17px cells. Measuring
+// only "M" in Canvas gives a shorter line and rounds the column advance down
+// relative to Desktop. Keep FitAddon, cursor, selection, and drawing on one grid.
+const measureFont=CanvasRenderer.prototype.measureFont;
+CanvasRenderer.prototype.measureFont=function(){
+  const measured=measureFont.call(this),scale=this.fontSize/13,height=17*scale;
+  return {width:8.4*scale,height,baseline:measured.baseline+(height-measured.height)/2};
+};
+// Paint backgrounds across complete physical pixels. Fractional columns must
+// share solid edges rather than independently antialiasing each cell boundary.
+CanvasRenderer.prototype.renderCellBackground=function(cell,col,row){
+  if(this.isInSelection(col,row))this.ctx.fillStyle=this.theme.selectionBackground;
+  else{
+    const inverse=cell.flags&CellFlags.INVERSE;
+    const r=inverse?cell.fg_r:cell.bg_r,g=inverse?cell.fg_g:cell.bg_g,b=inverse?cell.fg_b:cell.bg_b;
+    if(r===0&&g===0&&b===0)return;
+    this.ctx.fillStyle=this.rgbToCSS(r,g,b);
+  }
+  const dpr=this.devicePixelRatio,{width,height}=this.metrics;
+  const left=Math.floor(col*width*dpr)/dpr,top=Math.floor(row*height*dpr)/dpr;
+  this.ctx.fillRect(left,top,Math.ceil((col+cell.width)*width*dpr)/dpr-left,Math.ceil((row+1)*height*dpr)/dpr-top);
+};
 const render=CanvasRenderer.prototype.render,renderCursor=CanvasRenderer.prototype.renderCursor;
 CanvasRenderer.prototype.render=function(buffer,force,viewport,terminal,...rest){
   const state=terminalFocus.get(terminal);
