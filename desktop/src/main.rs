@@ -8944,7 +8944,11 @@ impl Workspace {
             ))
             .when(
                 pane.is_some_and(|pane| {
-                    pane.restored.is_some() && !pane.attaching && pane.session.is_none()
+                    pane.restored
+                        .as_ref()
+                        .is_some_and(|saved| saved.shell.is_some())
+                        && !pane.attaching
+                        && pane.session.is_none()
                 }),
                 |element| {
                     element.child(
@@ -9672,6 +9676,29 @@ impl Render for Workspace {
         self.refresh_terminal_paint_caches(window);
         let tiled = if let Some(layout) = &self.layout {
             self.render_layout(layout, cx)
+        } else if self.boomux_overview.workspaces.is_empty() && self.terminals.is_empty() {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .p_6()
+                .text_center()
+                .text_sm()
+                .text_color(rgb(0xa6adc8))
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xcdd6f4))
+                        .child("Create your first Workspace"),
+                )
+                .child("Click + in the sidebar, then choose New Workspace to get started.")
+                .child("Once created, press Ctrl + Enter to add a Shell.")
+                .child("Press F1 for keyboard shortcuts.")
+                .into_any_element()
         } else {
             div().size_full().into_any_element()
         };

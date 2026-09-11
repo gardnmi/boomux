@@ -188,7 +188,7 @@ impl Workspace {
                 })
             })
             .collect();
-        let arrangement = Arrangement {
+        let mut arrangement = Arrangement {
             tree: self.layout.as_ref().map(encode_tree),
             floating: self
                 .floating
@@ -206,6 +206,7 @@ impl Workspace {
                 .map(|id| id as u64),
             canvas: [self.layout_canvas.0.max(1.0), self.layout_canvas.1.max(1.0)],
         };
+        arrangement.discard_unbound_panes();
         let retained_panes: usize = self
             .layout_document
             .arrangements
@@ -294,6 +295,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mut saved = saved;
+        saved.discard_unbound_panes();
         self.layout_restoring = true;
         self.restore_pointer_guard = PointerGuard::Waiting;
         // A quick return can find this Workspace still sliding out. Preserve
