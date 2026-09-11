@@ -223,15 +223,25 @@ you view Git. See [Git panel behavior](../docs/desktop/git-panel.md).
 
 ### Remotes
 
-Connect another machine using the general connect action above the machine
-cards, or **+ → New remote workspace…**.
+Use **+ → New remote workspace…** to choose a machine. Select a connected
+machine to create and open a Workspace there, or choose **Connect another
+machine…** to set up a new SSH connection. Use Up/Down and Enter to choose;
+Escape closes the picker. You can also connect from the Remotes tab.
+
+Setup asks for an SSH address and a display name, using your existing SSH
+configuration. Authentication and any installation consent happen in the setup
+terminal. After successful setup, press Enter to close setup and open the exact
+remote Shell it created. If opening fails, use the sidebar to reopen that Shell
+rather than repeating setup.
 
 Remote Workspaces use a machine icon and show connection status. Their Shells
-run on that machine. Connecting creates an initial Workspace and Shell;
-open it from the sidebar.
+run on that machine. Connection loss does not mean remote work has stopped.
 
 Machine cards start collapsed. Click a header to expand it, or use Enter/Space
-when the Remotes panel has keyboard focus.
+when the Remotes panel has keyboard focus. Unavailable machines show a recovery
+action even while collapsed: **Sign in…**, **Review update…**, or **Review
+connection…**. Update review retains identity verification and installation
+consent; older incompatible versions may require manual updates on the machine.
 
 | Machine action | Result |
 | --- | --- |

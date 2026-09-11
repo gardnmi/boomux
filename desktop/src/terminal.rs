@@ -454,6 +454,7 @@ pub struct TerminalSession {
     pub shell_id: String,
     pub shell_name: String,
     pub setup_workspace_cleanup: Option<SetupWorkspaceCleanup>,
+    pub connect_result: Option<boomux::desktop_connect::ConnectResultReceiver>,
     shared: Arc<SharedTerminal>,
     last_size: Mutex<(u16, u16)>,
 }
@@ -544,6 +545,7 @@ impl TerminalSession {
             shell_id: shell.id,
             shell_name: shell.name,
             setup_workspace_cleanup: None,
+            connect_result: None,
             shared,
             // Attachment already established this geometry. Avoid an unchanged
             // first-render resize canceling the reader's temporary redraw size.
@@ -1112,7 +1114,11 @@ fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
         status: shell.status,
         run_id: shell.run.map(|run| run.id),
         desktop_setup: match shell.command.get(1).map(String::as_str) {
-            Some("__desktop-setup" | "__guided-node-add") => shell.command.len() == 2,
+            Some("__desktop-setup") => shell.command.len() == 2,
+            Some("__guided-node-add") => {
+                shell.command.len() == 2
+                    || (shell.command.len() == 4 && shell.command[2] == "--result-socket")
+            }
             Some(
                 "__guided-node-upgrade"
                 | "__guided-node-reauthenticate"
@@ -1121,6 +1127,16 @@ fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
             _ => false,
         },
     }
+}
+
+pub fn connected_shell(
+    identity: boomux::protocol::QualifiedIdentity,
+) -> Result<ShellChoice, String> {
+    let client = client::connect().map_err(|e| e.to_string())?;
+    let key = crate::remote::key(&identity.node_id, &identity.inner_id);
+    let mut shell = crate::remote::shell(&client, &key).map_err(|e| e.to_string())?;
+    crate::remote::qualify_shell(&identity.node_id, &mut shell);
+    Ok(shell_choice(shell))
 }
 
 /// Create a pending shell next to an existing shell. Boomux remains the owner
@@ -1200,6 +1216,7 @@ pub enum WorkspaceLaunch {
     Setup,
     ConfigEdit,
     AddNode,
+    AddNodeResult(std::path::PathBuf),
     RemoteWorkspace {
         node_id: String,
         name: String,
@@ -1215,6 +1232,7 @@ impl WorkspaceLaunch {
             self,
             Self::Setup
                 | Self::AddNode
+                | Self::AddNodeResult(_)
                 | Self::UpgradeNode(_)
                 | Self::ReauthenticateNode(_)
                 | Self::UninstallNode(_)
@@ -1242,6 +1260,14 @@ impl WorkspaceLaunch {
             Self::Setup => Some(("Set up agents", vec!["__desktop-setup".into()])),
             Self::ConfigEdit => Some(("Edit Boomux config", vec!["config".into(), "edit".into()])),
             Self::AddNode => Some(("Connect remote machine", vec!["__guided-node-add".into()])),
+            Self::AddNodeResult(path) => Some((
+                "Connect remote machine",
+                vec![
+                    "__guided-node-add".into(),
+                    "--result-socket".into(),
+                    path.to_string_lossy().into_owned(),
+                ],
+            )),
             Self::UpgradeNode(id) => Some((
                 "Update remote Boomux",
                 vec!["__guided-node-upgrade".into(), id.clone()],
@@ -2817,6 +2843,7 @@ mod tests {
     fn remote_setup_cleanup_owns_only_the_created_temporary_workspace() {
         for launch in [
             super::WorkspaceLaunch::AddNode,
+            super::WorkspaceLaunch::AddNodeResult("/tmp/setup-result".into()),
             super::WorkspaceLaunch::UpgradeNode("remote".into()),
             super::WorkspaceLaunch::UninstallNode("remote".into()),
             super::WorkspaceLaunch::ReauthenticateNode("remote".into()),
@@ -3300,6 +3327,42 @@ mod tests {
             super::project_workspace_name("api", ["api", "api-2", "api-4"].into_iter()),
             "api-3"
         );
+    }
+
+    #[test]
+    fn remote_result_setup_retains_exact_cleanup_ownership() {
+        let path = std::path::PathBuf::from("/tmp/result with spaces; literal");
+        let launch = super::WorkspaceLaunch::AddNodeResult(path.clone());
+        let command = launch.command().unwrap().1;
+        assert_eq!(
+            command,
+            [
+                "__guided-node-add",
+                "--result-socket",
+                path.to_str().unwrap()
+            ]
+        );
+        let mut shell: boomux::protocol::ShellSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "setup", "workspace_id": "workspace", "name": "connect", "cwd": "/tmp", "status": "pending",
+            "command": ["/bin/boomux", "__guided-node-add", "--result-socket", path]
+        })).unwrap();
+        assert!(super::shell_choice(shell.clone()).desktop_setup);
+        let mut workspace: boomux::protocol::WorkspaceSnapshot =
+            serde_json::from_value(serde_json::json!({
+                "id": "workspace", "name": "temporary", "revision": 1, "shells": [shell]
+            }))
+            .unwrap();
+        assert!(
+            super::SetupWorkspaceCleanup::from_creation(&launch, "owner".into(), &workspace)
+                .is_some()
+        );
+        workspace.shells[0].command[3] = "/tmp/another-launch".into();
+        assert!(
+            super::SetupWorkspaceCleanup::from_creation(&launch, "owner".into(), &workspace)
+                .is_none()
+        );
+        shell.command[2] = "--other".into();
+        assert!(!super::shell_choice(shell).desktop_setup);
     }
 
     #[test]
