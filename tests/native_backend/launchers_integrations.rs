@@ -51,28 +51,37 @@ fn managed_integrations_install_at_startup_refresh_on_handoff_and_respect_uninst
         },
         "refresh receipt was not saved",
     );
-    let output = daemon
-        .command()
-        .args(["integration", "uninstall", "pi"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    // Receipt publication precedes releasing the integration lock. A restart
+    // also begins asynchronous maintenance, so both explicit commands can
+    // legitimately encounter a busy lock. Retry only that documented outcome;
+    // ownership, filesystem, and other command failures must still fail here.
+    let run_after_maintenance = |arguments: &[&str]| {
+        let busy = std::io::Error::from_raw_os_error(libc::EWOULDBLOCK).to_string();
+        wait_until(
+            || {
+                let output = daemon
+                    .command()
+                    .args(arguments)
+                    .env("PATH", daemon.runtime_dir.join("bin"))
+                    .output()
+                    .unwrap();
+                if output.status.success() {
+                    return true;
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Sync prefixes each integration's error with its name.
+                assert!(
+                    !stderr.trim().is_empty() && stderr.lines().all(|line| line.ends_with(&busy)),
+                    "{arguments:?}: {stderr}"
+                );
+                false
+            },
+            &format!("integration maintenance did not release its lock for {arguments:?}"),
+        );
+    };
+    run_after_maintenance(&["integration", "uninstall", "pi"]);
     daemon.client.restart().unwrap();
-    let output = daemon
-        .command()
-        .args(["integration", "sync"])
-        .env("PATH", daemon.runtime_dir.join("bin"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    run_after_maintenance(&["integration", "sync"]);
     assert!(!asset.exists());
 }
 
