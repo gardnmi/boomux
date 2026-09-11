@@ -359,19 +359,16 @@ See [`docs/ci.md`](docs/ci.md) for the full selection and evidence contract.
 
 ### Development previews
 
-Use a GitHub prerelease to distribute a tested development build before the
-feature joins the stable release. Previews are manually published, not nightly.
-The initial publisher supports the macOS Apple Silicon ZIP. The publishing
-workflow can live on `main` while the Mac build workflow and application port
-remain on `feature/macos`; publishing does not require merging that port.
+macOS validation runs inside the normal **CI** workflow on PRs and `main`.
+The required **CI result** includes native tests and packaged-app smoke. See
+[CI selection and preview promotion](docs/ci.md#native-macos-validation).
 
-After both general CI for the source revision and the `macOS preview` workflow
-pass, run **Actions → Publish development preview → Run workflow**, supplying the
-Mac build run ID. This entry becomes available after the workflow is merged to
-the default branch. It promotes the exact tested bytes without rebuilding, uses
-a unique `preview-macos-YYYYMMDD.<run-id>` tag, and keeps stable updates unchanged.
-The release contains requirements, testing instructions, checksums, and source
-information. New previews use new tags; retries cannot replace published bytes.
+To distribute an Apple Silicon testing preview, wait for a successful **CI**
+main push, or manually run **CI** for a development branch. Run **Publish
+development preview** with that CI run ID. It promotes the exact tested ZIP
+without rebuilding, using a unique `preview-macos-YYYYMMDD.<run-id>` prerelease
+tag. PR/merge-group artifacts cannot be published. Stable updates remain
+Linux-only; Mac signing is ad-hoc and the app is not notarized.
 
 
 ## Clean Up

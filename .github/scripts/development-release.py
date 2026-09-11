@@ -10,10 +10,18 @@ import zipfile
 
 MAX_ARCHIVE = 128 * 1024 * 1024
 MAX_CONTENT = 512 * 1024 * 1024
-REQUIRED_JOBS = {
+LEGACY_REQUIRED_JOBS = {
     "macos": {"Check backend", "Test descriptor transfer", "Test native process identity",
               "Test native lifecycle and recovery"},
     "package": {"Build preview executables", "Package preview", "Exercise packaged application"},
+}
+REQUIRED_JOBS = {
+    "macos / Native macOS": {"Run native Clippy", "Test descriptor transfer",
+                             "Test native process identity", "Test native lifecycle and recovery",
+                             "Test native Desktop"},
+    "macos / Package macOS preview": {"Build preview executables", "Package preview",
+                                     "Exercise packaged application"},
+    "CI result": {"Require every selected check"},
 }
 
 
@@ -57,10 +65,11 @@ def validate_run(run, jobs, repo, run_id):
             and run["conclusion"] == "success" and run["event"] in {"push", "workflow_dispatch"}
             and run["head_repository"]["full_name"] == repo
             and run["repository"]["full_name"] == repo
-            and run["path"] == ".github/workflows/macos-preview.yml"
+            and run["path"] in {".github/workflows/ci.yml", ".github/workflows/macos-preview.yml"}
             and re.fullmatch(r"[0-9a-f]{40}", run["head_sha"])):
         raise ValueError("Expected a successful macOS preview run from this repository")
-    for name, steps in REQUIRED_JOBS.items():
+    required = LEGACY_REQUIRED_JOBS if run["path"] == ".github/workflows/macos-preview.yml" else REQUIRED_JOBS
+    for name, steps in required.items():
         if not any(job["name"] == name and job["conclusion"] == "success"
                    and steps <= {step["name"] for step in job["steps"] if step["conclusion"] == "success"}
                    for job in jobs):

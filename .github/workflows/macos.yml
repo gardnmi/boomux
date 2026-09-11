@@ -1,26 +1,14 @@
-name: macOS preview
+name: macOS validation
 
 on:
-  push:
-    branches: [feature/macos]
-    paths-ignore:
-      - docs/architecture.md
-      - docs/live-pty-handoff.md
-      - docs/platforms/macos.md
-      - docs/lifecycle-validation.md
-      - docs/adr/**
-      - DEVELOPMENT.md
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
-concurrency:
-  group: macos-preview-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  macos:
+  native:
+    name: Native macOS
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -28,32 +16,19 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install stable --profile minimal --component clippy
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.15.2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: macos-preview-v1
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           cache-on-failure: true
-      - name: Probe native executable and process APIs
-        run: |
-          uname -m
-          python3 - <<'PYCODE'
-          import ctypes, os, subprocess
-          libc = ctypes.CDLL(None)
-          print("identity signal API:", getattr(libc, "proc_signal_with_audittoken", None))
-          fd = os.open("/bin/echo", os.O_RDONLY)
-          try:
-              result = subprocess.run([f"/dev/fd/{fd}", "descriptor-exec-ok"], pass_fds=(fd,), capture_output=True, text=True)
-              print("descriptor exec:", result.returncode, result.stdout, result.stderr)
-          except OSError as error:
-              print("descriptor exec unavailable:", error)
-          finally:
-              os.close(fd)
-          PYCODE
-      - name: Check backend
-        run: cargo +stable check --locked --all-targets
+      - name: Run native Clippy
+        run: cargo +stable clippy --locked -p boomux -p boomux-desktop --all-targets --all-features -- -D warnings
+      - name: Compile native lifecycle tests
+        run: cargo +stable test --locked --test native_backend --no-run
       - name: Test descriptor transfer
         run: cargo +stable test --locked --lib fd_transfer -- --test-threads=1
       - name: Test native process identity
@@ -62,8 +37,8 @@ jobs:
         env:
           BOOMUX_TEST_DIAGNOSTICS: "1"
         run: python3 .github/scripts/test-macos-native.py
-      - name: Test Desktop layout persistence
-        run: cargo +stable test -p boomux-desktop layout_ --locked -- --test-threads=1
+      - name: Test native Desktop
+        run: cargo +stable test -p boomux-desktop --locked -- --test-threads=1
       - name: Upload native diagnostics
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -73,6 +48,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
   package:
+    name: Package macOS preview
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -80,13 +56,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install stable --profile minimal --component clippy
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.15.2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: macos-preview-release-v1
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - name: Build preview executables
         run: cargo +stable build --release --locked -p boomux -p boomux-desktop

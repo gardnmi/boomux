@@ -27,6 +27,14 @@ consistent between GUI, terminal, and SSH invocations. Configuration and state
 continue to honor Boomux and XDG overrides. Platform work does not by itself
 justify a public protocol or persisted-state version bump.
 
+## Continuous validation
+
+The native jobs now run through the normal `CI` workflow on PR integration
+commits and main pushes, and are included in the required `CI result` gate.
+`macos.yml` replaces the temporary feature-branch-only `macos-preview.yml`.
+See [CI and preview publishing](../ci.md#native-macos-validation). Historical
+runs below record earlier compatibility evidence, not validation of later code.
+
 ## Validation evidence
 
 The native runner is Apple Silicon on macOS 15.7.9. Backend compilation,

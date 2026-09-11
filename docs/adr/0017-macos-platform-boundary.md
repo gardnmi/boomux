@@ -1,6 +1,6 @@
 # 0017: Isolate host operations for the macOS preview
 
-Status: accepted for the feature/macos preview; native validation evidence is
+Status: accepted for the macOS testing preview; native validation evidence is
 tracked in ../platforms/macos.md before support is advertised.
 
 ## Decision
