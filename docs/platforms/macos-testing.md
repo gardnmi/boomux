@@ -1,5 +1,12 @@
 # Boomux macOS testing preview
 
+> [!WARNING]
+> **macOS is a largely untested experimental preview.** It has limited automated
+> CI and smoke-test coverage, with very little real-world testing. Everyday use,
+> hardware compatibility, and session reliability are not established. Expect
+> bugs; use it for evaluation only, not important work. Inclusion in a regular
+> release does not make the macOS build stable or production-ready.
+
 macOS support is experimental and requires Apple Silicon (M1 or newer) and
 macOS 15 or newer. Intel builds are not published. The app is ad-hoc signed,
 not Apple-notarized.

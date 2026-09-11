@@ -9,6 +9,11 @@ This document retains the packaging, migration, and ownership guarantees.
 
 One Boomux release contains the CLI packages for x86_64/ARM64 and the Desktop
 bundle for x86_64 GNU/Linux, plus an experimental Apple Silicon macOS 15+ ZIP.
+The macOS bundle is largely untested in real-world use and is for evaluation
+only, not important work. Limited CI and smoke tests do not establish everyday
+reliability. Keep this warning prominent in regular and development release
+notes; inclusion in a regular release does not make macOS production-ready.
+
 The universal `boomux-installer.sh --desktop` selects the host platform. macOS
 installation and manual updates follow the [Mac guide](../platforms/macos-testing.md);
 its bundle is ad-hoc signed and not notarized. The remaining installation and

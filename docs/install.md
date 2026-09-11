@@ -14,6 +14,9 @@ For the everyday install-and-launch steps, use the
 
 Each stable GitHub release publishes `boomux-installer.sh` alongside the native
 GNU/Linux archives and an experimental Apple Silicon macOS Desktop bundle.
+The macOS bundle is largely untested in real-world use and is for evaluation
+only, not important work. Publishing it in a stable release does not establish
+macOS stability; see the [testing status and limitations](platforms/macos-testing.md).
 The stable entry point is:
 
 ```console

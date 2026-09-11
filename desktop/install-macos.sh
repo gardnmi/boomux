@@ -53,6 +53,8 @@ trap 'exit 1' HUP INT TERM
 temporary=$(mktemp -d "$applications/.boomux-install.XXXXXX")
 archive=boomux-desktop-aarch64-apple-darwin.zip
 base_url=$repository/releases/download/$tag
+printf 'WARNING: macOS is a largely untested experimental preview with very little real-world testing.\n'
+printf 'Limited CI and smoke tests do not establish everyday reliability. Use for evaluation only, not important work.\n'
 printf 'Downloading Boomux %s for Apple Silicon macOS (experimental)...\n' "${tag#v}"
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fLsS --max-filesize 134217728 -o "$temporary/$archive" "$base_url/$archive"
 curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fLsS --max-filesize 1024 -o "$temporary/$archive.sha256" "$base_url/$archive.sha256"

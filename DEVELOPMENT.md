@@ -8,7 +8,9 @@ authoritative in the documents listed under [Repository Orientation](#repository
 
 ## Prerequisites
 
-The supported release workflow targets Linux. The macOS preview targets Apple
+The supported release workflow targets Linux. The macOS preview is largely
+untested in real-world use; CI and smoke tests do not establish everyday
+reliability. It is for evaluation only, not important work. It targets Apple
 Silicon on macOS 15+ with Xcode command-line tools and Zig 0.15.2 for Desktop;
 see [macOS development and validation](docs/platforms/macos.md). Both use the
 stable Rust toolchain with `rustfmt` and Clippy. Install the toolchain with:
