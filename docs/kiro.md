@@ -1,97 +1,78 @@
-# Kiro CLI v2 and v3
+# Kiro CLI engines
 
-Boomux provides separate `kiro-v2` and `kiro-v3` integrations. **Typing
-`kiro-cli` preserves Kiro's own default engine and your exact arguments.**
-Boomux never adds `--v3`. If your Kiro settings select v3 by default, those
-settings still apply.
+**Use `kiro-cli` normally.** Boomux preserves the command's exact arguments and
+lets the installed Kiro choose its engine and agent. Depending on the installed
+release and Kiro settings, a bare launch may run v2 or v3. Boomux does not add an
+engine flag, select a different agent, or require a special agent profile.
 
-| Integration | Setup | Start in a managed ShellRun |
+Explicit Kiro options such as `--v3` or `--agent reviewer` remain unchanged.
+The package version alone does not determine the running engine: some `2.x`
+packages also include the opt-in v3 engine.
+
+## Support by engine
+
+| Engine that Kiro runs | Automatic integration | Limits |
 | --- | --- | --- |
-| Kiro v2 | `boomux integration setup kiro-v2` | `kiro-cli chat --agent-engine v2 --agent boomux-v2` |
-| Kiro v3 | `boomux integration setup kiro-v3` | `kiro-cli --v3` |
+| v2 | Ordinary terminal behavior and a foreground Kiro hint | Automatic Session lifecycle reporting and notifications are unavailable. |
+| v3 | Standalone hooks report canonical Session activity through the managed launcher, including bare launches | Requires hooks to fire; see headless and notification limits below. |
 
-These are engine versions; an installed CLI with a `2.x` package version can
-also offer the opt-in v3 engine. See [dated validation](lifecycle-validation.md)
-for the exact versions and behavior exercised.
+The integration inventory lists `kiro-v2` and `kiro-v3` separately and explains
+v2's limitation. V2 has no installable lifecycle asset. Kiro v2 embeds hooks in
+agent configurations and does not provide the global hook facility needed to
+instrument the normal built-in agent. Boomux leaves your agent configurations,
+default agent, prompts, tools, and permissions alone. It does not infer Working,
+Idle, Blocked, Inactive, or Done from v2 terminal output or process exit.
 
-## Installation and selection
+## V3 installation
 
-Automatic integration maintenance prepares both assets. Setup, status, install,
-and uninstall can address each integration independently:
+Automatic integration maintenance prepares the v3 hooks. Manual inspection and
+setup are available with:
 
 ```console
-boomux integration status kiro-v2
 boomux integration status kiro-v3
-boomux integration uninstall kiro-v2
+boomux integration setup kiro-v3
 ```
 
-V2 owns `${KIRO_HOME:-$HOME/.kiro}/agents/boomux-v2.json`, a dedicated profile
-with embedded hooks. Select it explicitly with `--agent boomux-v2`; installing
-it does not change your default agent, selected model, or engine. It enables
-built-in tools without granting blanket tool trust. Existing custom profiles
-are untouched. To use your own profile, copy the four hook groups from the
-bundled profile into your profile and keep the `boomux kiro hook-v2` commands.
-Only profiles containing those hooks report v2 activity. Project profiles can
-shadow global profiles with the same name; check which profile Kiro loads.
+The asset is `${KIRO_HOME:-$HOME/.kiro}/hooks/boomux.json`. The old setup name
+`kiro` remains an alias for `kiro-v3`, including its existing ownership receipt
+and uninstall preference. V3 Agent records keep the legacy `kiro` integration
+key, preserving history and exact resume.
 
-V3 owns `${KIRO_HOME:-$HOME/.kiro}/hooks/boomux.json`, the existing standalone
-hook asset. The old setup name `kiro` remains an alias for `kiro-v3`, including
-its existing ownership receipt and uninstall preference. V3 Agent records keep
-the legacy `kiro` integration key, preserving history and exact resume. V2
-records use `kiro-v2`; they are never resumed with a v3 command.
+Modified assets require explicit replacement with `--force`. Uninstall with
+`boomux integration uninstall kiro-v3` to opt out. Reopen existing managed
+ShellRuns after upgrading Boomux to refresh their launcher shim. Then launch
+Kiro as usual.
 
-The runtime status cannot infer an engine from `kiro-cli` alone. It reports
-`not_observable` until exact hook evidence identifies a version; a reporting v2
-Session is not treated as a broken v3 installation, or vice versa. To verify a
-specific live Shell, use `boomux integration verify kiro-v2 --shell <id>` or
-the equivalent `kiro-v3` command.
+The runtime status cannot infer an engine from the `kiro-cli` foreground name
+alone. Before exact v3 hook evidence exists, it reports `not_observable`.
+A Launch Holder authorizes reporting from one managed process; acquiring a
+holder does not create an Agent or declare that v3 is running. Only recognized
+v3 hook payloads establish a v3 Session.
 
-Both installers preserve modified assets unless explicitly replaced with
-`--force`. Uninstalling one leaves the other installed. Reopen an existing
-managed ShellRun after upgrading Boomux to refresh its launcher shim.
+## V3 lifecycle and notification limits
 
-## Lifecycle and notification limits
+| Evidence | Report |
+| --- | --- |
+| SessionStart | Unknown |
+| Prompt submission, tool start, tool return | Working |
+| Stop: finished responding | Idle |
+| Final supervised holder exits | Inactive |
+| Permission wait or error | No Blocked report |
+| Permanent Session completion | No Done report |
 
-| Evidence | v2 profile | v3 standalone hooks |
-| --- | --- | --- |
-| Startup | Unknown | Unknown |
-| Prompt submission, tool start, tool return | Working | Working |
-| Finished responding | Not established | Stop reports Idle |
-| Permission wait or error | No Blocked report | No Blocked report |
-| Host exit | No profile exit cleanup | Final supervised holder release reports Inactive |
-| Permanent Session completion | No Done report | No Done report |
-
-On CLI `2.21.1`, the v2 terminal probe emitted startup and prompt hooks for
-the same Session. Headless mode emitted a prompt hook but no startup hook.
-Tool-event decoding is covered by fixtures; tool execution was not part of
-these host probes.
-
-V2 deliberately does not install a Stop handler. The legacy documentation calls
-`agentStop`/`stop` a Session-end boundary, while v3 defines Stop as finishing a
-response. We have not established a reliable v2 turn-idle or inactivity signal.
-V2 can therefore remain Working after a response or after returning to the
-shell prompt; it does not provide reliable ready-for-input notifications. Quiet
-output, a returned tool, and process exit are not inferred completion signals.
-V2 has no automatic exact Session resume or title discovery capability.
-
-V3 Idle means a resumable turn has finished, not that the Session is permanently
-Done. Notifications still depend on your Boomux notification settings. V3
-tracking requires a current hook asset, the managed launcher, and an explicit
-leading `--v3`. Cloud execution, service commands, absolute executable paths
-typed in a login shell, and PATH changes that bypass the shim do not establish
-local v3 lifecycle authority. On CLI `2.21.1`, the tested terminal UI emitted
-SessionStart, UserPromptSubmit, and Stop for the same Session, but the
+Idle means a resumable turn has finished. Notifications also depend on your
+Boomux notification settings. On CLI `2.21.1`, the tested terminal UI emitted
+SessionStart, UserPromptSubmit, and Stop for the same Session. Its headless
 `--no-interactive` probe emitted none of the capture hooks despite completing
-its response. Do not rely on v3 headless notifications on this host version.
-No exact Kiro Web handoff is provided.
+its response, so headless notifications are not validated for that version.
 
-V2 hooks use the canonical `session_id` and exact managed ShellRun environment;
-missing identity or unsupported events fail open without reporting a guessed
-Session. V3 hooks additionally require the supervised Launch Holder. Hooks
-produce no stdout and do not decide tool permissions. Missing or delayed host
-hooks limit what Boomux can report; they are not reconstructed from terminal
-text.
+Cloud execution, service commands, and invocations that bypass the managed
+launcher do not establish local v3 lifecycle authority. Absolute executable
+paths typed in a login shell and modified PATHs can bypass the shim. No exact
+Kiro Web handoff is provided. Missing hooks are not reconstructed from terminal
+text. Legacy v2 event names cannot be interpreted as v3 lifecycle events.
 
+See [dated host validation](lifecycle-validation.md) for the exact test scope.
 Upstream references: [CLI 2.x hooks](https://kiro.dev/docs/cli/2x-reference/),
-[v3 hooks](https://kiro.dev/docs/cli/hooks/), and
-[engine migration](https://kiro.dev/docs/cli/v3/).
+[v3 global hooks](https://kiro.dev/changelog/cli/2-13/), and
+[v3 hook events](https://kiro.dev/docs/cli/hooks/).

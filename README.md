@@ -120,7 +120,7 @@ here use Tree layout.
 
 ### Coding Agents, Ready To Go
 
-Boomux bundles integrations for **Claude Code, Codex, OpenCode, Pi, Kiro CLI v2, and Kiro CLI v3**.
+Boomux bundles integrations for **Claude Code, Codex, OpenCode, Pi, and Kiro CLI v3**.
 The service prepares them automatically on startup, including on remote
 machines, and updates unchanged managed integrations with the bundled version.
 
@@ -133,8 +133,9 @@ Integrations report lifecycle events; quiet terminal output or process exit
 alone does not establish Agent completion.
 See [automatic integration management](docs/install.md#automatic-integration-management)
 for opt-outs, customization protection, and troubleshooting.
-See [Kiro v2 and v3](docs/kiro.md) for explicit engine selection and notification
-limits; bare `kiro-cli` keeps its normal engine.
+See [Kiro v2 and v3](docs/kiro.md) for engine support and notification
+limits. Use `kiro-cli` normally; Boomux preserves its default engine and agent.
+Automatic v2 lifecycle reporting is unavailable.
 
 ### Remote Workspaces
 

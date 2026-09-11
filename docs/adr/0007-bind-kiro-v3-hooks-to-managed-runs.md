@@ -69,12 +69,13 @@ carrying that holder's private capability.
 
 ## 2026-09-10 engine selection amendment
 
-The integration split supersedes automatic promotion of bare `kiro-cli` to v3.
-Only an explicit leading `--v3` selects v3 holder tracking. V2 has a separate
-opt-in profile and bounded legacy hook handler; see [Kiro usage](../kiro.md)
-and the current architecture. Existing v3 holder authority is unchanged.
+The launcher preserves all arguments and the installed host's default engine
+and agent. Bare `kiro-cli` can run v2 or v3. Eligible managed local launches
+acquire only process-bound reporting authority; v3 hook payloads establish v3
+Sessions. Empty holders create no Agent and follow existing bounded cleanup.
+Explicit `--v3` is neither added nor required for reporting.
 
-The dedicated v2 profile does not modify user-selected custom profiles. Its
-canonical Session hooks use ShellRun authority without making holder-based
-process-exit or inactivity claims. This narrower v2 scope is distinct from the
-rejected use of unscoped global v3 hooks as full lifecycle authority.
+V2 has no supported transparent global-hook installation. Its descriptor states
+that limitation; Boomux does not create or select a custom agent profile. The
+v3 decoder rejects legacy v2 event names. See [Kiro usage](../kiro.md) and the
+current architecture. Existing v3 holder and Session identities are preserved.

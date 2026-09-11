@@ -11,32 +11,33 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
-## 2026-09-10: separate Kiro engines
+## 2026-09-10: Kiro engine selection and hook limitations
 
-Kiro CLI `2.21.1` was exercised with explicit engine selection in temporary
-projects, using the existing host authentication. No global agent profile,
-default engine, or installed Boomux binary was changed. Hook capture commands
-replaced only the reporter commands in temporary copies of the bundled assets.
-Prompts requested a tool-free `OK` response.
+Kiro CLI `2.21.1` was exercised in temporary projects with existing host
+authentication. No global agent profile, default engine, or installed Boomux
+binary was changed. Prompts requested a tool-free `OK` response.
 
-| Engine and launch | Direct host evidence | Limits |
+| Probe | Direct host evidence | Scope |
 | --- | --- | --- |
-| v2: `kiro-cli chat --agent-engine v2 --agent boomux-v2` in a PTY | The installed CLI accepted the bundled agent profile via `agent validate`. The terminal run emitted `agentSpawn` and `userPromptSubmit` with canonical `session_id` fields. | Stop and tool execution were not exercised; no Idle, Blocked, Inactive, or Done claim. |
-| v2 with `--no-interactive` | Successful response and `userPromptSubmit` with canonical Session identity. | No startup event was captured in this mode. |
-| v3: `kiro-cli --v3 chat <prompt>` in a PTY | SessionStart, UserPromptSubmit, and Stop payloads carried the same canonical Session ID. | No permission wait, tools, subagents, or cloud execution was exercised. |
-| v3 with `--no-interactive` | Successful response, but none of the temporary capture hooks fired. | No headless lifecycle or notification claim for this host version. |
+| v2 with a temporary custom profile in a PTY | `agentSpawn` and `userPromptSubmit` carried the same canonical Session ID. | Demonstrates profile hooks only. The profile approach is not shipped because it changes which agent the user must select. |
+| v2 custom profile with `--no-interactive` | Successful response and `userPromptSubmit`; no startup event captured. | Not evidence for automatic default-agent integration. |
+| Normal built-in v2 agent | Agent editing rejects the built-in agent; an invocation-local agent-directory override did not attach the capture hook. | No safe transparent global lifecycle facility was established. |
+| v3 terminal UI | SessionStart, UserPromptSubmit, and Stop payloads carried the same canonical Session ID. | No tools, permission wait, subagents, or cloud execution exercised. |
+| v3 with `--no-interactive` | Successful response, but none of the temporary capture hooks fired. | No headless notification claim. |
 
-Host capture and Boomux reporting were checked separately. Focused reducer and
-native fixtures validate exact ShellRun v2 registration, stale-run rejection,
-fail-open/no-stdout behavior, independent installation/uninstall, unchanged bare
-argv, v3 holder reporting and cleanup, handoff rollback, and exact v3 recovery.
-The v3 legacy `kiro` Session key and installation receipt are preserved. These
-fixtures do not constitute a live end-to-end desktop notification test.
+The official [2.x reference](https://kiro.dev/docs/cli/2x-reference/) places
+hooks inside agent configurations; [global hooks](https://kiro.dev/changelog/cli/2-13/)
+are documented for v3. Automatic v2 lifecycle reporting is therefore declared
+unavailable rather than installing or selecting a special agent profile.
 
-V2 deliberately omits Stop: the upstream 2.x reference describes `agentStop` /
-`stop` as Session end, and this probe did not establish a reliable turn-idle
-boundary. Working can remain stale after a response or host exit. See
-[Kiro usage and limitations](kiro.md) for the current contract.
+Focused native fixtures exercise an unchanged bare command whose host emits v3
+hooks, an unchanged bare command that emits no hooks and creates no Agent,
+current-run holder reporting, cleanup, handoff rollback, and exact v3 recovery.
+They do not infer engine from package version or flags. Installation fixtures
+preserve custom agent and default-agent settings and create no v2 profile.
+Host capture and Boomux reporting were checked separately; this is not a live
+end-to-end desktop notification test. The v3 legacy `kiro` Session key and
+installation receipt remain preserved. See [Kiro usage](kiro.md).
 
 ## 2026-09-09: installed harness smoke refresh
 

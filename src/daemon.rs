@@ -1373,10 +1373,7 @@ fn kiro_launch_eligible(_shell: &Shell, effective_command: &[String]) -> bool {
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             == Some("kiro-cli")
-    }) && (effective_command.len() == 1
-        || effective_command
-            .get(1)
-            .is_some_and(|argument| matches!(argument.as_str(), "--v3" | "chat")))
+    })
 }
 
 fn claude_remote_control_command(
@@ -18514,6 +18511,8 @@ mod tests {
         for argv in [
             vec!["/opt/kiro/bin/kiro-cli".into()],
             vec!["kiro-cli".into(), "chat".into()],
+            vec!["kiro-cli".into(), "--agent".into(), "reviewer".into()],
+            vec!["kiro-cli".into(), "--version".into()],
             vec![
                 "/opt/kiro/bin/kiro-cli".into(),
                 "--v3".into(),
@@ -18522,12 +18521,7 @@ mod tests {
         ] {
             assert!(kiro_launch_eligible(&shell, &argv));
         }
-        for argv in [
-            vec!["kiro-cli".into(), "--version".into()],
-            vec!["kiro".into()],
-        ] {
-            assert!(!kiro_launch_eligible(&shell, &argv));
-        }
+        assert!(!kiro_launch_eligible(&shell, &["kiro".into()]));
     }
 
     #[test]

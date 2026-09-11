@@ -67,9 +67,12 @@ fn native_daemon_lifecycle() {
         capabilities["data"]["integration_hosts"]["kiro-v3"]["package"],
         "kiro-cli"
     );
-    assert_eq!(
-        capabilities["data"]["integration_hosts"]["kiro-v2"]["validated_version"],
-        "2.21.1"
+    assert!(capabilities["data"]["integration_hosts"]["kiro-v2"]["validated_version"].is_null());
+    assert!(
+        capabilities["data"]["integration_hosts"]["kiro-v2"]["lifecycle_limitation"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable")
     );
     let json_commands = capabilities["data"]["json_commands"].as_array().unwrap();
     for command in [

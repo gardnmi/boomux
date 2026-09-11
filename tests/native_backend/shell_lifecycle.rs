@@ -402,9 +402,11 @@ fn bare_kiro_command_preserves_default_engine_and_stored_argv() {
         "Kiro command did not capture its launch",
     );
     assert_eq!(fs::read(daemon.runtime_dir.join("kiro-argv")).unwrap(), b"");
-    assert_eq!(
-        fs::read_to_string(daemon.runtime_dir.join("kiro-marker")).unwrap(),
-        "unset"
+    Uuid::parse_str(&fs::read_to_string(daemon.runtime_dir.join("kiro-marker")).unwrap()).unwrap();
+    assert!(
+        daemon.client.snapshot().unwrap().workspaces[0]
+            .agents
+            .is_empty()
     );
     assert_eq!(
         daemon.client.get_shell(shell_id).unwrap().command,
@@ -623,7 +625,12 @@ fn kiro_installed_after_managed_login_shell_start_preserves_default_engine() {
         "typed Kiro command did not capture its launch",
     );
     assert_eq!(fs::read(argv_output).unwrap(), b"");
-    assert_eq!(fs::read_to_string(marker_output).unwrap(), "unset");
+    Uuid::parse_str(&fs::read_to_string(marker_output).unwrap()).unwrap();
+    assert!(
+        daemon.client.snapshot().unwrap().workspaces[0]
+            .agents
+            .is_empty()
+    );
     AttachFrame::Input(b"exit\n".to_vec())
         .write_to(&mut attachment.stream)
         .unwrap();

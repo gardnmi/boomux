@@ -22,79 +22,6 @@ use crate::support::{
 };
 
 #[test]
-fn kiro_v2_hooks_report_separate_sessions_and_fail_open() {
-    let mut daemon = TestDaemon::start();
-    let workspace = daemon
-        .client
-        .create_workspace(
-            "kiro-v2",
-            vec![ShellSpec {
-                name: "shell".into(),
-                command: vec!["/bin/sleep".into(), "300".into()],
-                cwd: daemon.runtime_dir.clone(),
-            }],
-        )
-        .unwrap();
-    let shell_id = workspace.shells[0].id.clone();
-    let attachment = daemon.client.attach(&shell_id, false, profile()).unwrap();
-    let run_id = daemon.client.get_shell(&shell_id).unwrap().run.unwrap().id;
-    let hook = |event: &str, run: Option<&str>| {
-        let mut command = daemon.command();
-        command
-            .args(["kiro", "hook-v2"])
-            .env_remove("BOOMUX_SHELL_ID")
-            .env_remove("BOOMUX_RUN_ID")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(run) = run {
-            command
-                .env("BOOMUX_SHELL_ID", &shell_id)
-                .env("BOOMUX_RUN_ID", run);
-        }
-        let mut child = command.spawn().unwrap();
-        write!(
-            child.stdin.take().unwrap(),
-            "{{\"session_id\":\"v2-session\",\"hook_event_name\":\"{event}\"}}"
-        )
-        .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success());
-        assert!(output.stdout.is_empty());
-    };
-    hook("userPromptSubmit", None);
-    assert!(
-        daemon.client.snapshot().unwrap().workspaces[0]
-            .agents
-            .is_empty()
-    );
-    hook("agentSpawn", Some(&run_id));
-    let snapshot = daemon.client.snapshot().unwrap();
-    let agent = &snapshot.workspaces[0].agents[0];
-    assert_eq!(agent.integration, "kiro-v2");
-    assert_eq!(agent.observation.state, AgentState::Unknown);
-    hook("userPromptSubmit", Some(&run_id));
-    let snapshot = daemon.client.snapshot().unwrap();
-    let working = &snapshot.workspaces[0].agents[0];
-    assert_eq!(working.id, agent.id);
-    assert_eq!(working.observation.state, AgentState::Working);
-    assert_eq!(
-        working.observation.authority,
-        AgentAuthority::LifecycleIntegration
-    );
-    hook("stop", Some(&run_id));
-    hook("agentSpawn", Some(&Uuid::new_v4().to_string()));
-    let snapshot = daemon.client.snapshot().unwrap();
-    assert_eq!(snapshot.workspaces[0].agents.len(), 1);
-    assert_eq!(
-        snapshot.workspaces[0].agents[0].observation.state,
-        AgentState::Working
-    );
-    drop(attachment);
-    daemon.stop_with_cli();
-}
-
-#[test]
 fn claude_hook_reports_lifecycle_and_synchronizes_ephemeral_bridge_binding() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
@@ -385,7 +312,7 @@ fn kiro_agent_without_live_holder_becomes_inactive() {
 }
 
 #[test]
-fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
+fn bare_kiro_uses_actual_v3_hooks_and_inactivates_only_the_exited_session() {
     let mut daemon = TestDaemon::start();
     let workspace = daemon
         .client
@@ -459,7 +386,7 @@ fn sequential_kiro_process_holders_inactivate_only_the_exited_session() {
         let stop_file = daemon.runtime_dir.join(format!("kiro-{case}-stop"));
         let mut command = daemon.command();
         command
-            .args(["kiro", "launch", "--", "--v3"])
+            .args(["kiro", "launch", "--"])
             .env("KIRO_HOME", &kiro_home)
             .env("BOOMUX_REAL_KIRO", &kiro)
             .env("BOOMUX_SHELL_ID", &shell_id)
@@ -815,10 +742,8 @@ fn cold_recovery_resumes_exact_kiro_v3_session_with_run_scoped_hooks() {
         },
         "initial Kiro run changed its default engine",
     );
-    assert_eq!(
-        fs::read_to_string(daemon.runtime_dir.join("kiro-recovery-marker")).unwrap(),
-        "unset"
-    );
+    Uuid::parse_str(&fs::read_to_string(daemon.runtime_dir.join("kiro-recovery-marker")).unwrap())
+        .unwrap();
     let first_run = daemon.client.get_shell(&shell_id).unwrap().run.unwrap();
     let agent = daemon
         .client

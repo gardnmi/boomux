@@ -888,12 +888,6 @@ fn kiro_hidden_launcher_preserves_default_engine_and_explicit_arguments() {
             )
             .env_remove("BOOMUX_SHELL_ID")
             .env_remove("BOOMUX_RUN_ID");
-        if case == "v2-current" {
-            // V2 hook PATH selection needs only run context, never a daemon holder.
-            command
-                .env("BOOMUX_SHELL_ID", "shell-1")
-                .env("BOOMUX_RUN_ID", "run-1");
-        }
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
@@ -927,23 +921,5 @@ fn kiro_hidden_launcher_preserves_default_engine_and_explicit_arguments() {
     assert!(argv.is_empty());
     assert_eq!(marker, "unset");
 
-    fs::create_dir_all(kiro_home.join("agents")).unwrap();
-    fs::write(
-        kiro_home.join("agents/boomux-v2.json"),
-        include_str!("../../integrations/kiro-v2/boomux-v2.json"),
-    )
-    .unwrap();
-    let (argv, marker) = run(
-        &["chat", "--agent-engine", "v2", "--agent", "boomux-v2"],
-        "v2-current",
-    );
-    assert_eq!(argv, b"chat\0--agent-engine\0v2\0--agent\0boomux-v2\0");
-    assert_eq!(marker, "unset");
-    assert_eq!(
-        fs::read_to_string(root.join("v2-current-executable"))
-            .unwrap()
-            .trim(),
-        env!("CARGO_BIN_EXE_boomux")
-    );
     fs::remove_dir_all(root).unwrap();
 }

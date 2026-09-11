@@ -78,7 +78,6 @@ impl IntegrationId {
     pub(crate) const PI: Self = Self(&boomux::integrations::PI);
     pub(crate) const CODEX: Self = Self(&boomux::integrations::CODEX);
     pub(crate) const KIRO: Self = Self(&boomux::integrations::KIRO);
-    pub(crate) const KIRO_V2: Self = Self(&boomux::integrations::KIRO_V2);
     #[allow(non_upper_case_globals)]
     pub(crate) const Opencode: Self = Self::OPENCODE;
     #[allow(non_upper_case_globals)]
@@ -116,7 +115,14 @@ impl FromStr for IntegrationId {
         boomux::integrations::by_key(value)
             .filter(|descriptor| descriptor.installation.is_some())
             .map(Self)
-            .ok_or_else(|| format!("unknown installable integration: {value}"))
+            .ok_or_else(|| {
+                boomux::integrations::by_key(value)
+                    .and_then(|descriptor| descriptor.lifecycle_limitation)
+                    .map_or_else(
+                        || format!("unknown installable integration: {value}"),
+                        |reason| format!("{value}: {reason}"),
+                    )
+            })
     }
 }
 
@@ -179,17 +185,27 @@ pub(crate) struct IntegrationSummary {
     pub(crate) display_name: &'static str,
     pub(crate) package: &'static str,
     pub(crate) validated_version: &'static str,
+    pub(crate) lifecycle_limitation: Option<&'static str>,
 }
 
 impl From<IntegrationId> for IntegrationSummary {
     fn from(id: IntegrationId) -> Self {
-        let spec = id.spec();
-        let installation = id.installation();
+        Self::from(id.spec())
+    }
+}
+
+impl From<&'static IntegrationDescriptor> for IntegrationSummary {
+    fn from(spec: &'static IntegrationDescriptor) -> Self {
         Self {
             name: spec.key,
             display_name: spec.display_name,
-            package: installation.package,
-            validated_version: installation.validated_version,
+            package: spec
+                .installation
+                .map_or("-", |installation| installation.package),
+            validated_version: spec
+                .installation
+                .map_or("-", |installation| installation.validated_version),
+            lifecycle_limitation: spec.lifecycle_limitation,
         }
     }
 }
@@ -996,7 +1012,7 @@ fn config_root(id: IntegrationId, environment: &Environment) -> Result<PathBuf, 
         InstallTargetKind::Codex => {
             codex_config_root(environment.codex_home.clone(), environment.home.clone())
         }
-        InstallTargetKind::Kiro | InstallTargetKind::KiroV2 => {
+        InstallTargetKind::Kiro => {
             kiro_config_root(environment.kiro_home.clone(), environment.home.clone())
         }
     }
@@ -1020,10 +1036,6 @@ fn target_at(id: IntegrationId, config_root: &Path) -> InstallTarget {
             directory: config_root.to_owned(),
             path: config_root.join("hooks.json"),
         },
-        InstallTargetKind::KiroV2 => InstallTarget {
-            directory: config_root.join("agents"),
-            path: config_root.join("agents/boomux-v2.json"),
-        },
         InstallTargetKind::Kiro => InstallTarget {
             directory: config_root.join("hooks"),
             path: config_root.join("hooks/boomux.json"),
@@ -1038,7 +1050,7 @@ const fn config_root_name(id: IntegrationId) -> &'static str {
         InstallTargetKind::Pi => "Pi configuration root",
         InstallTargetKind::Claude => "Claude configuration root",
         InstallTargetKind::Codex => "Codex configuration root",
-        InstallTargetKind::Kiro | InstallTargetKind::KiroV2 => "Kiro configuration root",
+        InstallTargetKind::Kiro => "Kiro configuration root",
     }
 }
 
@@ -2001,38 +2013,37 @@ mod tests {
     }
 
     #[test]
-    fn kiro_versions_install_and_uninstall_independently() {
+    fn kiro_v2_declares_its_limit_without_installing_an_agent_profile() {
         let home = TestDirectory::new("kiro-versions");
         let environment = environment(&home.0);
-        let v2: IntegrationId = "kiro-v2".parse().unwrap();
+        assert!(
+            "kiro-v2"
+                .parse::<IntegrationId>()
+                .unwrap_err()
+                .contains("automatic lifecycle reporting is unavailable")
+        );
         let v3: IntegrationId = "kiro-v3".parse().unwrap();
         assert_eq!("kiro".parse::<IntegrationId>().unwrap(), v3);
-        let v2_path = PathBuf::from(install(v2, &environment, false).unwrap().path);
-        let v3_path = PathBuf::from(install(v3, &environment, false).unwrap().path);
-        assert!(v2_path.ends_with("agents/boomux-v2.json"));
-        assert!(v3_path.ends_with("hooks/boomux.json"));
-        let profile: Value = serde_json::from_str(&fs::read_to_string(&v2_path).unwrap()).unwrap();
-        assert_eq!(profile["name"], "boomux-v2");
-        assert!(profile["allowedTools"].as_array().unwrap().is_empty());
-        let hooks = profile["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), 4);
-        for event in [
-            "agentSpawn",
-            "userPromptSubmit",
-            "preToolUse",
-            "postToolUse",
-        ] {
-            assert_eq!(hooks[event][0]["command"], "boomux kiro hook-v2");
+        for id in IntegrationId::all() {
+            install(id, &environment, false).unwrap();
         }
-        fs::write(&v2_path, "custom").unwrap();
-        assert!(install(v2, &environment, false).is_err());
-        assert!(uninstall(v2, &environment, false).is_err());
-        uninstall(v3, &environment, false).unwrap();
-        assert!(!v3_path.exists());
-        assert_eq!(fs::read_to_string(&v2_path).unwrap(), "custom");
-        install(v2, &environment, true).unwrap();
-        uninstall(v2, &environment, false).unwrap();
-        assert!(!v2_path.exists());
+        assert!(!home.0.join(".kiro/agents").exists());
+        assert!(home.0.join(".kiro/hooks/boomux.json").exists());
+        let agents = home.0.join(".kiro/agents");
+        fs::create_dir_all(&agents).unwrap();
+        let profile = br#"{"name":"reviewer","prompt":"preserve this","hooks":{}}"#;
+        fs::write(agents.join("reviewer.json"), profile).unwrap();
+        let settings = br#"{"chat.defaultAgent":"reviewer"}"#;
+        fs::write(home.0.join(".kiro/settings.json"), settings).unwrap();
+        for id in IntegrationId::all() {
+            install(id, &environment, false).unwrap();
+        }
+        assert_eq!(fs::read(agents.join("reviewer.json")).unwrap(), profile);
+        assert_eq!(
+            fs::read(home.0.join(".kiro/settings.json")).unwrap(),
+            settings
+        );
+        assert!(!agents.join("boomux-v2.json").exists());
     }
 
     #[test]
@@ -2270,25 +2281,18 @@ mod tests {
         ));
         let mut kiro_snapshot = snapshot.clone();
         kiro_snapshot.workspaces[0].shells[0].foreground_process = Some("kiro-cli".into());
-        let v2 = "kiro-v2".parse::<IntegrationId>().unwrap();
         let v3 = "kiro-v3".parse::<IntegrationId>().unwrap();
-        for version in [v2, v3] {
-            assert_eq!(
-                inspect_runtime(version.spec(), Some(&kiro_snapshot)).state,
-                RuntimeState::NotObservable
-            );
-        }
+        assert_eq!(
+            inspect_runtime(v3.spec(), Some(&kiro_snapshot)).state,
+            RuntimeState::NotObservable
+        );
         kiro_snapshot.workspaces[0].agents[0].observation.authority =
             AgentAuthority::LifecycleIntegration;
-        for (key, reporting, other) in [("kiro-v2", v2, v3), ("kiro", v3, v2)] {
+        for (key, reporting) in [("kiro", v3), ("kiro-v3", v3)] {
             kiro_snapshot.workspaces[0].agents[0].integration = key.into();
             assert_eq!(
                 inspect_runtime(reporting.spec(), Some(&kiro_snapshot)).state,
                 RuntimeState::Reporting
-            );
-            assert_eq!(
-                inspect_runtime(other.spec(), Some(&kiro_snapshot)).state,
-                RuntimeState::NotRunning
             );
             assert!(matches!(
                 check_verification_target(
