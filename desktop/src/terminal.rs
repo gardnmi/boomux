@@ -1457,6 +1457,22 @@ pub fn cleanup_setup_workspace(cleanup: SetupWorkspaceCleanup) -> Result<(), Str
     cleanup.cleanup(&client)
 }
 
+pub fn rename_connection(node_id: &str, previous_name: &str, name: &str) -> Result<(), String> {
+    let client = client::connect_if_running()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Boomux is not running".to_string())?;
+    let registration = client
+        .node_registration(node_id)
+        .map_err(|error| error.to_string())?;
+    if registration.alias != previous_name {
+        return Err("Connection name changed. Close this dialog and try again.".into());
+    }
+    client
+        .rename_node_registration(node_id, name, registration.revision)
+        .map(|_| ())
+        .map_err(|error| format!("Could not rename connection: {error}"))
+}
+
 pub fn rename_workspace(workspace_id: &str, name: &str) -> Result<(), String> {
     let Some(client) = client::connect_if_running()
         .map_err(|error| format!("could not connect to Boomux: {error}"))?

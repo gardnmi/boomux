@@ -2514,8 +2514,15 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             )?;
             print_node_registration(CommandKey::NodeAdd, &registration, json)?;
             if desktop_workspace {
-                let shell = client::connect_or_start()?
-                    .create_remote_workspace(&registration.node_id, &registration.alias)?;
+                let Some(shell) = client::connect_or_start()?
+                    .create_initial_remote_workspace(&registration.node_id, &registration.alias)?
+                else {
+                    println!(
+                        "Connected to {}. The starter Workspace name is already in use. Press Enter at the next prompt, then open an existing Workspace from the Desktop sidebar or create a new one from the + menu.",
+                        registration.alias
+                    );
+                    return Ok(());
+                };
                 if let Some(path) = desktop_result_socket {
                     let identity = protocol::QualifiedIdentity {
                         node_id: registration.node_id.clone(),

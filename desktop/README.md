@@ -232,10 +232,17 @@ Setup asks for an SSH address and a display name, using your existing SSH
 configuration. Authentication and any installation consent happen in the setup
 terminal. After successful setup, press Enter to close setup and open the exact
 remote Shell it created. If opening fails, use the sidebar to reopen that Shell
-rather than repeating setup.
+rather than repeating setup. If the starter Workspace name already exists on
+the machine, connection still succeeds: press Enter, then open an existing
+Workspace from the sidebar or create a new one from the **+** menu. Setup does
+not select or modify an existing Workspace based on its name.
 
 Remote Workspaces use a machine icon and show connection status. Their Shells
 run on that machine. Connection loss does not mean remote work has stopped.
+
+Use **Rename connection…** in an expanded machine card to change its local
+display name, including while disconnected. This leaves its SSH address and
+remote Workspace names unchanged.
 
 Machine cards start collapsed. Click a header to expand it, or use Enter/Space
 when the Remotes panel has keyboard focus. Unavailable machines show a recovery

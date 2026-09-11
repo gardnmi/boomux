@@ -268,15 +268,22 @@ use the registered owner's existing guarded APIs. Cached directories are not
 invented from local paths. Remote creation resolves the owner's starting directory
 and creates the owner-local Workspace and first pending Shell with fresh exact IDs;
 ambiguous mutation failures are surfaced without automatic replay.
-The initial connect flow creates this Workspace after successful registration.
-Desktop opens its exact Shell after the user acknowledges the setup result.
+The initial connect flow attempts to create this Workspace after successful
+registration. An owner-confirmed `already_exists` result leaves the connection
+successful and directs the user to existing Workspaces in the sidebar, without
+selecting or modifying one by name. Other failures remain errors and are not
+replayed. When creation succeeds, Desktop opens its exact Shell after the user
+acknowledges the setup result.
 The Workspace menu's remote picker uses the existing Node summaries and creates
 and attaches the first Shell on the selected connected machine. Unavailable
 machines offer recovery instead of attempting creation. Multi-placement
 coordinator metadata is left unchanged.
 
 The Remotes tab retains sign-in actions and adds an explicitly confirmed
-remote update action. No background installation or upgrade is performed.
+remote update action. Expanded machine cards also expose connection renaming,
+including while disconnected. Rename uses the exact registered Node ID and a
+revision guard; it changes only the local alias, preserving the SSH route and
+remote Workspace names. No background installation or upgrade is performed.
 Once remote
 Nodes are registered, the existing sidebar subtitle shows a compact Node count
 and connection summary. Selection uses stable Node IDs, including when aliases

@@ -223,6 +223,10 @@ enum SidebarItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SidebarResource {
+    Connection {
+        id: String,
+        name: String,
+    },
     Workspace {
         id: String,
         name: String,
@@ -237,12 +241,15 @@ enum SidebarResource {
 impl SidebarResource {
     fn name(&self) -> &str {
         match self {
-            Self::Workspace { name, .. } | Self::Shell { name, .. } => name,
+            Self::Workspace { name, .. }
+            | Self::Shell { name, .. }
+            | Self::Connection { name, .. } => name,
         }
     }
 
     fn kind_label(&self) -> &'static str {
         match self {
+            Self::Connection { .. } => "connection",
             Self::Workspace { .. } => "Workspace",
             Self::Shell { .. } => "Shell",
         }
@@ -2960,6 +2967,7 @@ impl Workspace {
                 let matches = match target {
                     SidebarResource::Workspace { id, .. } => shell.workspace_id == *id,
                     SidebarResource::Shell { id, .. } => shell.id == *id,
+                    SidebarResource::Connection { .. } => false,
                 };
                 matches.then_some(*id)
             })
@@ -3047,6 +3055,12 @@ impl Workspace {
             let result = cx
                 .background_spawn(async move {
                     match (&operation_target, kind) {
+                        (SidebarResource::Connection { id, name }, ResourceDialogKind::Rename) => {
+                            terminal::rename_connection(id, name, &operation_value)?;
+                        }
+                        (SidebarResource::Connection { .. }, ResourceDialogKind::Remove) => {
+                            return Err("Use Forget connection on the machine card".into());
+                        }
                         (SidebarResource::Workspace { id, .. }, ResourceDialogKind::Rename) => {
                             terminal::rename_workspace(id, &operation_value)?;
                         }
@@ -3083,6 +3097,12 @@ impl Workspace {
                                     session.shell_name = value.clone();
                                 }
                             }
+                        }
+                        if let SidebarResource::Connection { id, .. } = &target
+                            && let Some(node) =
+                                this.node_views.iter_mut().find(|node| node.id == *id)
+                        {
+                            node.label = value.clone();
                         }
                         this.set_boomux_overview(overview);
                         this.resource_dialog = None;
@@ -6555,6 +6575,18 @@ impl Workspace {
                         if node.connected() { "" } else { " · cached" }))
                     .when_some(node.version.clone(), |detail, version| detail.child(format!("Boomux {version}")))
                     .when(!node.connected(), |detail| detail.child(node.last_seen(now_ms)).child(node.guidance()))
+                    .child(Self::settings_option("rename-remote-connection", "Rename connection…", false)
+                        .flex_none()
+                        .on_click(cx.listener({
+                            let id = node.id.clone();
+                            let name = node.label.clone();
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_resource_dialog(ResourceDialogKind::Rename,
+                                    SidebarResource::Connection { id: id.clone(), name: name.clone() });
+                                cx.notify();
+                            }
+                        })))
                     .when(!node.local && node.connected(), |detail| {
                         let node_id = node.id.clone();
                         let name = node.label.clone();
@@ -7763,11 +7795,11 @@ impl Workspace {
         let target = menu.target.clone();
         let open_workspace_id = match &target {
             SidebarResource::Workspace { id, .. } => Some(id.clone()),
-            SidebarResource::Shell { .. } => None,
+            SidebarResource::Shell { .. } | SidebarResource::Connection { .. } => None,
         };
         let create_workspace_id = match &target {
             SidebarResource::Workspace { id, .. } => Some(id.clone()),
-            SidebarResource::Shell { .. } => None,
+            SidebarResource::Shell { .. } | SidebarResource::Connection { .. } => None,
         };
         let rename_target = target.clone();
         let remove_target = target.clone();
@@ -8921,6 +8953,12 @@ impl Workspace {
             ResourceDialogKind::Remove => format!("Remove {kind_label}?"),
         };
         let detail = match (&dialog.target, dialog.kind) {
+            (SidebarResource::Connection { .. }, ResourceDialogKind::Rename) => {
+                "Change this connection’s display name on this computer. The SSH address and remote Workspace names stay the same.".into()
+            }
+            (SidebarResource::Connection { .. }, ResourceDialogKind::Remove) => {
+                "Use Forget connection on the machine card.".into()
+            }
             (_, ResourceDialogKind::Rename) => {
                 "Type a new name, then press Enter to save it.".to_string()
             }

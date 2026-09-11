@@ -1020,6 +1020,24 @@ impl Client {
         }
     }
 
+    /// Offer a starter Workspace after registering a machine. An owner-confirmed
+    /// collision leaves the connection usable without selecting or changing any
+    /// existing Workspace. Never retry an ambiguous creation.
+    pub fn create_initial_remote_workspace(
+        &self,
+        node_id: &str,
+        name: &str,
+    ) -> Result<Option<ShellSnapshot>> {
+        match self.create_remote_workspace(node_id, name) {
+            Ok(shell) => Ok(Some(shell)),
+            Err(ClientError::Remote(RemoteError {
+                code: Some(ErrorCode::AlreadyExists),
+                ..
+            })) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Create an owner-local remote Workspace and its first Shell. The owner
     /// resolves the initial directory; this never forwards local environment or paths.
     pub fn create_remote_workspace(&self, node_id: &str, name: &str) -> Result<ShellSnapshot> {
@@ -2645,6 +2663,73 @@ mod tests {
 
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn initial_remote_workspace_handles_collision_without_replaying_or_hiding_failures() {
+        for outcome in [
+            Some(ErrorCode::AlreadyExists),
+            Some(ErrorCode::OutcomeUnknown),
+            Some(ErrorCode::Timeout),
+            None,
+        ] {
+            let directory =
+                env::temp_dir().join(format!("boomux-client-remote-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert!(matches!(request.message, Request::RouteNodeHostService {
+                    node_id, operation: protocol::HostServiceOperation::ResolveDirectory { .. }
+                } if node_id == "remote-owner"));
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::new(Response::HostService {
+                        result: protocol::HostServiceResult::Directory {
+                            path: "/remote/home".into(),
+                        },
+                    }),
+                )
+                .unwrap();
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert!(matches!(request.message, Request::RouteNodeOperation {
+                    node_id, operation: RoutedOperation::CreateWorkspaceShell {
+                        workspace_name, default_cwd: Some(cwd), ..
+                    }
+                } if node_id == "remote-owner" && workspace_name == "omarchy"
+                    && cwd == Path::new("/remote/home")));
+                // The same text with no typed code must remain an error.
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::new(Response::Error {
+                        code: outcome,
+                        message: "workspace name already exists: omarchy".into(),
+                    }),
+                )
+                .unwrap();
+                listener.set_nonblocking(true).unwrap();
+                listener
+            });
+            let client = Client::from_socket_path(socket);
+            let result = client.create_initial_remote_workspace("remote-owner", "omarchy");
+            if outcome == Some(ErrorCode::AlreadyExists) {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(
+                    matches!(result, Err(ClientError::Remote(RemoteError { code, .. }))
+                    if code == outcome)
+                );
+            }
+            let listener = server.join().unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
