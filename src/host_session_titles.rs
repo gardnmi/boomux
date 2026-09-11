@@ -689,7 +689,7 @@ mod tests {
         );
         assert_eq!(
             projection_integrations().collect::<Vec<_>>(),
-            ["opencode", "pi", "claude", "codex", "kiro"]
+            ["opencode", "pi", "claude", "codex", "kiro-v3"]
         );
         assert!(catalog("pi", Path::new("/repo")).is_none());
         assert!(catalog("claude", Path::new("/repo")).is_none());

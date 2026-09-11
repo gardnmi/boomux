@@ -21,6 +21,7 @@ pub enum InstallTargetKind {
     Claude,
     Codex,
     Kiro,
+    KiroV2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,14 +209,16 @@ pub const CODEX: IntegrationDescriptor = IntegrationDescriptor {
     run_scoped_launcher: Some(RunScopedLauncher::Codex),
 };
 
+// The legacy `kiro` lifecycle key remains v3 so existing holder reports and
+// durable Sessions keep their identity across upgrades.
 pub const KIRO: IntegrationDescriptor = IntegrationDescriptor {
-    key: "kiro",
-    display_name: "Kiro CLI",
+    key: "kiro-v3",
+    display_name: "Kiro CLI v3",
     installation: Some(InstallationCapability {
         package: "kiro-cli",
-        validated_version: "2.18.0",
+        validated_version: "2.21.1",
         asset_name: "hooks",
-        content: include_str!("../integrations/kiro/boomux.json"),
+        content: include_str!("../integrations/kiro-v3/boomux.json"),
         executable: "kiro-cli",
         reload_message: "Reopen its managed ShellRun, then start Kiro CLI in v3 mode to activate the hooks",
         target: InstallTargetKind::Kiro,
@@ -234,10 +237,29 @@ pub const KIRO: IntegrationDescriptor = IntegrationDescriptor {
     run_scoped_launcher: Some(RunScopedLauncher::Kiro),
 };
 
-pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE, CODEX, KIRO];
+pub const KIRO_V2: IntegrationDescriptor = IntegrationDescriptor {
+    key: "kiro-v2",
+    display_name: "Kiro CLI v2",
+    installation: Some(InstallationCapability {
+        package: "kiro-cli",
+        validated_version: "2.21.1",
+        asset_name: "agent profile",
+        content: include_str!("../integrations/kiro-v2/boomux-v2.json"),
+        executable: "kiro-cli",
+        reload_message: "Start kiro-cli chat --agent-engine v2 --agent boomux-v2 in a managed ShellRun; lifecycle coverage is partial",
+        target: InstallTargetKind::KiroV2,
+    }),
+    // No version can be inferred from the shared executable name alone.
+    titles: None,
+    resume: None,
+    foreground: None,
+    run_scoped_launcher: None,
+};
+
+pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE, CODEX, KIRO_V2, KIRO];
 
 pub fn by_key(key: &str) -> Option<&'static IntegrationDescriptor> {
-    descriptor_by_key(ALL, key)
+    descriptor_by_key(ALL, if key == "kiro" { "kiro-v3" } else { key })
 }
 
 pub fn by_foreground_process(process_name: &str) -> Option<&'static IntegrationDescriptor> {

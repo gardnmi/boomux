@@ -73,6 +73,26 @@ pub(crate) fn read_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::
     })
 }
 
+// V2 has no validated turn-idle boundary. Keep its legacy event vocabulary
+// separate so a v3 Stop payload cannot silently acquire v2 lifecycle meaning.
+pub(crate) fn read_v2_update(reader: impl Read) -> Result<HookUpdate, Box<dyn std::error::Error>> {
+    let bytes = read_bounded_hook_input(reader, "Kiro v2")?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if !matches!(
+        value
+            .get("hook_event_name")
+            .and_then(serde_json::Value::as_str),
+        Some("agentSpawn" | "userPromptSubmit" | "preToolUse" | "postToolUse")
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported Kiro v2 lifecycle event",
+        )
+        .into());
+    }
+    read_update(bytes.as_slice())
+}
+
 fn reduce(event: HookEvent) -> LifecycleObservation {
     let (state, evidence) = match event {
         HookEvent::SessionStart => (AgentState::Unknown, "Kiro hook execution started"),
@@ -143,6 +163,31 @@ mod tests {
                 PathBuf::from("/worktrees/omarchy/Panel.qml"),
             ]
         );
+    }
+
+    #[test]
+    fn v2_accepts_only_observed_activity_boundaries() {
+        for (event, state) in [
+            ("agentSpawn", AgentState::Unknown),
+            ("userPromptSubmit", AgentState::Working),
+            ("preToolUse", AgentState::Working),
+            ("postToolUse", AgentState::Working),
+        ] {
+            let payload = format!(r#"{{"session_id":"v2-session","hook_event_name":"{event}"}}"#);
+            assert_eq!(
+                read_v2_update(payload.as_bytes())
+                    .unwrap()
+                    .observation
+                    .state,
+                state
+            );
+        }
+        for event in ["stop", "agentStop", "Stop", "SessionStart", "Future"] {
+            let payload = format!(r#"{{"session_id":"v2-session","hook_event_name":"{event}"}}"#);
+            assert!(read_v2_update(payload.as_bytes()).is_err());
+        }
+        assert!(read_v2_update(br#"{"hook_event_name":"agentSpawn"}"#.as_slice()).is_err());
+        assert!(read_v2_update(vec![b'x'; MAX_HOOK_INPUT_BYTES + 1].as_slice()).is_err());
     }
 
     #[test]

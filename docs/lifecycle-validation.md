@@ -11,6 +11,33 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-09-10: separate Kiro engines
+
+Kiro CLI `2.21.1` was exercised with explicit engine selection in temporary
+projects, using the existing host authentication. No global agent profile,
+default engine, or installed Boomux binary was changed. Hook capture commands
+replaced only the reporter commands in temporary copies of the bundled assets.
+Prompts requested a tool-free `OK` response.
+
+| Engine and launch | Direct host evidence | Limits |
+| --- | --- | --- |
+| v2: `kiro-cli chat --agent-engine v2 --agent boomux-v2` in a PTY | The installed CLI accepted the bundled agent profile via `agent validate`. The terminal run emitted `agentSpawn` and `userPromptSubmit` with canonical `session_id` fields. | Stop and tool execution were not exercised; no Idle, Blocked, Inactive, or Done claim. |
+| v2 with `--no-interactive` | Successful response and `userPromptSubmit` with canonical Session identity. | No startup event was captured in this mode. |
+| v3: `kiro-cli --v3 chat <prompt>` in a PTY | SessionStart, UserPromptSubmit, and Stop payloads carried the same canonical Session ID. | No permission wait, tools, subagents, or cloud execution was exercised. |
+| v3 with `--no-interactive` | Successful response, but none of the temporary capture hooks fired. | No headless lifecycle or notification claim for this host version. |
+
+Host capture and Boomux reporting were checked separately. Focused reducer and
+native fixtures validate exact ShellRun v2 registration, stale-run rejection,
+fail-open/no-stdout behavior, independent installation/uninstall, unchanged bare
+argv, v3 holder reporting and cleanup, handoff rollback, and exact v3 recovery.
+The v3 legacy `kiro` Session key and installation receipt are preserved. These
+fixtures do not constitute a live end-to-end desktop notification test.
+
+V2 deliberately omits Stop: the upstream 2.x reference describes `agentStop` /
+`stop` as Session end, and this probe did not establish a reliable turn-idle
+boundary. Working can remain stale after a response or host exit. See
+[Kiro usage and limitations](kiro.md) for the current contract.
+
 ## 2026-09-09: installed harness smoke refresh
 
 Tested on Linux with a freshly built debug Boomux `1.11.1`, protocol `54`.

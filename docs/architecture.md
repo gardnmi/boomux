@@ -1267,17 +1267,33 @@ phone-accessible Remote destination.
 
 ### Kiro CLI Lifecycle Integration
 
-The Kiro descriptor targets `kiro-cli` `2.18.0` with its opt-in v3 harness as a
-compatibility point. Installation owns the dedicated
+The independently installable `kiro-v2` descriptor owns the dedicated
+`${KIRO_HOME:-$HOME/.kiro}/agents/boomux-v2.json` profile. It must be selected
+explicitly; installation never selects an engine or replaces an existing agent
+profile. Its bounded legacy decoder accepts only agentSpawn, userPromptSubmit,
+preToolUse, and postToolUse. Hooks ensure/report the canonical
+`(kiro-v2, session, shell, run)` key at LifecycleIntegration authority through
+the ordinary exact-run API. Startup reports Unknown; prompt/tool activity reports
+Working. Unchanged observations are coalesced. Runtime status uses exact Agent evidence
+to distinguish v2 and v3; foreground `kiro-cli` alone remains NotObservable.
+No Stop, Idle, Blocked, Inactive,
+Done, automatic resume, or title capability is claimed for v2. Missing hooks can
+leave Working stale. These limitations are documented in [Kiro usage](kiro.md).
+
+The `kiro-v3` descriptor (legacy install alias `kiro`) targets `kiro-cli`
+`2.21.1` with its opt-in v3 harness as a compatibility point. Installation owns the dedicated
 `${KIRO_HOME:-$HOME/.kiro}/hooks/boomux.json` file and registers non-deciding
 SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop command hooks.
 The ordinary bounded, symlink-safe, atomic integration installer applies because
 Boomux does not share that file with unrelated Kiro configuration.
 
 Eligible managed Kiro invocations pass through the common Shell-scoped shim and
-hidden launcher. A bare `kiro-cli` becomes `kiro-cli --v3`, while an explicit
-leading `--v3` is preserved. The launcher supervises the exact argument vector
-with the matching Boomux executable directory first on the sanitized child PATH,
+hidden launcher. A bare `kiro-cli` retains its exact empty argument vector and
+Kiro-selected default engine. Only an explicit leading `--v3` enables holder
+tracking; it is preserved unchanged. Bare and `chat` configured commands also
+use the launcher without selecting an engine. When the corresponding version
+asset is current in a managed ShellRun, the launcher places the matching Boomux
+executable directory first on the sanitized child PATH,
 so bare lifecycle hook commands cannot select an older user installation instead
 of the launcher's CLI. Managed Codex launches use the same path priority; the
 selected harness executable and argument vector remain unchanged. Unmanaged
@@ -1287,15 +1303,18 @@ acquires a private daemon-owned Launch Holder
 only while the installed asset is current. Only that Kiro process tree receives
 the holder capability. Eligible login ShellRuns stage the delegating shim even
 when Kiro is not yet installed, so a later installation into their existing
-executable search path does not bypass lifecycle integration. Kiro v2 and
+executable search path does not bypass v3 lifecycle integration. Non-v3 and
 service invocations, absolute paths typed in a login Shell,
 modified PATHs, absent or modified assets, and use outside Boomux execute stock
-Kiro unchanged and untracked. Exact configured executable paths are retained
+Kiro unchanged without v3 holder tracking. V2 profile hooks independently use
+exact ShellRun context. Exact configured executable paths are retained
 through `BOOMUX_REAL_KIRO`; private launcher provenance is removed from unrelated
 children.
 
 Kiro hook `session_id` is the canonical Session identity and ensures the exact
-`(kiro, session, shell, run)` Agent key through its live Launch Holder. Prompt and
+`(kiro, session, shell, run)` Agent key through its live Launch Holder. This
+legacy v3 key and its existing asset path/receipt remain unchanged by the
+installation-name split; v2 uses its own key and target. Prompt and
 tool events report Working. Kiro v3 documents Stop as the boundary where the
 agent completed its turn and finished responding, so Stop reports Idle for that
 exact Session. Idle is resumable turn completion, not permanent Session

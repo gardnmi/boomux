@@ -1145,6 +1145,9 @@ enum KiroCommands {
     /// Receive one lifecycle event on standard input
     #[command(hide = true)]
     Hook,
+    /// Receive one Kiro v2 agent-profile lifecycle event
+    #[command(hide = true)]
+    HookV2,
     /// Launch Kiro v3 with run-scoped lifecycle authority
     #[command(hide = true)]
     Launch {
@@ -1355,6 +1358,7 @@ command_keys! {
     CodexHook => ("codex.hook", HumanOnly),
     CodexLaunch => ("codex.launch", HumanOnly),
     KiroHook => ("kiro.hook", HumanOnly),
+    KiroHookV2 => ("kiro.hook-v2", HumanOnly),
     KiroLaunch => ("kiro.launch", HumanOnly),
     Open => ("open", HumanOnly),
     Prompt => ("prompt", HumanOnly),
@@ -1619,6 +1623,9 @@ impl Cli {
             Some(Commands::Kiro {
                 command: KiroCommands::Hook,
             }) => CommandKey::KiroHook,
+            Some(Commands::Kiro {
+                command: KiroCommands::HookV2,
+            }) => CommandKey::KiroHookV2,
             Some(Commands::Kiro {
                 command: KiroCommands::Launch { .. },
             }) => CommandKey::KiroLaunch,
@@ -2050,6 +2057,14 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         }) => {
             if let Err(error) = kiro_hook_command() {
                 eprintln!("boomux kiro hook: {error}");
+            }
+            Ok(())
+        }
+        Some(Commands::Kiro {
+            command: KiroCommands::HookV2,
+        }) => {
+            if let Err(error) = kiro_v2_hook_command() {
+                eprintln!("boomux kiro hook-v2: {error}");
             }
             Ok(())
         }
@@ -6865,8 +6880,13 @@ fn format_recommended_action(
         integration_management::RecommendedAction::None => "none",
         integration_management::RecommendedAction::Install => "install integration",
         integration_management::RecommendedAction::Replace => "replace with --force",
-        integration_management::RecommendedAction::RestartHost if integration == "kiro" => {
-            "reopen managed ShellRun, then launch bare kiro-cli"
+        integration_management::RecommendedAction::RestartHost
+            if matches!(integration, "kiro" | "kiro-v3") =>
+        {
+            "reopen managed ShellRun, then launch kiro-cli --v3"
+        }
+        integration_management::RecommendedAction::RestartHost if integration == "kiro-v2" => {
+            "launch kiro-cli chat --agent-engine v2 --agent boomux-v2"
         }
         integration_management::RecommendedAction::RestartHost => "restart host",
         integration_management::RecommendedAction::InspectError => "inspect reported error",
@@ -10038,6 +10058,49 @@ fn register_or_ensure_agent(
     Ok(())
 }
 
+fn kiro_v2_hook_command() -> Result<(), Box<dyn Error>> {
+    let (shell_id, run_id) = match (
+        env::var("BOOMUX_SHELL_ID").ok(),
+        env::var("BOOMUX_RUN_ID").ok(),
+    ) {
+        (Some(shell_id), Some(run_id)) => {
+            resolve_agent_context(None, None, Some(shell_id), Some(run_id))?
+        }
+        _ => return Ok(()),
+    };
+    let update = kiro_hooks::read_v2_update(io::stdin().lock())?;
+    let observation = update.observation;
+    let report = AgentReport {
+        state: observation.state,
+        authority: AgentAuthority::LifecycleIntegration,
+        evidence: observation.evidence.into(),
+        confidence: 100,
+    };
+    let client = client::connect_or_start()?;
+    let mut agent = client.ensure_agent(
+        &shell_id,
+        &run_id,
+        AgentRegistrationSpec {
+            name: "Kiro CLI v2".into(),
+            integration: "kiro-v2".into(),
+            external_session_id: Some(update.session_id),
+            report: report.clone(),
+        },
+    )?;
+    if agent.ended_at_ms.is_none()
+        && (agent.observation.state != report.state
+            || agent.observation.authority != report.authority
+            || agent.observation.evidence != report.evidence
+            || agent.observation.confidence != report.confidence)
+    {
+        agent = client.report_agent(&agent.id, &run_id, report)?;
+    }
+    for path in update.working_contexts {
+        let _ = client.observe_agent_working_context(&agent.id, &shell_id, &run_id, path);
+    }
+    Ok(())
+}
+
 fn claude_hook_command() -> Result<(), Box<dyn Error>> {
     let (shell_id, run_id) = match (
         env::var("BOOMUX_SHELL_ID").ok(),
@@ -10231,22 +10294,25 @@ fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
 
 fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     let executable = resolve_real_kiro()?;
-    let explicit_v3 = arguments.first().is_some_and(|argument| argument == "--v3")
+    let managed_v3 = arguments.first().is_some_and(|argument| argument == "--v3")
         && !arguments.iter().any(|argument| argument == "--cloud");
-    let managed_v3 = arguments.is_empty() || explicit_v3;
+    let integration = if managed_v3 {
+        integration_management::IntegrationId::KIRO
+    } else {
+        integration_management::IntegrationId::KIRO_V2
+    };
+    let managed_run = env::var("BOOMUX_SHELL_ID").is_ok_and(|value| !value.is_empty())
+        && env::var("BOOMUX_RUN_ID").is_ok_and(|value| !value.is_empty());
     let environment = integration_management::Environment::from_process();
-    let hooks_current = integration_management::inspect_without_host_probe(
-        integration_management::IntegrationId::KIRO,
-        &environment,
-        None,
-    )
-    .asset
-    .state
-        == integration_management::AssetState::Current;
-    let argv = kiro_argv(executable, arguments, managed_v3 && hooks_current);
+    let hooks_current =
+        integration_management::inspect_without_host_probe(integration, &environment, None)
+            .asset
+            .state
+            == integration_management::AssetState::Current;
+    let argv = kiro_argv(executable, arguments);
     let mut command = Command::new(&argv[0]);
     sanitize_inherited_opencode_shim(&mut command);
-    if managed_v3 && hooks_current {
+    if managed_run && hooks_current {
         prioritize_boomux_hook_executable(&mut command)?;
     }
     let holder = if managed_v3 && hooks_current {
@@ -10303,11 +10369,8 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit,
     Ok(process_exit_from_status(status))
 }
 
-fn kiro_argv(executable: PathBuf, arguments: Vec<OsString>, managed_v3: bool) -> Vec<OsString> {
+fn kiro_argv(executable: PathBuf, arguments: Vec<OsString>) -> Vec<OsString> {
     let mut argv = vec![executable.into_os_string()];
-    if managed_v3 && arguments.is_empty() {
-        argv.push("--v3".into());
-    }
     argv.extend(arguments);
     argv
 }
@@ -11949,7 +12012,7 @@ fn print_integration_diagnostic(
     } else {
         if integration == integration_management::IntegrationId::KIRO {
             eprintln!(
-                "err {} integration: {} foreground process(es) are untracked; reopen the owning managed ShellRun, then launch bare kiro-cli and verify it loads {path}",
+                "err {} integration: {} foreground process(es) are untracked; reopen the owning managed ShellRun, then launch kiro-cli --v3 and verify it loads {path}",
                 spec.key, status.runtime.untracked_processes
             );
         } else {
@@ -14237,13 +14300,12 @@ mod tests {
             kiro_argv(
                 "/exact/kiro-cli".into(),
                 vec!["chat".into(), "literal; value".into()],
-                false,
             ),
             ["/exact/kiro-cli", "chat", "literal; value"].map(OsString::from)
         );
         assert_eq!(
-            kiro_argv("/exact/kiro-cli".into(), Vec::new(), true),
-            ["/exact/kiro-cli", "--v3"].map(OsString::from)
+            kiro_argv("/exact/kiro-cli".into(), Vec::new()),
+            ["/exact/kiro-cli"].map(OsString::from)
         );
         let status = Command::new("/bin/sh")
             .args(["-c", "exit 23"])
@@ -15525,7 +15587,8 @@ mod tests {
              pi        @earendil-works/pi-coding-agent  0.84.1\n\
              claude    @anthropic-ai/claude-code        2.1.236\n\
              codex     @openai/codex                    0.147.0\n\
-             kiro      kiro-cli                         2.18.0\n"
+             kiro-v2   kiro-cli                         2.21.1\n\
+             kiro-v3   kiro-cli                         2.21.1\n"
         );
 
         let status = integration_management::IntegrationStatus {
@@ -15564,7 +15627,7 @@ mod tests {
                 "kiro",
                 integration_management::RecommendedAction::RestartHost
             ),
-            "reopen managed ShellRun, then launch bare kiro-cli"
+            "reopen managed ShellRun, then launch kiro-cli --v3"
         );
     }
 

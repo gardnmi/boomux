@@ -358,7 +358,7 @@ fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
 }
 
 #[test]
-fn bare_kiro_command_selects_v3_without_rewriting_stored_argv() {
+fn bare_kiro_command_preserves_default_engine_and_stored_argv() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("kiro-bin");
         let kiro_home = runtime_dir.join("kiro-home");
@@ -366,7 +366,7 @@ fn bare_kiro_command_selects_v3_without_rewriting_stored_argv() {
         fs::create_dir_all(kiro_home.join("hooks")).unwrap();
         fs::write(
             kiro_home.join("hooks/boomux.json"),
-            include_str!("../../integrations/kiro/boomux.json"),
+            include_str!("../../integrations/kiro-v3/boomux.json"),
         )
         .unwrap();
         let kiro = bin.join("kiro-cli");
@@ -401,11 +401,11 @@ fn bare_kiro_command_selects_v3_without_rewriting_stored_argv() {
         || fs::read(daemon.runtime_dir.join("kiro-marker")).is_ok(),
         "Kiro command did not capture its launch",
     );
+    assert_eq!(fs::read(daemon.runtime_dir.join("kiro-argv")).unwrap(), b"");
     assert_eq!(
-        fs::read(daemon.runtime_dir.join("kiro-argv")).unwrap(),
-        b"--v3\0"
+        fs::read_to_string(daemon.runtime_dir.join("kiro-marker")).unwrap(),
+        "unset"
     );
-    Uuid::parse_str(&fs::read_to_string(daemon.runtime_dir.join("kiro-marker")).unwrap()).unwrap();
     assert_eq!(
         daemon.client.get_shell(shell_id).unwrap().command,
         [kiro.display().to_string()]
@@ -562,7 +562,7 @@ fn bare_codex_typed_in_managed_login_shell_uses_run_scoped_hooks() {
 }
 
 #[test]
-fn kiro_installed_after_managed_login_shell_start_selects_v3() {
+fn kiro_installed_after_managed_login_shell_start_preserves_default_engine() {
     let mut daemon = TestDaemon::start();
     let bin = daemon.runtime_dir.join("kiro-login-bin");
     let home = daemon.runtime_dir.join("kiro-login-home");
@@ -573,7 +573,7 @@ fn kiro_installed_after_managed_login_shell_start_selects_v3() {
     fs::create_dir_all(kiro_home.join("hooks")).unwrap();
     fs::write(
         kiro_home.join("hooks/boomux.json"),
-        include_str!("../../integrations/kiro/boomux.json"),
+        include_str!("../../integrations/kiro-v3/boomux.json"),
     )
     .unwrap();
     let workspace = daemon
@@ -622,8 +622,8 @@ fn kiro_installed_after_managed_login_shell_start_selects_v3() {
         || fs::read(&marker_output).is_ok(),
         "typed Kiro command did not capture its launch",
     );
-    assert_eq!(fs::read(argv_output).unwrap(), b"--v3\0");
-    Uuid::parse_str(&fs::read_to_string(marker_output).unwrap()).unwrap();
+    assert_eq!(fs::read(argv_output).unwrap(), b"");
+    assert_eq!(fs::read_to_string(marker_output).unwrap(), "unset");
     AttachFrame::Input(b"exit\n".to_vec())
         .write_to(&mut attachment.stream)
         .unwrap();

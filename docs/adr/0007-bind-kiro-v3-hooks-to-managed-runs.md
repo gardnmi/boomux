@@ -1,6 +1,7 @@
 # Bind Kiro V3 Hooks To Managed Runs
 
-Status: Accepted; Stop lifecycle semantics superseded by ADR 0009
+Status: Accepted; Stop lifecycle semantics superseded by ADR 0009; bare-launch
+selection superseded by the 2026-09-10 amendment below
 
 Kiro CLI v3 supports global standalone hooks whose payload contains the
 canonical `session_id`, but a global hook alone does not establish which Boomux
@@ -65,3 +66,15 @@ holder operations and handoff. Acquire and handoff import both revalidate the
 exact current ShellRun at their final authority boundary. Dead-holder cleanup may
 signal only an acquired holder-led process group that still contains a process
 carrying that holder's private capability.
+
+## 2026-09-10 engine selection amendment
+
+The integration split supersedes automatic promotion of bare `kiro-cli` to v3.
+Only an explicit leading `--v3` selects v3 holder tracking. V2 has a separate
+opt-in profile and bounded legacy hook handler; see [Kiro usage](../kiro.md)
+and the current architecture. Existing v3 holder authority is unchanged.
+
+The dedicated v2 profile does not modify user-selected custom profiles. Its
+canonical Session hooks use ShellRun authority without making holder-based
+process-exit or inactivity claims. This narrower v2 scope is distinct from the
+rejected use of unscoped global v3 hooks as full lifecycle authority.

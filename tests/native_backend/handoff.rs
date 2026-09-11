@@ -531,7 +531,7 @@ fn graceful_restart_transfers_live_kiro_holder_authority_and_rolls_back_safely()
     fs::create_dir_all(kiro_home.join("hooks")).unwrap();
     fs::write(
         kiro_home.join("hooks/boomux.json"),
-        include_str!("../../integrations/kiro/boomux.json"),
+        include_str!("../../integrations/kiro-v3/boomux.json"),
     )
     .unwrap();
     let kiro = daemon.runtime_dir.join("kiro-handoff-cli");
@@ -561,7 +561,7 @@ fn graceful_restart_transfers_live_kiro_holder_authority_and_rolls_back_safely()
     let phase_two = daemon.runtime_dir.join("kiro-handoff-phase-two");
     let mut holder = daemon
         .command()
-        .args(["kiro", "launch", "--"])
+        .args(["kiro", "launch", "--", "--v3"])
         .env("KIRO_HOME", &kiro_home)
         .env("BOOMUX_REAL_KIRO", &kiro)
         .env("BOOMUX_SHELL_ID", &shell_id)

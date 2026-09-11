@@ -1376,7 +1376,7 @@ fn kiro_launch_eligible(_shell: &Shell, effective_command: &[String]) -> bool {
     }) && (effective_command.len() == 1
         || effective_command
             .get(1)
-            .is_some_and(|argument| argument == "--v3"))
+            .is_some_and(|argument| matches!(argument.as_str(), "--v3" | "chat")))
 }
 
 fn claude_remote_control_command(
@@ -18501,7 +18501,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_launcher_accepts_only_bare_or_explicit_v3_shapes() {
+    fn kiro_launcher_accepts_chat_without_selecting_an_engine() {
         let shell = create_pending_shell(
             "workspace",
             ShellSpec {
@@ -18513,6 +18513,7 @@ mod tests {
         .unwrap();
         for argv in [
             vec!["/opt/kiro/bin/kiro-cli".into()],
+            vec!["kiro-cli".into(), "chat".into()],
             vec![
                 "/opt/kiro/bin/kiro-cli".into(),
                 "--v3".into(),
@@ -18522,7 +18523,6 @@ mod tests {
             assert!(kiro_launch_eligible(&shell, &argv));
         }
         for argv in [
-            vec!["kiro-cli".into(), "chat".into()],
             vec!["kiro-cli".into(), "--version".into()],
             vec!["kiro".into()],
         ] {

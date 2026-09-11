@@ -1,0 +1,40 @@
+{
+  "name": "boomux-v2",
+  "description": "Kiro v2 with partial Boomux lifecycle reporting",
+  "tools": [
+    "@builtin"
+  ],
+  "allowedTools": [],
+  "resources": [
+    "file://AGENTS.md",
+    "file://.kiro/steering/**/*.md"
+  ],
+  "hooks": {
+    "agentSpawn": [
+      {
+        "command": "boomux kiro hook-v2",
+        "timeout_ms": 5000
+      }
+    ],
+    "userPromptSubmit": [
+      {
+        "command": "boomux kiro hook-v2",
+        "timeout_ms": 5000
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "boomux kiro hook-v2",
+        "timeout_ms": 5000,
+        "matcher": ".*"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "boomux kiro hook-v2",
+        "timeout_ms": 5000,
+        "matcher": ".*"
+      }
+    ]
+  }
+}
