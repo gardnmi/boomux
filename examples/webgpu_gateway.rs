@@ -338,6 +338,7 @@ async fn asset(State(app): State<App>, uri: Uri) -> Response {
     let (path, mime) = match uri.path() {
         "/" | "/index.html" => ("poc/webgpu-tiling/index.html", "text/html"),
         "/app.js" => ("poc/webgpu-tiling/app.js", "text/javascript"),
+        "/themes.js" => ("poc/webgpu-tiling/themes.js", "text/javascript"),
         "/terminal.js" => ("poc/webgpu-tiling/terminal.js", "text/javascript"),
         "/renderer.js" => ("poc/webgpu-tiling/renderer.js", "text/javascript"),
         "/layout.js" => ("poc/webgpu-tiling/layout.js", "text/javascript"),

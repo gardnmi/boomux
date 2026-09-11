@@ -1,3 +1,4 @@
+import {getTheme,rgba,mountThemePicker} from './themes.js';
 import {leaf,split,remove,insert,layout,dropAt,neighbor,swap,ancestors} from './layout.js';
 import {createRenderer} from './renderer.js';
 import {createTerminal} from './terminal.js';
@@ -11,6 +12,7 @@ const templates=[
 let tree,panes=new Map(),floating=new Map(),active=1,next=5,expanded=null,drag=null,resize=null,drop=null;
 let targets=new Map(),shown=new Map(),tween=null,draw=null,frame=0,width=1,height=1;
 let layoutMode=false,fitTimer=null;
+mountThemePicker();window.addEventListener('boomux-theme',schedule);
 let daemon=null,workspaceId=null,loading=true,creating=false;
 let activityTab='agents',activityCollapsed=false,gitOwner=null,gitResult=null,gitRequest=null;
 const savedKey='boomux.webgpu.layout.v1';
@@ -309,7 +311,7 @@ window.addEventListener('pointermove',e=>{
   lastHoverPoint={x:e.clientX,y:e.clientY};
   // Follow genuine pointer movement, not pane reflow beneath a stationary
   // pointer. Selection, drag/resize, and keyboard layout mode retain focus.
-  if(moved&&e.pointerType!=='touch'&&!e.buttons&&!drag&&!resize&&!layoutMode&&document.hasFocus()){
+  if(!$('#theme-dialog').open&&moved&&e.pointerType!=='touch'&&!e.buttons&&!drag&&!resize&&!layoutMode&&document.hasFocus()){
     const hovered=e.target.closest('.pane'),id=Number(hovered?.dataset.id),p=panes.get(id);
     if(p){
       if(active!==id){active=id;syncSidebar();schedule();}
@@ -349,6 +351,7 @@ function setLayoutMode(enabled){
 $('#layout-mode').onclick=()=>setLayoutMode(!layoutMode);
 window.addEventListener('paste',e=>{if(layoutMode){e.preventDefault();e.stopImmediatePropagation();}},true);
 window.addEventListener('keydown',e=>{
+  if($('#theme-dialog').open)return;
   const consume=()=>{e.preventDefault();e.stopImmediatePropagation();};
   if(e.key==='Escape'&&(layoutMode||drag||resize||(expanded&&!e.target.closest('.pane-body')))){
     consume();if(drag||resize)finish(true);else if(expanded){expanded=null;reflow();}else setLayoutMode(false);return;
@@ -402,6 +405,7 @@ function paint(now){
       const r=dividers[index]?.rect;if(r)Object.assign(el.style,{left:`${r.x}px`,top:`${r.y}px`,width:`${r.w}px`,height:`${r.h}px`});
     }
   }
+  const theme=getTheme();
   frame=0;const t=tween?Math.min(1,(now-tween.start)/180):1,ease=1-(1-t)**3,rects=[];
   const surface=(r,color)=>rects.push({...r,color});
   const ordered=[...targets].sort(([a],[b])=>(a===drag?.id?2:floating.has(a)?1:0)-(b===drag?.id?2:floating.has(b)?1:0));
@@ -410,9 +414,9 @@ function paint(now){
     const from=tween?.from.get(id)||target,r={};for(const k of ['x','y','w','h'])r[k]=(id===drag?.id)?target[k]:from[k]+(target[k]-from[k])*ease;
     shown.set(id,r);const p=panes.get(id);if(!p)continue;
     Object.assign(p.el.style,{transform:`translate3d(${r.x}px,${r.y}px,0)`,width:`${Math.max(1,r.w)}px`,height:`${Math.max(1,r.h)}px`,zIndex:id===drag?.id?'20':floating.has(id)?'10':'1'});
-    surface(r,id===active?[.30,.40,.43,1]:[.15,.18,.20,1]);
-    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.max(0,r.h-2)},[.075,.090,.110,1]);
-    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.min(31,r.h-2)},[.075,.090,.110,1]);
+    surface(r,rgba(id===active?theme.accent:theme.border));
+    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.max(0,r.h-2)},rgba(theme.bg));
+    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.min(31,r.h-2)},rgba(theme.bg));
   }
   const label=$('#drop-label'),overlay=$('#drop-overlay');label.style.display='none';overlay.style.display='none';
   if(drag?.lifted){

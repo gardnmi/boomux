@@ -7,7 +7,7 @@ const port=Number(process.env.POC_PORT||4387);
 const host=`127.0.0.1:${port}`,origin=`http://${host}`;
 const sessions=new Set();
 const maxSessions=48,maxPending=1024*1024;
-const routes=new Map(['index.html','app.js','style.css','layout.js','renderer.js','terminal.js'].map(name=>['/'+name,resolve(root,name)]));
+const routes=new Map(['index.html','app.js','style.css','layout.js','renderer.js','terminal.js','themes.js'].map(name=>['/'+name,resolve(root,name)]));
 routes.set('/',resolve(root,'index.html'));
 routes.set('/vendor/ghostty-web.js',resolve(repo,'node_modules/ghostty-web/dist/ghostty-web.js'));
 routes.set('/vendor/ghostty-vt.wasm',resolve(repo,'node_modules/ghostty-web/ghostty-vt.wasm'));

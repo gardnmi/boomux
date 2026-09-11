@@ -1,3 +1,4 @@
+import {getTheme,rgba} from './themes.js';
 // One instanced draw for pane surfaces, borders, and the drop preview.
 // DOM handles text and controls. Rendering is requested only on changes.
 export async function createRenderer(canvas, status, invalidate) {
@@ -40,7 +41,7 @@ export async function createRenderer(canvas, status, invalidate) {
       for(const r of rects){data.set([r.x/w,r.y/h,r.w/w,r.h/h,...r.color],offset);offset+=8;}
       if(offset) device.queue.writeBuffer(buffer,0,data,0,offset);
       const encoder=device.createCommandEncoder();
-      const pass=encoder.beginRenderPass({colorAttachments:[{view:context.getCurrentTexture().createView(),clearValue:{r:.063,g:.071,b:.094,a:1},loadOp:'clear',storeOp:'store'}]});
+      const pass=encoder.beginRenderPass({colorAttachments:[{view:context.getCurrentTexture().createView(),clearValue:rgba(getTheme().deep),loadOp:'clear',storeOp:'store'}]});
       pass.setPipeline(pipeline);pass.setBindGroup(0,bind);pass.draw(6,rects.length);pass.end();
       device.queue.submit([encoder.finish()]);
     };

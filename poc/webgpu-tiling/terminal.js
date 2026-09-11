@@ -1,3 +1,4 @@
+import {getTheme,terminalTheme} from './themes.js';
 import {Ghostty,Terminal,FitAddon,CanvasRenderer} from '/vendor/ghostty-web.js';
 
 // The pinned ghostty-web renderer lacks an inactive cursor style. Keep this
@@ -8,8 +9,25 @@ const terminalFocus=new WeakMap(),rendererFocus=new WeakMap();
 const render=CanvasRenderer.prototype.render,renderCursor=CanvasRenderer.prototype.renderCursor;
 CanvasRenderer.prototype.render=function(buffer,force,viewport,terminal,...rest){
   const state=terminalFocus.get(terminal);
+  if(state&&state.theme!==getTheme()){
+    state.theme=getTheme();const colors=terminalTheme();this.setTheme(colors);
+    // This pinned WASM returns resolved RGB cells and has no runtime palette
+    // setter. Translate its startup colors at paint time, preserving the VT,
+    // scrollback, selection, and PTY connection. See README for the RGB caveat.
+    state.colors=new Map();
+    for(const name of [...ansiColors,'foreground','background']){
+      const rgb=parseInt(state.initialColors[name].slice(1),16);
+      if(!state.colors.has(rgb)||name==='foreground'||name==='background')state.colors.set(rgb,colors[name]);
+    }
+    force=true;
+  }
   if(state){rendererFocus.set(this,state);force ||= state.changed;state.changed=false;}
   return render.call(this,buffer,force,viewport,terminal,...rest);
+};
+const ansiColors=['black','red','green','yellow','blue','magenta','cyan','white','brightBlack','brightRed','brightGreen','brightYellow','brightBlue','brightMagenta','brightCyan','brightWhite'];
+const rgbToCSS=CanvasRenderer.prototype.rgbToCSS;
+CanvasRenderer.prototype.rgbToCSS=function(r,g,b){
+  return rendererFocus.get(this)?.colors?.get((r<<16)|(g<<8)|b)??rgbToCSS.call(this,r,g,b);
 };
 CanvasRenderer.prototype.renderCursor=function(col,row){
   if(rendererFocus.get(this)?.focused!==false)return renderCursor.call(this,col,row);
@@ -36,7 +54,7 @@ function initialize(){
 export function createTerminal(container,status,isLayoutMode,options={}){
   let disposed=false,terminal,fit,socket,subscriptions=[];
   let connectionError=false,reconstructing=false;
-  const cursor={focused:false,changed:true};
+  const cursor={focused:false,changed:true,initialColors:terminalTheme(),theme:getTheme()};
   function updateFocus(){
     const focused=document.hasFocus()&&container.contains(document.activeElement)&&!isLayoutMode();
     if(cursor.focused!==focused){cursor.focused=focused;cursor.changed=true;}
@@ -59,9 +77,10 @@ export function createTerminal(container,status,isLayoutMode,options={}){
     const ghostty=await initialize();if(disposed)return;
     container.replaceChildren();
     terminal=new Terminal({ghostty,fontFamily:'"JetBrains Mono", monospace',fontSize:13,cursorBlink:false,scrollback:2000,
-      theme:{background:'#13171c',foreground:'#c9d4e8',cursor:'#a9b9ff',selectionBackground:'#405478',black:'#161b24',red:'#ed929b',green:'#8bc6ac',yellow:'#e1b889',blue:'#8cafd7',magenta:'#b4a2e5',cyan:'#83c6ce',white:'#c9d4e8',brightBlack:'#65738b'}});
+      theme:cursor.initialColors});
     terminalFocus.set(terminal,cursor);
     fit=new FitAddon();terminal.loadAddon(fit);terminal.open(container);updateFocus();
+    container.querySelector("canvas").addEventListener("contextrestored",()=>{cursor.changed=true;});
     // This pinned ghostty-web version returns true for a handled key (unlike
     // xterm.js), so only layout-owned chords are consumed here.
     terminal.attachCustomKeyEventHandler(e=>isLayoutMode()||(e.ctrlKey&&e.code==='Space')||(options.shell&&container.dataset.connected!=='true'));

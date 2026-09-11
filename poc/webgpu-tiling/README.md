@@ -219,3 +219,33 @@ real terminals:
 PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
   node poc/webgpu-tiling/panels.test.mjs
 ```
+
+
+## Theme picker
+
+Use the palette button next to the sidebar settings gear to preview and apply
+22 Omarchy themes, or return to the original Boomux palette. Escape cancels a
+preview. Left/right arrows move through themes while the picker is open. The
+selection persists in this browser and synchronizes across tabs of the same
+origin. Theme changes repaint the interface and existing terminals without
+reconnecting attachments or clearing scrollback.
+
+Palettes come from the MIT-licensed Omarchy repository; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the pinned revision and license.
+The picker and preview are original code; no Omarchy website implementation or
+artwork is bundled.
+
+The pinned Ghostty WASM does not expose runtime palette updates or indexed-color
+metadata. Existing terminals translate their startup palette's resolved RGB
+colors while painting. Consequently, explicit truecolor values identical to a
+startup palette color also change, and duplicate startup colors cannot become
+distinct colors later. Other truecolor values are preserved. New terminals use
+the selected palette directly. This adapter can be removed when the library
+exposes native runtime palette updates.
+
+Focused picker/terminal checks use synthetic output and no real attachments:
+
+```sh
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
+  node poc/webgpu-tiling/themes.test.mjs
+```
