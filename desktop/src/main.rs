@@ -9728,7 +9728,11 @@ impl Render for Workspace {
                         .child("Create your first Workspace"),
                 )
                 .child("Click + in the sidebar, then choose New Workspace to get started.")
-                .child("Once created, press Ctrl + Enter to add a Shell.")
+                .child(if cfg!(target_os = "macos") {
+                    "Once created, press Command + Enter to add a Shell."
+                } else {
+                    "Once created, press Ctrl + Enter to add a Shell."
+                })
                 .child("Press F1 for keyboard shortcuts.")
                 .into_any_element()
         } else {
