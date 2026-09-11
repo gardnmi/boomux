@@ -996,6 +996,24 @@ impl Render for WorkspaceRowDrag {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SelectionAutoscroll {
+    pane_id: usize,
+    position: gpui::Point<gpui::Pixels>,
+    bounds: Bounds<gpui::Pixels>,
+}
+
+fn selection_scroll_delta(y: f32, top: f32, bottom: f32) -> isize {
+    let distance = if y < top {
+        y - top
+    } else if y >= bottom {
+        y - bottom + 1.0
+    } else {
+        return 0;
+    };
+    (distance.signum() * (1.0 + distance.abs() / TERMINAL_CELL_HEIGHT).min(6.0)) as isize
+}
+
 impl TerminalSelectionDrag {
     fn selection(
         &self,
@@ -1018,8 +1036,14 @@ impl TerminalSelectionDrag {
             )
         };
         Some(TerminalSelection {
-            anchor: cell(anchor?),
-            head: cell(position),
+            anchor: {
+                let (row, col) = cell(anchor?);
+                (row + screen.scroll_offset as usize, col)
+            },
+            head: {
+                let (row, col) = cell(position);
+                (row + screen.scroll_offset as usize, col)
+            },
         })
     }
 }
@@ -1352,19 +1376,20 @@ fn selection_indices(selection: TerminalSelection, cols: usize) -> (usize, usize
 fn terminal_selected_text(screen: &TerminalScreen, selection: TerminalSelection) -> String {
     let cols = usize::from(screen.cols);
     let (start, end) = selection_indices(selection, cols);
-    let first_row = start / cols;
-    let last_row = end / cols;
+    let offset = screen.scroll_offset as usize;
+    let first_row = (start / cols).max(offset);
+    let last_row = (end / cols).min(offset + usize::from(screen.rows).saturating_sub(1));
     (first_row..=last_row)
         .map(|row| {
-            let start_col = if row == first_row { start % cols } else { 0 };
-            let end_col = if row == last_row {
+            let start_col = if row == start / cols { start % cols } else { 0 };
+            let end_col = if row == end / cols {
                 end % cols
             } else {
                 cols.saturating_sub(1)
             };
             let mut line = String::new();
             for col in start_col..=end_col {
-                let cell = &screen.cells[row * cols + col];
+                let cell = &screen.cells[(row - offset) * cols + col];
                 if !cell.continuation {
                     line.push_str(&cell.text);
                 }
@@ -1517,6 +1542,9 @@ struct Workspace {
     pointer_drag: Option<PointerDrag>,
     terminal_scrollbar_drag: Option<TerminalScrollbarPointerDrag>,
     terminal_selection_release: Option<usize>,
+    selection_autoscroll: Option<SelectionAutoscroll>,
+    selection_autoscroll_task: Option<gpui::Task<()>>,
+    selection_copy_task: Option<gpui::Task<()>>,
     copied_pane: Option<usize>,
     copied_cleanup: Option<gpui::Task<()>>,
     layout_animation: Option<LayoutAnimation>,
@@ -1731,6 +1759,9 @@ impl Workspace {
             pointer_drag: None,
             terminal_scrollbar_drag: None,
             terminal_selection_release: None,
+            selection_autoscroll: None,
+            selection_autoscroll_task: None,
+            selection_copy_task: None,
             copied_pane: None,
             copied_cleanup: None,
             layout_animation: None,
@@ -1878,6 +1909,8 @@ impl Workspace {
         cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
                 this.terminal_selection_release = None;
+                this.selection_autoscroll = None;
+                this.selection_autoscroll_task = None;
                 this.layout_leader_release_task = None;
                 if this.layout_leader_pressed_at.take().is_some() && this.layout_leader_entered {
                     this.leave_layout_mode(cx);
@@ -4017,6 +4050,9 @@ impl Workspace {
         }
         if let Some(pane) = self.terminals.get_mut(&pane_id) {
             self.terminal_selection_release = None;
+            self.selection_autoscroll = None;
+            self.selection_autoscroll_task = None;
+            self.selection_copy_task = None;
             pane.selection_anchor_position = Some(event.position);
             pane.selection = None;
             cx.notify();
@@ -4052,6 +4088,13 @@ impl Workspace {
         ) else {
             return;
         };
+        // Keep the original cell anchored in scrollback, not in viewport pixels.
+        let selection = TerminalSelection {
+            anchor: pane
+                .selection
+                .map_or(selection.anchor, |previous| previous.anchor),
+            head: selection.head,
+        };
         pane.selection = Some(selection);
         self.terminal_selection_release = Some(drag.pane_id);
         #[cfg(target_os = "linux")]
@@ -4063,8 +4106,126 @@ impl Workspace {
                 cx.write_to_primary(ClipboardItem::new_string(text));
             }
         }
+        let scrolling = selection_scroll_delta(
+            f32::from(event.event.position.y),
+            f32::from(event.bounds.top()),
+            f32::from(event.bounds.bottom()),
+        ) != 0;
+        self.selection_autoscroll = scrolling.then_some(SelectionAutoscroll {
+            pane_id,
+            position: event.event.position,
+            bounds: event.bounds,
+        });
+        if scrolling && self.selection_autoscroll_task.is_none() {
+            self.selection_autoscroll_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    if !this
+                        .update(cx, |this, cx| this.tick_selection_autoscroll(cx))
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                }
+            }));
+        } else if !scrolling {
+            self.selection_autoscroll_task = None;
+        }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn tick_selection_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let keep_scrolling = (|| {
+            let drag = self.selection_autoscroll?;
+            if self.terminal_selection_release != Some(drag.pane_id)
+                || self.layout_mode
+                || self.pointer_drag.is_some()
+            {
+                return None;
+            }
+            let pane = self.terminals.get_mut(&drag.pane_id)?;
+            let screen = pane.screen.as_ref()?;
+            let delta = selection_scroll_delta(
+                f32::from(drag.position.y),
+                f32::from(drag.bounds.top()),
+                f32::from(drag.bounds.bottom()),
+            );
+            let offset = screen.scroll_offset as usize;
+            let target = offset
+                .saturating_add_signed(delta)
+                .min(screen.scroll_total.saturating_sub(screen.scroll_len) as usize);
+            if target == offset {
+                return None;
+            }
+            pane.session.as_ref()?.scroll_to(target);
+            Some(())
+        })()
+        .is_some();
+        if !keep_scrolling {
+            self.selection_autoscroll_task = None;
+            self.selection_autoscroll = None;
+        }
+        cx.notify();
+        keep_scrolling
+    }
+
+    fn copy_scrollback_selection(
+        &mut self,
+        pane_id: usize,
+        clipboard: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pane) = self.terminals.get(&pane_id) else {
+            return false;
+        };
+        let (Some(selection), Some(screen), Some(session)) =
+            (pane.selection, pane.screen.as_ref(), pane.session.as_ref())
+        else {
+            return false;
+        };
+        let visible =
+            screen.scroll_offset as usize..screen.scroll_offset as usize + usize::from(screen.rows);
+        if visible.contains(&selection.anchor.0) && visible.contains(&selection.head.0) {
+            return false;
+        }
+        let receiver = match session.selected_text(selection.anchor, selection.head) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                self.terminals.get_mut(&pane_id).unwrap().error = Some(error);
+                cx.notify();
+                return true;
+            }
+        };
+        self.selection_copy_task = Some(cx.spawn(async move |this, cx| {
+            if let Ok(result) = receiver.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    // A later gesture or closed pane must not receive this copy.
+                    if this.terminals.get(&pane_id).and_then(|pane| pane.selection)
+                        != Some(selection)
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(text) if !text.is_empty() => {
+                            #[cfg(target_os = "linux")]
+                            cx.write_to_primary(ClipboardItem::new_string(text.clone()));
+                            if clipboard {
+                                this.copy_terminal_text(pane_id, text, cx);
+                            }
+                        }
+                        Err(error) => {
+                            this.terminals.get_mut(&pane_id).unwrap().error = Some(error);
+                            cx.notify();
+                        }
+                        _ => (),
+                    }
+                });
+            }
+        }));
+        true
     }
 
     fn copy_terminal_text(&mut self, pane_id: usize, text: String, cx: &mut Context<Self>) {
@@ -4087,6 +4248,10 @@ impl Workspace {
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.copy_scrollback_selection(self.focused, true, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let Some(text) = self.terminals.get(&self.focused).and_then(|pane| {
             Some(terminal_selected_text(
                 pane.screen.as_ref()?,
@@ -4338,8 +4503,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if event.button == MouseButton::Left {
+            self.selection_autoscroll = None;
+            self.selection_autoscroll_task = None;
             let source_pane = self.terminal_selection_release;
             let enabled = self.copy_on_select && !self.layout_mode && self.pointer_drag.is_none();
+            if source_pane.is_some_and(|id| self.copy_scrollback_selection(id, enabled, cx)) {
+                self.terminal_selection_release = None;
+            }
             if let Some(text) = take_terminal_selection_copy(
                 &mut self.terminal_selection_release,
                 &self.terminals,
@@ -5848,6 +6018,19 @@ impl Workspace {
                         let next_revision = terminal.revision();
                         if next_revision != revision {
                             pane.screen = Some(terminal.screen());
+                            if let Some(drag) = this
+                                .selection_autoscroll
+                                .filter(|drag| drag.pane_id == pane_id)
+                                && let (Some(selection), Some(screen)) =
+                                    (pane.selection.as_mut(), pane.screen.as_ref())
+                            {
+                                let (row, col) = terminal_cell_from_offset(
+                                    f32::from(drag.position.x - drag.bounds.left()),
+                                    f32::from(drag.position.y - drag.bounds.top()),
+                                    screen,
+                                );
+                                selection.head = (row + screen.scroll_offset as usize, col);
+                            }
                             revision = next_revision;
                             cx.notify();
                         }
@@ -10349,7 +10532,7 @@ fn prepare_terminal_paint(
         let mut runs = Vec::with_capacity(cells.len());
         for (col, cell) in cells.iter().enumerate() {
             let selected = selection_range.is_some_and(|(start, end)| {
-                let index = row * cols + col;
+                let index = (row + screen.scroll_offset as usize) * cols + col;
                 (start..=end).contains(&index)
             });
             let (foreground, background) = if selected {
@@ -11546,6 +11729,48 @@ mod pointer_tests {
             images: Vec::new(),
             image_placements: Vec::new(),
         }
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_is_directional_bounded_and_stops_inside() {
+        assert_eq!(selection_scroll_delta(100.0, 100.0, 500.0), 0);
+        assert_eq!(selection_scroll_delta(499.0, 100.0, 500.0), 0);
+        assert_eq!(selection_scroll_delta(99.0, 100.0, 500.0), -1);
+        assert_eq!(selection_scroll_delta(500.0, 100.0, 500.0), 1);
+        assert_eq!(selection_scroll_delta(-1000.0, 100.0, 500.0), -6);
+        assert_eq!(selection_scroll_delta(2000.0, 100.0, 500.0), 6);
+    }
+
+    #[test]
+    fn terminal_selection_clips_visible_text_using_scrollback_coordinates() {
+        let mut screen = selection_test_screen();
+        screen.scroll_offset = 10;
+        screen.scroll_total = 20;
+        let selection = TerminalSelection {
+            anchor: (9, 2),
+            head: (11, 1),
+        };
+        assert_eq!(terminal_selected_text(&screen, selection), "abc\nef");
+        assert_eq!(
+            terminal_selected_text(
+                &screen,
+                TerminalSelection {
+                    anchor: selection.head,
+                    head: selection.anchor
+                }
+            ),
+            "abc\nef"
+        );
+        assert_eq!(
+            terminal_selected_text(
+                &screen,
+                TerminalSelection {
+                    anchor: (0, 0),
+                    head: (1, 2)
+                }
+            ),
+            ""
+        );
     }
 
     #[test]
