@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.15.2](https://github.com/gardnmi/boomux/compare/v1.15.1...v1.15.2) (2026-09-10)
+
+
+### Bug Fixes
+
+* **desktop:** discard unbound saved pane placeholders ([#403](https://github.com/gardnmi/boomux/issues/403)) ([fb4fce5](https://github.com/gardnmi/boomux/commit/fb4fce5f99ec85c0897f674195d3fe0704322509))
+
+## [1.15.1](https://github.com/gardnmi/boomux/compare/v1.15.0...v1.15.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* **desktop:** restore workspace animations and prevent UI stalls ([#401](https://github.com/gardnmi/boomux/issues/401)) ([f3d6870](https://github.com/gardnmi/boomux/commit/f3d687080e90f185d4734ca1084fd4ad9f6d3902))
+
+## [1.15.0](https://github.com/gardnmi/boomux/compare/v1.14.1...v1.15.0) (2026-09-10)
+
+
+### Features
+
+* **desktop:** persist internal pane arrangements across restarts ([#399](https://github.com/gardnmi/boomux/issues/399)) ([efa3de7](https://github.com/gardnmi/boomux/commit/efa3de79eb11961a331e08d20e42decee9f8ef2d))
+
 ## [1.14.1](https://github.com/gardnmi/boomux/compare/v1.14.0...v1.14.1) (2026-09-09)
 
 

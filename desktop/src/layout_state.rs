@@ -64,6 +64,41 @@ impl Default for Document {
         }
     }
 }
+impl Arrangement {
+    /// Unbound UI placeholders have no terminal identity to restore. Retain
+    /// references to unavailable Shells, which can still be reconnected later.
+    pub fn discard_unbound_panes(&mut self) {
+        self.panes.retain(|_, pane| pane.shell.is_some());
+        fn prune(tree: Tree, panes: &BTreeMap<u64, Pane>) -> Option<Tree> {
+            match tree {
+                Tree::Pane(id) => panes.contains_key(&id).then_some(Tree::Pane(id)),
+                Tree::Split {
+                    horizontal,
+                    ratio,
+                    first,
+                    second,
+                } => match (prune(*first, panes), prune(*second, panes)) {
+                    (Some(first), Some(second)) => Some(Tree::Split {
+                        horizontal,
+                        ratio,
+                        first: Box::new(first),
+                        second: Box::new(second),
+                    }),
+                    (first, second) => first.or(second),
+                },
+            }
+        }
+        self.tree = self.tree.take().and_then(|tree| prune(tree, &self.panes));
+        self.floating
+            .retain(|pane| self.panes.contains_key(&pane.pane));
+        self.focused = self
+            .focused
+            .filter(|id| self.panes.contains_key(id))
+            .or_else(|| self.panes.keys().next().copied());
+        self.expanded = self.expanded.filter(|id| self.panes.contains_key(id));
+    }
+}
+
 impl Tree {
     fn validate(&self, depth: usize, ids: &mut HashSet<u64>) -> Result<(), String> {
         if depth > 64 || ids.len() >= MAX_PANES {
@@ -408,5 +443,79 @@ mod tests {
         assert_eq!(request.document, fixture());
         request.completion.send_blocking(Ok(())).unwrap();
         latest.recv_blocking().unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod unbound_tests {
+    use super::*;
+    #[test]
+    fn empty_placeholders_collapse_without_losing_saved_shells() {
+        let branch = Tree::Split {
+            horizontal: true,
+            ratio: 0.3,
+            first: Box::new(Tree::Pane(7)),
+            second: Box::new(Tree::Pane(8)),
+        };
+        let mut saved = Arrangement {
+            tree: Some(Tree::Split {
+                horizontal: false,
+                ratio: 0.5,
+                first: Box::new(Tree::Pane(6)),
+                second: Box::new(branch.clone()),
+            }),
+            panes: BTreeMap::from([
+                (
+                    6,
+                    Pane {
+                        shell: None,
+                        workspace: None,
+                    },
+                ),
+                (
+                    7,
+                    Pane {
+                        shell: Some("running".into()),
+                        workspace: Some("workspace".into()),
+                    },
+                ),
+                (
+                    8,
+                    Pane {
+                        shell: Some("unavailable-but-reconnectable".into()),
+                        workspace: None,
+                    },
+                ),
+                (
+                    9,
+                    Pane {
+                        shell: None,
+                        workspace: None,
+                    },
+                ),
+            ]),
+            floating: vec![Floating {
+                pane: 9,
+                rect: [0., 0., 100., 100.],
+            }],
+            focused: Some(6),
+            expanded: Some(9),
+            canvas: [1000., 800.],
+        };
+        saved.discard_unbound_panes();
+        assert_eq!(saved.tree, Some(branch));
+        assert_eq!(saved.panes.len(), 2);
+        assert!(saved.floating.is_empty());
+        assert_eq!(saved.focused, Some(7));
+        assert_eq!(saved.expanded, None);
+        let cleaned = saved.clone();
+        saved.discard_unbound_panes();
+        assert_eq!(saved, cleaned);
+        for pane in saved.panes.values_mut() {
+            pane.shell = None;
+        }
+        saved.discard_unbound_panes();
+        assert!(saved.tree.is_none() && saved.panes.is_empty());
+        assert_eq!(saved.focused, None);
     }
 }
