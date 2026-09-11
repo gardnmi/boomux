@@ -249,3 +249,26 @@ Focused picker/terminal checks use synthetic output and no real attachments:
 PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
   node poc/webgpu-tiling/themes.test.mjs
 ```
+
+
+### Showcase presentation
+
+The picker’s **Showcase** toggle switches to a large three-card carousel, with
+arrow buttons, left/right keys, and touch swipes. Click the center preview or
+**Apply theme** to select it. **List view** returns to the compact picker; this
+presentation preference is stored separately from the selected palette.
+Open `http://127.0.0.1:4390/?theme-showcase` to go straight to the showcase for
+recording. Previews contain synthetic Boomux content, not copies of live Shells.
+
+Selection opens the new theme through a 360 ms diagonal center-out wipe, inspired
+by the supplied Omarchy site recording and implemented independently with the
+browser View Transition API. The terminal canvases and pane compositor repaint
+before the new snapshot. Only one transition can run at a time; the browser
+releases its snapshots when it ends. Reduced motion, disabled layout animation,
+and browsers without this API apply the theme immediately. No website source or
+preview artwork is included.
+
+```sh
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
+  node poc/webgpu-tiling/showcase.test.mjs
+```

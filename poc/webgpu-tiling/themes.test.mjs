@@ -14,7 +14,7 @@ async function hasInk(rgb){
 }
 await p.getByRole('button',{name:'Choose theme',exact:true}).click();assert.equal(await p.locator('.theme-choice').count(),23);
 await p.getByRole('button',{name:'Catppuccin Latte',exact:true}).click();assert.equal(await p.locator('html').getAttribute('data-theme'),'boomux','preview does not apply');
-await p.getByRole('button',{name:'Apply theme',exact:true}).click();await p.waitForTimeout(150);
+await p.getByRole('button',{name:'Apply theme',exact:true}).click();await p.waitForFunction(()=>!document.documentElement.classList.contains('theme-wiping'));await p.waitForTimeout(100);
 assert.equal(await p.locator('html').getAttribute('data-theme'),'catppuccin-latte');assert.equal(connections,initial,'theme does not recreate attachments');
 const bg=await p.locator('.pane-body').first().evaluate(el=>getComputedStyle(el).backgroundColor);assert.equal(bg,'rgb(239, 241, 245)');
 const pixel=await p.locator('.pane-body canvas').first().evaluate(c=>Array.from(c.getContext('2d').getImageData(100,100,1,1).data));assert.deepEqual(pixel.slice(0,3),[239,241,245],'existing terminal canvas receives light background');
@@ -23,8 +23,8 @@ assert.ok(await hasInk([210,15,57]),'existing ANSI red recolors');
 assert.ok(await hasInk([18,58,188]),'unrelated truecolor survives');
 await p.getByRole('button',{name:'Choose theme',exact:true}).click();await p.getByRole('button',{name:'Tokyo Night',exact:true}).click();await p.keyboard.press('Escape');assert.equal(await p.locator('html').getAttribute('data-theme'),'catppuccin-latte');
 await p.reload();await p.waitForSelector('.pane-body[data-connected="true"]');assert.equal(await p.locator('html').getAttribute('data-theme'),'catppuccin-latte','theme persists');
-await p.waitForTimeout(150);assert.ok(await hasInk([210,15,57]),'new terminal starts with saved ANSI palette');
-await p.getByRole('button',{name:'Choose theme',exact:true}).click();await p.getByRole('button',{name:'Tokyo Night',exact:true}).click();await p.getByRole('button',{name:'Apply theme',exact:true}).click();await p.waitForTimeout(150);
+await p.waitForFunction(()=>!document.documentElement.classList.contains('theme-wiping'));await p.waitForTimeout(100);assert.ok(await hasInk([210,15,57]),'new terminal starts with saved ANSI palette');
+await p.getByRole('button',{name:'Choose theme',exact:true}).click();await p.getByRole('button',{name:'Tokyo Night',exact:true}).click();await p.getByRole('button',{name:'Apply theme',exact:true}).click();await p.waitForFunction(()=>!document.documentElement.classList.contains('theme-wiping'));await p.waitForTimeout(100);
 assert.ok(await hasInk([247,118,142]),'second theme maps from terminal startup palette');
 await p.getByRole('button',{name:'Choose theme',exact:true}).click();await p.screenshot({path:'/tmp/boomux-theme-picker.png'});assert.deepEqual(errors,[]);console.log('23 palettes, preview/cancel, light canvas recoloring, retained connections, and persistence passed');
 }finally{await b.close();}

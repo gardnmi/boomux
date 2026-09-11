@@ -45,7 +45,11 @@
 
 </main>
 <dialog id="theme-dialog" aria-labelledby="theme-title">
-  <div class="theme-dialog-title"><div><h2 id="theme-title">Choose a theme</h2><p>Omarchy palettes for your workspace</p></div><button id="theme-cancel" aria-label="Close theme picker">×</button></div>
+  <div class="theme-dialog-title"><div><h2 id="theme-title">Choose a theme</h2><p>Omarchy palettes for your workspace</p></div><button id="theme-view" type="button" aria-pressed="false">Showcase</button><button id="theme-cancel" aria-label="Close theme picker">×</button></div>
+  <div class="theme-showcase" hidden>
+    <div class="showcase-browse"><button id="theme-previous" aria-label="Previous theme">←</button><div class="showcase-cards" aria-label="Theme previews"></div><button id="theme-next" aria-label="Next theme">→</button></div>
+    <div class="showcase-caption"><span id="showcase-position"></span><h3 id="showcase-name" aria-live="polite"></h3><p>Click the center preview to apply.</p></div>
+  </div>
   <div class="theme-picker-body"><div class="theme-list" aria-label="Themes"></div><div class="theme-preview-column"><h3 id="theme-preview-name"></h3><div class="theme-preview"><div class="preview-sidebar">boomux<br><br><span>WORKSPACES</span><p>development</p><span>Agents · Git · Remotes</span></div><div class="preview-terminal"><div>shell <span>~/project</span></div><pre><b>~/project</b> $ git status
 On branch main
 

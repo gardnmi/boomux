@@ -12,7 +12,7 @@ const templates=[
 let tree,panes=new Map(),floating=new Map(),active=1,next=5,expanded=null,drag=null,resize=null,drop=null;
 let targets=new Map(),shown=new Map(),tween=null,draw=null,frame=0,width=1,height=1;
 let layoutMode=false,fitTimer=null;
-mountThemePicker();window.addEventListener('boomux-theme',schedule);
+mountThemePicker();window.addEventListener('boomux-theme',()=>{if(draw){cancelAnimationFrame(frame);paint(performance.now());}else schedule();});
 let daemon=null,workspaceId=null,loading=true,creating=false;
 let activityTab='agents',activityCollapsed=false,gitOwner=null,gitResult=null,gitRequest=null;
 const savedKey='boomux.webgpu.layout.v1';

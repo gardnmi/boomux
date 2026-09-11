@@ -60,6 +60,10 @@ export function createTerminal(container,status,isLayoutMode,options={}){
     if(cursor.focused!==focused){cursor.focused=focused;cursor.changed=true;}
     if(focused&&options.shell&&socket?.readyState===WebSocket.OPEN)socket.send(JSON.stringify({type:'focus'}));
   }
+  // View transitions snapshot synchronously; paint the new palette before the
+  // browser captures the new view, rather than waiting for the next VT frame.
+  function paintTheme(){if(terminal?.renderer&&terminal?.wasmTerm)terminal.renderer.render(terminal.wasmTerm,true,terminal.viewportY,terminal);}
+  window.addEventListener('boomux-theme',paintTheme);
   container.addEventListener('focusin',updateFocus);
   container.addEventListener('focusout',updateFocus);
   window.addEventListener('focus',updateFocus);
@@ -135,6 +139,6 @@ export function createTerminal(container,status,isLayoutMode,options={}){
     ready,
     fit:fitTerminal,
     focus(){if(!disposed&&!isLayoutMode())terminal?.focus();},
-    dispose(){disposed=true;container.removeEventListener('focusin',updateFocus);container.removeEventListener('focusout',updateFocus);window.removeEventListener('focus',updateFocus);window.removeEventListener('blur',updateFocus);socket?.close(1000,'Pane closed');for(const s of subscriptions)s.dispose();terminal?.dispose();}
+    dispose(){disposed=true;window.removeEventListener('boomux-theme',paintTheme);container.removeEventListener('focusin',updateFocus);container.removeEventListener('focusout',updateFocus);window.removeEventListener('focus',updateFocus);window.removeEventListener('blur',updateFocus);socket?.close(1000,'Pane closed');for(const s of subscriptions)s.dispose();terminal?.dispose();}
   };
 }

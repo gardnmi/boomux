@@ -846,16 +846,70 @@ function apply(theme,persist=true){
 apply(current,false);
 export function mountThemePicker(){
  const trigger=document.querySelector('#theme-picker'),dialog=document.querySelector('#theme-dialog');let candidate=current;
+ let showcase=false,suppressCardClick=false,changing=false;
+ try{showcase=localStorage.getItem('boomux.webgpu.theme-view')==='showcase';}catch{}
+ const view=dialog.querySelector('#theme-view'),cards=dialog.querySelector('.showcase-cards');
+ const title=dialog.querySelector('#showcase-name'),position=dialog.querySelector('#showcase-position');
  const list=dialog.querySelector('.theme-list'),preview=dialog.querySelector('.theme-preview'),label=dialog.querySelector('#theme-preview-name');
- function select(t){candidate=t;label.textContent=t.name;for(const k of ['bg','surface','fg','muted','accent','border'])preview.style.setProperty(`--preview-${k}`,t[k]);for(const b of list.children){b.setAttribute('aria-pressed',String(b.dataset.theme===t.id));} }
+ function select(t){candidate=t;renderCards();label.textContent=t.name;for(const k of ['bg','surface','fg','muted','accent','border'])preview.style.setProperty(`--preview-${k}`,t[k]);for(const b of list.children){b.setAttribute('aria-pressed',String(b.dataset.theme===t.id));} }
+
+ // Three reusable previews: synthetic Boomux content, never live terminal data.
+ for(const offset of [-1,0,1]){
+  const card=document.createElement('button');card.type='button';card.className='showcase-card';card.dataset.offset=offset;
+  const content=preview.cloneNode(true);content.removeAttribute('style');card.append(content);
+  card.onclick=()=>{if(suppressCardClick){suppressCardClick=false;return;}if(offset)step(offset);else dialog.querySelector('#theme-apply').click();};cards.append(card);
+ }
+ function renderCards(){
+  const index=themes.indexOf(candidate);title.textContent=candidate.name;position.textContent=`${String(index+1).padStart(2,'0')} / ${themes.length}`;
+  for(const card of cards.children){
+   const offset=Number(card.dataset.offset),t=themes[(index+offset+themes.length)%themes.length];
+   card.setAttribute('aria-label',offset?`Preview ${t.name}`:`Apply ${t.name}`);
+   for(const k of ['bg','surface','fg','muted','accent','border'])card.style.setProperty(`--preview-${k}`,t[k]);
+  }
+ }
+ function setView(){
+  dialog.classList.toggle('showcase',showcase);dialog.querySelector('.theme-showcase').hidden=!showcase;
+  view.textContent=showcase?'List view':'Showcase';view.setAttribute('aria-pressed',String(showcase));
+  renderCards();
+ }
+ function step(delta){
+  select(themes[(themes.indexOf(candidate)+delta+themes.length)%themes.length]);
+  if(showcase&&!matchMedia('(prefers-reduced-motion: reduce)').matches){
+   for(const animation of cards.getAnimations())animation.cancel();
+   cards.animate([{translate:`${delta*55}px 0`,opacity:.45},{translate:'0 0',opacity:1}],{duration:240,easing:'ease-out'});
+  }
+ }
+ view.onclick=()=>{showcase=!showcase;setView();try{localStorage.setItem('boomux.webgpu.theme-view',showcase?'showcase':'list');}catch{}};
+ dialog.querySelector('#theme-previous').onclick=()=>step(-1);
+ dialog.querySelector('#theme-next').onclick=()=>step(1);
+ let touchStart=null;
+ cards.addEventListener('pointerdown',e=>{suppressCardClick=false;if(e.pointerType==='touch')touchStart=e.clientX;});
+ cards.addEventListener('pointerup',e=>{if(touchStart!==null){const dx=e.clientX-touchStart;touchStart=null;if(Math.abs(dx)>45){suppressCardClick=true;step(dx<0?1:-1);e.preventDefault();}}});
+ cards.addEventListener('pointercancel',()=>{touchStart=null;});
+ setView();
  for(const t of themes){const b=document.createElement('button');b.type='button';b.dataset.theme=t.id;b.className='theme-choice';b.setAttribute('aria-pressed','false');
  const swatches=document.createElement('span');swatches.className='theme-swatches';swatches.setAttribute('aria-hidden','true');for(const color of [t.bg,t.surface,t.fg,t.accent]){const dot=document.createElement('i');dot.style.background=color;swatches.append(dot);}
  b.append(swatches,document.createTextNode(t.name));b.onclick=()=>select(t);list.append(b);}
- trigger.onclick=()=>{document.querySelector('#settings').open=false;select(current);dialog.showModal();list.querySelector(`[data-theme="${current.id}"]`).focus();};
- dialog.querySelector('#theme-apply').onclick=()=>{apply(candidate);dialog.close();};
+ trigger.onclick=()=>{if(changing)return;document.querySelector('#settings').open=false;select(current);dialog.showModal();(showcase?dialog.querySelector('#theme-next'):list.querySelector(`[data-theme="${current.id}"]`)).focus();};
+ dialog.querySelector('#theme-apply').onclick=()=>{
+  if(changing)return;
+  const selected=candidate;
+  if(selected===current){dialog.close();return;}
+  const commit=()=>{apply(selected);dialog.close();};
+  const motion=!matchMedia('(prefers-reduced-motion: reduce)').matches&&document.querySelector('#motion')?.checked!==false;
+  if(!motion||!document.startViewTransition||document.hidden){commit();return;}
+  changing=true;document.documentElement.classList.add('theme-wiping');
+  const cleanup=()=>{changing=false;document.documentElement.classList.remove('theme-wiping');};
+  try{
+   const transition=document.startViewTransition(commit);
+   transition.ready.catch(()=>{}); // A skipped animation still applies the theme.
+   transition.finished.then(cleanup,cleanup);
+  }catch{cleanup();commit();}
+ };
  dialog.querySelector('#theme-cancel').onclick=()=>dialog.close();
  dialog.addEventListener('click',e=>{if(e.target===dialog){const r=dialog.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)dialog.close();}});
  dialog.addEventListener('close',()=>trigger.focus());
- dialog.addEventListener('keydown',e=>{if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();select(themes[(themes.indexOf(candidate)+(e.key==='ArrowRight'?1:themes.length-1))%themes.length]);list.querySelector(`[data-theme="${candidate.id}"]`).focus();}});
+ dialog.addEventListener('keydown',e=>{if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();step(e.key==='ArrowRight'?1:-1);if(!showcase)list.querySelector(`[data-theme="${candidate.id}"]`).focus();}});
+ if(new URLSearchParams(location.search).has('theme-showcase')){showcase=true;setView();trigger.click();}
  window.addEventListener('storage',e=>{if(e.key===key){const t=themes.find(t=>t.id===e.newValue);if(t)apply(t,false);}});
 }
