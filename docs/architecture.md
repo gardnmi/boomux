@@ -18,6 +18,7 @@ This is the implementation reference. For product usage, see the
 | `src/dashboard_projection.rs` | Typed snapshot/session-to-dashboard classification, view construction, and title enrichment |
 | `src/protocol.rs` | Versioned control and attachment wire models, framing, and request version requirements |
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
+| `src/platform/` | Linux and Darwin process identity, monitoring, runtime paths, descriptor and filesystem operations |
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
 | `src/global_workspace_store.rs` | Independently versioned coordinator Workspace metadata, placement membership, initialization and schema migration, prepared resource and placement-default recovery, and resumable close progress |
@@ -54,6 +55,16 @@ This is the implementation reference. For product usage, see the
 | `src/projects.rs`, `src/git.rs` | Bounded project discovery and asynchronous Git metadata |
 | `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
 | `src/desktop_notifications.rs` | Bounded fail-open desktop and sound delivery |
+
+## macOS preview boundary
+
+The `feature/macos` preview retains the existing resource, event, and persistence
+model. Host operations live in `src/platform/`; [ADR 0017](adr/0017-macos-platform-boundary.md)
+and the [macOS validation record](platforms/macos.md) describe the Darwin
+implementation. References below to pidfds, eventfd, `/proc`, and H8 describe
+the Linux implementation. Darwin uses kqueue process monitors, kernel-validated
+process identity descriptors, socketpair control wakeups, and a separate private
+`BOOMUXM1` handoff format. Public protocol and state versions remain unchanged.
 
 ## Managed Integration Assets
 

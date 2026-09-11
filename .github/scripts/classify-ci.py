@@ -14,6 +14,8 @@ FULL = {"run_code": True, "run_desktop": True, "run_package": True, "run_benchma
 
 
 def documentation(path):
+    if path == "docs/platforms/macos-testing.md":
+        return False  # Shipped inside the macOS app archive.
     return (path in DOCS or path == "desktop/AGENTS.md"
             or (path.startswith("docs/") and path.endswith(".md")))
 
@@ -66,6 +68,7 @@ def release_only(base, head, paths):
 
 
 COMPONENT_STEPS = {
+    "macos": ("macos / Native macOS", {"Run native Clippy", "Test descriptor transfer", "Test native process identity", "Test native lifecycle and recovery", "Test native Desktop"}),
     "backend": ("Rust", {"Run Clippy", "Run Rust unit tests", "Run configuration CLI tests", "Run native backend tests"}),
     "desktop": ("Desktop Rust", {"Run Desktop Clippy", "Run Desktop tests"}),
     "integrations": ("Integrations", {"Verify embedded web terminal assets", "Run integration tests"}),
@@ -98,7 +101,7 @@ def reusable_components(source, base):
     if not paths:
         return set(COMPONENT_STEPS)
     if paths <= desktop:
-        return set(COMPONENT_STEPS) - {"desktop"}
+        return set(COMPONENT_STEPS) - {"desktop", "macos"}
     # Shared manifests, dependencies, CI definitions, renames, or unknown inputs
     # invalidate inherited evidence. A green run or a cache hit alone is no proof.
     return set()

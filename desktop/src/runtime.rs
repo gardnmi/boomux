@@ -1,5 +1,6 @@
 //! Display-independent checks used before activating a downloaded release.
 
+#[cfg(target_os = "linux")]
 pub fn check() -> Result<(), String> {
     let mut missing = Vec::new();
     for library in [
@@ -32,4 +33,52 @@ pub fn check() -> Result<(), String> {
             missing.join(", ")
         ))
     }
+}
+
+#[cfg(target_os = "macos")]
+pub fn check() -> Result<(), String> {
+    // System frameworks are supplied by macOS; the actual renderer is tested
+    // by launching the packaged application on a logged-in Mac.
+    let path = c"/System/Library/Frameworks/Metal.framework/Metal";
+    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    if handle.is_null() {
+        return Err("Metal is unavailable on this Mac".into());
+    }
+    unsafe {
+        libc::dlclose(handle);
+    }
+    // GPUI's macOS font backend is optional. A successful window alone can
+    // otherwise hide its no-op text renderer, leaving every label invisible.
+    let platform = gpui_platform::current_platform(true);
+    let text = platform.text_system();
+    for family in [".SystemUIFont", "Menlo"] {
+        let font_id = text
+            .font_id(&gpui::font(family))
+            .map_err(|e| e.to_string())?;
+        let glyph_id = text
+            .glyph_for_char(font_id, 'M')
+            .ok_or_else(|| format!("Missing native glyph in {family}"))?;
+        let params = gpui::RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: gpui::px(14.),
+            subpixel_variant: gpui::point(0, 0),
+            scale_factor: 1.,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+        let bounds = text
+            .glyph_raster_bounds(&params)
+            .map_err(|e| e.to_string())?;
+        let (_, pixels) = text
+            .rasterize_glyph(&params, bounds)
+            .map_err(|e| e.to_string())?;
+        if !pixels.iter().any(|pixel| *pixel != 0) {
+            return Err(format!(
+                "Native font renderer produced no pixels for {family}"
+            ));
+        }
+    }
+    Ok(())
 }

@@ -46,6 +46,10 @@ mod host_session_titles;
 mod hyprland;
 mod integration_management;
 mod kiro_hooks;
+#[cfg(target_os = "macos")]
+mod macos_parent_guard;
+#[cfg(target_os = "macos")]
+mod macos_terminal;
 mod mobile_web;
 mod process_adapter;
 mod projects;
@@ -147,12 +151,17 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "persistent_workspace_selection",
     "create_and_open_shell",
     "atomic_workspace_shell_creation",
+    #[cfg(target_os = "linux")]
     "hyprland_special_workspaces",
+    #[cfg(target_os = "linux")]
     "contextual_desktop_terminal",
+    #[cfg(target_os = "linux")]
     "coordinated_shell_desktop_placement",
+    #[cfg(target_os = "linux")]
     "desktop_workspace_show",
     "node_reauthentication",
     "local_update_status",
+    #[cfg(target_os = "linux")]
     "guided_local_update",
     "guided_local_uninstall",
     "guided_setup",
@@ -1671,6 +1680,14 @@ impl CliExit {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(code) = macos_parent_guard::dispatch() {
+        return code;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(code) = macos_terminal::dispatch() {
+        return code;
+    }
     if env::var_os("BOOMUX_INTERNAL_GUIDED_STOP").as_deref() == Some(std::ffi::OsStr::new("1")) {
         unsafe {
             env::remove_var("BOOMUX_INTERNAL_GUIDED_STOP");
@@ -3493,9 +3510,38 @@ fn normalize_daemon_executable(path: &[u8]) -> Option<String> {
     Some(executable)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn daemon_process_identity(_client: &client::Client) -> Option<DaemonProcessIdentity> {
-    None
+#[cfg(target_os = "macos")]
+fn daemon_process_identity(client: &client::Client) -> Option<DaemonProcessIdentity> {
+    let before = fs::metadata(client.socket_path()).ok()?;
+    let credentials = client.daemon_process_credentials().ok()?;
+    if credentials.uid != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let process = boomux::platform::process_snapshot(credentials.pid).ok()?;
+    let executable = boomux::platform::daemon_executable_path(credentials.pid)
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()?;
+    let confirmed = client.daemon_process_credentials().ok()?;
+    let after = fs::metadata(client.socket_path()).ok()?;
+    if confirmed != credentials
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || boomux::platform::process_snapshot(credentials.pid)
+            .ok()?
+            .start_time
+            != process.start_time
+    {
+        return None;
+    }
+    Some(DaemonProcessIdentity {
+        pid: credentials.pid,
+        protocol_version: credentials.protocol_version,
+        executable: Some(executable),
+        socket_device: after.dev(),
+        socket_inode: after.ino(),
+    })
 }
 
 fn bootstrap_activate(
@@ -3506,22 +3552,6 @@ fn bootstrap_activate(
     expected_socket_device: u64,
     expected_socket_inode: u64,
 ) -> io::Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (
-            transaction,
-            expected_pid,
-            expected_protocol,
-            expected_executable,
-            expected_socket_device,
-            expected_socket_inode,
-        );
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "proof-bound bootstrap activation is unsupported on this platform",
-        ));
-    }
-    #[cfg(target_os = "linux")]
     {
         let suffix = transaction
             .strip_prefix(".boomux.bootstrap.")
@@ -10281,11 +10311,14 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit,
         command.env_remove("BOOMUX_KIRO_LAUNCH_HOLDER");
     }
     command.args(&argv[1..]);
+    #[cfg(target_os = "macos")]
+    let mut command = macos_parent_guard::wrap(command)?;
     let holder_pid = std::process::id() as libc::pid_t;
     // The child stays in the foreground process group for ordinary terminal
     // signals. A direct holder death also terminates the exact managed child.
     unsafe {
         command.pre_exec(move || {
+            #[cfg(target_os = "linux")]
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -12948,8 +12981,8 @@ mod tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -12968,7 +13001,8 @@ mod tests {
             .stderr(stderr);
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(())
@@ -13032,8 +13066,8 @@ mod tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -13050,7 +13084,8 @@ mod tests {
             .stderr(Stdio::from(slave));
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(())
@@ -15778,6 +15813,7 @@ mod tests {
             "desktop_notifications",
             "sound_notifications",
             "integration_management",
+            #[cfg(target_os = "linux")]
             "desktop_workspace_show",
             "node_reauthentication",
             "protocol_31",
@@ -15794,7 +15830,7 @@ mod tests {
                 .iter()
                 .filter(|feature| **feature == "desktop_workspace_show")
                 .count(),
-            1
+            usize::from(cfg!(target_os = "linux"))
         );
         assert!(!NON_PROTOCOL_FEATURES.contains(&"workspace_open_desktop_show"));
         assert_eq!(

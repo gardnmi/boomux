@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 use toml_edit::{Array, DocumentMut, Item, Value};
 
@@ -372,7 +372,7 @@ impl Drop for Temporary {
     }
 }
 
-// Coreutils timeout owns the entire process group, including our editor helper.
+// The bounded subprocess helper owns the command deadline.
 // Pipe readers retain at most 64 KiB (1 MiB for project discovery).
 // All waits happen on a worker thread.
 fn run(args: &[&str], editor: Option<String>) -> Result<String, String> {
@@ -391,17 +391,15 @@ pub fn discover_projects() -> Result<boomux::protocol::HostProjectDiscovery, Str
     .map_err(|e| format!("Invalid project discovery result: {e}"))
 }
 fn run_layer(args: &[&str], editor: Option<String>, global: bool) -> Result<String, String> {
-    let mut command = Command::new("timeout");
+    let mut command = crate::subprocess::command(
+        if args == ["daemon", "restart"] {
+            30
+        } else {
+            10
+        },
+        "boomux",
+    );
     command
-        .args([
-            "--kill-after=1s",
-            if args == ["daemon", "restart"] {
-                "30s"
-            } else {
-                "10s"
-            },
-            "boomux",
-        ])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

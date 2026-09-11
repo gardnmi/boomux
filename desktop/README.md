@@ -10,7 +10,8 @@ Ghostty’s terminal core, backed by persistent Boomux Shells.
 > [!NOTE]
 > Stable Desktop releases support GNU/Linux x86_64 with glibc 2.39+, X11 or
 > Wayland, and a working Vulkan driver. Ubuntu 24.04+ and current Arch are the
-> runtime baseline. Shells persist when you close Desktop; internal pane arrangements are saved across restarts. Outer window geometry
+> runtime baseline. Releases also include experimental Apple Silicon macOS 15+
+> builds, ad-hoc signed and not notarized. Shells persist when you close Desktop; internal pane arrangements are saved across restarts. Outer window geometry
 > is not saved. See [current limitations](#current-limitations).
 
 ## Install Release Builds
@@ -22,15 +23,19 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh -s -- --desktop
 ```
 
-**Requires:** GNU/Linux x86_64, glibc 2.39+, X11 or Wayland, and a working Vulkan
-driver. Hyprland is not required. See [runtime packages](../README.md#requirements)
+**Requires:** GNU/Linux x86_64 with glibc 2.39+, X11 or Wayland, and Vulkan;
+or Apple Silicon macOS 15+. The same command detects the OS. Hyprland is not
+required. macOS builds are experimental, ad-hoc signed, and not notarized. See [runtime packages](../README.md#requirements)
 and the [installation contract](../docs/install.md).
 
-The installer runs without sudo or a local Rust/Zig toolchain. It adds an
+On Mac, open the installed version of Boomux in `~/Applications`. See the
+[Mac guide](../docs/platforms/macos-testing.md) for first launch and updates.
+
+The installer runs without sudo or a local Rust/Zig toolchain. On Linux it adds an
 application-menu entry and command links under `~/.local/bin`, preserving any
 independent Boomux CLI installation.
 
-Launch **Boomux Desktop** from the application menu, or run:
+On Linux, launch **Boomux Desktop** from the application menu, or run:
 
 ```sh
 boomux-desktop

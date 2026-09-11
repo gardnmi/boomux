@@ -8,14 +8,20 @@ This document retains the packaging, migration, and ownership guarantees.
 ## Distribution and installation
 
 One Boomux release contains the CLI packages for x86_64/ARM64 and the Desktop
-bundle for x86_64 GNU/Linux. The Desktop archive contains `bin/boomux`, the
+bundle for x86_64 GNU/Linux, plus an experimental Apple Silicon macOS 15+ ZIP.
+The universal `boomux-installer.sh --desktop` selects the host platform. macOS
+installation and manual updates follow the [Mac guide](../platforms/macos-testing.md);
+its bundle is ad-hoc signed and not notarized. The remaining installation and
+update details here describe Linux.
+
+The Linux Desktop archive contains `bin/boomux`, the
 `bin/boomux-desktop` launcher, `libexec/boomux-desktop`, application integration,
 licenses/notices, and `release.txt`. The CLI executable is byte-identical to the
 standalone x86_64 archive from the same source SHA and version.
 
 Since v1.10.0, `boomux-installer.sh` offers
 Desktop (including Boomux) or CLI only. Its `--desktop`/`--cli` options support
-explicit selection; noninteractive calls require one. The direct Desktop route
+explicit selection; noninteractive calls require one. The direct Linux Desktop route
 remains supported:
 
 ```sh

@@ -40,11 +40,16 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 ```
 
 Installs Desktop and the matching Boomux service together.
-Available for GNU/Linux x86_64.
+The same command selects GNU/Linux x86_64 or Apple Silicon macOS 15+.
+macOS support is experimental; the app is ad-hoc signed and not notarized.
 
 ### Launch
 
-Open **Boomux Desktop** from your application launcher, or run:
+On macOS, open the installed version of **Boomux** in `~/Applications` using Finder.
+If macOS blocks it, use **System Settings > Privacy & Security > Open Anyway**.
+To update, quit the app and rerun the installer; older versions are preserved.
+
+On Linux, open **Boomux Desktop** from your application launcher, or run:
 
 ```console
 boomux-desktop

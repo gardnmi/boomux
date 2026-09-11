@@ -48,7 +48,7 @@ const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/gardnmi/boomux/re
 
 macro_rules! remote_runtime_prefix {
     () => {
-        "PATH=/usr/bin:/bin; export PATH; boomux_runtime_fail() { printf 'boomux-runtime-v1:%s:%s\\n' \"$1\" \"$2\" >&2; exit \"$2\"; }; boomux_os=$(/usr/bin/uname -s 2>/dev/null) || boomux_runtime_fail unsupported 91; boomux_uid=$(/usr/bin/id -u 2>/dev/null) || boomux_runtime_fail invalid 89; case \"$boomux_uid\" in ''|*[!0-9]*) boomux_runtime_fail invalid 89 ;; esac; if [ -n \"${XDG_RUNTIME_DIR-}\" ]; then boomux_runtime=$XDG_RUNTIME_DIR; elif [ \"$boomux_os\" = Linux ]; then boomux_runtime=/run/user/$boomux_uid; else boomux_runtime_fail missing 88; fi; case \"$boomux_runtime\" in /*) ;; *) boomux_runtime_fail invalid 89 ;; esac; [ \"${#boomux_runtime}\" -le 4096 ] || boomux_runtime_fail invalid 89; case \"$boomux_runtime\" in *[!A-Za-z0-9_./-]*) boomux_runtime_fail invalid 89 ;; esac; [ -d \"$boomux_runtime\" ] && [ ! -L \"$boomux_runtime\" ] || boomux_runtime_fail unsafe 90; case \"$boomux_os\" in Linux) boomux_runtime_stat=$(/usr/bin/stat -Lc '%u:%a' -- \"$boomux_runtime\" 2>/dev/null) || boomux_runtime_fail unsafe 90 ;; Darwin) boomux_runtime_owner=$(/usr/bin/stat -f '%u' \"$boomux_runtime\" 2>/dev/null) || boomux_runtime_fail unsafe 90; boomux_runtime_mode=$(/usr/bin/stat -f '%Lp' \"$boomux_runtime\" 2>/dev/null) || boomux_runtime_fail unsafe 90; boomux_runtime_stat=$boomux_runtime_owner:$boomux_runtime_mode ;; *) boomux_runtime_fail unsupported 91 ;; esac; [ \"$boomux_runtime_stat\" = \"$boomux_uid:700\" ] || boomux_runtime_fail unsafe 90; XDG_RUNTIME_DIR=$boomux_runtime; export XDG_RUNTIME_DIR; "
+        "PATH=/usr/bin:/bin; export PATH; boomux_runtime_fail() { printf 'boomux-runtime-v1:%s:%s\\n' \"$1\" \"$2\" >&2; exit \"$2\"; }; boomux_os=$(/usr/bin/uname -s 2>/dev/null) || boomux_runtime_fail unsupported 91; boomux_uid=$(/usr/bin/id -u 2>/dev/null) || boomux_runtime_fail invalid 89; case \"$boomux_uid\" in ''|*[!0-9]*) boomux_runtime_fail invalid 89 ;; esac; if [ -n \"${XDG_RUNTIME_DIR-}\" ]; then boomux_runtime=$XDG_RUNTIME_DIR; elif [ \"$boomux_os\" = Linux ]; then boomux_runtime=/run/user/$boomux_uid; elif [ \"$boomux_os\" = Darwin ]; then boomux_runtime=/tmp/boomux-$boomux_uid; (umask 077; /bin/mkdir \"$boomux_runtime\") 2>/dev/null || :; else boomux_runtime_fail missing 88; fi; case \"$boomux_runtime\" in /*) ;; *) boomux_runtime_fail invalid 89 ;; esac; [ \"${#boomux_runtime}\" -le 4096 ] || boomux_runtime_fail invalid 89; case \"$boomux_runtime\" in *[!A-Za-z0-9_./-]*) boomux_runtime_fail invalid 89 ;; esac; [ -d \"$boomux_runtime\" ] && [ ! -L \"$boomux_runtime\" ] || boomux_runtime_fail unsafe 90; case \"$boomux_os\" in Linux) boomux_runtime_stat=$(/usr/bin/stat -Lc '%u:%a' -- \"$boomux_runtime\" 2>/dev/null) || boomux_runtime_fail unsafe 90 ;; Darwin) boomux_runtime_owner=$(/usr/bin/stat -f '%u' \"$boomux_runtime\" 2>/dev/null) || boomux_runtime_fail unsafe 90; boomux_runtime_mode=$(/usr/bin/stat -f '%Lp' \"$boomux_runtime\" 2>/dev/null) || boomux_runtime_fail unsafe 90; boomux_runtime_stat=$boomux_runtime_owner:$boomux_runtime_mode ;; *) boomux_runtime_fail unsupported 91 ;; esac; [ \"$boomux_runtime_stat\" = \"$boomux_uid:700\" ] || boomux_runtime_fail unsafe 90; XDG_RUNTIME_DIR=$boomux_runtime; export XDG_RUNTIME_DIR; "
     };
 }
 
@@ -1176,6 +1176,12 @@ impl RemotePlatform {
         match (self.operating_system, self.architecture) {
             (RemoteOperatingSystem::Linux, RemoteArchitecture::X86_64) => {
                 Some("x86_64-unknown-linux-gnu")
+            }
+            (RemoteOperatingSystem::MacOs, RemoteArchitecture::Aarch64) => {
+                Some("aarch64-apple-darwin")
+            }
+            (RemoteOperatingSystem::MacOs, RemoteArchitecture::X86_64) => {
+                Some("x86_64-apple-darwin")
             }
             _ => None,
         }
@@ -3103,7 +3109,10 @@ pub fn download_latest_release_metadata(parent: &Path) -> io::Result<Vec<u8>> {
 pub fn download_release_binary_in(parent: &Path, target: &str, tag: &str) -> io::Result<Vec<u8>> {
     if !matches!(
         target,
-        "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+        "x86_64-unknown-linux-gnu"
+            | "aarch64-unknown-linux-gnu"
+            | "aarch64-apple-darwin"
+            | "x86_64-apple-darwin"
     ) || !is_release_tag(tag)
     {
         return Err(io::Error::new(
@@ -5465,14 +5474,16 @@ mod tests {
     }
 
     #[test]
-    fn macos_runtime_discovery_preserves_explicit_runtime_and_rejects_absence() {
+    fn macos_runtime_discovery_preserves_explicit_runtime_and_creates_private_default() {
         let root = runtime_directory();
         let runtime = root.join("runtime");
         fs::create_dir_all(&root).unwrap();
         fs::create_dir(&runtime).unwrap();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
         let uid = unsafe { libc::geteuid() };
+        let default_runtime = root.join("default");
         let macos_prefix = REMOTE_RUNTIME_PREFIX
+            .replace("/tmp/boomux-$boomux_uid", default_runtime.to_str().unwrap())
             .replace("/usr/bin/uname -s", "printf 'Darwin\\n'")
             .replace("/usr/bin/stat -f '%u'", &format!("printf '{uid}\\n'"))
             .replace("/usr/bin/stat -f '%Lp'", "printf '700\\n'");
@@ -5480,9 +5491,20 @@ mod tests {
         assert!(supplied.status.success());
         assert_eq!(supplied.stdout, runtime.as_os_str().as_bytes());
 
-        let missing = run_runtime_prefix_text(&macos_prefix, None, None);
-        assert_eq!(missing.status.code(), Some(88));
-        assert_eq!(missing.stderr, b"boomux-runtime-v1:missing:88\n");
+        for _ in 0..2 {
+            let default = run_runtime_prefix_text(&macos_prefix, None, None);
+            assert!(default.status.success());
+            assert_eq!(default.stdout, default_runtime.as_os_str().as_bytes());
+            let metadata = fs::metadata(&default_runtime).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            assert_eq!(metadata.uid(), uid);
+        }
+
+        fs::remove_dir(&default_runtime).unwrap();
+        std::os::unix::fs::symlink(&runtime, &default_runtime).unwrap();
+        let unsafe_default = run_runtime_prefix_text(&macos_prefix, None, None);
+        assert_eq!(unsafe_default.status.code(), Some(90));
+        assert_eq!(unsafe_default.stderr, b"boomux-runtime-v1:unsafe:90\n");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5978,7 +6000,7 @@ mod tests {
         let mac = RemotePlatform::parse_probe(b"boomux-platform-v1\0Darwin\0arm64\0").unwrap();
         assert_eq!(mac.operating_system, RemoteOperatingSystem::MacOs);
         assert_eq!(mac.architecture, RemoteArchitecture::Aarch64);
-        assert_eq!(mac.release_target(), None);
+        assert_eq!(mac.release_target(), Some("aarch64-apple-darwin"));
 
         for invalid in [
             &b"wrong\0Linux\0x86_64\0"[..],

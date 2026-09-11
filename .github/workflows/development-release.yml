@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Successful macOS preview run ID to publish (no rebuild)
+        description: Successful main push or manual CI run ID with macOS artifacts (no rebuild)
         required: true
         type: string
 
