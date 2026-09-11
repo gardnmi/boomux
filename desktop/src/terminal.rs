@@ -430,6 +430,11 @@ enum EmulatorCommand {
         cell_width: u32,
         cell_height: u32,
     },
+    CopySelection {
+        anchor: (usize, usize),
+        head: (usize, usize),
+        reply: async_channel::Sender<Result<String, String>>,
+    },
     Scroll(ScrollViewport),
     ScrollLatest,
     ThemeLatest,
@@ -594,6 +599,21 @@ impl TerminalSession {
             self.shared.set_status(error);
         }
         true
+    }
+
+    pub fn selected_text(
+        &self,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> Result<async_channel::Receiver<Result<String, String>>, String> {
+        let (reply, receiver) = async_channel::bounded(1);
+        self.shared
+            .emulator_command(EmulatorCommand::CopySelection {
+                anchor,
+                head,
+                reply,
+            })?;
+        Ok(receiver)
     }
 
     pub fn scroll(&self, lines: isize) -> bool {
@@ -1606,6 +1626,13 @@ impl EmulatorCore {
                 self.cell_width = cell_width;
                 self.cell_height = cell_height;
             }
+            EmulatorCommand::CopySelection {
+                anchor,
+                head,
+                reply,
+            } => {
+                let _ = reply.try_send(self.selected_text(anchor, head));
+            }
             EmulatorCommand::Scroll(viewport) => self.terminal.scroll_viewport(viewport),
             EmulatorCommand::ScrollLatest => {
                 unreachable!("latest scroll requests are resolved by the emulator worker")
@@ -1624,6 +1651,45 @@ impl EmulatorCore {
             }
         }
         Ok(true)
+    }
+
+    fn selected_text(
+        &self,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> Result<String, String> {
+        use libghostty_vt::selection::{FormatOptions, Selection};
+        use libghostty_vt::terminal::{Point, PointCoordinate};
+        let endpoint = |(row, col): (usize, usize)| {
+            let point = PointCoordinate {
+                x: u16::try_from(col)
+                    .map_err(|_| "selection column is out of range".to_string())?,
+                y: u32::try_from(row).map_err(|_| "selection row is out of range".to_string())?,
+            };
+            self.terminal
+                .grid_ref(Point::Screen(point))
+                .map_err(|error| error.to_string())
+        };
+        let selection = Selection::new(endpoint(anchor)?, endpoint(head)?, false);
+        let options = || {
+            FormatOptions::new()
+                .with_selection(&selection)
+                .with_trim(true)
+        };
+        // Clipboard extraction stays on the worker and allocates only on copy.
+        // Refuse oversized copies instead of truncating or duplicating scrollback.
+        let mut bytes = vec![0; 8192];
+        let length = match self.terminal.format_selection_buf(options(), &mut bytes) {
+            Err(libghostty_vt::Error::OutOfSpace { required }) if required <= 4 * 1024 * 1024 => {
+                bytes.resize(required, 0);
+                self.terminal.format_selection_buf(options(), &mut bytes)
+            }
+            result => result,
+        }
+        .map_err(|error| format!("could not copy selection (4 MiB maximum): {error}"))?
+        .unwrap_or(0);
+        bytes.truncate(length);
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn screen(&mut self) -> Result<TerminalScreen, String> {
@@ -3915,6 +3981,30 @@ mod tests {
             text.contains("history-19999"),
             "newest output must remain available"
         );
+    }
+
+    #[test]
+    fn terminal_selection_copy_includes_offscreen_history_in_both_directions() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        core.apply(EmulatorCommand::Output(
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive".to_vec(),
+        ))
+        .unwrap();
+        assert!(core.screen().unwrap().scroll_offset > 0);
+        assert_eq!(
+            core.selected_text((0, 1), (4, 2)).unwrap(),
+            "ne\ntwo\nthree\nfour\nfiv"
+        );
+        core.apply(EmulatorCommand::Scroll(
+            libghostty_vt::terminal::ScrollViewport::Top,
+        ))
+        .unwrap();
+        assert_eq!(
+            core.selected_text((4, 2), (0, 1)).unwrap(),
+            "ne\ntwo\nthree\nfour\nfiv"
+        );
+        assert!(core.selected_text((99999, 0), (0, 0)).is_err());
     }
 
     #[test]
