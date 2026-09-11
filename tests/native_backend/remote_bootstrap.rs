@@ -1,12 +1,15 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use boomux::client::Client;
 use boomux::federation::{
     FEDERATION_VERSION, FederationConnectionMode, FederationHandshake, write_handshake,
@@ -15,6 +18,7 @@ use boomux::protocol::{self, Envelope, Request, Response};
 use boomux::ssh_bootstrap::{
     REMOTE_INSTALL_ACTIVATE_COMMAND, REMOTE_INSTALL_COMMAND, REMOTE_INSTALL_ROLLBACK_COMMAND,
 };
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
