@@ -62,16 +62,28 @@ fn managed_integrations_install_at_startup_refresh_on_handoff_and_respect_uninst
         String::from_utf8_lossy(&output.stderr)
     );
     daemon.client.restart().unwrap();
-    let output = daemon
-        .command()
-        .args(["integration", "sync"])
-        .env("PATH", daemon.runtime_dir.join("bin"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    // Restart returns before background integration maintenance finishes. Its
+    // nonblocking target locks may temporarily reject an overlapping sync.
+    let contention = std::io::Error::from_raw_os_error(libc::EWOULDBLOCK).to_string();
+    wait_until(
+        || {
+            let output = daemon
+                .command()
+                .args(["integration", "sync"])
+                .env("PATH", daemon.runtime_dir.join("bin"))
+                .output()
+                .unwrap();
+            if output.status.success() {
+                return true;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stderr.trim().is_empty() && stderr.lines().all(|line| line.ends_with(&contention)),
+                "unexpected integration sync failure: {stderr}"
+            );
+            false
+        },
+        "integration sync remained locked after handoff",
     );
     assert!(!asset.exists());
 }
