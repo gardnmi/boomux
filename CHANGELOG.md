@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.16.0](https://github.com/gardnmi/boomux/compare/v1.15.2...v1.16.0) (2026-09-11)
+
+
+### Features
+
+* **macos:** add native desktop and unified release installation ([c90fe11](https://github.com/gardnmi/boomux/commit/c90fe11e887d103b2dbc8a1742af123d800687a6))
+
+
+### Bug Fixes
+
+* **desktop:** guide new users to create a workspace ([#405](https://github.com/gardnmi/boomux/issues/405)) ([5911f95](https://github.com/gardnmi/boomux/commit/5911f9584bd55e5ae220f54e0898f3449b1f61d3))
+* **kiro:** preserve host-selected engines and agents ([#407](https://github.com/gardnmi/boomux/issues/407)) ([37dfda4](https://github.com/gardnmi/boomux/commit/37dfda40420e6967b90eff1327d51c8e0af5739e))
+
 ## [1.15.2](https://github.com/gardnmi/boomux/compare/v1.15.1...v1.15.2) (2026-09-10)
 
 
