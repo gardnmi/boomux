@@ -530,6 +530,11 @@ fn validate_lock(descriptor: &OwnedFd, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn validate_pty(descriptor: &OwnedFd, expected_pid: u32) -> io::Result<()> {
+    crate::platform::validate_pty(descriptor, expected_pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,9 +758,4 @@ mod tests {
         let encoded = serde_json::to_vec(&manifest).unwrap();
         assert!(encoded.len() + std::mem::size_of::<u32>() <= protocol::MAX_CONTROL_FRAME);
     }
-}
-
-#[cfg(target_os = "macos")]
-fn validate_pty(descriptor: &OwnedFd, expected_pid: u32) -> io::Result<()> {
-    crate::platform::validate_pty(descriptor, expected_pid)
 }

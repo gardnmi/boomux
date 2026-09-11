@@ -774,6 +774,24 @@ impl Drop for TemporaryPreference {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn launch(
+    desktop_entry: Option<&str>,
+    _title: &str,
+    cwd: Option<&Path>,
+    program: &OsStr,
+    arguments: &[OsString],
+    _placement: Option<HyprlandPlacement<'_>>,
+    _reuse_existing: bool,
+) -> Result<(), Box<dyn Error>> {
+    if desktop_entry.is_some() {
+        return Err(
+            "macOS terminal selection currently supports Terminal.app; omit --terminal".into(),
+        );
+    }
+    crate::macos_terminal::launch(program, arguments, cwd).map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,22 +979,4 @@ mod tests {
             installed
         );
     }
-}
-
-#[cfg(target_os = "macos")]
-fn launch(
-    desktop_entry: Option<&str>,
-    _title: &str,
-    cwd: Option<&Path>,
-    program: &OsStr,
-    arguments: &[OsString],
-    _placement: Option<HyprlandPlacement<'_>>,
-    _reuse_existing: bool,
-) -> Result<(), Box<dyn Error>> {
-    if desktop_entry.is_some() {
-        return Err(
-            "macOS terminal selection currently supports Terminal.app; omit --terminal".into(),
-        );
-    }
-    crate::macos_terminal::launch(program, arguments, cwd).map_err(Into::into)
 }

@@ -18155,6 +18155,11 @@ fn lock<T>(mutex: &Mutex<T>) -> io::Result<MutexGuard<'_, T>> {
         .map_err(|_| io::Error::other("daemon state lock poisoned"))
 }
 
+#[cfg(target_os = "macos")]
+fn opencode_listener_belongs_to_session(port: u16, session_id: u32) -> bool {
+    platform::listener_belongs_to_session(port, session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -25855,9 +25860,4 @@ mod tests {
             io::ErrorKind::InvalidData
         );
     }
-}
-
-#[cfg(target_os = "macos")]
-fn opencode_listener_belongs_to_session(port: u16, session_id: u32) -> bool {
-    platform::listener_belongs_to_session(port, session_id)
 }

@@ -548,73 +548,6 @@ pub fn daemon_listener_holder(path: &std::path::Path, uid: u32) -> io::Result<u3
     Ok(candidates[0])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn executable_alias_runs_the_pinned_mach_o() {
-        prepare_default_runtime_root().unwrap();
-        let root = super::super::runtime_root().unwrap().join("boomux");
-        fs::create_dir_all(root).unwrap();
-        let executable = File::open(std::env::current_exe().unwrap()).unwrap();
-        let pin = ExecutablePin::prepare(&executable).unwrap();
-        let output = std::process::Command::new(&pin.path)
-            .arg("--help")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "pinned executable: {:?}; {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let alias = pin.path.clone();
-        drop(pin);
-        assert!(!alias.exists());
-    }
-    #[test]
-    fn identity_transfer_and_signaling_preserve_exact_process() {
-        prepare_default_runtime_root().unwrap();
-        let root = super::super::runtime_root().unwrap().join("boomux");
-        fs::create_dir_all(root).unwrap();
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let handle = open_process(child.id()).unwrap();
-        assert_eq!(
-            process_argv(child.id()).unwrap(),
-            [b"/bin/sleep".to_vec(), b"30".to_vec()]
-        );
-        let mut idle = libc::pollfd {
-            fd: process_wait_fd(&handle),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut idle, 1, 0) }, 0);
-        let duplicate = handle.as_fd().try_clone_to_owned().unwrap();
-        let imported = import_process(duplicate, child.id()).unwrap();
-        assert!(
-            import_process(
-                handle.as_fd().try_clone_to_owned().unwrap(),
-                std::process::id()
-            )
-            .is_err()
-        );
-        signal_process(imported.as_fd(), libc::SIGKILL).unwrap();
-        assert!(!child.wait().unwrap().success());
-        let mut event = libc::pollfd {
-            fd: process_wait_fd(&imported),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut event, 1, 1000) }, 1);
-        assert_ne!(event.revents & libc::POLLIN, 0);
-        // A stale identity must not turn into a PID-only kill.
-        signal_process(handle.as_fd(), libc::SIGKILL).unwrap();
-    }
-}
-
 /// Darwin cannot exec an open file descriptor. A private hard link pins the
 /// inspected inode across pathname replacement. Cross-filesystem linking fails
 /// before ownership transfer instead of falling back to a mutable pathname.
@@ -781,4 +714,71 @@ pub fn validate_listener(fd: BorrowedFd<'_>) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn executable_alias_runs_the_pinned_mach_o() {
+        prepare_default_runtime_root().unwrap();
+        let root = super::super::runtime_root().unwrap().join("boomux");
+        fs::create_dir_all(root).unwrap();
+        let executable = File::open(std::env::current_exe().unwrap()).unwrap();
+        let pin = ExecutablePin::prepare(&executable).unwrap();
+        let output = std::process::Command::new(&pin.path)
+            .arg("--help")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "pinned executable: {:?}; {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let alias = pin.path.clone();
+        drop(pin);
+        assert!(!alias.exists());
+    }
+    #[test]
+    fn identity_transfer_and_signaling_preserve_exact_process() {
+        prepare_default_runtime_root().unwrap();
+        let root = super::super::runtime_root().unwrap().join("boomux");
+        fs::create_dir_all(root).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let handle = open_process(child.id()).unwrap();
+        assert_eq!(
+            process_argv(child.id()).unwrap(),
+            [b"/bin/sleep".to_vec(), b"30".to_vec()]
+        );
+        let mut idle = libc::pollfd {
+            fd: process_wait_fd(&handle),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut idle, 1, 0) }, 0);
+        let duplicate = handle.as_fd().try_clone_to_owned().unwrap();
+        let imported = import_process(duplicate, child.id()).unwrap();
+        assert!(
+            import_process(
+                handle.as_fd().try_clone_to_owned().unwrap(),
+                std::process::id()
+            )
+            .is_err()
+        );
+        signal_process(imported.as_fd(), libc::SIGKILL).unwrap();
+        assert!(!child.wait().unwrap().success());
+        let mut event = libc::pollfd {
+            fd: process_wait_fd(&imported),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut event, 1, 1000) }, 1);
+        assert_ne!(event.revents & libc::POLLIN, 0);
+        // A stale identity must not turn into a PID-only kill.
+        signal_process(handle.as_fd(), libc::SIGKILL).unwrap();
+    }
 }
