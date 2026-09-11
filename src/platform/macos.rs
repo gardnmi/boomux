@@ -121,7 +121,12 @@ pub fn process_cwd(pid: u32) -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_vec(bytes)))
 }
 
-fn process_arguments(pid: u32) -> io::Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+struct ProcessArguments {
+    argv: Vec<Vec<u8>>,
+    environment: Vec<Vec<u8>>,
+}
+
+fn process_arguments(pid: u32) -> io::Result<ProcessArguments> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
     // Darwin rejects buffers larger than ARG_MAX, even when the process has
     // only a few arguments. Query the required length before allocating.
@@ -188,17 +193,23 @@ fn process_arguments(pid: u32) -> io::Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
         .take_while(|s| !s.is_empty())
         .map(<[u8]>::to_vec)
         .collect();
-    Ok((args, vars))
+    Ok(ProcessArguments {
+        argv: args,
+        environment: vars,
+    })
 }
 
 pub fn process_argv(pid: u32) -> io::Result<Vec<Vec<u8>>> {
-    process_arguments(pid).map(|v| v.0)
+    process_arguments(pid).map(|arguments| arguments.argv)
 }
 pub fn process_environment_value(pid: u32, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
-    Ok(process_arguments(pid)?.1.into_iter().find_map(|s| {
-        let i = s.iter().position(|b| *b == b'=')?;
-        (s[..i] == *name).then(|| s[i + 1..].to_vec())
-    }))
+    Ok(process_arguments(pid)?
+        .environment
+        .into_iter()
+        .find_map(|s| {
+            let i = s.iter().position(|b| *b == b'=')?;
+            (s[..i] == *name).then(|| s[i + 1..].to_vec())
+        }))
 }
 pub fn process_name(pid: u32) -> io::Result<Vec<u8>> {
     let info: libc::proc_bsdinfo = pid_info(pid, libc::PROC_PIDTBSDINFO)?;
