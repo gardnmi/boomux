@@ -31,7 +31,7 @@ function syncSidebar(){
 }
 function addPane(id,template){
   const p={...template},el=document.createElement('section');p.el=el;el.className='pane';el.dataset.id=id;
-  el.innerHTML=`<div class="pane-heading"><span class="terminal-mark" aria-hidden="true">›_</span><span class="pane-name">${escapeHtml(p.name)}</span><span class="pane-location" title="${escapeHtml(p.path)}">${escapeHtml(p.path)}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">◇</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">⛶</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${escapeHtml(p.path)}</span><span class="terminal-status">Starting…</span></div>`;
+  el.innerHTML=`<div class="pane-heading"><span class="pane-name">${escapeHtml(p.name)}</span><span class="pane-location" title="${escapeHtml(p.path)}">${escapeHtml(p.path)}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">◇</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">⛶</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${escapeHtml(p.path)}</span><span class="terminal-status">Starting…</span></div>`;
   el.addEventListener('pointerdown',e=>{
     active=id;syncSidebar();schedule();
     if(e.button!==0||e.target.closest('button')||expanded)return;
@@ -412,7 +412,7 @@ function paint(now){
     Object.assign(p.el.style,{transform:`translate3d(${r.x}px,${r.y}px,0)`,width:`${Math.max(1,r.w)}px`,height:`${Math.max(1,r.h)}px`,zIndex:id===drag?.id?'20':floating.has(id)?'10':'1'});
     surface(r,id===active?[.30,.40,.43,1]:[.15,.18,.20,1]);
     surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.max(0,r.h-2)},[.075,.090,.110,1]);
-    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.min(31,r.h-2)},id===active?[.105,.125,.14,1]:[.085,.10,.12,1]);
+    surface({x:r.x+1,y:r.y+1,w:Math.max(0,r.w-2),h:Math.min(31,r.h-2)},[.075,.090,.110,1]);
   }
   const label=$('#drop-label'),overlay=$('#drop-overlay');label.style.display='none';overlay.style.display='none';
   if(drag?.lifted){

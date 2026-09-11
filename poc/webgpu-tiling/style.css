@@ -78,3 +78,12 @@ aside,.daemon-mode aside{display:flex;flex-direction:column;padding:18px 14px 10
 .pane-foot{position:absolute;right:8px;bottom:5px;max-width:55%;height:auto;border:0;padding:2px 5px;font-size:9px;color:#687b7b;pointer-events:none;opacity:0;background:#13171ce8;border-radius:3px}.pane:hover .pane-foot,.pane:focus-within .pane-foot{opacity:1}.pane-foot>span:first-child{display:none}
 .attachment-error{inset:32px 0 0;background:#13171cf5}
 @media(prefers-reduced-motion:reduce){.pane-controls{transition:none}}
+/* Blend the heading into the terminal instead of drawing a title bar. */
+.pane-heading{height:32px;padding:0 14px;gap:12px;border-bottom:0}
+.pane.focused .pane-heading:before{display:none}
+.pane-name{font-size:11px;font-weight:500;color:#829095}.focused .pane-name{color:#bccbc9}
+.pane-location{font-family:inherit;font-size:10px;color:#536067;margin-left:0;opacity:0;transition:opacity .12s}
+.pane-heading:hover .pane-location,.pane-heading:focus-within .pane-location{opacity:1}
+.pane.focused .pane-controls{opacity:0}.pane-heading:hover .pane-controls,.pane-heading:focus-within .pane-controls{opacity:1}
+.pane-controls button{font-size:13px;color:#718080}
+@media(prefers-reduced-motion:reduce){.pane-location{transition:none}}
