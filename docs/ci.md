@@ -164,7 +164,11 @@ No separate branch-protection entry or feature-branch trigger is needed.
 Both native jobs check out the same revision as the Linux jobs (the proposed
 integration commit on PRs). Apple Silicon `macos-15` runs backend/Desktop Clippy,
 descriptor and process-identity tests, the selected serial native lifecycle
-scenarios, and Desktop tests. Lifecycle tests are compiled before their bounded
+scenarios, and platform-applicable Desktop tests. The four stable Linux bundle
+restart/process fixtures remain in Linux CI because Mac app-bundle updates are
+not supported; portable bundle validation still runs on both platforms. Keyboard
+fixtures verify Command shortcuts and native Option text on Mac. Lifecycle tests
+are compiled before their bounded
 scenario deadlines. The package job builds both optimized executables, packages
 and ad-hoc signs the app, checks native glyphs and dependencies, and exercises
 window creation, Shell survival, and daemon restart. Native and app diagnostics

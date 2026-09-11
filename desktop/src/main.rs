@@ -11295,7 +11295,8 @@ mod pointer_tests {
                 key: "enter".into(),
                 key_char: None,
                 modifiers: gpui::Modifiers {
-                    control: true,
+                    control: !cfg!(target_os = "macos"),
+                    platform: cfg!(target_os = "macos"),
                     ..Default::default()
                 },
             },

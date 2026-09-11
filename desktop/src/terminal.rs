@@ -3516,7 +3516,13 @@ mod tests {
                 KeyAction::Press,
             )
             .unwrap(),
-            b"\x1ba"
+            // Ghostty defaults to native Option text on macOS; Linux Alt
+            // prefixes the text with Escape.
+            if cfg!(target_os = "macos") {
+                b"a".as_slice()
+            } else {
+                b"\x1ba".as_slice()
+            }
         );
         assert_eq!(
             encode_key(
