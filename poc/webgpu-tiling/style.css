@@ -96,3 +96,8 @@ aside,.daemon-mode aside{display:flex;flex-direction:column;padding:18px 14px 10
 .pane-heading:hover .pane-controls,.pane-heading:focus-within .pane-controls{opacity:1}
 .pane-controls button{height:21px;width:23px;font-size:13px}
 .attachment-error{inset:34px 0 0}
+/* Desktop-style emphasis around the entire terminal pane. */
+.pane:after{content:'';position:absolute;inset:0;pointer-events:none;z-index:35;border:1px solid transparent}
+.pane:hover:after{border-color:#718d89}
+.pane.focused:after{border:2px solid #91b8b0}
+.focused .pane-name{box-shadow:none}
