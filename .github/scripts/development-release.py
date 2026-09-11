@@ -135,6 +135,13 @@ def publication(run, package, repo):
     title = f"macOS Development Preview — {date} ({sha[:8]})"
     notes = f"""Development preview for testing. Not a stable release.
 
+> [!WARNING]
+> **macOS is a largely untested experimental preview.** It has limited automated
+> CI and smoke-test coverage, with very little real-world testing. Everyday use,
+> hardware compatibility, and session reliability are not established. Expect
+> bugs; use it for evaluation only, not important work. Inclusion in a regular
+> release does not make the macOS build stable or production-ready.
+
 - Apple Silicon (M1 or newer), macOS 15+.
 - Matching Desktop and CLI, version {package['version']}.
 - Source: `{sha}`.
