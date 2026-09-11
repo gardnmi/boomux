@@ -44,7 +44,17 @@ second owner lookup. Newly started/restarted Shells still resolve their new run.
 ### Terminal Selection And Clipboard
 
 Selection drag updates use only the source pane's bounds and retain the original
-mouse-down anchor. The primary selection updates during the drag. On left-button
+mouse-down anchor in scrollback coordinates. Dragging above or below the source
+pane runs one gesture-scoped 50 ms timer, scrolling one to six rows per tick.
+Viewport requests coalesce through the existing emulator worker queue. Returning
+inside, releasing the button, losing window activation, removing the pane, or
+reaching a history boundary ends the timer; there is no idle per-pane polling.
+
+Visible highlighting projects the anchored selection into each new viewport.
+Copies spanning off-screen history are formatted by Ghostty on its existing
+worker, with a 4 MiB output limit and an explicit error on overflow. Only one
+pending asynchronous copy is retained per Desktop; a new gesture cancels it.
+No second scrollback buffer is created. The primary selection updates during the drag. On left-button
 release, Desktop copies nonempty selected text from that pane to the system
 clipboard once per gesture when `copy_on_select` is enabled (the default).
 The preference applies immediately and is saved in Desktop settings. Disabling
