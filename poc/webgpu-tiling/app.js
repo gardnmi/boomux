@@ -28,12 +28,12 @@ function syncSidebar(){
   $('#add').disabled=panes.size>=24||creating;
   $('#pane-list').replaceChildren();
   if(daemon){syncDaemonSidebar();saveLayout();return;}
-  for(const [id,p] of panes){const b=document.createElement('button');b.className='sidebar-pane'+(id===active?' selected':'');b.innerHTML=`<span style="color:${p.color}">▣</span> ${escapeHtml(p.name)}<small>${floating.has(id)?'float':String(id).padStart(2,'0')}</small>`;b.onclick=()=>{active=id;if(expanded)expanded=id;reflow();};$('#pane-list').append(b);}
+  for(const [id,p] of panes){const b=document.createElement('button');b.className='sidebar-pane'+(id===active?' selected':'');b.innerHTML=`<span style="color:${p.color}">▣</span> ${escapeHtml(p.name)}<small>${p.minimized?'minimized':floating.has(id)?'float':String(id).padStart(2,'0')}</small>`;b.onclick=()=>{if(p.minimized){p.minimized=false;tree=tree?split(tree,leaf(id)):leaf(id);}active=id;if(expanded)expanded=id;reflow();p.terminal?.focus();};$('#pane-list').append(b);}
   for(const [id,p] of panes)p.el.setAttribute('aria-label',`${escapeHtml(p.name)} pane ${id}${id===active?', selected':''}`);
 }
 function addPane(id,template){
   const p={...template},el=document.createElement('section');p.el=el;el.className='pane';el.dataset.id=id;
-  el.innerHTML=`<div class="pane-heading"><span class="pane-name">${escapeHtml(p.name)}</span><span class="pane-location" title="${escapeHtml(p.path)}">${escapeHtml(p.path)}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">↗</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">□</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${escapeHtml(p.path)}</span><span class="terminal-status">Starting…</span></div>`;
+  el.innerHTML=`<div class="pane-heading"><span class="pane-name">${escapeHtml(p.name)}</span><span class="pane-location" title="${escapeHtml(p.path)}">${escapeHtml(p.path)}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">↗</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">□</button><button data-action="minimize" title="Minimize; restore from sidebar" aria-label="Minimize pane">−</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${escapeHtml(p.path)}</span><span class="terminal-status">Starting…</span></div>`;
   el.addEventListener('pointerdown',e=>{
     active=id;syncSidebar();schedule();
     if(e.button!==0||e.target.closest('button')||expanded)return;
@@ -46,7 +46,13 @@ function addPane(id,template){
   el.querySelector('.pane-heading').ondblclick=e=>{if(!e.target.closest('button')){expanded=expanded===id?null:id;reflow();}};
   el.querySelectorAll('button').forEach(b=>b.onclick=()=>{
     if(drag||resize)return;
-    if(b.dataset.action==='close'){tree=remove(tree,id);floating.delete(id);p.terminal?.dispose();panes.delete(id);shown.delete(id);el.remove();if(expanded===id)expanded=null;active=panes.keys().next().value;}
+    if(b.dataset.action==='minimize'&&!p.shell){
+      tree=remove(tree,id);floating.delete(id);p.minimized=true;shown.delete(id);if(expanded===id)expanded=null;
+      document.activeElement?.blur();active=[...panes].find(([,pane])=>!pane.minimized)?.[0];
+    }
+    // Daemon panes minimize by detaching; the persistent Shell stays available
+    // in the sidebar. Standalone demo PTYs stay mounted so they are not killed.
+    if(b.dataset.action==='close'||(b.dataset.action==='minimize'&&p.shell)){tree=remove(tree,id);floating.delete(id);p.terminal?.dispose();panes.delete(id);shown.delete(id);el.remove();if(expanded===id)expanded=null;active=[...panes].find(([,pane])=>!pane.minimized)?.[0];}
     if(b.dataset.action==='expand')expanded=expanded===id?null:id;
     if(b.dataset.action==='float'){expanded=null;if(floating.has(id)){floating.delete(id);tree=tree?split(tree,leaf(id)):leaf(id);}else{const r=shown.get(id);tree=remove(tree,id);floating.set(id,{x:Math.max(12,r.x+20),y:Math.max(12,r.y+20),w:Math.min(520,width-24),h:Math.min(360,height-24)});}}
     reflow();
@@ -308,7 +314,8 @@ function reflow(animate=true){
     float.textContent=floating.has(id)?'↙':'↗';float.setAttribute('aria-pressed',String(floating.has(id)));
     expand.textContent=expanded===id?'❐':'□';expand.setAttribute('aria-pressed',String(expanded===id));
   }
-  $('#empty').style.display=panes.size?'none':'block';syncSidebar();schedule();
+  if(!daemon)$('#empty').innerHTML=panes.size?'All panes are minimized.<br><small>Restore a pane from the sidebar.</small>':'Your canvas is clear.<br><small>Add a pane to start tiling.</small>';
+  $('#empty').style.display=targets.size?'none':'block';syncSidebar();schedule();
 }
 function point(e){const r=stage.getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top};}
 window.addEventListener('pointermove',e=>{
@@ -367,7 +374,7 @@ window.addEventListener('keydown',e=>{
   const key=e.key.toLowerCase(),direction={arrowleft:'left',arrowright:'right',arrowup:'top',arrowdown:'bottom',h:'left',j:'bottom',k:'top',l:'right'}[key];
   const path=ancestors(tree,active).reverse();
   if(key==='tab'){
-    consume();const ids=[...panes.keys()],i=ids.indexOf(active);active=ids[(i+(e.shiftKey?-1:1)+ids.length)%ids.length];if(expanded)expanded=active;reflow();return;
+    consume();const ids=[...panes].filter(([,p])=>!p.minimized).map(([id])=>id),i=ids.indexOf(active);if(!ids.length)return;active=ids[(i+(e.shiftKey?-1:1)+ids.length)%ids.length];if(expanded)expanded=active;reflow();return;
   }
   if(!panes.has(active))return;
   // Desktop reserves unmodified J for rotating the nearest split.

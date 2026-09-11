@@ -276,3 +276,13 @@ preview artwork is included.
 PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
   node poc/webgpu-tiling/showcase.test.mjs
 ```
+
+### Minimize panes
+
+The header’s **−** button removes a pane from the canvas. A daemon-backed pane
+releases its attachment and leaves its Shell running; reopen the same Shell from
+the sidebar using normal attachment/takeover rules. In standalone demo mode,
+minimized panes retain their PTY and emulator, and their sidebar rows restore them.
+Layout keyboard navigation skips minimized panes.
+
+The synthetic `minimize.test.mjs` check covers both paths and minimizing all panes.
