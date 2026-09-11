@@ -4,7 +4,8 @@
 
 Drag panes into place, resize your splits, and move around from the keyboard.
 Boomux brings your terminals, AI agents, and Git context into one native
-workspace on Linux or macOS—with persistent Shells behind every view.
+workspace on Linux, with a largely untested macOS preview and persistent Shells
+behind every view.
 
 [Website](https://gardnmi.github.io/boomux/) ·
 [Install Desktop](#install) ·
@@ -39,6 +40,13 @@ but is **not required**: Desktop runs on X11, Wayland, or macOS. It does not emb
 arbitrary desktop applications or replace your window manager.
 
 ## Install
+
+> [!WARNING]
+> **macOS is a largely untested experimental preview.** It has limited automated
+> CI and smoke-test coverage, with very little real-world testing. Everyday use,
+> hardware compatibility, and session reliability are not established. Expect
+> bugs; use it for evaluation only, not important work. Inclusion in a regular
+> release does not make the macOS build stable or production-ready.
 
 Install **Boomux Desktop**, including its matching Boomux CLI:
 

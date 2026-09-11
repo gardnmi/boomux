@@ -1,5 +1,12 @@
 # macOS preview implementation
 
+> [!WARNING]
+> **macOS is a largely untested experimental preview.** It has limited automated
+> CI and smoke-test coverage, with very little real-world testing. Everyday use,
+> hardware compatibility, and session reliability are not established. Expect
+> bugs; use it for evaluation only, not important work. Inclusion in a regular
+> release does not make the macOS build stable or production-ready.
+
 Status: experimental Apple Silicon Desktop, included with regular releases and
 installed by the universal `boomux-installer.sh --desktop` entry point.
 
