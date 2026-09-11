@@ -17,7 +17,8 @@ try{
  });
  await page.goto(process.env.POC_URL||'http://127.0.0.1:4389');
  await page.waitForFunction(()=>document.querySelectorAll('.pane-body[data-connected="true"]').length===4);
- await page.getByRole('button',{name:'Choose theme',exact:true}).click();
+ await page.locator('.pane-body').first().click();
+ await page.keyboard.press('Control+Shift+Y');
  await page.getByRole('button',{name:'Showcase',exact:true}).click();
  assert.equal(await page.locator('.showcase-card').count(),3);
  const initial=connections;
@@ -28,11 +29,11 @@ try{
  assert.equal(await page.locator('html').getAttribute('data-theme'),'boomux','browsing is preview only');
  await page.keyboard.press('Escape');
  assert.equal(await page.locator('#theme-dialog').evaluate(d=>d.open),false);
- assert.equal(await page.locator('#theme-picker').evaluate(el=>el===document.activeElement),true);
+ await page.waitForFunction(()=>document.activeElement===document.querySelector('#theme-picker'));
  await page.getByRole('button',{name:'Choose theme',exact:true}).click();
  assert.equal(await page.locator('#showcase-name').textContent(),'Boomux','cancel restores selection');
  await page.getByRole('button',{name:'Next theme',exact:true}).click();
- await page.getByRole('button',{name:'Apply theme',exact:true}).click();
+ await page.keyboard.press('Enter');
  await page.evaluate(async()=>{await window.lastThemeTransition.ready;
   const wipe=document.getAnimations().find(a=>a.animationName==='boomux-theme-reveal');
   if(!wipe)throw Error('Diagonal wipe did not start');wipe.pause();wipe.currentTime=130;
@@ -67,6 +68,16 @@ try{
  await page.getByRole('button',{name:'Next theme',exact:true}).click();
  await page.getByRole('button',{name:'Apply theme',exact:true}).click();
  assert.equal(await page.locator('html').getAttribute('data-theme'),'ethereal','unsupported browsers apply directly');
+ await page.keyboard.press('Control+Shift+Y');
+ await page.getByRole('button',{name:'List view',exact:true}).click();
+ await page.getByRole('button',{name:'Nord',exact:true}).click();
+ await page.keyboard.press('Enter');
+ assert.equal(await page.locator('html').getAttribute('data-theme'),'nord','Enter applies list selection');
+ await page.keyboard.press('Control+Shift+Y');
+ assert.equal(await page.locator('#theme-dialog').evaluate(d=>d.open),true);
+ await page.keyboard.press('Control+Shift+Y');
+ assert.equal(await page.locator('#theme-dialog').evaluate(d=>d.open),false,'shortcut toggles picker');
+ assert.equal(inputs,0,'theme shortcuts and Enter never reach Shells');
  assert.deepEqual(errors,[]);
  console.log('Showcase browsing, cancel/apply, focus, preserved attachments, list toggle, narrow viewport, recording link, diagonal wipe, reduced motion, and unsupported-browser fallback passed');
 }finally{await browser.close();}

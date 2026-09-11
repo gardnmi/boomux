@@ -253,6 +253,10 @@ PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs \
 
 ### Showcase presentation
 
+**Ctrl+Shift+Y** opens/closes the theme options, including when a terminal has
+focus. **Enter** applies the previewed theme in either view; **Escape** cancels.
+The palette button tooltip shows the shortcut.
+
 The picker’s **Showcase** toggle switches to a large three-card carousel, with
 arrow buttons, left/right keys, and touch swipes. Click the center preview or
 **Apply theme** to select it. **List view** returns to the compact picker; this

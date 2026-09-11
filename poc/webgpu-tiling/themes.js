@@ -909,7 +909,17 @@ export function mountThemePicker(){
  dialog.querySelector('#theme-cancel').onclick=()=>dialog.close();
  dialog.addEventListener('click',e=>{if(e.target===dialog){const r=dialog.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)dialog.close();}});
  dialog.addEventListener('close',()=>trigger.focus());
- dialog.addEventListener('keydown',e=>{if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();step(e.key==='ArrowRight'?1:-1);if(!showcase)list.querySelector(`[data-theme="${candidate.id}"]`).focus();}});
+ window.addEventListener('keydown',e=>{
+  if(e.isComposing||!e.ctrlKey||!e.shiftKey||e.altKey||e.metaKey||e.code!=='KeyY')return;
+  e.preventDefault();e.stopImmediatePropagation();
+  if(!e.repeat){if(dialog.open)dialog.close();else trigger.click();}
+ },true);
+ dialog.addEventListener('keydown',e=>{
+  if(e.isComposing)return;
+  if(e.key==='Enter'&&!e.ctrlKey&&!e.altKey&&!e.metaKey&&!e.shiftKey){
+   e.preventDefault();e.stopPropagation();if(!e.repeat)dialog.querySelector('#theme-apply').click();return;
+  }
+  if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();step(e.key==='ArrowRight'?1:-1);if(!showcase)list.querySelector(`[data-theme="${candidate.id}"]`).focus();}});
  if(new URLSearchParams(location.search).has('theme-showcase')){showcase=true;setView();trigger.click();}
  window.addEventListener('storage',e=>{if(e.key===key){const t=themes.find(t=>t.id===e.newValue);if(t)apply(t,false);}});
 }
