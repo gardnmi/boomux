@@ -87,3 +87,12 @@ aside,.daemon-mode aside{display:flex;flex-direction:column;padding:18px 14px 10
 .pane.focused .pane-controls{opacity:0}.pane-heading:hover .pane-controls,.pane-heading:focus-within .pane-controls{opacity:1}
 .pane-controls button{font-size:13px;color:#718080}
 @media(prefers-reduced-motion:reduce){.pane-location{transition:none}}
+/* Tab treatment: a small title attached to the pane edge. */
+.pane-heading{height:34px;padding:0 8px 0 0;gap:10px;border-bottom:1px solid #293137;align-items:stretch}
+.pane-name{display:flex;align-items:center;padding:0 15px;max-width:45%;background:#1c242a;border-right:1px solid #303b42;border-radius:0 0 6px 0;font-size:12px;font-weight:500;color:#94a4ad;position:relative}
+.focused .pane-name{background:#253239;color:#dfebe9;box-shadow:inset 0 2px #91b8b0}
+.pane-location{display:flex;align-items:center;opacity:1;color:#64747d;font:10px 'JetBrains Mono',monospace}
+.pane-controls,.pane.focused .pane-controls{align-self:center;opacity:.55;gap:1px;padding:1px 3px;border:1px solid #2a343b;border-radius:5px;background:#192126}
+.pane-heading:hover .pane-controls,.pane-heading:focus-within .pane-controls{opacity:1}
+.pane-controls button{height:21px;width:23px;font-size:13px}
+.attachment-error{inset:34px 0 0}
