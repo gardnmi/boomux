@@ -2807,8 +2807,7 @@ mod tests {
     fn layout_restore_requests_exact_run_without_restart_or_takeover() {
         use boomux::protocol::{self, Envelope, Request, Response, ShellStatus};
         use std::os::unix::net::UnixListener;
-        let directory =
-            std::env::temp_dir().join(format!("layout-attach-{}", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("la-{:016x}", fastrand::u64(..)));
         std::fs::create_dir(&directory).unwrap();
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -2890,8 +2889,7 @@ mod tests {
     fn remote_attachment_and_reconnect_keep_exact_owner_and_run() {
         use boomux::protocol::{self, Envelope, Request, Response};
         use std::os::unix::net::UnixListener;
-        let directory =
-            std::env::temp_dir().join(format!("remote-attach-{}", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("ra-{:016x}", fastrand::u64(..)));
         std::fs::create_dir(&directory).unwrap();
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -3518,7 +3516,13 @@ mod tests {
                 KeyAction::Press,
             )
             .unwrap(),
-            b"\x1ba"
+            // Ghostty defaults to native Option text on macOS; Linux Alt
+            // prefixes the text with Escape.
+            if cfg!(target_os = "macos") {
+                b"a".as_slice()
+            } else {
+                b"\x1ba".as_slice()
+            }
         );
         assert_eq!(
             encode_key(

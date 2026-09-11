@@ -1,7 +1,11 @@
 use std::env;
 use std::error::Error;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+#[cfg(target_os = "linux")]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -12,7 +16,9 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentState,
@@ -337,10 +343,7 @@ impl std::fmt::Display for RemoteError {
 impl Error for RemoteError {}
 
 pub fn socket_path() -> io::Result<PathBuf> {
-    let runtime = env::var_os("BOOMUX_RUNTIME_DIR")
-        .or_else(|| env::var_os("XDG_RUNTIME_DIR"))
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    let runtime = crate::platform::runtime_root()?;
     if !runtime.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -585,6 +588,35 @@ impl Client {
 
     pub fn ping(&self) -> Result<()> {
         expect_ok(self.request(Request::Ping)?, Response::Pong)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn daemon_peer_credentials(&self) -> Result<DaemonPeerCredentials> {
+        let (stream, protocol_version, response) = self.send(Request::Ping)?;
+        expect_ok(response, Response::Pong)?;
+        // getpeereid is cached after disconnect; LOCAL_PEERPID is not. The
+        // one-response handler may already have closed its endpoint here.
+        let uid = crate::platform::peer_uid(&stream).map_err(ClientError::Transport)?;
+        let pid = crate::platform::daemon_listener_holder(&self.socket_path, uid)
+            .map_err(ClientError::Transport)?;
+        Ok(DaemonPeerCredentials {
+            pid,
+            uid,
+            protocol_version,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn daemon_process_credentials(&self) -> Result<DaemonPeerCredentials> {
+        let before = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
+        let peer = self.daemon_peer_credentials()?;
+        let after = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(ClientError::Transport(io::Error::other(
+                "daemon socket changed during inspection",
+            )));
+        }
+        Ok(peer)
     }
 
     #[cfg(target_os = "linux")]

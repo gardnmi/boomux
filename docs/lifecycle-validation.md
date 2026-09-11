@@ -11,6 +11,22 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-09-10: macOS preview native fixtures
+
+Apple Silicon macOS 15.7.9 passed the selected native lifecycle tests at
+`caeae0d` ([CI evidence](https://github.com/gardnmi/boomux/actions/runs/34421149607)).
+This includes descriptor ownership transfer, detached live handoff, attached
+client reconnect, explicit replacement rollback, exited-run terminal state,
+cold metadata recovery, and bounded stalled-connection recovery.
+
+The OpenCode Shared Harness Runtime and Kiro holder scenarios use controlled
+fixture executables. They passed live-run handoff and destructive-stop cleanup;
+Kiro also passed failed-replacement rollback and standalone launcher-parent-death
+cleanup through the new native guard. These are backend/adapter fixtures, **not
+live compatibility claims for any installed macOS OpenCode or Kiro version**.
+Other harness reducers retain their existing contracts; actual macOS host
+versions, provider calls, permissions, and remote SSH require separate evidence.
+
 ## 2026-09-09: installed harness smoke refresh
 
 Tested on Linux with a freshly built debug Boomux `1.11.1`, protocol `54`.

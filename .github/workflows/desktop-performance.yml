@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: performance-${{ github.ref }}
+  group: desktop-performance-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

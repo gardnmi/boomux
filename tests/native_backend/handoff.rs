@@ -2,6 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -46,7 +48,7 @@ fn replacement_bootstrap_rejects_invalid_inherited_descriptor() {
 #[test]
 fn replacement_bootstrap_receives_listener_and_lock_ownership() {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_boomux"));
-    let root = std::env::temp_dir().join(format!(
+    let root = PathBuf::from("/tmp").join(format!(
         "boomux-handoff-{}-{}",
         std::process::id(),
         Uuid::new_v4()
@@ -95,7 +97,10 @@ fn replacement_bootstrap_receives_listener_and_lock_ownership() {
 
     parent_channel.set_read_timeout(Some(TIMEOUT)).unwrap();
     parent_channel.set_write_timeout(Some(TIMEOUT)).unwrap();
+    #[cfg(target_os = "linux")]
     parent_channel.write_all(b"BOOMUXH8").unwrap();
+    #[cfg(target_os = "macos")]
+    parent_channel.write_all(b"BOOMUXM1").unwrap();
     protocol::write_message(
         &mut parent_channel,
         &serde_json::json!({
@@ -684,9 +689,15 @@ fn native_daemon_handoffs_multiple_detached_shells() {
             .unwrap();
         thread::sleep(Duration::from_millis(50));
         let command = format!("printf 'pid{index}=%s:end\\n' \"$$\"\n");
-        AttachFrame::Input(command.into_bytes())
-            .write_to(&mut attachment)
-            .unwrap();
+        if let Err(error) = AttachFrame::Input(command.into_bytes()).write_to(&mut attachment) {
+            let snapshot = daemon.client.get_shell(&shell.id);
+            let mut pending = Vec::new();
+            let _ = attachment.read_to_end(&mut pending);
+            panic!(
+                "input failed: {error}; shell: {snapshot:?}; pending: {:?}",
+                String::from_utf8_lossy(&pending)
+            );
+        }
         let output = read_until(&mut attachment, b":end");
         pids.push(parse_pid(&output, &format!("pid{index}=")).unwrap());
         let run = daemon.client.get_shell(&shell.id).unwrap().run.unwrap();
@@ -758,7 +769,7 @@ fn explicit_executable_handoff_preserves_live_runs_and_rolls_back_on_failure() {
 
     let initial_pid = daemon.client.daemon_process_credentials().unwrap().pid;
     let invalid = daemon.runtime_dir.join("invalid");
-    fs::copy("/bin/false", &invalid).unwrap();
+    fs::copy("/usr/bin/false", &invalid).unwrap();
     fs::set_permissions(&invalid, fs::Permissions::from_mode(0o755)).unwrap();
     let failed = daemon
         .command()
@@ -825,10 +836,24 @@ fn explicit_executable_handoff_preserves_live_runs_and_rolls_back_on_failure() {
         let pid = daemon.client.daemon_process_credentials().unwrap().pid;
         assert_ne!(pid, previous_pid);
         previous_pid = pid;
+        #[cfg(target_os = "linux")]
         assert_eq!(
-            fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+            boomux::platform::process_executable(pid).unwrap(),
             *executable
         );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                boomux::platform::daemon_executable_path(pid).unwrap(),
+                *executable
+            );
+            let actual = fs::metadata(boomux::platform::process_executable(pid).unwrap()).unwrap();
+            let expected = fs::metadata(executable).unwrap();
+            assert_eq!(
+                (actual.dev(), actual.ino()),
+                (expected.dev(), expected.ino())
+            );
+        }
         assert_eq!(
             daemon.client.get_shell(shell_id).unwrap().run.unwrap().id,
             run_id
@@ -966,14 +991,7 @@ fn send_descriptor(stream: &UnixStream, descriptor: RawFd, marker: u8) {
     let descriptors = [descriptor];
     let control = [ControlMessage::ScmRights(&descriptors)];
     assert_eq!(
-        sendmsg::<()>(
-            stream.as_raw_fd(),
-            &data,
-            &control,
-            MsgFlags::MSG_NOSIGNAL,
-            None,
-        )
-        .unwrap(),
+        sendmsg::<()>(stream.as_raw_fd(), &data, &control, MsgFlags::empty(), None,).unwrap(),
         1
     );
 }
@@ -1007,4 +1025,43 @@ fn read_raw_until(reader: &mut dyn Read, needle: &[u8]) -> Vec<u8> {
         String::from_utf8_lossy(needle),
         String::from_utf8_lossy(&output)
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_parent_guard_reaps_exact_child_without_daemon() {
+    let root = std::env::temp_dir().join(format!("boomux-parent-guard-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let child_file = root.join("child");
+    let guard_file = root.join("guard");
+    let mut launcher = Command::new("/bin/sh")
+        .args(["-c", r#""$1" __macos-parent-guard "$$" /bin/sh -c 'printf "%s" "$$" > "$1"; exec /bin/sleep 60' fixture "$2" & guard=$!; printf '%s' "$guard" > "$3"; wait"#, "fixture"])
+        .arg(env!("CARGO_BIN_EXE_boomux"))
+        .arg(&child_file)
+        .arg(&guard_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn().unwrap();
+    wait_until(
+        || child_file.exists(),
+        "parent guard did not launch its child",
+    );
+    let child_pid: i32 = fs::read_to_string(child_file).unwrap().parse().unwrap();
+    let guard_pid = fs::read_to_string(guard_file).unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let usage = Command::new("/bin/ps")
+        .args(["-o", "rss=,pcpu=", "-p", &guard_pid])
+        .output()
+        .unwrap();
+    eprintln!(
+        "Mac parent guard RSS (KiB), CPU (%): {}",
+        String::from_utf8_lossy(&usage.stdout).trim()
+    );
+    launcher.kill().unwrap();
+    launcher.wait().unwrap();
+    wait_until(
+        || !process_exists(child_pid),
+        "exact child survived originating parent death",
+    );
+    fs::remove_dir_all(root).unwrap();
 }

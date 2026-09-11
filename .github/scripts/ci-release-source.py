@@ -12,11 +12,15 @@ def metadata(directory, sha, tag, target, kind="cli"):
         raise ValueError("source must be an exact commit SHA")
     if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
         raise ValueError("invalid release tag")
-    if target not in {"x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"}:
+    if target not in {"x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"}:
         raise ValueError("unsupported release target")
-    if kind not in {"cli", "desktop"} or (kind == "desktop" and target != "x86_64-unknown-linux-gnu"):
+    if (kind not in {"cli", "desktop"}
+            or (kind == "desktop" and target == "aarch64-unknown-linux-gnu")
+            or (kind == "cli" and target == "aarch64-apple-darwin")):
         raise ValueError("unsupported artifact kind or target")
     name = f"boomux-{tag}-{target}.tar.gz" if kind == "cli" else f"boomux-desktop-{target}.tar.gz"
+    if target == "aarch64-apple-darwin":
+        name = f"boomux-desktop-{target}.zip"
     with (directory / name).open("rb") as archive:
         digest = hashlib.file_digest(archive, "sha256").hexdigest()
     if (directory / (name + ".sha256")).read_text().strip() != f"{digest}  {name}":

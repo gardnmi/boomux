@@ -1,12 +1,15 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use boomux::client::Client;
 use boomux::federation::{
     FEDERATION_VERSION, FederationConnectionMode, FederationHandshake, write_handshake,
@@ -15,6 +18,7 @@ use boomux::protocol::{self, Envelope, Request, Response};
 use boomux::ssh_bootstrap::{
     REMOTE_INSTALL_ACTIVATE_COMMAND, REMOTE_INSTALL_COMMAND, REMOTE_INSTALL_ROLLBACK_COMMAND,
 };
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -243,8 +247,8 @@ fn run_interactive_with_timeout(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0
@@ -263,7 +267,7 @@ fn run_interactive_with_timeout(
         .stderr(Stdio::from(slave));
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                 Err(std::io::Error::last_os_error())
             } else {
                 Ok(())
@@ -958,8 +962,8 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0
@@ -978,7 +982,7 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
         .stderr(Stdio::from(slave));
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                 Err(std::io::Error::last_os_error())
             } else {
                 Ok(())

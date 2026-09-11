@@ -10,6 +10,7 @@ mod nodes;
 mod remote;
 mod runtime;
 mod settings;
+mod subprocess;
 mod terminal;
 mod theme;
 mod updates;
@@ -350,17 +351,29 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Enter",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Enter"
+        } else {
+            "Ctrl + Enter"
+        },
         description: "Create a Shell in the focused terminal's Workspace",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + W",
+        keys: if cfg!(target_os = "macos") {
+            "Command + W"
+        } else {
+            "Ctrl + W"
+        },
         description: "Minimize and detach; preserve its Boomux Shell",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Shift + W",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Shift + W"
+        } else {
+            "Ctrl + Shift + W"
+        },
         description: "Permanently remove the selected Shell",
     },
     ShortcutSpec {
@@ -425,7 +438,11 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Terminal,
-        keys: "Ctrl + Shift + C / V",
+        keys: if cfg!(target_os = "macos") {
+            "Command + C / V"
+        } else {
+            "Ctrl + Shift + C / V"
+        },
         description: "Copy selection or paste clipboard",
     },
     ShortcutSpec {
@@ -475,12 +492,20 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Sidebar,
-        keys: "Ctrl + Enter",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Enter"
+        } else {
+            "Ctrl + Enter"
+        },
         description: "Create a Shell in the selected row's Workspace",
     },
     ShortcutSpec {
         section: ShortcutSection::Sidebar,
-        keys: "Ctrl + Shift + Up / Down",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Shift + Up / Down"
+        } else {
+            "Ctrl + Shift + Up / Down"
+        },
         description: "Move the selected Workspace",
     },
     ShortcutSpec {
@@ -4029,11 +4054,14 @@ impl Workspace {
         };
         pane.selection = Some(selection);
         self.terminal_selection_release = Some(drag.pane_id);
-        let selected = pane
-            .selection
-            .map(|selection| terminal_selected_text(screen, selection));
-        if let Some(text) = selected.filter(|text| !text.is_empty()) {
-            cx.write_to_primary(ClipboardItem::new_string(text));
+        #[cfg(target_os = "linux")]
+        {
+            let selected = pane
+                .selection
+                .map(|selection| terminal_selected_text(screen, selection));
+            if let Some(text) = selected.filter(|text| !text.is_empty()) {
+                cx.write_to_primary(ClipboardItem::new_string(text));
+            }
         }
         cx.stop_propagation();
         cx.notify();
@@ -4098,7 +4126,11 @@ impl Workspace {
     }
 
     fn paste_primary(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
+        #[cfg(target_os = "linux")]
+        let item = cx.read_from_primary();
+        #[cfg(target_os = "macos")]
+        let item = cx.read_from_clipboard();
+        if let Some(text) = item.and_then(|item| item.text()) {
             self.paste_into_focused(&text, cx);
         }
     }
@@ -9696,7 +9728,11 @@ impl Render for Workspace {
                         .child("Create your first Workspace"),
                 )
                 .child("Click + in the sidebar, then choose New Workspace to get started.")
-                .child("Once created, press Ctrl + Enter to add a Shell.")
+                .child(if cfg!(target_os = "macos") {
+                    "Once created, press Command + Enter to add a Shell."
+                } else {
+                    "Once created, press Ctrl + Enter to add a Shell."
+                })
                 .child("Press F1 for keyboard shortcuts.")
                 .into_any_element()
         } else {
@@ -10300,7 +10336,11 @@ fn prepare_terminal_paint(
     let mut lines = Vec::with_capacity(usize::from(screen.rows));
     let mut backgrounds = Vec::new();
     let mut cursor_outline = None;
-    let mut base_font = font("JetBrainsMono Nerd Font");
+    let mut base_font = font(if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "JetBrainsMono Nerd Font"
+    });
     base_font.features = gpui::FontFeatures::disable_ligatures();
     let selection_range = selection.map(|selection| selection_indices(selection, cols));
 
@@ -10501,6 +10541,9 @@ fn paint_terminal_images(
 }
 
 fn main() {
+    if subprocess::dispatch() {
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("boomux-desktop {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -10541,27 +10584,31 @@ fn main() {
         Ok(saved) => (saved, None),
         Err(error) => (settings::Settings::default(), Some(error)),
     };
-    let mut layout_session = layout_state::Session::load();
-    match boomux::client::connect_if_running()
-        .ok()
-        .flatten()
-        .and_then(|client| client.node_identity().ok())
-    {
-        Some(owner)
-            if layout_session.document.owner.is_empty()
-                || layout_session.document.owner == owner =>
-        {
-            layout_session.document.owner = owner
+    let application = gpui_platform::application();
+    #[cfg(target_os = "macos")]
+    application.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            let loaded = settings::path()
+                .ok_or_else(|| "Cannot resolve Desktop settings".to_string())
+                .and_then(|path| settings::Settings::load(&path));
+            let (saved, error) = match loaded {
+                Ok(saved) => (saved, None),
+                Err(error) => (settings::Settings::default(), Some(error)),
+            };
+            open_desktop_window(cx, saved, error);
         }
-        _ => {
-            layout_session.error = Some(
-                "Saved layout belongs to an unavailable or different Node; it was retained.".into(),
-            );
-            layout_session.writer = None;
-            layout_session.document = layout_state::Document::default();
-        }
-    }
-    gpui_platform::application().run(move |cx: &mut App| {
+        cx.activate(true);
+    });
+    application.run(move |cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        cx.bind_keys([
+            KeyBinding::new("cmd-c", CopySelection, Some("Terminal")),
+            KeyBinding::new("cmd-v", PasteClipboard, Some("Terminal")),
+            KeyBinding::new("cmd-v", PasteClipboard, Some("BoomuxSettingsInput")),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
+        #[cfg(target_os = "macos")]
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.bind_keys([
             KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("BoomuxSettingsInput")),
             // Layout commands remain available while Control is held with the leader.
@@ -10715,25 +10762,52 @@ fn main() {
             KeyBinding::new("shift-insert", PasteClipboard, Some("SidebarLayout")),
         ]);
 
-        let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // Omarchy tags org.omarchy.* windows as terminals, which makes
-                // its universal clipboard binding choose Ctrl/Shift+Insert.
-                app_id: Some("org.omarchy.boomux-desktop".into()),
-                ..Default::default()
-            },
-            move |window, cx| {
-                cx.new(|cx| Workspace::new(window, cx, saved, settings_error, layout_session))
-            },
-        )
-        .unwrap();
+        open_desktop_window(cx, saved, settings_error);
         cx.activate(true);
         if let Some(path) = update_ready {
             bundle_update::signal_ready(path);
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+gpui::actions!(macos, [Quit]);
+
+fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: Option<String>) {
+    let mut layout_session = layout_state::Session::load();
+    match boomux::client::connect_if_running()
+        .ok()
+        .flatten()
+        .and_then(|client| client.node_identity().ok())
+    {
+        Some(owner)
+            if layout_session.document.owner.is_empty()
+                || layout_session.document.owner == owner =>
+        {
+            layout_session.document.owner = owner
+        }
+        _ => {
+            layout_session.error = Some(
+                "Saved layout belongs to an unavailable or different Node; it was retained.".into(),
+            );
+            layout_session.writer = None;
+            layout_session.document = layout_state::Document::default();
+        }
+    }
+    let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Omarchy tags org.omarchy.* windows as terminals, which makes
+            // its universal clipboard binding choose Ctrl/Shift+Insert.
+            app_id: Some("org.omarchy.boomux-desktop".into()),
+            ..Default::default()
+        },
+        move |window, cx| {
+            cx.new(|cx| Workspace::new(window, cx, saved, settings_error, layout_session))
+        },
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -11129,7 +11203,8 @@ mod pointer_tests {
             key: "c".into(),
             key_char: Some("c".into()),
             modifiers: gpui::Modifiers {
-                control: true,
+                control: !cfg!(target_os = "macos"),
+                platform: cfg!(target_os = "macos"),
                 shift: true,
                 ..Default::default()
             },
@@ -11220,7 +11295,8 @@ mod pointer_tests {
                 key: "enter".into(),
                 key_char: None,
                 modifiers: gpui::Modifiers {
-                    control: true,
+                    control: !cfg!(target_os = "macos"),
+                    platform: cfg!(target_os = "macos"),
                     ..Default::default()
                 },
             },

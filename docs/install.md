@@ -13,7 +13,8 @@ For the everyday install-and-launch steps, use the
 ## Surface
 
 Each stable GitHub release publishes `boomux-installer.sh` alongside the native
-GNU/Linux archives. The stable entry point is:
+GNU/Linux archives and an experimental Apple Silicon macOS Desktop bundle.
+The stable entry point is:
 
 ```console
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -30,9 +31,33 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 Noninteractive callers must select a mode. Unknown or conflicting arguments fail
 before network or filesystem mutation.
 
-Desktop installation is embedded from `desktop/install.sh` at release rendering
-time; mode selection does not fetch a second script. The installer never invokes
+Desktop installation is embedded from `desktop/install.sh` (Linux) and
+`desktop/install-macos.sh` (macOS) at release rendering time; mode selection does not fetch a second script. The installer never invokes
 privilege escalation or a package manager.
+
+## Desktop Platform Selection
+
+The same `--desktop` command detects the host OS and architecture. Linux supports
+x86_64 with the requirements and update ownership in the
+[Desktop release contract](desktop/releases.md). macOS supports Apple Silicon
+(`arm64`) on macOS 15 or newer. Intel Macs are rejected before downloading.
+
+On macOS it downloads `boomux-desktop-aarch64-apple-darwin.zip` and its checksum
+from the installer's pinned release. It verifies SHA-256 with `shasum`, the
+ad-hoc bundle signature with `codesign`, ARM64 architecture, and both executable
+versions. The app is experimental and **not notarized**.
+
+The destination is `~/Applications/Boomux-<version>.app`. `HOME` and Applications
+must be real, current-user-owned directories without group/world write access.
+An installation lock serializes installers. Existing apps and symlinks are never
+replaced. No command links, login service, or automatic launch are installed.
+Open the app in Finder; if blocked, use System Settings → Privacy & Security →
+Open Anyway. See the [Mac guide](platforms/macos-testing.md).
+
+To install a newer Mac version, quit Desktop and rerun the command. Old app
+versions remain available; do not remove an app whose bundled CLI still owns a
+running daemon. App-bundle automatic updates and standalone macOS `--cli`
+release assets are not provided.
 
 ## CLI Platform And Destination
 
@@ -57,7 +82,7 @@ update ownership and graceful daemon handoff contract.
 The installer is rendered for one strict `vMAJOR.MINOR.PATCH` release tag. It
 downloads only that tag's exact architecture archive and checksum sidecar from
 the fixed `gardnmi/boomux` HTTPS repository. Curl is restricted to HTTPS with
-TLS 1.2 or newer. The sidecar must validate through `sha256sum`, extraction must
+TLS 1.2 or newer. The sidecar must validate through `sha256sum` (Linux) or `shasum` (macOS), extraction must
 produce the exact expected executable path, and the candidate must print the
 embedded release version before installation.
 

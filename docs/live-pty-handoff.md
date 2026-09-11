@@ -9,6 +9,24 @@ This document specifies process-preserving daemon replacement.
 > invariants and transfer behavior are current; all delivery slices below are
 > implemented.
 
+## macOS preview
+
+The authority, quiescence, rollback, PID-preservation, and bounded-transfer
+requirements in this contract also apply to the macOS preview. Linux-specific
+mechanisms below retain their behavior. Darwin uses `BOOMUXM1`, validates the
+PTY with `TIOCPTYGNAME` and process terminal/session identity, and transfers a
+read-only process identity descriptor instead of a pidfd. The receiver verifies
+the kernel process unique identifier and creates a local kqueue exit monitor.
+Signals use the identity-checked audit-token API, with no PID-only fallback.
+
+Darwin cannot execute `/dev/fd/N`. Before quiescing, replacement preparation
+creates an owner-private hard link to the validated executable and verifies its
+device/inode against the open descriptor. It executes that alias with the
+original absolute path as argv[0]. Failure, including cross-filesystem linking,
+leaves the old daemon authoritative. Successful replacements retain the alias
+until exit; cold startup under the daemon lock reclaims stale aliases. Official
+macOS self-update remains outside the preview.
+
 ## Goal
 
 Replace the Boomux daemon without terminating running shell processes or ending

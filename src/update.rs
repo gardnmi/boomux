@@ -3,7 +3,9 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -442,34 +444,10 @@ pub(crate) fn remove_uninstall_target(target: &UninstallTarget) -> io::Result<()
     sync_directory(parent)
 }
 
-#[cfg(target_os = "linux")]
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    let from = std::ffi::CString::new(from.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    let to = std::ffi::CString::new(to.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    if unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "self-uninstall requires Linux atomic rename support",
-    ))
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    boomux::platform::rename_noreplace(libc::AT_FDCWD, &from, libc::AT_FDCWD, &to)
 }
 
 pub(crate) fn revalidate_uninstall_target(target: &UninstallTarget) -> io::Result<()> {
@@ -573,6 +551,8 @@ fn release_target() -> Option<&'static str> {
     match (env::consts::OS, env::consts::ARCH) {
         ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
         _ => None,
     }
 }
