@@ -150,3 +150,10 @@ button{color:var(--ui-fg);background:var(--ui-raised);border-color:var(--ui-bord
 .theme-wiping::view-transition-new(root){animation:boomux-theme-reveal 360ms cubic-bezier(.35,0,.2,1) both;mix-blend-mode:normal}
 @keyframes boomux-theme-reveal{from{clip-path:polygon(60% 0,60% 0,40% 100%,40% 100%)}to{clip-path:polygon(-20% 0,140% 0,120% 100%,-40% 100%)}}
 @media(prefers-reduced-motion:reduce){.theme-wiping::view-transition-new(root){animation:none}}
+
+/* Desktop pane controls: separate compact outlined buttons. */
+.pane-controls,.pane.focused .pane-controls{gap:4px;opacity:1}
+.pane-controls button{display:grid;place-items:center;width:28px;height:26px;padding:0;border:1px solid var(--ui-border);border-radius:6px;background:transparent;color:var(--ui-fg);font:18px/1 ui-sans-serif,system-ui,sans-serif}
+.pane-controls button:hover,.pane-controls button[aria-pressed=true]{background:var(--ui-selection);color:var(--ui-fg);border-color:var(--ui-muted)}
+.pane-controls button:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2px}
+.pane-controls button[data-action=close]{font-size:17px}.pane-controls button[data-action=close]:hover{background:#89384c;border-color:#89384c;color:#f5e0e6}

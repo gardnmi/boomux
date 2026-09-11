@@ -33,7 +33,7 @@ function syncSidebar(){
 }
 function addPane(id,template){
   const p={...template},el=document.createElement('section');p.el=el;el.className='pane';el.dataset.id=id;
-  el.innerHTML=`<div class="pane-heading"><span class="pane-name">${escapeHtml(p.name)}</span><span class="pane-location" title="${escapeHtml(p.path)}">${escapeHtml(p.path)}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">◇</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">⛶</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${escapeHtml(p.path)}</span><span class="terminal-status">Starting…</span></div>`;
+  el.innerHTML=`<div class="pane-heading"><span class="pane-name">${escapeHtml(p.name)}</span><span class="pane-location" title="${escapeHtml(p.path)}">${escapeHtml(p.path)}</span><div class="pane-controls"><button data-action="float" title="Toggle floating" aria-label="Toggle floating">↗</button><button data-action="expand" title="Expand / restore" aria-label="Expand or restore">□</button><button data-action="close" title="Close terminal session" aria-label="Close terminal session">×</button></div></div><div class="pane-body">Starting Ghostty…</div><div class="pane-foot"><span>${escapeHtml(p.path)}</span><span class="terminal-status">Starting…</span></div>`;
   el.addEventListener('pointerdown',e=>{
     active=id;syncSidebar();schedule();
     if(e.button!==0||e.target.closest('button')||expanded)return;
@@ -302,6 +302,11 @@ function reflow(animate=true){
     el.onpointerdown=e=>{if(e.button!==0)return;e.preventDefault();clearTimeout(fitTimer);resize={...d,ratio:d.node.ratio};el.setPointerCapture(e.pointerId);};
     el.onkeydown=e=>{const delta=['ArrowRight','ArrowDown'].includes(e.key)?.04:['ArrowLeft','ArrowUp'].includes(e.key)?-.04:0;if(delta){e.preventDefault();d.node.ratio=Math.max(.15,Math.min(.85,d.node.ratio+delta));reflow();}};
     $('#dividers').append(el);
+  }
+  for(const [id,p] of panes){
+    const float=p.el.querySelector('[data-action="float"]'),expand=p.el.querySelector('[data-action="expand"]');
+    float.textContent=floating.has(id)?'↙':'↗';float.setAttribute('aria-pressed',String(floating.has(id)));
+    expand.textContent=expanded===id?'❐':'□';expand.setAttribute('aria-pressed',String(expanded===id));
   }
   $('#empty').style.display=panes.size?'none':'block';syncSidebar();schedule();
 }
