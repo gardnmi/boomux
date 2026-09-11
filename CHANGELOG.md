@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.17.0](https://github.com/gardnmi/boomux/compare/v1.16.1...v1.17.0) (2026-09-11)
+
+
+### Features
+
+* **desktop:** filter projects in the workspace menu ([#411](https://github.com/gardnmi/boomux/issues/411)) ([5b064bf](https://github.com/gardnmi/boomux/commit/5b064bfec733ccacda5776c6fab935a18215f749))
+
+
+### Bug Fixes
+
+* **desktop:** scroll while extending terminal selections ([#412](https://github.com/gardnmi/boomux/issues/412)) ([0f5bc0f](https://github.com/gardnmi/boomux/commit/0f5bc0fd2ceb6fb4edc1c75907d1c2c60abf73a2))
+
+## [1.16.1](https://github.com/gardnmi/boomux/compare/v1.16.0...v1.16.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* preserve managed harness launches after prompt path changes ([#409](https://github.com/gardnmi/boomux/issues/409)) ([31bec82](https://github.com/gardnmi/boomux/commit/31bec82fe3494b7590af0905646ac465820d98b5))
+
 ## [1.16.0](https://github.com/gardnmi/boomux/compare/v1.15.2...v1.16.0) (2026-09-11)
 
 

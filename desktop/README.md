@@ -62,7 +62,7 @@ Workspaces remain visible until their owning machine can confirm they are empty.
 | To… | Use… |
 | --- | --- |
 | Create a Workspace | **+ → New workspace** |
-| Open a project | Choose a configured project from **+** |
+| Open a project | Open **+**, type to filter projects by name or path, then choose a project |
 | Add project folders | **Settings → Projects → Browse for folders** |
 | Create a Shell | **Ctrl + Enter** |
 | Rename a Workspace or Shell | Select it, then **F2** |
