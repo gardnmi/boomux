@@ -55,8 +55,9 @@ one process and one kqueue per Kiro launch, not per Shell or attachment.
 
 Desktop keeps GPUI and Ghostty, uses a macOS filesystem watcher and system Menlo
 font, and bundles a matching CLI. The preview requires macOS 15+, starts on
-Apple Silicon, and uses ad-hoc signing. Notarization, official release assets,
-and app-bundle self-update remain separate production-distribution work.
+Apple Silicon, and uses ad-hoc signing. Regular releases include the experimental
+Mac bundle, installed through the universal Desktop command. Notarization and
+app-bundle self-update remain separate production-distribution work.
 
 ## Consequences
 

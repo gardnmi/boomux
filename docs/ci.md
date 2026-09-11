@@ -171,8 +171,17 @@ fixtures verify Command shortcuts and native Option text on Mac. Lifecycle tests
 are compiled before their bounded
 scenario deadlines. The package job builds both optimized executables, packages
 and ad-hoc signs the app, checks native glyphs and dependencies, and exercises
-window creation, Shell survival, and daemon restart. Native and app diagnostics
-are retained separately from the ZIP and checksum.
+window creation, Shell survival, and daemon restart. The public installer is also exercised with the actual native bundle. Native
+and app diagnostics are retained separately from the ZIP and checksum.
+
+The package job uploads `boomux-desktop-macos-aarch64` containing the canonical
+`boomux-desktop-aarch64-apple-darwin.zip`, its checksum, and source provenance.
+Normal Release Please publication downloads it from the exact successful main
+CI run and verifies source SHA, version, target, and checksum before uploading.
+Missing or expired artifacts fail publication; only explicit tag recovery
+rebuilds and smoke-tests on macOS. The published ZIP contains the same bytes as
+the tested preview ZIP. The release stays draft until Mac and Linux assets are
+ready. macOS support remains experimental and ad-hoc signed.
 
 Release evidence reuse now requires the native job's actual successful test
 steps. Pre-port Linux-only runs cannot satisfy it, and Desktop source changes
@@ -188,8 +197,9 @@ groups so they cannot cancel one another.
 ## Development previews
 
 Development previews are manually published GitHub prereleases, not scheduled
-nightlies. Stable assets remain Linux-only. Merging the macOS port does not
-advertise notarization, Intel support, or app-bundle automatic updates.
+nightlies. They remain available alongside the experimental Mac bundle included
+with regular releases. Neither distribution advertises notarization, Intel
+support, or app-bundle automatic updates.
 
 1. Let a **CI** main push complete, or manually dispatch **CI** for the intended
    development branch. Native and package macOS jobs must run and pass. PR and

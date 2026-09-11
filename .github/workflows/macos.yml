@@ -71,6 +71,8 @@ jobs:
         run: python3 desktop/scripts/package-macos.py
       - name: Exercise packaged application
         run: python3 desktop/scripts/smoke-macos.py
+      - name: Test universal macOS installer
+        run: sh desktop/scripts/test-macos-install.sh
       - name: Upload application diagnostics
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -85,5 +87,12 @@ jobs:
           path: |
             dist/macos/*.zip
             dist/macos/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload macOS release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boomux-desktop-macos-aarch64
+          path: dist/macos/release/
           if-no-files-found: error
           retention-days: 30

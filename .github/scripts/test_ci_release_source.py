@@ -67,6 +67,23 @@ class SourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "validated release source"):
             source.process("verify", *self.args, "desktop")
 
+    def test_macos_provenance_rejects_wrong_version_source_and_bytes(self):
+        self.name = "boomux-desktop-aarch64-apple-darwin.zip"
+        (self.directory / self.name).write_bytes(b"macOS fixture")
+        self.checksum()
+        args = (self.directory, self.args[1], self.args[2], "aarch64-apple-darwin", "desktop")
+        source.process("record", *args)
+        source.process("verify", *args)
+        for sha, tag in [("b" * 40, "v1.2.3"), (self.args[1], "v1.2.4")]:
+            with self.assertRaisesRegex(ValueError, "validated release source"):
+                source.process("verify", self.directory, sha, tag, *args[3:])
+        (self.directory / self.name).write_bytes(b"changed Mac app")
+        self.checksum()
+        with self.assertRaisesRegex(ValueError, "validated release source"):
+            source.process("verify", *args)
+        with self.assertRaisesRegex(ValueError, "artifact kind or target"):
+            source.process("record", *args[:-1], "cli")
+
     def test_unknown_artifact_and_unsupported_desktop_target_are_rejected(self):
         for target, kind in [(self.args[3], "unknown"), ("aarch64-unknown-linux-gnu", "desktop")]:
             with self.assertRaisesRegex(ValueError, "artifact kind or target"):

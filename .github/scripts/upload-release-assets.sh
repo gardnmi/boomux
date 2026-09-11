@@ -25,6 +25,9 @@ expected_assets[boomux-desktop-installer.sh]=1
 desktop_archive=boomux-desktop-x86_64-unknown-linux-gnu.tar.gz
 expected_assets["$desktop_archive"]=1
 expected_assets["$desktop_archive.sha256"]=1
+macos_archive=boomux-desktop-aarch64-apple-darwin.zip
+expected_assets["$macos_archive"]=1
+expected_assets["$macos_archive.sha256"]=1
 for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
   archive="boomux-${tag}-${target}.tar.gz"
   expected_assets["$archive"]=1
@@ -72,6 +75,11 @@ done
   cd "$(dirname "${local_assets[$desktop_archive]}")"
   sha256sum --check "$desktop_archive.sha256"
 )
+(
+  cd "$(dirname "${local_assets[$macos_archive]}")"
+  sha256sum --check "$macos_archive.sha256"
+)
+python3 .github/scripts/verify-macos-bundle.py "$tag" "$(git rev-parse HEAD)" "${local_assets[$macos_archive]}"
 desktop_installer=${local_assets[boomux-desktop-installer.sh]}
 sh -n "$desktop_installer"
 if ! grep -Fq "version=\${BOOMUX_DESKTOP_VERSION:-$tag} # release-version" "$desktop_installer" \

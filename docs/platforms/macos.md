@@ -1,10 +1,10 @@
 # macOS preview implementation
 
-Status: Apple Silicon testing preview built and validated; no official macOS
-release is advertised yet.
+Status: experimental Apple Silicon Desktop, included with regular releases and
+installed by the universal `boomux-installer.sh --desktop` entry point.
 
 The port targets Apple Silicon first and retains Linux behavior. The initial
-artifact is a testing preview, not an official signed/notarized release.
+artifact remains experimental, ad-hoc signed, and not notarized.
 
 ## Completed preview scope
 
@@ -83,8 +83,7 @@ safe filesystem purge. Complete root/Desktop suites were not run locally.
   root as local startup. Official macOS auto-download assets do not exist yet;
   manually install the matching CLI to test a remote macOS Node. Cross-host SSH
   sessions and live third-party harness versions require separate validation.
-- Ad-hoc signing supports this testing handoff. Notarization, official release
-  publishing, login services, Intel builds, and app-bundle automatic updates
+- Ad-hoc signing supports this testing handoff. Notarization, login services, Intel builds, and app-bundle automatic updates
   remain production-distribution work.
 - Executable pinning currently requires the installed CLI and runtime directory
   to share a filesystem. Unsupported pinning or identity APIs fail before live

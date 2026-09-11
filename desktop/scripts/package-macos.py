@@ -69,6 +69,17 @@ def main():
     subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(stage), str(archive)], check=True)
     digest = hashlib.file_digest(archive.open("rb"), "sha256").hexdigest()
     archive.with_suffix(".zip.sha256").write_text(f"{digest}  {archive.name}\n")
+    # Publish these exact smoke-tested bytes with the regular release too.
+    release = dist / "release"
+    release.mkdir(exist_ok=True)
+    candidate = release / f"boomux-desktop-{arch}-apple-darwin.zip"
+    shutil.copy2(archive, candidate)
+    candidate.with_suffix(".zip.sha256").write_text(f"{digest}  {candidate.name}\n")
+    subprocess.run(["python3", str(ROOT / ".github/scripts/ci-release-source.py"),
+                    "record", str(release), sha, f"v{version}",
+                    f"{arch}-apple-darwin", "desktop"], check=True)
+    subprocess.run(["python3", str(ROOT / ".github/scripts/verify-macos-bundle.py"),
+                    f"v{version}", sha, str(candidate)], check=True)
     print(archive)
 
 if __name__ == "__main__":

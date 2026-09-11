@@ -367,8 +367,10 @@ To distribute an Apple Silicon testing preview, wait for a successful **CI**
 main push, or manually run **CI** for a development branch. Run **Publish
 development preview** with that CI run ID. It promotes the exact tested ZIP
 without rebuilding, using a unique `preview-macos-YYYYMMDD.<run-id>` prerelease
-tag. PR/merge-group artifacts cannot be published. Stable updates remain
-Linux-only; Mac signing is ad-hoc and the app is not notarized.
+tag. PR/merge-group artifacts cannot be published. Regular releases also promote the canonical Mac ZIP from their exact successful
+main CI run. The universal installer selects Linux or Apple Silicon macOS. Mac
+support remains experimental, ad-hoc signed, and not notarized; automatic
+app-bundle updates are not provided.
 
 
 ## Clean Up
