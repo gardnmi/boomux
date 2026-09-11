@@ -46,6 +46,7 @@ function addPane(id,template){
   el.querySelector('.pane-heading').ondblclick=e=>{if(!e.target.closest('button')){expanded=expanded===id?null:id;reflow();}};
   el.querySelectorAll('button').forEach(b=>b.onclick=()=>{
     if(drag||resize)return;
+    if(b.dataset.action==='close'&&p.shell){removeDaemonShell(p.shell).catch(showError);return;}
     if(b.dataset.action==='minimize'&&!p.shell){
       tree=remove(tree,id);floating.delete(id);p.minimized=true;shown.delete(id);if(expanded===id)expanded=null;
       document.activeElement?.blur();active=[...panes].find(([,pane])=>!pane.minimized)?.[0];
@@ -196,7 +197,8 @@ function syncDaemonSidebar(){
         item.onclick=()=>openShell(shell);row.append(item);
         const actions=[];
         if(shell.run)actions.push(['Open Shell',()=>openShell(shell)]);
-        if(entry)actions.push(['Detach pane',()=>entry[1].el.querySelector('[data-action="close"]').click()]);
+        if(entry)actions.push(['Minimize pane',()=>entry[1].el.querySelector('[data-action="minimize"]').click()]);
+        actions.push(['Remove Shell',()=>removeDaemonShell(shell)]);
         if(shell.cwd)actions.push(['Copy working directory',()=>navigator.clipboard.writeText(shell.cwd)]);
         row.append(sidebarMenu(`Actions for ${shell.name}`,actions));children.append(row);
       }
@@ -208,7 +210,7 @@ function syncDaemonSidebar(){
   for(const [id,p]of panes)p.el.setAttribute('aria-label',`${p.name} pane ${id}${id===active?', selected':''}`);
 }
 function connectPane(id,p,takeover=false){
-  if(p.shell){const close=p.el.querySelector('[data-action="close"]');close.title='Detach pane; leave the Shell running';close.setAttribute('aria-label','Detach pane');}
+  if(p.shell){const close=p.el.querySelector('[data-action="close"]');close.title='Remove Shell';close.setAttribute('aria-label','Remove Shell');}
   p.el.querySelector('.attachment-error')?.remove();
   p.terminal?.dispose();
   p.terminal=createTerminal(p.el.querySelector('.pane-body'),p.el.querySelector('.terminal-status'),()=>layoutMode,
@@ -239,6 +241,25 @@ async function refreshDaemon(){
   if(!response.ok)throw Error(info.error||'Daemon unavailable');
   if(info.node_id!==daemon.node_id)throw Error('Owning Node changed; reopen the gateway explicitly.');
   daemon=info;if(info.warning)showError(info.warning);syncSidebar();renderActivity();
+}
+const removingShells=new Set();
+async function removeDaemonShell(shell){
+  if(removingShells.has(shell.id))return;
+  if(!confirm(`Remove Shell "${shell.name}"? This stops its running processes and permanently removes the Shell from its Workspace.`))return;
+  const nodeId=daemon.node_id,runId=shell.run?.id||null;
+  removingShells.add(shell.id);
+  try{
+    const response=await fetch('/api/shell/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({node_id:nodeId,shell_id:shell.id,run_id:runId})});
+    const result=await response.json();if(!response.ok)throw Error(result.error||'Shell removal failed');
+    // Remove only the exact pane that was confirmed, even if the user switched
+    // Workspaces while the owning Node processed the request.
+    for(const [id,p] of panes)if(p.shell?.id===shell.id&&(p.shell.run?.id||null)===runId){
+      if(drag||resize)finish(true);
+      tree=remove(tree,id);floating.delete(id);p.terminal?.dispose();panes.delete(id);shown.delete(id);p.el.remove();if(expanded===id)expanded=null;
+      if(active===id)active=[...panes].find(([,pane])=>!pane.minimized)?.[0];
+    }
+    reflow();await refreshDaemon();
+  }finally{removingShells.delete(shell.id);}
 }
 async function createDaemonShell(){
   if(creating||panes.size>=24)return;creating=true;syncSidebar();

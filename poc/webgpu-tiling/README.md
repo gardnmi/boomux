@@ -25,10 +25,16 @@ Both modes build the debug gateway and CLI; `CARGO_TARGET_DIR` is supported.
 Use Bun 1.3.14 or later for asset installation.
 
 Choose a Workspace in the sidebar to reveal its Shells, then click a Shell to
-attach. **New Shell** creates a daemon-owned Bash Shell in the Workspace's default
-working directory; its minimal prompt shows the path. **Refresh Shells** updates
-the listing. A Shell without a current run must first be started through Boomux.
-The pane close button detaches; terminate Shells through the normal Boomux UI or CLI.
+attach. **New Shell** uses the same daemon default-shell specification as Desktop,
+in the Workspace's default working directory. Normal startup files initialize
+prompts such as Starship. This affects newly created Shells; existing early PoC
+Shells retain their recorded minimal Bash command. **Refresh Shells** updates the
+listing. A Shell without a current run must first be started through Boomux.
+**−** minimizes/detaches without stopping the Shell. **×** and the sidebar’s
+**Remove Shell** action ask for confirmation, then stop processes and remove the
+Shell on its owning Node. Failures keep the pane available and report the error.
+Removal preflights the displayed run against the live owner and uses a
+revision-guarded Shell removal operation.
 
 Reloading or closing the page keeps Shell processes running. The most recent
 Workspace layout is stored in localStorage with exact Node, Shell, and run IDs;
@@ -51,7 +57,7 @@ not a remote-access service. It exposes local and registered remote Node Workspa
 show the owning Node and connection health; cached rows remain visible when stale.
 Attachments revalidate the exact ShellRun on the owner, and remote creation uses
 the owner's login shell and directory. Discovery failures retain local Workspaces
-and show a warning. Full coordinated Workspace placement controls and Desktop
+and show a warning. Full coordinated Workspace placement controls and all Desktop
 lifecycle controls are not included.
 
 No asset build is required. The footer reports whether WebGPU initialized;

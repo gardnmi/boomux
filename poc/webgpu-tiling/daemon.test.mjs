@@ -66,7 +66,7 @@ try{
     await page.keyboard.type("printf '\\nHANDOFF:%s:%s\\n' \"$$\" \"$WEB_POC\"");await page.keyboard.press('Enter');
     await eventually(()=>streams.some(s=>s.output.includes(`HANDOFF:${pid}:survives\r\n`)),'handoff preserves PID, state, and input');
   }
-  await page.locator('.pane').first().getByRole('button',{name:'Detach pane',exact:true}).click();
+  await page.locator('.pane').first().getByRole('button',{name:'Minimize pane',exact:true}).click();
   assert.ok((await snapshot()).snapshot.workspaces.flatMap(w=>w.shells).some(s=>s.id===shell&&s.run?.id===run&&s.status==='running'),'pane closure detaches without terminating');
   await page.reload();await page.waitForFunction(()=>document.querySelectorAll('.pane-body[data-connected="true"]').length===1);
   assert.equal(await page.locator('.pane').count(),1,'detached pane stays detached after refresh');

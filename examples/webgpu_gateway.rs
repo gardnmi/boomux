@@ -17,7 +17,10 @@ use axum::{
 };
 use boomux::{
     client::{self, Client},
-    protocol::{ProtocolFeature, ShellSpec, TerminalProfile},
+    protocol::{
+        ProtocolFeature, Request as DaemonRequest, Response as DaemonResponse, RoutedOperation,
+        RoutedOperationResult, ShellSpec, TerminalProfile,
+    },
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -192,21 +195,13 @@ fn profile(rows: u16, cols: u16) -> TerminalProfile {
         pixel_height: 0,
     }
 }
-fn shell_spec(root: &std::path::Path, cwd: PathBuf) -> ShellSpec {
-    ShellSpec {
-        name: format!("web-{}", &uuid::Uuid::new_v4().to_string()[..8]),
-        command: vec![
-            "bash".into(),
-            "--noprofile".into(),
-            "--rcfile".into(),
-            root.join("poc/webgpu-tiling/shell.bash")
-                .to_string_lossy()
-                .into_owned(),
-            "-i".into(),
-        ],
+fn shell_spec(cwd: PathBuf) -> ShellSpec {
+    ShellSpec::login(
+        format!("web-{}", &uuid::Uuid::new_v4().to_string()[..8]),
         cwd,
-    }
+    )
 }
+
 async fn create_shell(State(app): State<App>, Json(request): Json<CreateShell>) -> ApiResult {
     operation(app, move |app| {
         if request.node_id != app.node_id {
@@ -247,14 +242,69 @@ async fn create_shell(State(app): State<App>, Json(request): Json<CreateShell>) 
             .client
             .create_started_shell(
                 &workspace.id,
-                shell_spec(
-                    &app.root,
-                    workspace.default_cwd.unwrap_or_else(|| app.root.clone()),
-                ),
+                shell_spec(workspace.default_cwd.unwrap_or_else(|| app.root.clone())),
                 profile(24, 80),
             )
             .map_err(|e| e.to_string())?;
         Ok(json!({"node_id":app.node_id,"shell":shell}))
+    })
+    .await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveShell {
+    node_id: String,
+    shell_id: String,
+    run_id: Option<String>,
+}
+fn check_remove_run(expected: Option<&str>, current: Option<&str>) -> Result<(), String> {
+    if expected != current {
+        return Err("ShellRun changed; refresh and confirm removal again".into());
+    }
+    Ok(())
+}
+async fn remove_shell(State(app): State<App>, Json(request): Json<RemoveShell>) -> ApiResult {
+    operation(app, move |app| {
+        if request.node_id != app.node_id {
+            return Err("Wrong owning Node".into());
+        }
+        // Resolve the live owner before any mutation; cached remote projections
+        // are never authority to remove a resource. After the run preflight,
+        // use Desktop's revision-guarded removal to reject metadata changes.
+        let shell = remote::shell(&app.client, &request.shell_id).map_err(|e| e.to_string())?;
+        check_remove_run(
+            request.run_id.as_deref(),
+            shell.run.as_ref().map(|r| r.id.as_str()),
+        )?;
+        if let Some(identity) = remote::identity(&request.shell_id) {
+            match app
+                .client
+                .route_node_operation(
+                    identity.node_id,
+                    RoutedOperation::CloseShell {
+                        shell_id: identity.inner_id,
+                        expected_revision: shell.revision,
+                    },
+                )
+                .map_err(|e| e.to_string())?
+            {
+                RoutedOperationResult::Ok => {}
+                _ => return Err("Unexpected remote Shell removal response".into()),
+            }
+        } else {
+            match app
+                .client
+                .request(DaemonRequest::GuardedCloseShell {
+                    shell_id: shell.id,
+                    expected_revision: shell.revision,
+                })
+                .map_err(|e| e.to_string())?
+            {
+                DaemonResponse::Ok => {}
+                _ => return Err("Unexpected Shell removal response".into()),
+            }
+        }
+        Ok(json!({"removed":true}))
     })
     .await
 }
@@ -395,7 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let workspace = client.create_workspace_with_default_cwd(
                     "WebGPU playground",
                     Some(root.clone()),
-                    vec![shell_spec(&root, root.clone())],
+                    vec![shell_spec(root.clone())],
                 )?;
                 std::fs::create_dir_all(manifest.parent().unwrap())?;
                 let temporary = manifest.with_extension("tmp");
@@ -426,6 +476,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/snapshot", get(snapshot))
         .route("/api/git", post(git_overview))
         .route("/api/shell", post(create_shell))
+        .route("/api/shell/remove", post(remove_shell))
         .route("/api/attach", post(grant))
         .route("/pty", get(terminal))
         .fallback(get(asset))
@@ -441,6 +492,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_shell_uses_owner_default_startup() {
+        let cwd = PathBuf::from("/workspace with spaces");
+        let spec = shell_spec(cwd.clone());
+        assert_eq!(spec.command, ShellSpec::login("desktop", &cwd).command);
+        assert!(spec.command.is_empty());
+        assert_eq!(spec.cwd, cwd);
+    }
+
+    #[test]
+    fn removal_rejects_stale_run_including_pending_transitions() {
+        assert!(check_remove_run(Some("run-a"), Some("run-a")).is_ok());
+        assert!(check_remove_run(None, None).is_ok());
+        assert!(check_remove_run(Some("run-a"), Some("run-b")).is_err());
+        assert!(check_remove_run(None, Some("run-a")).is_err());
+        assert!(check_remove_run(Some("run-a"), None).is_err());
+    }
 
     #[test]
     fn remote_projection_retains_owner_run_and_staleness() {
