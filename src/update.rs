@@ -444,7 +444,7 @@ pub(crate) fn remove_uninstall_target(target: &UninstallTarget) -> io::Result<()
     sync_directory(parent)
 }
 
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let from = std::ffi::CString::new(from.as_os_str().as_bytes()).map_err(io::Error::other)?;
     let to = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(io::Error::other)?;
     boomux::platform::rename_noreplace(libc::AT_FDCWD, &from, libc::AT_FDCWD, &to)
@@ -598,7 +598,7 @@ fn classify_installation(
     }
 }
 
-fn is_package_path(path: &Path) -> bool {
+pub(crate) fn is_package_path(path: &Path) -> bool {
     [
         "/usr/bin/boomux",
         "/usr/local/bin/boomux",
@@ -845,6 +845,12 @@ fn replace_with_rollback(
 }
 
 trait TransactionFs {
+    fn backup_path(&self, parent: &Path) -> PathBuf {
+        parent.join(format!(".boomux-backup-{}", Uuid::new_v4()))
+    }
+    fn backup_is_hard_link(&self) -> bool {
+        true
+    }
     fn hard_link(&self, source: &Path, destination: &Path) -> io::Result<()>;
     fn rename(&self, source: &Path, destination: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
@@ -913,13 +919,19 @@ fn replace_with_rollback_using(
             "downloaded Boomux candidate changed before activation",
         ));
     }
-    let backup = parent.join(format!(".boomux-backup-{}", Uuid::new_v4()));
+    let backup = operations.backup_path(parent);
     operations.hard_link(target, &backup)?;
     if let Err(error) = operations.sync_directory(parent) {
         let _ = operations.remove_file(&backup);
         return Err(error);
     }
-    if !same_file_after_backup(&fingerprint(target)?, baseline) {
+    let after_backup = fingerprint(target)?;
+    let unchanged = if operations.backup_is_hard_link() {
+        same_file_after_backup(&after_backup, baseline)
+    } else {
+        &after_backup == baseline
+    };
+    if !unchanged {
         let _ = operations.remove_file(&backup);
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -1103,7 +1115,7 @@ fn daemon_disposition(target: &Path) -> io::Result<DaemonDisposition> {
     })
 }
 
-fn reserve_daemon_absence(socket: &Path) -> io::Result<client::DaemonLockReservation> {
+pub(crate) fn reserve_daemon_absence(socket: &Path) -> io::Result<client::DaemonLockReservation> {
     client::reserve_daemon_lock(socket)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::ResourceBusy,
@@ -1113,14 +1125,14 @@ fn reserve_daemon_absence(socket: &Path) -> io::Result<client::DaemonLockReserva
 }
 
 #[cfg(target_os = "linux")]
-struct DaemonExecutable {
-    pid: u32,
-    path: PathBuf,
+pub(crate) struct DaemonExecutable {
+    pub(crate) pid: u32,
+    pub(crate) path: PathBuf,
     fingerprint: FileFingerprint,
 }
 
 #[cfg(target_os = "linux")]
-fn daemon_executable(daemon: &client::Client) -> Option<DaemonExecutable> {
+pub(crate) fn daemon_executable(daemon: &client::Client) -> Option<DaemonExecutable> {
     let credentials = daemon.daemon_process_credentials().ok()?;
     if credentials.uid != unsafe { libc::geteuid() } {
         return None;
@@ -1148,14 +1160,14 @@ fn daemon_executable(daemon: &client::Client) -> Option<DaemonExecutable> {
 }
 
 #[cfg(not(target_os = "linux"))]
-struct DaemonExecutable {
-    pid: u32,
-    path: PathBuf,
+pub(crate) struct DaemonExecutable {
+    pub(crate) pid: u32,
+    pub(crate) path: PathBuf,
     fingerprint: FileFingerprint,
 }
 
 #[cfg(not(target_os = "linux"))]
-fn daemon_executable(_daemon: &client::Client) -> Option<DaemonExecutable> {
+pub(crate) fn daemon_executable(_daemon: &client::Client) -> Option<DaemonExecutable> {
     None
 }
 
@@ -1322,6 +1334,122 @@ fn refusal_message(status: &UpdateStatus) -> &'static str {
         },
         UpdateState::UpdateAvailable => "this Boomux installation is not eligible for self-update",
     }
+}
+
+/// Confirm a recovery handoff against both the kernel's executable and the installed inode.
+pub(crate) fn verify_recovery_executable(daemon: &client::Client, target: &Path) -> io::Result<()> {
+    let installed = fingerprint(target)?;
+    let executable = daemon_executable(daemon)
+        .ok_or_else(|| io::Error::other("replacement daemon executable could not be verified"))?;
+    if executable.path != target || !same_candidate(&executable.fingerprint, &installed) {
+        return Err(io::Error::other(
+            "replacement daemon did not use the installed executable",
+        ));
+    }
+    Ok(())
+}
+
+/// Use the normal rollback transaction for an owner-verified recovery target.
+pub(crate) fn replace_for_recovery(
+    target: &Path,
+    candidate: &Path,
+    expected_node: &str,
+    notifications: crate::protocol::NotificationDeliveryConfig,
+    running: bool,
+) -> io::Result<()> {
+    let baseline = fingerprint(target)?;
+    let pinned = fingerprint(candidate)?;
+    let handoff = || -> io::Result<()> {
+        if running {
+            let daemon = client::connect().map_err(|e| io::Error::other(e.to_string()))?;
+            if daemon
+                .node_identity()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                != expected_node
+            {
+                return Err(io::Error::other("Node identity changed before handoff"));
+            }
+            daemon
+                .restart_with_executable(target.to_path_buf(), notifications.clone())
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            verify_recovery_executable(&daemon, target)?;
+        }
+        Ok(())
+    };
+    replace_with_rollback_using(
+        &RecoveryTransactionFs,
+        ReplacementTransaction {
+            target,
+            candidate,
+            baseline: &baseline,
+            candidate_fingerprint: &pinned,
+        },
+        handoff,
+        handoff,
+        |warning| eprintln!("boomux: {warning}"),
+    )
+}
+
+// Recovery uses one reserved copy, so interruption cannot leave the installed
+// executable with an extra hard link or accumulate unbounded rollback files.
+struct RecoveryTransactionFs;
+impl TransactionFs for RecoveryTransactionFs {
+    fn backup_path(&self, parent: &Path) -> PathBuf {
+        parent.join(".boomux-recovery-backup")
+    }
+    fn backup_is_hard_link(&self) -> bool {
+        false
+    }
+    fn hard_link(&self, source: &Path, backup: &Path) -> io::Result<()> {
+        remove_recovery_temporary(backup)?;
+        let mut input = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(source)?;
+        let mode = input.metadata()?.mode() & 0o777;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(backup)?;
+        if io::copy(
+            &mut Read::by_ref(&mut input).take(MAX_EXECUTABLE_BYTES + 1),
+            &mut output,
+        )? > MAX_EXECUTABLE_BYTES
+        {
+            return Err(io::Error::other(
+                "recovery backup exceeds the executable bound",
+            ));
+        }
+        output.sync_all()
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        sync_directory(path)
+    }
+}
+
+/// Reclaim only the reserved, private temporary file while holding recovery's lock.
+pub(crate) fn remove_recovery_temporary(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() != 1
+        || metadata.len() > MAX_EXECUTABLE_BYTES
+    {
+        return Err(io::Error::other("unsafe recovery temporary file"));
+    }
+    fs::remove_file(path)
 }
 
 #[cfg(test)]
@@ -1612,6 +1740,34 @@ mod tests {
             b"/other/boomux\0daemon\0receive-handoff\0--channel\x00198\0",
             target
         ));
+    }
+
+    #[test]
+    fn recovery_replacement_rolls_back_without_linking_the_installed_file() {
+        let directory = temporary_directory();
+        let target = directory.join("boomux");
+        let candidate = directory.join("candidate");
+        fs::write(&target, b"old executable").unwrap();
+        fs::write(&candidate, b"new executable").unwrap();
+        let baseline = fingerprint(&target).unwrap();
+        let pinned = fingerprint(&candidate).unwrap();
+        let result = replace_with_rollback_using(
+            &RecoveryTransactionFs,
+            ReplacementTransaction {
+                target: &target,
+                candidate: &candidate,
+                baseline: &baseline,
+                candidate_fingerprint: &pinned,
+            },
+            || Err(io::Error::other("handoff failed")),
+            || Ok(()),
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"old executable");
+        assert_eq!(fs::metadata(&target).unwrap().nlink(), 1);
+        assert!(!directory.join(".boomux-recovery-backup").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

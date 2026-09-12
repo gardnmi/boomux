@@ -354,35 +354,41 @@ impl NodeRegistrationManager {
     ) -> io::Result<NodeRegistrationSnapshot> {
         validate_target(&target)?;
         validate_node_id(verified_node_id)?;
-        self.prepare_drain_commit(selector, expected_revision, timeout, |state, index| {
-            if state.registrations[index].snapshot.node_id != verified_node_id {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "new SSH target resolved to a different Boomux Node identity",
-                ));
-            }
-            if state.registrations[index].snapshot.target == target {
-                return Ok(state.registrations[index].snapshot.clone());
-            }
-            if state
-                .registrations
-                .iter()
-                .enumerate()
-                .any(|(other, registration)| {
-                    other != index && registration.snapshot.target == target
-                })
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "SSH target is already registered",
-                ));
-            }
-            let revision = next(state.revision, "registration revision")?;
-            state.revision = revision;
-            state.registrations[index].snapshot.target = target;
-            state.registrations[index].snapshot.revision = revision;
-            Ok(state.registrations[index].snapshot.clone())
-        })
+        self.prepare_drain_commit(
+            selector,
+            expected_revision,
+            timeout,
+            false,
+            |state, index| {
+                if state.registrations[index].snapshot.node_id != verified_node_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "new SSH target resolved to a different Boomux Node identity",
+                    ));
+                }
+                if state.registrations[index].snapshot.target == target {
+                    return Ok(state.registrations[index].snapshot.clone());
+                }
+                if state
+                    .registrations
+                    .iter()
+                    .enumerate()
+                    .any(|(other, registration)| {
+                        other != index && registration.snapshot.target == target
+                    })
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "SSH target is already registered",
+                    ));
+                }
+                let revision = next(state.revision, "registration revision")?;
+                state.revision = revision;
+                state.registrations[index].snapshot.target = target;
+                state.registrations[index].snapshot.revision = revision;
+                Ok(state.registrations[index].snapshot.clone())
+            },
+        )
     }
 
     pub(crate) fn forget(
@@ -391,13 +397,19 @@ impl NodeRegistrationManager {
         timeout: Duration,
     ) -> io::Result<NodeRegistrationSnapshot> {
         let expected_revision = self.inspect(selector)?.revision;
-        self.prepare_drain_commit(selector, expected_revision, timeout, |state, index| {
-            let tombstone_epoch = next(state.tombstone_epoch, "registration tombstone epoch")?;
-            state.tombstone_epoch = tombstone_epoch;
-            let mut removed = state.registrations.remove(index).snapshot;
-            removed.tombstone_epoch = tombstone_epoch;
-            Ok(removed)
-        })
+        self.prepare_drain_commit(
+            selector,
+            expected_revision,
+            timeout,
+            true,
+            |state, index| {
+                let tombstone_epoch = next(state.tombstone_epoch, "registration tombstone epoch")?;
+                state.tombstone_epoch = tombstone_epoch;
+                let mut removed = state.registrations.remove(index).snapshot;
+                removed.tombstone_epoch = tombstone_epoch;
+                Ok(removed)
+            },
+        )
     }
 
     pub(crate) fn begin_upgrade_maintenance_if(
@@ -586,6 +598,7 @@ impl NodeRegistrationManager {
         selector: &str,
         expected_revision: u64,
         timeout: Duration,
+        forget_maintenance: bool,
         mutate: impl FnOnce(&mut RegistrationState, usize) -> io::Result<NodeRegistrationSnapshot>,
     ) -> io::Result<NodeRegistrationSnapshot> {
         let mut state = self.lock_state()?;
@@ -593,7 +606,9 @@ impl NodeRegistrationManager {
         expire_maintenance(current);
         let index = find_index(current, selector)?;
         require_revision(&current.registrations[index], expected_revision)?;
-        if !current.registrations[index].admission_open {
+        let bypass_maintenance =
+            forget_maintenance && current.registrations[index].maintenance.is_some();
+        if !current.registrations[index].admission_open && !bypass_maintenance {
             return Err(registration_busy(&current.registrations[index]));
         }
         current.registrations[index].admission_epoch = next(
@@ -610,7 +625,8 @@ impl NodeRegistrationManager {
                 break;
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                current.registrations[index].admission_open = true;
+                current.registrations[index].admission_open =
+                    current.registrations[index].maintenance.is_none();
                 self.changed.notify_all();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -625,7 +641,8 @@ impl NodeRegistrationManager {
             if wait.timed_out() {
                 let current = available_mut(&mut state)?;
                 let index = find_index(current, selector)?;
-                current.registrations[index].admission_open = true;
+                current.registrations[index].admission_open =
+                    current.registrations[index].maintenance.is_none();
                 self.changed.notify_all();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -640,16 +657,22 @@ impl NodeRegistrationManager {
         let result = match mutate(&mut replacement, index) {
             Ok(result) => result,
             Err(error) => {
-                current.registrations[index].admission_open = true;
+                current.registrations[index].admission_open =
+                    current.registrations[index].maintenance.is_none();
                 self.changed.notify_all();
                 return Err(error);
             }
         };
-        if let Some(registration) = replacement.registrations.get_mut(index) {
-            registration.admission_open = true;
+        if let Some(registration) = replacement
+            .registrations
+            .iter_mut()
+            .find(|registration| registration.snapshot.node_id == result.node_id)
+        {
+            registration.admission_open = registration.maintenance.is_none();
         }
         if let Err(error) = save(&self.path, &replacement) {
-            current.registrations[index].admission_open = true;
+            current.registrations[index].admission_open =
+                current.registrations[index].maintenance.is_none();
             self.changed.notify_all();
             return Err(error);
         }
@@ -1275,6 +1298,70 @@ mod tests {
         assert!(manager.admit(&registration).unwrap());
         manager.release(&registration);
         fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn local_forget_does_not_wait_for_remote_maintenance() {
+        let path = path();
+        let manager = NodeRegistrationManager::load_at(path.clone());
+        let registration = manager
+            .add("work".into(), "offline".into(), node_id(2), &node_id(1))
+            .unwrap();
+        let (_, token) = manager
+            .begin_upgrade_maintenance_if(
+                "work",
+                registration.revision,
+                Duration::from_millis(1),
+                Duration::from_secs(60),
+                || true,
+            )
+            .unwrap();
+        manager.forget("work", Duration::from_millis(10)).unwrap();
+        assert!(manager.inspect("work").is_err());
+        assert!(!manager.has_active_upgrade_maintenance().unwrap());
+        assert!(
+            manager
+                .finish_upgrade_maintenance(&registration.node_id, &token)
+                .is_err()
+        );
+        assert!(
+            NodeRegistrationManager::load_at(path.clone())
+                .inspect("work")
+                .is_err()
+        );
+        fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_local_forget_preserves_the_maintenance_lease() {
+        let path = path();
+        let manager = NodeRegistrationManager::load_at(path.clone());
+        let registration = manager
+            .add("work".into(), "offline".into(), node_id(2), &node_id(1))
+            .unwrap();
+        let (_, token) = manager
+            .begin_upgrade_maintenance_if(
+                "work",
+                registration.revision,
+                Duration::from_millis(1),
+                Duration::from_secs(60),
+                || true,
+            )
+            .unwrap();
+        let parent = path.parent().unwrap();
+        let moved = parent.with_extension("saved");
+        fs::rename(parent, &moved).unwrap();
+        fs::write(parent, b"prevent persistence").unwrap();
+        assert!(manager.forget("work", Duration::from_millis(10)).is_err());
+        assert!(manager.has_active_upgrade_maintenance().unwrap());
+        assert!(!manager.admit(&registration).unwrap());
+        fs::remove_file(parent).unwrap();
+        fs::rename(&moved, parent).unwrap();
+        manager
+            .finish_upgrade_maintenance(&registration.node_id, &token)
+            .unwrap();
+        manager.forget("work", Duration::from_millis(10)).unwrap();
+        fs::remove_dir_all(parent.parent().unwrap()).unwrap();
     }
 
     #[test]

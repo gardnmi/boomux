@@ -35,3 +35,6 @@ mod workspace_creation;
 
 #[path = "native_backend/git_work.rs"]
 mod git_work;
+
+#[path = "native_backend/remote_maintenance.rs"]
+mod remote_maintenance;

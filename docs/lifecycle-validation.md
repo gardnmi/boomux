@@ -468,3 +468,26 @@ cargo clippy --all-targets --all-features -- -D warnings
 Reducer tests remain compatibility evidence, not substitutes for the live cases
 listed above. Future host-version bumps should append a dated record rather than
 silently reusing this one.
+
+
+## 2026-09-11: Isolated Linux Remote Maintenance Recovery
+
+The development binary at version 1.18.0/protocol 54 was exercised in isolated
+HOME, state, config, and runtime directories. These are local native-process
+fixtures, not validation against a deployed remote host or macOS.
+
+- Repaired a missing executable while retaining the existing Node identity and
+  saved data; repeated uninstall succeeded with no executable left to remove.
+- Updated a running owner at a custom user installation path, then repaired the
+  same owner after unlinking its executable. The Shell run identity and actual
+  process survived both executable handoffs. Removal stopped that owner.
+- Rejected changed identity, changed executable, unsafe directory links, and
+  incompatible saved state before executable replacement. Removal preserved
+  incompatible saved state instead of requiring it to load.
+- Kept a legacy update transaction intact, rejected a held recovery lock, and
+  reclaimed an abandoned recovery lock.
+
+Focused fixtures separately exercise integration cleanup failures, unfamiliar
+integration names, local forget during maintenance, failed forget persistence,
+rollback with a copied backup, and expiration of staged recovery helpers. These
+checks do not establish live mixed-version protocol-52 or macOS recovery support.
