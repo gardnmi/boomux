@@ -50,9 +50,25 @@ boomux-desktop
 
 The launcher starts or reuses the Boomux service automatically.
 
+## Conversations
+
+Select a Workspace and open **Conversations** in the lower sidebar. Conversations
+observed by Boomux integrations appear together across supported harnesses. Click
+**Open** to focus a running conversation or **Resume** to open its original
+harness in a floating terminal pane. Remote conversations stay on their owner;
+connect unavailable machines from Remotes first. Resume requires protocol 55 on
+the local daemon and remote owner. Harness history and the saved directory must
+still be available to the harness.
+
+Closing a terminal or Shell keeps its conversation entry. Renaming the Workspace
+keeps the association. Removing the Workspace removes its entries from Boomux,
+but does not delete the harness's own history files. A new Workspace with the
+same name starts empty. The first version lists conversations observed inside
+Boomux using recorded Agent names; it does not import outside harness history.
+
 ## Workspaces And Shells
 
-Desktop automatically removes Workspaces that have no Shells, including empty
+Desktop automatically removes Workspaces that have no Shells or recorded conversations, including empty
 entries left from earlier use. Opening a project again creates a fresh Workspace;
 project shortcuts and files on disk are preserved. Workspace-specific launchers,
 folder defaults, and retained Agent history are removed with the Workspace.

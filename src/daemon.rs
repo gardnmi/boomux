@@ -3294,6 +3294,10 @@ fn routed_response_timeout(operation: &RoutedOperation) -> Duration {
 }
 
 fn routed_owner_feature(operation: &RoutedOperation) -> Option<protocol::ProtocolFeature> {
+    if matches!(operation, RoutedOperation::OpenWorkspaceConversation { .. }) {
+        return Some(protocol::ProtocolFeature::WorkspaceConversations);
+    }
+
     if matches!(
         operation,
         RoutedOperation::SetAgentSessionDisplayName { .. }
@@ -13400,6 +13404,44 @@ impl DaemonService {
                 let workspace = self.create_workspace_mutation(undo, name, default_cwd, shells)?;
                 let events = workspace_created_events(&workspace);
                 Ok((Response::Workspace { workspace }, events))
+            }),
+            Request::OpenWorkspaceConversation {
+                workspace_id,
+                agent_id,
+                shell_id,
+            } => self.durable_mutation_outcome(|undo| {
+                validate_uuid(&shell_id, "conversation Shell key")?;
+                let workspace = self
+                    .durable
+                    .workspace(&workspace_id)?
+                    .snapshot(&self.durable)?;
+                let plan = crate::conversations::plan(&workspace, &agent_id, &shell_id)
+                    .map_err(|message| DaemonError::lifecycle(ErrorCode::NotFound, message))?;
+                match plan {
+                    crate::conversations::OpenPlan::Existing(shell) => {
+                        Ok(DurableMutation::Unchanged(Response::Shell {
+                            shell: *shell,
+                        }))
+                    }
+                    crate::conversations::OpenPlan::Resume(spec) => {
+                        let (shell, record) =
+                            self.durable
+                                .create_shell_exact(&workspace_id, &shell_id, spec)?;
+                        let Some(record) = record else {
+                            return Ok(DurableMutation::Unchanged(Response::Shell { shell }));
+                        };
+                        undo.record(record);
+                        let event = DaemonEventKind::ShellCreated {
+                            workspace_id,
+                            shell_id: shell.id.clone(),
+                            name: shell.name.clone(),
+                        };
+                        Ok(DurableMutation::Changed(
+                            Response::Shell { shell },
+                            vec![event],
+                        ))
+                    }
+                }
             }),
             Request::CreateWorkspaceShell {
                 workspace_id,

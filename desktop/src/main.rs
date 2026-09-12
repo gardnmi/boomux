@@ -1,5 +1,6 @@
 mod boomux_settings;
 mod bundle_update;
+mod conversations;
 mod project_search;
 use boomux::generated_names;
 mod git_panel;
@@ -1593,6 +1594,7 @@ struct Workspace {
     project_folder_picker_pending: bool,
     project_folder_picker_open: bool,
     nodes_open: bool,
+    conversations: conversations::Panel,
     node_views: Vec<nodes::NodeView>,
     nodes_error: Option<String>,
     node_forget_confirm: Option<String>,
@@ -1822,6 +1824,7 @@ impl Workspace {
             project_folder_picker_pending: false,
             project_folder_picker_open: false,
             nodes_open: false,
+            conversations: conversations::Panel::default(),
             node_views: Vec::new(),
             nodes_error: None,
             node_forget_confirm: None,
@@ -2428,7 +2431,10 @@ impl Workspace {
         visible_sidebar_items(&self.boomux_overview, &self.expanded_workspaces)
             .into_iter()
             .filter(|item| sidebar_item_visible_in_layout(self.pane_layout_mode, item))
-            .filter(|item| !self.git_panel.open || !matches!(item, SidebarItem::Agent { .. }))
+            .filter(|item| {
+                !(self.git_panel.open || self.conversations.open)
+                    || !matches!(item, SidebarItem::Agent { .. })
+            })
             .collect()
     }
 
@@ -5322,7 +5328,7 @@ impl Workspace {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let attached_shell = shell.clone();
+            let mut attached_shell = shell.clone();
             let result = cx
                 .background_spawn(async move {
                     TerminalSession::attach(shell, rows, cols, pixel_width, pixel_height)
@@ -5335,6 +5341,7 @@ impl Workspace {
                 pane.attaching = false;
                 match result {
                     Ok(terminal) => {
+                        attached_shell.run_id = terminal.run_id.clone();
                         let shell_id = terminal.shell_id.clone();
                         pane.screen = Some(terminal.screen());
                         pane.shell = Some(attached_shell);
@@ -5705,6 +5712,7 @@ impl Workspace {
                                 cx.notify();
                             }
                         }
+                        this.refresh_conversations(cx);
                         true
                     })
                     .unwrap_or(false);
@@ -6388,6 +6396,7 @@ impl Workspace {
     }
 
     fn open_nodes(&mut self, cx: &mut Context<Self>) {
+        self.conversations.open = false;
         self.project_menu_open = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
@@ -7806,8 +7815,10 @@ impl Workspace {
                                 .px_3()
                                 .py_1()
                                 .items_center()
-                                .children([0, 1, 2].map(|tab| {
-                                    let selected = if self.nodes_open {
+                                .children([0, 3, 1, 2].map(|tab| {
+                                    let selected = if self.conversations.open {
+                                        tab == 3
+                                    } else if self.nodes_open {
                                         tab == 2
                                     } else {
                                         tab == usize::from(self.git_panel.open)
@@ -7815,6 +7826,7 @@ impl Workspace {
                                     div()
                                         .id(match tab {
                                             0 => "sidebar-agents-tab",
+                                            3 => "sidebar-conversations-tab",
                                             1 => "sidebar-git-tab",
                                             _ => "sidebar-nodes-tab",
                                         })
@@ -7828,7 +7840,9 @@ impl Workspace {
                                             0x181825
                                         }))
                                         .text_color(rgb(if selected { 0xcdd6f4 } else { 0x7f849c }))
-                                        .child(if tab == 2 {
+                                        .child(if tab == 3 {
+                                            "Conversations".to_owned()
+                                        } else if tab == 2 {
                                             "Remotes".to_owned()
                                         } else if tab == 1 {
                                             "Git".to_owned()
@@ -7839,7 +7853,9 @@ impl Workspace {
                                         })
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             window.focus(&this.focus_handle, cx);
-                                            if tab == 2 {
+                                            if tab == 3 {
+                                                this.open_conversations(cx);
+                                            } else if tab == 2 {
                                                 this.open_nodes(cx);
                                             } else {
                                                 this.select_git_tab(tab == 1, cx);
@@ -7853,28 +7869,34 @@ impl Workspace {
                         )
                         .when_some(self.render_git_panel(cx), |section, git| section.child(git))
                         .when_some(self.nodes_panel(cx), |section, nodes| section.child(nodes))
-                        .when(!self.git_panel.open && !self.nodes_open, |section| {
-                            section.child(
-                                div()
-                                    .id("sidebar-agents-scroll")
-                                    .track_scroll(&self.sidebar_agent_scroll_handle)
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .px_3()
-                                    .pb_3()
-                                    .when(agent_rows.is_empty(), |list| {
-                                        list.child(
-                                            div()
-                                                .py_3()
-                                                .text_sm()
-                                                .text_color(rgb(0x6c7086))
-                                                .child("No active Boomux agents"),
-                                        )
-                                    })
-                                    .children(agent_rows),
-                            )
-                        }),
+                        .when_some(self.conversations_panel(cx), |section, panel| {
+                            section.child(panel)
+                        })
+                        .when(
+                            !self.git_panel.open && !self.nodes_open && !self.conversations.open,
+                            |section| {
+                                section.child(
+                                    div()
+                                        .id("sidebar-agents-scroll")
+                                        .track_scroll(&self.sidebar_agent_scroll_handle)
+                                        .flex_1()
+                                        .min_h_0()
+                                        .overflow_y_scroll()
+                                        .px_3()
+                                        .pb_3()
+                                        .when(agent_rows.is_empty(), |list| {
+                                            list.child(
+                                                div()
+                                                    .py_3()
+                                                    .text_sm()
+                                                    .text_color(rgb(0x6c7086))
+                                                    .child("No active Boomux agents"),
+                                            )
+                                        })
+                                        .children(agent_rows),
+                                )
+                            },
+                        ),
                 )
             })
             .when_some(settings_panel, |element, settings| element.child(settings))
@@ -12570,6 +12592,7 @@ mod pointer_tests {
                     id: id.into(),
                     name: id.into(),
                     shells: Vec::new(),
+                    has_conversations: false,
                     agent_count: 0,
                 })
                 .collect(),
@@ -12603,6 +12626,7 @@ mod pointer_tests {
                     desktop_setup: false,
                 })
                 .collect(),
+            has_conversations: false,
             agent_count: 0,
         };
         let overview = BoomuxOverview {
@@ -12827,6 +12851,7 @@ mod pointer_tests {
                 id: "workspace-1".into(),
                 name: "boomux-desktop".into(),
                 shells: vec![shell],
+                has_conversations: false,
                 agent_count: 1,
             }],
             agents: vec![AgentChoice {

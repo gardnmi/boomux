@@ -1166,3 +1166,18 @@ for up to ten minutes after its last renewal. This is distinct from the remote
 cleanup window. Rename, retarget, and new update/uninstall attempts report
 the remaining local lease time and resume after expiry. Local forget remains
 available during this lease.
+
+### Workspace conversations
+
+Protocol 55 adds the routed `OpenWorkspaceConversation` operation. Its inputs
+are owner-local Workspace and recorded Agent IDs plus a caller-generated exact
+Shell ID. The coordinator negotiates support on the owner before forwarding.
+The owner revalidates membership under its durable mutation gate and returns an
+exact current Shell or creates/reuses a pending native resume Shell. It never
+creates a missing Workspace. Literal harness arguments and the saved owner-side
+cwd remain on that Node. The result is attached using the existing exact-run
+remote attachment path; no local fallback executes a remote conversation.
+
+Desktop obtains conversation entries from live `GetWorkspace` results, not from
+provider catalogs or stale projection data. Removing a Workspace removes its
+entries with its Agent records. Legacy unscoped Session requests remain rejected.

@@ -69,6 +69,7 @@ pub struct WorkspaceChoice {
     pub name: String,
     pub shells: Vec<ShellChoice>,
     pub agent_count: usize,
+    pub has_conversations: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -454,6 +455,7 @@ enum EmulatorCommand {
 
 pub struct TerminalSession {
     pub shell_id: String,
+    pub run_id: Option<String>,
     pub shell_name: String,
     pub setup_workspace_cleanup: Option<SetupWorkspaceCleanup>,
     pub connect_result: Option<boomux::desktop_connect::ConnectResultReceiver>,
@@ -533,7 +535,7 @@ impl TerminalSession {
         spawn_reader(
             client,
             shell.id.clone(),
-            expected_run_id,
+            expected_run_id.clone(),
             stream,
             Arc::clone(&shared),
         );
@@ -544,6 +546,7 @@ impl TerminalSession {
         shared.set_status("attached");
 
         Ok(Self {
+            run_id: expected_run_id,
             shell_id: shell.id,
             shell_name: shell.name,
             setup_workspace_cleanup: None,
@@ -742,6 +745,7 @@ pub fn refresh_overview_and_nodes() -> (
             .iter()
             .filter(|workspace| {
                 workspace.shells.is_empty()
+                    && !workspace.has_conversations
                     && crate::remote::identity(&workspace.id).is_none_or(|id| {
                         nodes.as_ref().is_ok_and(|nodes| {
                             nodes
@@ -777,7 +781,7 @@ fn close_empty_workspace(client: &Client, id: &str) -> Result<bool, client::Clie
     use boomux::protocol::{RoutedOperation, RoutedOperationResult};
     let result = (|| {
         let workspace = crate::remote::workspace(client, id)?;
-        if !workspace.shells.is_empty() {
+        if !workspace.shells.is_empty() || !boomux::conversations::list(&workspace).is_empty() {
             return Ok(false);
         }
         if let Some(owner) = crate::remote::identity(id) {
@@ -881,6 +885,11 @@ fn append_remote_workspaces(
                 .or_default()
                 .push(shell);
         }
+        let retained_agent_workspaces: HashSet<_> = projection
+            .agents
+            .iter()
+            .map(|agent| agent.workspace_id.as_str())
+            .collect();
         let mut agent_counts = HashMap::<&str, usize>::new();
         for agent in &projection.agents {
             let current = shell_index
@@ -909,6 +918,7 @@ fn append_remote_workspaces(
                 id: crate::remote::key(&node.node_id, &workspace.id),
                 name: workspace.name.clone(),
                 shells,
+                has_conversations: retained_agent_workspaces.contains(workspace.id.as_str()),
                 agent_count: agent_counts
                     .get(workspace.id.as_str())
                     .copied()
@@ -1021,6 +1031,10 @@ fn overview_from_snapshot(snapshot: boomux::protocol::Snapshot) -> BoomuxOvervie
             id: workspace.id.clone(),
             name: workspace.name.clone(),
             shells,
+            has_conversations: workspace
+                .agents
+                .iter()
+                .any(|agent| agent.external_session_id.is_some()),
             agent_count,
         });
     }
@@ -1107,7 +1121,7 @@ fn agent_is_visible(state: AgentState, has_attention: bool, attached_to_current_
         || attached_to_current_run && !matches!(state, AgentState::Inactive | AgentState::Done)
 }
 
-fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
+pub(crate) fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
     ShellChoice {
         id: shell.id,
         name: shell.name,
@@ -3064,7 +3078,12 @@ mod tests {
         use boomux::protocol::{self, Envelope, ErrorCode, Request, Response};
         use std::os::unix::net::UnixListener;
 
-        for (has_shell, race) in [(true, false), (false, false), (false, true)] {
+        for (has_shell, has_conversation, race) in [
+            (true, false, false),
+            (false, false, false),
+            (false, false, true),
+            (false, true, false),
+        ] {
             let directory =
                 std::env::temp_dir().join(format!("desktop-empty-cleanup-{}", fastrand::u64(..)));
             std::fs::create_dir(&directory).unwrap();
@@ -3073,6 +3092,12 @@ mod tests {
             let mut workspace = setup_workspace_creation();
             if !has_shell {
                 workspace.shells.clear();
+            }
+            if has_conversation {
+                workspace.agents.push(serde_json::from_value(serde_json::json!({
+                    "id":"agent", "workspace_id":workspace.id, "shell_id":"removed", "run_id":"run", "name":"Conversation", "integration":"codex", "external_session_id":"thread", "started_at_ms":1,
+                    "observation":{"revision":1,"state":"inactive","authority":"lifecycle_integration","evidence":"","confidence":100,"observed_at_ms":1}
+                })).unwrap());
             }
             workspace.revision = 7;
             let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
@@ -3083,7 +3108,7 @@ mod tests {
                     },
                     Response::Workspace { workspace },
                 )];
-                if !has_shell {
+                if !has_shell && !has_conversation {
                     exchanges.push((
                         Request::GuardedCloseWorkspace {
                             workspace_id: "created-workspace".into(),
@@ -3126,7 +3151,7 @@ mod tests {
                 "created-workspace",
             )
             .unwrap();
-            assert_eq!(result, !has_shell && !race);
+            assert_eq!(result, !has_shell && !has_conversation && !race);
             finished_sender.send(()).unwrap();
             server.join().unwrap();
             std::fs::remove_dir_all(directory).unwrap();

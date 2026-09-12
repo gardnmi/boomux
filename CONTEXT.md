@@ -139,13 +139,28 @@ A foreground process hint is not an Agent Instance and is presented as Untracked
 An opaque identity assigned by an external harness and retained on an Agent
 Instance for lifecycle correlation, shared-runtime authority, and exact cold
 recovery. It is not a Boomux resource, history object, process, PTY, or lifecycle
-observation. Boomux does not list, inspect, rename, hide, open, or resume external
-history as a separate user-facing Session resource.
+observation. Boomux does not import external history as a separate user-facing
+Session resource. Workspace Conversations reference identities already recorded
+by integrations inside their owning Workspace.
 
 Two Agent Instances may carry the same integration and external session ID
 without becoming one durable Boomux entity. Every lifecycle mutation remains
 bound to an exact Agent Instance, Shell, and ShellRun. Compatibility decoders and
 old persisted presentation metadata do not restore a public Session model.
+
+## Workspace Conversation
+
+A Workspace-scoped entry derived from that Workspace's durable Agent records,
+identified by the owning Node, immutable Workspace ID, harness integration, and
+exact external conversation ID. Repeated runs are one entry within that Workspace.
+It is not an Agent lifecycle authority or a machine-wide harness history catalog.
+Closing a terminal or Shell preserves its entry while the Workspace exists.
+Renaming a Workspace preserves membership. Removing the Workspace removes its
+entries; recreating the same name does not recover them. Harness history files
+are not deleted. Directory names and Git working contexts do not transfer ownership.
+Opening focuses an exact current conversation run or asks the owning daemon to
+prepare a native resume Shell in the existing Workspace. It never recreates a
+missing Workspace or resumes on a different Node.
 
 ## Agent Working Context
 

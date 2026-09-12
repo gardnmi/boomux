@@ -271,7 +271,7 @@ floating panes over the current arrangement. They do not detach existing panes,
 change the expanded Workspace, or enter the saved arrangement. Closing a failed
 or cancelled setup leaves the underlying panes available.
 
-The lower sidebar has Agents, Git, and Remotes tabs. Remotes contains the scrollable
+The lower sidebar has Agents, Conversations, Git, and Remotes tabs. Remotes contains the scrollable
 machine cards with selected-machine details and create/update/sign-in controls.
 The general connect action sits above the cards, outside any machine's controls;
 it is no longer an overflow-menu popover. Node shortcuts apply only while the
@@ -560,3 +560,19 @@ Desktop layout document version 2 adds `hidden_remote_workspaces`. Version 1 is
 explicitly migrated with an empty hidden map while preserving its revision and
 arrangements. Unknown versions remain rejected. This is separate from daemon
 persistence and wire versions, which are unchanged.
+
+## Workspace Conversations
+
+`src/conversations.rs` owns the selected Workspace's conversation panel, loading,
+error, and open-request state. It fetches owner-confirmed Workspace snapshots in
+background work driven by the existing overview loop, at most every three seconds
+while visible. Selection changes discard the previous Workspace's entries; late
+responses are ignored. Rendering pages 50 entries at a time bounds UI work.
+
+The shared core projection groups recorded Agent runs by harness and exact
+conversation ID within one immutable Workspace. It does not inspect external
+history. Opening uses protocol 55 owner validation, focuses an existing exact-run
+pane, or attaches a floating pane without detaching the current layout. A failed
+or ambiguous open surfaces an error; retry retains its requested Shell ID.
+Missing/old remote owners never cause local execution. Empty Workspaces containing
+conversations are excluded from automatic empty-Workspace cleanup.
