@@ -115,7 +115,6 @@ mod tests {
         let make_workspace = |id: &str, shell_id: &str| terminal::WorkspaceChoice {
             id: id.into(),
             name: "same-name".into(),
-            has_conversations: false,
             agent_count: 0,
             shells: vec![ShellChoice {
                 id: shell_id.into(),

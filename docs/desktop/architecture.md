@@ -564,7 +564,7 @@ persistence and wire versions, which are unchanged.
 ## Workspace Conversations
 
 `src/conversations.rs` owns the selected Workspace's conversation panel, loading,
-error, and open-request state. It fetches owner-confirmed Workspace snapshots in
+error, and open-request state. It fetches owner-scoped conversation lists with cached harness titles in
 background work driven by the existing overview loop, at most every three seconds
 while visible. Selection changes discard the previous Workspace's entries; late
 responses are ignored. Rendering pages 50 entries at a time bounds UI work.
@@ -572,7 +572,8 @@ responses are ignored. Rendering pages 50 entries at a time bounds UI work.
 The shared core projection groups recorded Agent runs by harness and exact
 conversation ID within one immutable Workspace. It does not inspect external
 history. Opening uses protocol 55 owner validation, focuses an existing exact-run
-pane, or attaches a floating pane without detaching the current layout. A failed
+pane, or attaches a tiled pane without detaching the current layout. A failed
 or ambiguous open surfaces an error; retry retains its requested Shell ID.
-Missing/old remote owners never cause local execution. Empty Workspaces containing
-conversations are excluded from automatic empty-Workspace cleanup.
+Missing/old remote owners never cause local execution. Overview refresh is read-only: all user Workspaces remain until explicitly
+removed, including those without Shells or recorded conversations. The exact
+creation-receipt cleanup of temporary setup Workspaces remains separate.

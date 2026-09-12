@@ -13,8 +13,8 @@ working directories, and worktrees do not create or transfer associations.
 There is no import of conversations created outside Boomux in this first version.
 No additional durable schema is introduced. Workspace deletion already removes
 the Agent records and therefore removes every entry. Shell deletion does not.
-Desktop retains otherwise empty Workspaces with recorded conversations until
-explicit removal. Harness-owned conversation history is never deleted.
+Desktop retains all user Workspaces until explicit removal, including those
+without Shells or recorded conversations. Harness-owned conversation history is never deleted.
 
 Protocol 55 introduces a narrowly scoped open operation. Under the owner's
 mutation gate it revalidates the Agent/Workspace relationship, returns an exact
