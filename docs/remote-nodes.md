@@ -1113,3 +1113,9 @@ state, or forget the machine. In **Remotes → Hidden Workspaces**, select
 requires connectivity. **Forget connection only** on the machine card removes
 all that machine's cached entries and its local registration without contacting
 the owner. These operations have distinct scopes.
+
+A completed remote update retains its transaction lock and rollback files for
+up to three minutes while watchdog cleanup finishes. Another update during
+that window returns `busy` before uploading or replacing anything. This explicit
+refusal releases the attempted update's local maintenance window; it must not
+be presented as an unknown upgrade outcome. Wait for cleanup before retrying.

@@ -1947,6 +1947,11 @@ impl BootstrapSession {
                 ));
             }
             Err(first_error) => {
+                // Exit 73 is an explicit refusal before this transaction owns
+                // the lock. Do not retry or claim an unknown mutation outcome.
+                if error_code(&first_error) == "busy" {
+                    return Err(first_error);
+                }
                 if let Err(error) = maintenance() {
                     let failure = post_install_failure("stream", error);
                     return Err(
@@ -3852,7 +3857,7 @@ fn classify_ssh_command_failure(status: Option<i32>, stderr: &[u8]) -> io::Error
         return classified_error(
             io::ErrorKind::ResourceBusy,
             "busy",
-            "another remote Boomux bootstrap transaction is active",
+            "another remote Boomux update is active or finishing cleanup; wait up to three minutes and retry",
         );
     }
     if status == Some(92) {
@@ -7454,6 +7459,77 @@ mod tests {
         assert!(backup.exists());
         assert_eq!(fs::read_to_string(&count).unwrap(), "2");
         drop(connection);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_upgrade_busy_upload_does_not_retry_or_claim_unknown_outcome() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let destination = runtime.join("destination");
+        let backup = runtime.join("backup");
+        let count = runtime.join("count");
+        let committed = runtime.join("committed");
+        let restarted = runtime.join("restarted");
+        fs::write(&destination, b"previous-helper").unwrap();
+        let node_id = Uuid::new_v4().to_string();
+        let helper = compatible_helper_script(&node_id);
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) printf x >> {committed}; exit 73 ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 3 ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *': > \"$transaction/restarted\"'*) cat >/dev/null; : > {restarted} ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) : > {restarted} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {helper} ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                count = quote_posix_shell(count.to_str().unwrap()),
+                committed = quote_posix_shell(committed.to_str().unwrap()),
+                restarted = quote_posix_shell(restarted.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        add_fake_daemon_identity(&ssh, "/home/person/.local/bin/boomux");
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                bytes: b"replacement".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+            intent: RemoteInstallIntent::ExplicitRegisteredUpgrade {
+                expected_node_id: node_id,
+            },
+        };
+
+        let error = session
+            .install_and_connect(&plan, Duration::from_secs(1))
+            .err()
+            .expect("busy upload must fail");
+        assert_eq!(error_code(&error), "busy");
+        assert_eq!(
+            recovery_disposition(&error),
+            BootstrapRecoveryDisposition::NoRemoteMutation
+        );
+        assert!(error.to_string().contains("three minutes"));
+        assert_eq!(fs::read(&committed).unwrap(), b"x");
+        assert!(!restarted.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"previous-helper");
         fs::remove_dir_all(runtime).unwrap();
     }
 
