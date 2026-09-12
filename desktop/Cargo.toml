@@ -1,6 +1,6 @@
 [package]
 name = "boomux-desktop"
-version = "1.19.0"
+version = "1.19.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/gardnmi/boomux"
