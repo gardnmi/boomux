@@ -187,6 +187,10 @@ command path and republishes a screen without reconnecting the Boomux Shell.
 ## Rendering
 
 Text cells and Kitty image placements come from the same Ghostty terminal state.
+Each screen carries its resolved terminal background, including application OSC
+changes; the terminal canvas and padding use that color rather than the app
+canvas color. SGR faint text retains its palette/truecolor value and renders at
+50% foreground opacity, including underlines.
 The GPUI layer draws background images, cells, and foreground images in z-order,
 clips every placement to its pane, and caches GPU images by terminal generation.
 Images are explicitly dropped when their generation disappears or their pane

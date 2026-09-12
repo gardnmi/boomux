@@ -10927,7 +10927,7 @@ fn prepare_terminal_paint(
                     color: terminal_theme.cursor,
                 });
             }
-            if background != terminal_theme.background {
+            if background != screen.background {
                 backgrounds.push(TerminalBackground {
                     row,
                     col,
@@ -10950,15 +10950,21 @@ fn prepare_terminal_paint(
             if cell.italic {
                 cell_font = cell_font.italic();
             }
+            let mut text_color = rgb_to_hsla(gpui::rgb(foreground));
+            // Match Ghostty's default faint opacity without changing the cell
+            // background or its palette/truecolor value.
+            if cell.faint {
+                text_color.alpha = 0.5;
+            }
             push_text_run(
                 &mut runs,
                 TextRun {
                     len: text.len() - start,
                     font: cell_font,
-                    color: rgb_to_hsla(gpui::rgb(foreground)),
+                    color: text_color,
                     underline: cell.underline.then_some(UnderlineStyle {
                         thickness: px(1.0),
-                        color: Some(rgb_to_hsla(gpui::rgb(foreground))),
+                        color: Some(text_color),
                         wavy: false,
                     }),
                     ..Default::default()
@@ -10985,7 +10991,8 @@ fn prepare_terminal_paint(
 
 fn terminal_view(paint_cache: Arc<TerminalPaintCache>, images: Vec<RenderedTerminalImage>) -> Div {
     let cached_paint = Arc::clone(&paint_cache);
-    div().size_full().overflow_hidden().bg(rgb(0x11111b)).child(
+    let background = gpui::rgb(paint_cache.screen.background);
+    div().size_full().overflow_hidden().bg(background).child(
         canvas(
             move |_, _, _| images,
             move |bounds, images, window, cx| {
@@ -12015,6 +12022,7 @@ mod pointer_tests {
     #[test]
     fn terminal_selection_drag_uses_only_source_pane_bounds_and_mouse_down_anchor() {
         let screen = TerminalScreen {
+            background: 0,
             rows: 24,
             cols: 80,
             cells: Vec::new(),
@@ -12087,6 +12095,7 @@ mod pointer_tests {
                 foreground: 0xffffff,
                 background: 0,
                 bold: false,
+                faint: false,
                 italic: false,
                 underline: false,
                 wide: false,
@@ -12095,6 +12104,7 @@ mod pointer_tests {
             })
             .collect();
         TerminalScreen {
+            background: 0,
             rows: 2,
             cols: 4,
             cells,
