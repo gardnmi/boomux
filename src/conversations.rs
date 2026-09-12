@@ -4,7 +4,7 @@ use crate::protocol::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
     pub agent_id: String,
     pub integration: String,
@@ -85,6 +85,32 @@ pub fn list(workspace: &WorkspaceSnapshot) -> Vec<Conversation> {
             .then(a.agent_id.cmp(&b.agent_id))
     });
     entries
+}
+
+/// Enrich recorded entries from an owner-scoped catalog by exact harness and external identity.
+/// Catalog-only history never creates a Workspace conversation.
+pub(crate) fn enrich_titles(
+    entries: &mut [Conversation],
+    sessions: &[crate::host_session_titles::HostSession],
+) {
+    let titles: HashMap<_, _> = sessions
+        .iter()
+        .map(|session| {
+            (
+                (session.integration.as_str(), session.root_id.as_str()),
+                session.title.trim(),
+            )
+        })
+        .filter(|(_, title)| !title.is_empty())
+        .collect();
+    for entry in entries {
+        if let Some(title) = titles.get(&(
+            entry.integration.as_str(),
+            entry.external_session_id.as_str(),
+        )) {
+            entry.title = (*title).to_owned();
+        }
+    }
 }
 
 pub enum OpenPlan {
@@ -176,6 +202,32 @@ mod tests {
             {"id":"a1", "workspace_id":"workspace-a", "shell_id":"removed", "run_id":"r1", "name":"Investigate issue", "integration":"codex", "external_session_id":"thread-1", "started_at_ms":1, "observation":{"revision":1,"state":"inactive","authority":"lifecycle_integration","evidence":"","confidence":100,"observed_at_ms":2}},
             {"id":"a2", "workspace_id":"workspace-a", "shell_id":"removed", "run_id":"r2", "name":"Investigate issue", "integration":"codex", "external_session_id":"thread-1", "started_at_ms":3, "observation":{"revision":1,"state":"inactive","authority":"lifecycle_integration","evidence":"","confidence":100,"observed_at_ms":4}}
         ]})).unwrap()
+    }
+    #[test]
+    fn conversation_titles_match_exact_harness_and_session_without_importing_history() {
+        let mut entries = list(&workspace());
+        let mut title = crate::host_session_titles::HostSession {
+            integration: "codex".into(),
+            root_id: "thread-1".into(),
+            title: "Respond to greeting".into(),
+            directory: "/tmp".into(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        enrich_titles(&mut entries, &[title.clone()]);
+        assert_eq!(entries[0].title, "Respond to greeting");
+        title.title = "Renamed thread".into();
+        enrich_titles(&mut entries, &[title.clone()]);
+        assert_eq!(entries[0].title, "Renamed thread");
+        title.integration = "claude".into();
+        title.title = "Wrong harness".into();
+        enrich_titles(&mut entries, &[title.clone()]);
+        assert_eq!(entries[0].title, "Renamed thread");
+        title.integration = "codex".into();
+        title.root_id = "outside-boomux".into();
+        enrich_titles(&mut entries, &[title]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Renamed thread");
     }
     #[test]
     fn conversation_entries_survive_shell_removal_and_deduplicate_runs() {

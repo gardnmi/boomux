@@ -2320,6 +2320,21 @@ fn workspace_conversations_open_resume_and_disappear_with_owner_workspace() {
             }],
         )
         .unwrap();
+    let operation = boomux::protocol::HostServiceOperation::ListWorkspaceConversations {
+        workspace_id: workspace.id.clone(),
+    };
+    assert!(
+        matches!(daemon.client.host_service(operation.clone()).unwrap(),
+        boomux::protocol::HostServiceResult::WorkspaceConversations { conversations } if conversations.is_empty())
+    );
+    let old = versioned_request(&daemon.client, 54, Request::HostService { operation });
+    assert!(matches!(
+        old,
+        Response::Error {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }
+    ));
     let original = &workspace.shells[0];
     let attachment = daemon
         .client

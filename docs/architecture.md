@@ -333,7 +333,9 @@ Shell inside the durable mutation gate, publishing only after persistence.
 It never creates a Workspace. Local clients, coordinators, and remote owners
 require protocol 55 for this operation; old versions receive `unsupported_version`.
 Ordinary Workspace snapshots supply the recorded conversation inputs, with no
-new persistence fields, provider-history discovery, or remote projection fields.
+new persistence fields or remote projection fields. The protocol-55
+`ListWorkspaceConversations` host service adds owner-local title enrichment using
+bounded cached harness readers; it never imports catalog-only conversations.
 ADR 0018 defines this narrower feature separately from the retired Session APIs.
 
 Protocol 54 adds `create_started_shell`: local `CreateStartedShell` creates a

@@ -255,7 +255,6 @@ impl Workspace {
     }
 
     pub(crate) fn select_git_tab(&mut self, git: bool, cx: &mut Context<Self>) {
-        self.conversations.open = false;
         self.nodes_open = false;
         if self.git_panel.open == git {
             self.save_settings();

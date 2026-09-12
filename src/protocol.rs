@@ -261,6 +261,9 @@ pub enum HostServiceOperation {
         shell_id: String,
         run_id: String,
     },
+    ListWorkspaceConversations {
+        workspace_id: String,
+    },
     ListAgentSessions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_id: Option<String>,
@@ -486,6 +489,9 @@ pub enum HostServiceResult {
         shell_id: String,
         run_id: String,
         agents: Vec<AgentInstanceSnapshot>,
+    },
+    WorkspaceConversations {
+        conversations: Vec<crate::conversations::Conversation>,
     },
     AgentSessions {
         sessions: Vec<HostAgentSessionSummary>,
@@ -2239,6 +2245,13 @@ impl Request {
                 operation: HostServiceOperation::GitOverview { .. },
                 ..
             } => Some(ProtocolFeature::GitWorkOverview),
+            Self::HostService {
+                operation: HostServiceOperation::ListWorkspaceConversations { .. },
+            }
+            | Self::RouteNodeHostService {
+                operation: HostServiceOperation::ListWorkspaceConversations { .. },
+                ..
+            } => Some(ProtocolFeature::WorkspaceConversations),
             Self::HostService { .. }
             | Self::RouteNodeHostService { .. }
             | Self::ResumeAgentSession { .. }
@@ -2907,6 +2920,25 @@ mod tests {
             let encoded = serde_json::to_vec(&request).unwrap();
             assert_eq!(
                 serde_json::from_slice::<Request>(&encoded).unwrap(),
+                request
+            );
+        }
+        for request in [
+            Request::HostService {
+                operation: HostServiceOperation::ListWorkspaceConversations {
+                    workspace_id: "w".into(),
+                },
+            },
+            Request::RouteNodeHostService {
+                node_id: "owner".into(),
+                operation: HostServiceOperation::ListWorkspaceConversations {
+                    workspace_id: "w".into(),
+                },
+            },
+        ] {
+            assert_eq!(request.minimum_protocol_version(), 55);
+            assert_eq!(
+                serde_json::from_slice::<Request>(&serde_json::to_vec(&request).unwrap()).unwrap(),
                 request
             );
         }

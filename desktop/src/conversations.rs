@@ -44,15 +44,14 @@ impl Workspace {
     }
 
     pub(crate) fn open_conversations(&mut self, cx: &mut Context<Self>) {
-        self.select_git_tab(false, cx);
-        self.conversations.open = true;
+        self.conversations.open = !self.conversations.open;
         self.conversations.next_refresh = None;
         self.refresh_conversations(cx);
         cx.notify();
     }
 
     pub(crate) fn refresh_conversations(&mut self, cx: &mut Context<Self>) {
-        if !self.conversations.open || !self.sidebar_visible || self.settings_open {
+        if !self.conversations.open || self.settings_open {
             return;
         }
         let workspace = self.conversation_workspace();
@@ -81,8 +80,18 @@ impl Workspace {
             let requested = key.clone();
             let result = cx.background_spawn(async move {
                 let client = boomux::client::connect_if_running().map_err(|e| e.to_string())?.ok_or("Boomux is not running")?;
-                let workspace = remote::workspace(&client, &requested).map_err(|e| e.to_string())?;
-                Ok::<_, String>(boomux::conversations::list(&workspace))
+                let owner = remote::identity(&requested);
+                let operation = boomux::protocol::HostServiceOperation::ListWorkspaceConversations {
+                    workspace_id: owner.as_ref().map_or(requested.as_str(), |id| id.inner_id.as_str()).to_owned(),
+                };
+                let result = match owner {
+                    Some(owner) => client.route_node_host_service(owner.node_id, operation),
+                    None => client.host_service(operation),
+                }.map_err(|error| error.to_string())?;
+                match result {
+                    boomux::protocol::HostServiceResult::WorkspaceConversations { conversations } => Ok(conversations),
+                    _ => Err("Unexpected conversation response".to_owned()),
+                }
             }).await;
             this.update(cx, |this, cx| {
                 this.conversations.loading = false;
@@ -278,6 +287,42 @@ impl Workspace {
         } else if selected.is_some() {
             list = list.child(div().text_sm().child("Loading…"));
         }
-        Some(list.into_any_element())
+        Some(
+            div()
+                .id("conversations-drawer")
+                .absolute()
+                .right_0()
+                .top_0()
+                .bottom_0()
+                .w(px(400.0))
+                .max_w_full()
+                .flex()
+                .flex_col()
+                .occlude()
+                .bg(rgb(0x181825))
+                .border_l_1()
+                .border_color(rgb(0x313244))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_3()
+                        .py_3()
+                        .child("Conversations")
+                        .child(
+                            div()
+                                .id("close-conversations")
+                                .cursor_pointer()
+                                .child("Close")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.conversations.open = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(list)
+                .into_any_element(),
+        )
     }
 }

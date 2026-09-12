@@ -9902,6 +9902,27 @@ impl DaemonService {
                 shell_id,
                 run_id,
             }),
+            HostServiceOperation::ListWorkspaceConversations { workspace_id } => {
+                let workspace = self.workspace(&workspace_id)?.snapshot(&self.durable)?;
+                let mut conversations = crate::conversations::list(&workspace);
+                if !conversations.is_empty() {
+                    let snapshot = Snapshot {
+                        workspaces: vec![workspace],
+                        focused_terminal: None,
+                    };
+                    let integrations = conversations
+                        .iter()
+                        .map(|entry| entry.integration.as_str())
+                        .collect::<HashSet<_>>();
+                    let requests = host_services::session_catalog_requests(&snapshot)
+                        .into_iter()
+                        .filter(|request| integrations.contains(request.integration.as_str()))
+                        .collect::<Vec<_>>();
+                    let catalog = self.host_session_catalog.records(&requests)?;
+                    crate::conversations::enrich_titles(&mut conversations, &catalog);
+                }
+                Ok(HostServiceResult::WorkspaceConversations { conversations })
+            }
             HostServiceOperation::ListAgentSessions { .. }
             | HostServiceOperation::InspectAgentSession { .. }
             | HostServiceOperation::ResolveAgentSession { .. } => Err(DaemonError::lifecycle(
@@ -10280,7 +10301,8 @@ impl DaemonService {
         );
         let response_timeout = match &operation {
             HostServiceOperation::ListAgentSessions { .. }
-            | HostServiceOperation::InspectAgentSession { .. } => {
+            | HostServiceOperation::InspectAgentSession { .. }
+            | HostServiceOperation::ListWorkspaceConversations { .. } => {
                 REGISTERED_NODE_SESSION_RESPONSE_TIMEOUT
             }
             _ => REGISTERED_NODE_RESPONSE_TIMEOUT,

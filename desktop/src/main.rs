@@ -2431,10 +2431,7 @@ impl Workspace {
         visible_sidebar_items(&self.boomux_overview, &self.expanded_workspaces)
             .into_iter()
             .filter(|item| sidebar_item_visible_in_layout(self.pane_layout_mode, item))
-            .filter(|item| {
-                !(self.git_panel.open || self.conversations.open)
-                    || !matches!(item, SidebarItem::Agent { .. })
-            })
+            .filter(|item| !self.git_panel.open || !matches!(item, SidebarItem::Agent { .. }))
             .collect()
     }
 
@@ -6396,7 +6393,6 @@ impl Workspace {
     }
 
     fn open_nodes(&mut self, cx: &mut Context<Self>) {
-        self.conversations.open = false;
         self.project_menu_open = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
@@ -7809,16 +7805,26 @@ impl Workspace {
                         )
                         .child(
                             div()
+                                .id("open-workspace-conversations")
+                                .px_3()
+                                .py_2()
+                                .text_sm()
+                                .cursor_pointer()
+                                .child("Conversations →")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.open_conversations(cx)),
+                                ),
+                        )
+                        .child(
+                            div()
                                 .flex()
                                 .flex_none()
                                 .gap_3()
                                 .px_3()
                                 .py_1()
                                 .items_center()
-                                .children([0, 3, 1, 2].map(|tab| {
-                                    let selected = if self.conversations.open {
-                                        tab == 3
-                                    } else if self.nodes_open {
+                                .children([0, 1, 2].map(|tab| {
+                                    let selected = if self.nodes_open {
                                         tab == 2
                                     } else {
                                         tab == usize::from(self.git_panel.open)
@@ -7826,7 +7832,6 @@ impl Workspace {
                                     div()
                                         .id(match tab {
                                             0 => "sidebar-agents-tab",
-                                            3 => "sidebar-conversations-tab",
                                             1 => "sidebar-git-tab",
                                             _ => "sidebar-nodes-tab",
                                         })
@@ -7840,9 +7845,7 @@ impl Workspace {
                                             0x181825
                                         }))
                                         .text_color(rgb(if selected { 0xcdd6f4 } else { 0x7f849c }))
-                                        .child(if tab == 3 {
-                                            "Conversations".to_owned()
-                                        } else if tab == 2 {
+                                        .child(if tab == 2 {
                                             "Remotes".to_owned()
                                         } else if tab == 1 {
                                             "Git".to_owned()
@@ -7853,9 +7856,7 @@ impl Workspace {
                                         })
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             window.focus(&this.focus_handle, cx);
-                                            if tab == 3 {
-                                                this.open_conversations(cx);
-                                            } else if tab == 2 {
+                                            if tab == 2 {
                                                 this.open_nodes(cx);
                                             } else {
                                                 this.select_git_tab(tab == 1, cx);
@@ -7869,34 +7870,28 @@ impl Workspace {
                         )
                         .when_some(self.render_git_panel(cx), |section, git| section.child(git))
                         .when_some(self.nodes_panel(cx), |section, nodes| section.child(nodes))
-                        .when_some(self.conversations_panel(cx), |section, panel| {
-                            section.child(panel)
-                        })
-                        .when(
-                            !self.git_panel.open && !self.nodes_open && !self.conversations.open,
-                            |section| {
-                                section.child(
-                                    div()
-                                        .id("sidebar-agents-scroll")
-                                        .track_scroll(&self.sidebar_agent_scroll_handle)
-                                        .flex_1()
-                                        .min_h_0()
-                                        .overflow_y_scroll()
-                                        .px_3()
-                                        .pb_3()
-                                        .when(agent_rows.is_empty(), |list| {
-                                            list.child(
-                                                div()
-                                                    .py_3()
-                                                    .text_sm()
-                                                    .text_color(rgb(0x6c7086))
-                                                    .child("No active Boomux agents"),
-                                            )
-                                        })
-                                        .children(agent_rows),
-                                )
-                            },
-                        ),
+                        .when(!self.git_panel.open && !self.nodes_open, |section| {
+                            section.child(
+                                div()
+                                    .id("sidebar-agents-scroll")
+                                    .track_scroll(&self.sidebar_agent_scroll_handle)
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .px_3()
+                                    .pb_3()
+                                    .when(agent_rows.is_empty(), |list| {
+                                        list.child(
+                                            div()
+                                                .py_3()
+                                                .text_sm()
+                                                .text_color(rgb(0x6c7086))
+                                                .child("No active Boomux agents"),
+                                        )
+                                    })
+                                    .children(agent_rows),
+                            )
+                        }),
                 )
             })
             .when_some(settings_panel, |element, settings| element.child(settings))
@@ -10731,6 +10726,9 @@ impl Render for Workspace {
             .flex()
             .child(drawer)
             .child(terminal_area)
+            .when_some(self.conversations_panel(cx), |content, panel| {
+                content.child(panel)
+            })
             .when(!self.sidebar_visible, |content| {
                 content.child(
                     div()
