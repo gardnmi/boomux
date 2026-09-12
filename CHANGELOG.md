@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.19.1](https://github.com/gardnmi/boomux/compare/v1.19.0...v1.19.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* **desktop:** prioritize modal input over open panels ([#421](https://github.com/gardnmi/boomux/issues/421)) ([548aa82](https://github.com/gardnmi/boomux/commit/548aa82674842b55c6c06023af80cec6605063b3))
+
 ## [1.19.0](https://github.com/gardnmi/boomux/compare/v1.18.0...v1.19.0) (2026-09-12)
 
 
