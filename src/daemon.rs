@@ -9930,11 +9930,17 @@ impl DaemonService {
                     };
                     let integrations = conversations
                         .iter()
-                        .map(|entry| entry.integration.as_str())
+                        .map(|entry| {
+                            crate::conversations::canonical_integration(&entry.integration)
+                        })
                         .collect::<HashSet<_>>();
                     let requests = host_services::session_catalog_requests(&snapshot)
                         .into_iter()
-                        .filter(|request| integrations.contains(request.integration.as_str()))
+                        .filter(|request| {
+                            integrations.contains(crate::conversations::canonical_integration(
+                                &request.integration,
+                            ))
+                        })
                         .collect::<Vec<_>>();
                     let catalog = self.host_session_catalog.records(&requests)?;
                     crate::conversations::enrich_titles(&mut conversations, &catalog);
