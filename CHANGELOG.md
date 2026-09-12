@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.18.0](https://github.com/gardnmi/boomux/compare/v1.17.0...v1.18.0) (2026-09-12)
+
+
+### Features
+
+* **desktop:** streamline remote workspace setup and connection management ([#415](https://github.com/gardnmi/boomux/issues/415)) ([2acf3ac](https://github.com/gardnmi/boomux/commit/2acf3acfafdc3c55366976bc1b354cea8fe41108))
+
+
+### Bug Fixes
+
+* **desktop:** preserve terminal background and faint colors ([#418](https://github.com/gardnmi/boomux/issues/418)) ([d0ff62f](https://github.com/gardnmi/boomux/commit/d0ff62fab0803d9a4439864afaf93c3f709d2b4a))
+
 ## [1.17.0](https://github.com/gardnmi/boomux/compare/v1.16.1...v1.17.0) (2026-09-11)
 
 
