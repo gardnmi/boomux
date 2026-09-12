@@ -3,6 +3,7 @@ mod bundle_update;
 mod project_search;
 use boomux::generated_names;
 mod git_panel;
+mod input_routing;
 mod layout;
 mod layout_badge;
 mod layout_persistence;
@@ -30,6 +31,7 @@ use gpui::{
     UnderlineStyle, Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint,
     fill, font, point, prelude::*, px, relative, rgb_to_hsla, rgba, size,
 };
+use input_routing::{InputOverlays, InputTarget};
 use layout::{Axis, Direction, Node, Rect};
 use terminal::{
     AgentChoice, BoomuxOverview, ShellChoice, TerminalImagePlacement, TerminalScreen,
@@ -4316,6 +4318,15 @@ impl Workspace {
 
     fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if let Some(dialog) = self.resource_dialog.as_mut() {
+                if dialog.kind == ResourceDialogKind::Rename && !dialog.busy {
+                    append_resource_name(&mut dialog.value, &text);
+                    dialog.error = None;
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if self.project_menu_open {
                 if !self.remote_picker_open {
                     project_search::append(&mut self.project_search, &text);
@@ -4330,19 +4341,7 @@ impl Workspace {
                 cx.notify();
                 return;
             }
-            if let Some(ResourceDialog {
-                kind: ResourceDialogKind::Rename,
-                value,
-                busy: false,
-                ..
-            }) = self.resource_dialog.as_mut()
-            {
-                append_resource_name(value, &text);
-                cx.stop_propagation();
-                cx.notify();
-            } else {
-                self.paste_into_focused(&text, cx);
-            }
+            self.paste_into_focused(&text, cx);
         }
     }
 
@@ -4944,12 +4943,31 @@ impl Workspace {
         }
     }
 
+    fn keyboard_input_target(&self) -> InputTarget {
+        InputOverlays {
+            resource_dialog: self.resource_dialog.is_some(),
+            remote_picker: self.project_menu_open && self.remote_picker_open,
+            project_search: self.project_menu_open,
+            git_search: self.git_panel.search_focused,
+            remotes: self.nodes_open && self.navigation_region == NavigationRegion::Sidebar,
+            settings_restart: self.settings_restart_confirm,
+            settings_input: self.boomux_setting_input.is_some(),
+            help: self.help_open,
+        }
+        .target()
+    }
+
     fn terminal_key_down(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let input_target = self.keyboard_input_target();
+        if input_target == InputTarget::ResourceDialog {
+            self.resource_dialog_key_down(event, window, cx);
+            return;
+        }
         if event.keystroke.key == "space" && self.layout_leader_pressed_at.is_some() {
             self.layout_leader_release_task = None;
             cx.stop_propagation();
@@ -4964,7 +4982,7 @@ impl Workspace {
         } else if !event.is_held {
             self.layout_suppressed_keys.remove(&event.keystroke.key);
         }
-        if self.project_menu_open && self.remote_picker_open {
+        if input_target == InputTarget::RemotePicker {
             let modifiers = event.keystroke.modifiers;
             if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
                 cx.stop_propagation();
@@ -5009,7 +5027,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        if self.project_menu_open {
+        if input_target == InputTarget::ProjectSearch {
             match event.keystroke.key.as_str() {
                 "escape" => self.project_menu_open = false,
                 "backspace" => {
@@ -5035,7 +5053,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        if self.git_panel.search_focused {
+        if input_target == InputTarget::GitSearch {
             match event.keystroke.key.as_str() {
                 "escape" | "enter" => self.git_panel.search_focused = false,
                 "backspace" => {
@@ -5058,7 +5076,7 @@ impl Workspace {
             return;
         }
 
-        if self.nodes_open && self.navigation_region == NavigationRegion::Sidebar {
+        if input_target == InputTarget::Remotes {
             let modifiers = event.keystroke.modifiers;
             if modifiers.control
                 || modifiers.alt
@@ -5112,7 +5130,7 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        if self.settings_restart_confirm {
+        if input_target == InputTarget::SettingsRestart {
             if event.keystroke.key == "escape" {
                 self.settings_restart_confirm = false;
                 cx.notify();
@@ -5120,16 +5138,12 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        if self.boomux_setting_input.is_some() {
+        if input_target == InputTarget::SettingsInput {
             self.boomux_setting_key_down(event, cx);
             return;
         }
-        if self.help_open {
+        if input_target == InputTarget::Help {
             self.help_key_down(event, cx);
-            return;
-        }
-        if self.resource_dialog.is_some() {
-            self.resource_dialog_key_down(event, window, cx);
             return;
         }
         if self.settings_open && event.keystroke.key == "escape" {
@@ -10704,16 +10718,12 @@ impl Render for Workspace {
             })
             .track_focus(&self.focus_handle)
             .key_context(
-                if (self.nodes_open && self.navigation_region == NavigationRegion::Sidebar)
-                    || self.git_panel.search_focused
-                    || self.project_menu_open
-                    || self.boomux_setting_input.is_some()
-                    || self.settings_restart_confirm
-                {
-                    "BoomuxSettingsInput"
-                } else {
-                    workspace_key_context(self.help_open, self.navigation_region, self.layout_mode)
-                },
+                self.keyboard_input_target()
+                    .key_context(workspace_key_context(
+                        self.help_open,
+                        self.navigation_region,
+                        self.layout_mode,
+                    )),
             )
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
@@ -10794,9 +10804,9 @@ impl Render for Workspace {
             .text_color(rgb(0xcdd6f4))
             .child(content)
             .when_some(sidebar_menu, |element, menu| element.child(menu))
-            .when_some(resource_dialog, |element, dialog| element.child(dialog))
             .when_some(settings_restart, |element, dialog| element.child(dialog))
             .when_some(help, |element, help| element.child(help))
+            .when_some(resource_dialog, |element, dialog| element.child(dialog))
     }
 }
 
@@ -11373,6 +11383,9 @@ fn main() {
             KeyBinding::new("secondary-shift-c", CopySelection, Some("Layout")),
             KeyBinding::new("secondary-shift-c", CopySelection, Some("Sidebar")),
             KeyBinding::new("secondary-shift-c", CopySelection, Some("SidebarLayout")),
+            KeyBinding::new("secondary-v", PasteClipboard, Some("ResourceDialog")),
+            KeyBinding::new("secondary-shift-v", PasteClipboard, Some("ResourceDialog")),
+            KeyBinding::new("shift-insert", PasteClipboard, Some("ResourceDialog")),
             KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Terminal")),
             KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Layout")),
             KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Sidebar")),

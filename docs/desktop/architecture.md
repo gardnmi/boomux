@@ -70,6 +70,13 @@ handler. Future button forwarding must preserve exclusive gesture ownership.
 
 ### Input And Layout Mode
 
+Rename and removal dialogs own keyboard input while open, even when the Remotes,
+project, or Git panel remains open behind them. The shared input router gives
+these modals a dedicated `ResourceDialog` key context before panel navigation or
+layout-leader handling. Clipboard paste goes to an editable rename field and is
+consumed by busy or confirmation-only dialogs. Closing the modal restores the
+underlying panel's routing without changing its expanded state.
+
 GPUI key contexts separate ordinary terminal input from desktop layout actions.
 The default `Terminal` context reserves only explicit lifecycle, clipboard, and
 mode-entry commands; other keys reach the pane encoder. `Ctrl+Space` activates
@@ -108,6 +115,7 @@ and history but does not remove project shortcuts or filesystem contents.
 
 ## Module Map
 
+- `src/input_routing.rs`: keyboard recipient priority and modal key contexts.
 - `src/main.rs`: application model, Boomux sidebar projection, input routing,
   pane lifecycle, GPUI elements, terminal cell drawing, and GPU image caching.
 - `src/layout.rs`: binary split tree, normalized rectangles, spatial focus,
