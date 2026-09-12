@@ -6730,7 +6730,7 @@ impl Workspace {
                                     let id = id.clone();
                                     Self::settings_option(
                                         SharedString::from(format!("show-{id}")),
-                                        &format!("Show {name}"),
+                                        format!("Show {name}"),
                                         false,
                                     )
                                     .flex_none()

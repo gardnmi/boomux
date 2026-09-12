@@ -864,7 +864,7 @@ fn registrations_survive_cold_recovery_outside_authoritative_state() {
 }
 
 #[test]
-fn node_upgrade_maintenance_blocks_registration_changes_until_release() {
+fn node_upgrade_maintenance_blocks_route_changes_but_allows_local_forget() {
     let daemon = TestDaemon::start_with(|command, runtime_dir| {
         let ssh = runtime_dir.join("ssh");
         fs::write(&ssh, "#!/bin/sh\nexit 64\n").unwrap();
@@ -899,7 +899,7 @@ fn node_upgrade_maintenance_blocks_registration_changes_until_release() {
     assert!(
         daemon
             .client
-            .forget_node_registration(&registration.node_id)
+            .rename_node_registration(&registration.node_id, "office", registration.revision)
             .is_err()
     );
     assert_eq!(
@@ -918,6 +918,24 @@ fn node_upgrade_maintenance_blocks_registration_changes_until_release() {
         .rename_node_registration(&registration.node_id, "office", registration.revision)
         .unwrap();
     assert_eq!(renamed.alias, "office");
+    let (_, token) = daemon
+        .client
+        .begin_node_upgrade_maintenance(&renamed.node_id, renamed.revision)
+        .unwrap();
+    let forgotten = daemon
+        .client
+        .forget_node_registration(&renamed.node_id)
+        .unwrap();
+    assert_eq!(forgotten.node_id, renamed.node_id);
+    assert_eq!(forgotten.tombstone_epoch, renamed.tombstone_epoch + 1);
+    assert!(daemon.client.node_registration(&renamed.node_id).is_err());
+    assert!(
+        daemon
+            .client
+            .finish_node_upgrade_maintenance(&renamed.node_id, token)
+            .is_err()
+    );
+    daemon.client.restart().unwrap();
 }
 
 #[test]
