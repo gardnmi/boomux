@@ -2,7 +2,7 @@
 use crate::protocol::{
     AgentInstanceSnapshot, AgentState, ShellSnapshot, ShellSpec, ShellStatus, WorkspaceSnapshot,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Conversation {
@@ -40,6 +40,29 @@ pub fn list(workspace: &WorkspaceSnapshot) -> Vec<Conversation> {
         .iter()
         .map(|shell| (shell.id.as_str(), shell))
         .collect();
+    // An exact native resume may be running before its lifecycle integration
+    // reports a session. A current exact session report supersedes startup argv.
+    let claimed_runs: HashSet<_> = workspace
+        .agents
+        .iter()
+        .filter(|agent| agent.workspace_id == workspace.id && agent.external_session_id.is_some())
+        .map(|agent| (agent.shell_id.as_str(), agent.run_id.as_str()))
+        .collect();
+    let mut resumes: HashMap<&[String], &ShellSnapshot> = HashMap::new();
+    for shell in &workspace.shells {
+        if shell.workspace_id == workspace.id
+            && matches!(shell.status, ShellStatus::Running)
+            && shell
+                .run
+                .as_ref()
+                .is_some_and(|run| !claimed_runs.contains(&(shell.id.as_str(), run.id.as_str())))
+        {
+            let current = resumes.entry(shell.command.as_slice()).or_insert(shell);
+            if shell.id < current.id {
+                *current = shell;
+            }
+        }
+    }
     let mut entries = BTreeMap::new();
     for agent in &workspace.agents {
         if agent.workspace_id != workspace.id {
@@ -79,6 +102,16 @@ pub fn list(workspace: &WorkspaceSnapshot) -> Vec<Conversation> {
         }
     }
     let mut entries: Vec<_> = entries.into_values().collect();
+    for entry in &mut entries {
+        if entry.running_shell.is_none()
+            && let Some(command) = crate::integrations::by_key(&entry.integration)
+                .and_then(|integration| integration.resume)
+                .and_then(|resume| resume.command(&[], &entry.external_session_id))
+            && let Some(shell) = resumes.get(command.as_slice())
+        {
+            entry.running_shell = Some(shell.id.clone());
+        }
+    }
     entries.sort_by(|a, b| {
         b.updated_at_ms
             .cmp(&a.updated_at_ms)
@@ -179,6 +212,7 @@ pub fn plan(
                 || (matches!(shell.status, ShellStatus::Running)
                     && !workspace.agents.iter().any(|a| {
                         a.shell_id == shell.id
+                            && a.external_session_id.is_some()
                             && shell.run.as_ref().is_some_and(|run| run.id == a.run_id)
                     })))
     }) {
@@ -209,6 +243,63 @@ mod tests {
             {"id":"a2", "workspace_id":"workspace-a", "shell_id":"removed", "run_id":"r2", "name":"Investigate issue", "integration":"codex", "external_session_id":"thread-1", "started_at_ms":3, "observation":{"revision":1,"state":"inactive","authority":"lifecycle_integration","evidence":"","confidence":100,"observed_at_ms":4}}
         ]})).unwrap()
     }
+    #[test]
+    fn conversation_resume_becomes_open_before_session_report_and_stops_on_switch_or_exit() {
+        let mut workspace = workspace();
+        for agent in &mut workspace.agents {
+            agent.integration = "opencode".into();
+        }
+        let command = crate::integrations::by_key("opencode")
+            .unwrap()
+            .resume
+            .unwrap()
+            .command(&[], "thread-1")
+            .unwrap();
+        workspace.shells.push(serde_json::from_value(serde_json::json!({
+            "id":"resumed", "workspace_id":"workspace-a", "name":"resumed", "cwd":"/tmp", "command":command,
+            "status":"running", "run":{"id":"resume-run", "generation":1, "started_at_ms":5, "ended_at_ms":null, "exit_reason":null, "output_revision":0, "environment_has_run_id":true}
+        })).unwrap());
+        assert_eq!(
+            list(&workspace)[0].running_shell.as_deref(),
+            Some("resumed")
+        );
+        assert!(
+            matches!(plan(&workspace, "a1", "another-shell").unwrap(), OpenPlan::Existing(shell) if shell.id == "resumed")
+        );
+        let mut placeholder = workspace.agents[0].clone();
+        placeholder.id = "placeholder".into();
+        placeholder.shell_id = "resumed".into();
+        placeholder.run_id = "resume-run".into();
+        placeholder.external_session_id = None;
+        placeholder.observation.state = AgentState::Idle;
+        workspace.agents.push(placeholder);
+        assert_eq!(
+            list(&workspace)[0].running_shell.as_deref(),
+            Some("resumed")
+        );
+        workspace.agents.last_mut().unwrap().external_session_id = Some("another-thread".into());
+        assert!(
+            list(&workspace)
+                .iter()
+                .find(|entry| entry.external_session_id == "thread-1")
+                .unwrap()
+                .running_shell
+                .is_none()
+        );
+        assert!(matches!(
+            plan(&workspace, "a1", "another-shell").unwrap(),
+            OpenPlan::Resume(_)
+        ));
+        workspace.agents.pop();
+        workspace.shells[0].status = ShellStatus::Exited { code: Some(0) };
+        assert!(list(&workspace)[0].running_shell.is_none());
+        workspace.shells[0].status = ShellStatus::Pending;
+        assert!(list(&workspace)[0].running_shell.is_none());
+        workspace.shells[0].status = ShellStatus::Running;
+        workspace.shells[0].workspace_id = "other-workspace".into();
+        assert!(list(&workspace)[0].running_shell.is_none());
+    }
+
     #[test]
     fn conversation_titles_match_exact_harness_and_session_without_importing_history() {
         let mut entries = list(&workspace());

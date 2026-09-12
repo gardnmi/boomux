@@ -45,3 +45,9 @@ run. Archive affects list visibility only; archived entries remain resumable. It
 never marks an Agent completed or stops a process. Workspace deletion removes its
 entries and local preferences. The owner list also uses available harness activity
 timestamps for recency; opening a pane does not itself update conversation activity.
+
+A running exact-argv native resume Shell is shown as Open while its integration
+has not yet reported an exact session for that run. A generic Agent without a
+session ID does not block this startup association. A current exact session
+report supersedes it, preventing a Shell that switched conversations from being
+reused for the old entry. Pending and exited Shells are not labeled running.
