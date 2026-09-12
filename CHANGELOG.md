@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.19.0](https://github.com/gardnmi/boomux/compare/v1.18.0...v1.19.0) (2026-09-12)
+
+
+### Features
+
+* **remote:** make update and removal recoverable ([#419](https://github.com/gardnmi/boomux/issues/419)) ([8d0e730](https://github.com/gardnmi/boomux/commit/8d0e730b02bfda120836ea31d451dc91f7593327))
+
 ## [1.18.0](https://github.com/gardnmi/boomux/compare/v1.17.0...v1.18.0) (2026-09-12)
 
 
