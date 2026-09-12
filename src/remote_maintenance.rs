@@ -240,7 +240,6 @@ fn probe(expected: &str) -> Result<Probe> {
     let installed = binary_token(&destination)?;
     let environment = Environment::from_process();
     let preserved = IntegrationId::all()
-        .into_iter()
         .filter_map(|id| {
             let status = integration_management::inspect(id, &environment, None);
             matches!(
