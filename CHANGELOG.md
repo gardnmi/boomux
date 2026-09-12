@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.20.1](https://github.com/gardnmi/boomux/compare/v1.20.0...v1.20.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* **conversations:** resolve kiro aliases when loading titles ([#427](https://github.com/gardnmi/boomux/issues/427)) ([1320d1c](https://github.com/gardnmi/boomux/commit/1320d1c7e2dbabd0cc2741b9e0a9119a031a822b))
+
 ## [1.20.0](https://github.com/gardnmi/boomux/compare/v1.19.2...v1.20.0) (2026-09-12)
 
 
