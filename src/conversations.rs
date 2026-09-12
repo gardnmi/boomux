@@ -98,19 +98,25 @@ pub(crate) fn enrich_titles(
         .map(|session| {
             (
                 (session.integration.as_str(), session.root_id.as_str()),
-                session.title.trim(),
+                (session.title.trim(), session.updated_at_ms),
             )
         })
-        .filter(|(_, title)| !title.is_empty())
+        .filter(|(_, (title, _))| !title.is_empty())
         .collect();
-    for entry in entries {
-        if let Some(title) = titles.get(&(
+    for entry in entries.iter_mut() {
+        if let Some((title, updated_at_ms)) = titles.get(&(
             entry.integration.as_str(),
             entry.external_session_id.as_str(),
         )) {
             entry.title = (*title).to_owned();
+            entry.updated_at_ms = entry.updated_at_ms.max(*updated_at_ms);
         }
     }
+    entries.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then(a.agent_id.cmp(&b.agent_id))
+    });
 }
 
 pub enum OpenPlan {
@@ -229,6 +235,29 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "Renamed thread");
     }
+    #[test]
+    fn conversation_recency_includes_harness_activity_without_importing_entries() {
+        let mut entries = list(&workspace());
+        let mut other = entries[0].clone();
+        other.agent_id = "other".into();
+        other.external_session_id = "other-session".into();
+        other.updated_at_ms = 100;
+        entries.push(other);
+        let title = crate::host_session_titles::HostSession {
+            integration: "codex".into(),
+            root_id: "thread-1".into(),
+            title: "Latest work".into(),
+            directory: "/tmp".into(),
+            created_at_ms: 1,
+            updated_at_ms: 200,
+        };
+        enrich_titles(&mut entries, &[title]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].external_session_id, "thread-1");
+        assert_eq!(entries[0].updated_at_ms, 200);
+        assert_eq!(entries[1].updated_at_ms, 100);
+    }
+
     #[test]
     fn conversation_entries_survive_shell_removal_and_deduplicate_runs() {
         let workspace = workspace();

@@ -42,6 +42,14 @@ pub struct Floating {
     pub rect: [f32; 4],
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConversationPreference {
+    pub workspace: String,
+    pub integration: String,
+    pub session: String,
+    pub pinned: bool,
+    pub archived: bool,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub version: u32,
     pub revision: String,
@@ -52,11 +60,13 @@ pub struct Document {
     pub workspace_order: Vec<String>,
     #[serde(default)]
     pub hidden_remote_workspaces: BTreeMap<String, String>,
+    #[serde(default)]
+    pub conversations: Vec<ConversationPreference>,
 }
 impl Default for Document {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 3,
             revision: String::new(),
             owner: String::new(),
             active: String::new(),
@@ -64,6 +74,7 @@ impl Default for Document {
             minimized: Vec::new(),
             workspace_order: Vec::new(),
             hidden_remote_workspaces: BTreeMap::new(),
+            conversations: Vec::new(),
         }
     }
 }
@@ -131,7 +142,7 @@ impl Tree {
 }
 impl Document {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 2 {
+        if self.version != 3 {
             return Err("unsupported layout state version; saved file retained".into());
         }
         if self.arrangements.len() > 256
@@ -148,6 +159,19 @@ impl Document {
                     .is_none_or(|id| id.node_id.is_empty() || id.inner_id.is_empty())
             {
                 return Err("invalid hidden remote Workspace".into());
+            }
+        }
+        if self.conversations.len() > 4096 {
+            return Err("too many conversation preferences".into());
+        }
+        let mut identities = HashSet::new();
+        for entry in &self.conversations {
+            if [&entry.workspace, &entry.integration, &entry.session]
+                .iter()
+                .any(|value| value.is_empty() || value.len() > 1024)
+                || !identities.insert((&entry.workspace, &entry.integration, &entry.session))
+            {
+                return Err("invalid conversation preference".into());
             }
         }
         let mut total = 0;
@@ -222,6 +246,10 @@ fn read(path: &PathBuf) -> Result<Document, String> {
         // and revision while explicitly migrating to an empty hidden set.
         document.hidden_remote_workspaces.clear();
         document.version = 2;
+    }
+    if document.version == 2 {
+        document.conversations.clear();
+        document.version = 3;
     }
     document.validate()?;
     Ok(document)
@@ -377,6 +405,45 @@ mod tests {
         path
     }
     #[test]
+    fn conversation_preferences_migrate_persist_and_validate() {
+        let root = temporary();
+        let path = root.join("layout.json");
+        for version in [1, 2] {
+            let mut legacy = serde_json::to_value(fixture()).unwrap();
+            legacy["version"] = version.into();
+            legacy.as_object_mut().unwrap().remove("conversations");
+            fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            let migrated = read(&path).unwrap();
+            assert_eq!(migrated.version, 3);
+            assert!(migrated.conversations.is_empty());
+            assert_eq!(migrated.arrangements, fixture().arrangements);
+        }
+        let mut doc = read(&path).unwrap();
+        doc.conversations.push(ConversationPreference {
+            workspace: "remote:owner:workspace".into(),
+            integration: "codex".into(),
+            session: "thread".into(),
+            pinned: true,
+            archived: true,
+        });
+        let mut store = Store {
+            path: path.clone(),
+            revision: doc.revision.clone(),
+        };
+        store.save(doc.clone()).unwrap();
+        assert_eq!(read(&path).unwrap().conversations, doc.conversations);
+        doc.conversations.push(doc.conversations[0].clone());
+        assert!(doc.validate().is_err());
+        doc.conversations.pop();
+        doc.conversations[0].session.clear();
+        assert!(doc.validate().is_err());
+        doc.conversations[0].session = "thread".into();
+        doc.conversations = vec![doc.conversations[0].clone(); 4097];
+        assert!(doc.validate().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn hidden_remote_workspaces_migrate_and_survive_reload() {
         let root = temporary();
         let path = root.join("layout.json");
@@ -387,7 +454,7 @@ mod tests {
             .remove("hidden_remote_workspaces");
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
         let mut doc = read(&path).unwrap();
-        assert_eq!(doc.version, 2);
+        assert_eq!(doc.version, 3);
         assert!(doc.hidden_remote_workspaces.is_empty());
         assert_eq!(doc.arrangements, fixture().arrangements);
         doc.hidden_remote_workspaces

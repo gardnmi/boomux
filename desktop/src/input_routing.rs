@@ -6,6 +6,7 @@ pub(crate) struct InputOverlays {
     pub remote_picker: bool,
     pub project_search: bool,
     pub git_search: bool,
+    pub conversation_search: bool,
     pub remotes: bool,
     pub settings_restart: bool,
     pub settings_input: bool,
@@ -18,6 +19,7 @@ pub(crate) enum InputTarget {
     RemotePicker,
     ProjectSearch,
     GitSearch,
+    ConversationSearch,
     Remotes,
     SettingsRestart,
     SettingsInput,
@@ -32,6 +34,7 @@ impl InputOverlays {
             (self.resource_dialog, ResourceDialog),
             (self.remote_picker, RemotePicker),
             (self.project_search, ProjectSearch),
+            (self.conversation_search, ConversationSearch),
             (self.git_search, GitSearch),
             (self.remotes, Remotes),
             (self.settings_restart, SettingsRestart),
@@ -76,6 +79,10 @@ mod tests {
                 ..Default::default()
             },
             InputOverlays {
+                conversation_search: true,
+                ..Default::default()
+            },
+            InputOverlays {
                 git_search: true,
                 ..Default::default()
             },
@@ -103,6 +110,22 @@ mod tests {
             }
             assert_ne!(panel.target(), InputTarget::ResourceDialog);
         }
+    }
+
+    #[test]
+    fn conversation_search_owns_keys_until_dismissed() {
+        let mut overlays = InputOverlays {
+            conversation_search: true,
+            remotes: true,
+            ..Default::default()
+        };
+        assert_eq!(overlays.target(), InputTarget::ConversationSearch);
+        assert_eq!(
+            overlays.target().key_context("Terminal"),
+            "BoomuxSettingsInput"
+        );
+        overlays.conversation_search = false;
+        assert_eq!(overlays.target(), InputTarget::Remotes);
     }
 
     #[test]

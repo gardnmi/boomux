@@ -61,6 +61,17 @@ connect unavailable machines from Remotes first. Resume requires protocol 55 on
 the local daemon and remote owner. Harness history and the saved directory must
 still be available to the harness.
 
+The panel opens on **Recent**, with pinned conversations first and the rest
+ordered by their latest observed activity. Search filters titles and harness names
+within the current view. **Open** focuses or attaches a running conversation;
+**Resume** starts its original harness in a tiled pane.
+
+Use **Pin / Unpin** to keep a conversation handy. **Archive** moves it out of Recent;
+open **Archived** and choose **Restore** to bring it back. Archiving does not stop
+an agent, close a terminal, or delete harness history. Pins and archive preferences
+are saved on this Desktop, separately for each Workspace and harness conversation,
+and survive harness restarts. They do not sync between computers.
+
 Closing a terminal or Shell keeps its conversation entry. Renaming the Workspace
 keeps the association. Removing the Workspace removes its entries from Boomux,
 but does not delete the harness's own history files. A new Workspace with the

@@ -577,3 +577,17 @@ or ambiguous open surfaces an error; retry retains its requested Shell ID.
 Missing/old remote owners never cause local execution. Overview refresh is read-only: all user Workspaces remain until explicitly
 removed, including those without Shells or recorded conversations. The exact
 creation-receipt cleanup of temporary setup Workspaces remains separate.
+
+Conversation organization is Desktop presentation state. Layout document version 3
+adds up to 4096 pin/archive preferences keyed by owner-scoped Workspace, integration,
+and external conversation ID. Versions 1 and 2 migrate explicitly with no
+conversation preferences, preserving existing layout and visibility data. Preferences
+use the existing bounded atomic layout writer and are saved even when no terminal
+arrangement is active. Explicit Workspace removal clears its preferences. They do
+not sync across Desktop installations or affect Agent lifecycle or harness history.
+
+The panel caches filtered row indices outside rendering. Recent excludes archived
+entries and sorts pinned entries first, then by latest observed activity; Archived
+is separately searchable. Search matches title and harness. A dedicated keyboard
+recipient prevents search typing from reaching terminals and yields to resource
+dialogs. Open and Resume are explicit row actions; unavailable resume is not invoked.

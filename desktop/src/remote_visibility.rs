@@ -73,7 +73,7 @@ impl Workspace {
         let overview = self.boomux_overview.clone();
         self.set_boomux_overview(overview);
         self.reconcile_sidebar_item();
-        self.save_remote_visibility(cx);
+        self.save_presentation_preferences(cx);
         cx.notify();
     }
 
@@ -82,12 +82,12 @@ impl Workspace {
             return;
         }
         self.layout_document.hidden_remote_workspaces.remove(id);
-        self.save_remote_visibility(cx);
+        self.save_presentation_preferences(cx);
         // The normal local-daemon snapshot refresh restores the cached entry.
         cx.notify();
     }
 
-    fn save_remote_visibility(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn save_presentation_preferences(&mut self, cx: &mut Context<Self>) {
         self.capture_arrangement();
         let Some(writer) = &self.layout_writer else {
             return;

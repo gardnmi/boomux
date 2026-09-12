@@ -37,3 +37,11 @@ This supersedes ADR 0014 only for Workspace-scoped discovery and native resume.
 Its prohibition on global Session catalogs and the rejection of legacy Session
 list/inspect/mutation/resume APIs remain in force. Agent lifecycle state remains
 run-scoped and is never inferred from the conversation entry.
+
+Workspace conversation organization (pins, archive, title/harness search, recent
+ordering) belongs to Desktop presentation. Pins and archives are local preferences
+keyed by exact Workspace, harness, and external conversation identity, not an Agent
+run. Archive affects list visibility only; archived entries remain resumable. It
+never marks an Agent completed or stops a process. Workspace deletion removes its
+entries and local preferences. The owner list also uses available harness activity
+timestamps for recency; opening a pane does not itself update conversation activity.

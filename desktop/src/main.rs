@@ -2383,6 +2383,7 @@ impl Workspace {
     }
 
     fn focus_terminal_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         if !self.terminals.contains_key(&pane_id) {
             return;
@@ -2767,6 +2768,7 @@ impl Workspace {
 
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.project_menu_open = false;
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         if self.settings_open {
@@ -3130,6 +3132,14 @@ impl Workspace {
                                 this.node_views.iter_mut().find(|node| node.id == *id)
                         {
                             node.label = value.clone();
+                        }
+                        if kind == ResourceDialogKind::Remove
+                            && let SidebarResource::Workspace { id, .. } = &target
+                        {
+                            this.layout_document
+                                .conversations
+                                .retain(|entry| &entry.workspace != id);
+                            this.save_presentation_preferences(cx);
                         }
                         this.set_boomux_overview(overview);
                         this.resource_dialog = None;
@@ -3857,6 +3867,7 @@ impl Workspace {
     ) {
         self.capture_arrangement();
         self.layout_changed(cx);
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         self.floating_animation = None;
         self.focused = id;
@@ -4407,6 +4418,7 @@ impl Workspace {
                     self.sidebar_visible = false;
                     self.sidebar_menu = None;
                     self.sidebar_header_menu_open = false;
+                    self.conversations.search_focused = false;
                     self.git_panel.search_focused = false;
                     self.nodes_open = false;
                     if self.navigation_region == NavigationRegion::Sidebar {
@@ -4960,6 +4972,9 @@ impl Workspace {
             remote_picker: self.project_menu_open && self.remote_picker_open,
             project_search: self.project_menu_open,
             git_search: self.git_panel.search_focused,
+            conversation_search: self.conversations.open
+                && !self.settings_open
+                && self.conversations.search_focused,
             remotes: self.nodes_open && self.navigation_region == NavigationRegion::Sidebar,
             settings_restart: self.settings_restart_confirm,
             settings_input: self.boomux_setting_input.is_some(),
@@ -5062,6 +5077,10 @@ impl Workspace {
             }
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        if input_target == InputTarget::ConversationSearch {
+            self.conversation_search_key(event, cx);
             return;
         }
         if input_target == InputTarget::GitSearch {
@@ -6394,6 +6413,7 @@ impl Workspace {
 
     fn open_nodes(&mut self, cx: &mut Context<Self>) {
         self.project_menu_open = false;
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
@@ -6806,6 +6826,7 @@ impl Workspace {
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
         self.project_search.clear();
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         window.focus(&self.focus_handle, cx);
         if self.project_menu_open && !self.projects_loading {
