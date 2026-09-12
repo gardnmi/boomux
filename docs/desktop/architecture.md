@@ -531,3 +531,18 @@ Shell creation, restart, or attachment takeover. Updates freeze saving and await
 the durable snapshot before launching the replacement; failure permits retry.
 A per-file lock plus revision comparison prevents stale windows from replacing
 newer state. Outer OS window placement remains outside this feature.
+
+## Remote Workspace visibility
+
+`src/remote_visibility.rs` filters owner-qualified remote Workspace keys from
+Desktop's overview before sidebar ordering and navigation. Hiding detaches open
+and restored panes and removes their saved arrangements; it does not mutate the
+owner or its projection cache. The normal local snapshot refresh restores shown
+entries. The hidden map is bounded to 256 entries with 1,024-byte identities and
+labels, and shares the existing bounded atomic layout writer and stale-writer
+revision checks.
+
+Desktop layout document version 2 adds `hidden_remote_workspaces`. Version 1 is
+explicitly migrated with an empty hidden map while preserving its revision and
+arrangements. Unknown versions remain rejected. This is separate from daemon
+persistence and wire versions, which are unchanged.

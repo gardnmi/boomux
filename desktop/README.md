@@ -424,3 +424,11 @@ Queues and caches are bounded, and pane-owned resources are reclaimed on detach.
 - [Architecture and ownership](../docs/desktop/architecture.md)
 - [Performance measurements and guardrails](../docs/desktop/performance.md)
 - [Continuous integration](../docs/desktop/ci.md)
+
+### Remove an offline remote Workspace from the sidebar
+
+Choose **Hide from sidebar** in the remote Workspace's three-dot menu. This
+works offline, remembers the choice, and leaves remote work running. Restore it
+under **Remotes → Hidden Workspaces → Show**. Deleting remote Shells still
+requires the owner to be reachable; forgetting a machine's connection removes
+all its entries instead.

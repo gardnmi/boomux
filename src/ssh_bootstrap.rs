@@ -176,7 +176,7 @@ const REMOTE_INSTALL_RENEW_COMMAND: &str = concat!(
 );
 
 pub const PLATFORM_PROBE_COMMAND: &str = "os=$(/usr/bin/uname -s) || exit 92; arch=$(/usr/bin/uname -m) || exit 92; case \"$os\" in Linux|Darwin) ;; *) exit 92 ;; esac; for command in /usr/bin/uname /usr/bin/id /usr/bin/stat /usr/bin/cmp /bin/cat /bin/chmod /bin/cp /bin/date /bin/kill /bin/ln /bin/mkdir /bin/mv /bin/ps /bin/rm /bin/rmdir /bin/sleep /bin/sync; do [ -x \"$command\" ] || exit 92; done; printf 'boomux-platform-v1\\0%s\\0%s\\0' \"$os\" \"$arch\"";
-pub const EXECUTABLE_PROBE_COMMAND: &str = "printf 'boomux-executables-v1\\0'; path=$(command -v boomux 2>/dev/null || true); for candidate in \"$path\" /usr/local/bin/boomux /usr/bin/boomux /opt/homebrew/bin/boomux /home/linuxbrew/.linuxbrew/bin/boomux \"$HOME/.local/bin/boomux\" \"$HOME/.local/share/mise/shims/boomux\" \"$HOME/.nix-profile/bin/boomux\" /run/current-system/sw/bin/boomux; do case \"$candidate\" in /*) if [ \"$candidate\" = \"$HOME/.local/bin/boomux\" ] && [ -d \"$HOME/.local/bin/.boomux.bootstrap.lock\" ] && [ ! -d \"$HOME/.local/bin/.boomux.bootstrap.lock/committed\" ]; then continue; fi; [ -f \"$candidate\" ] && [ -x \"$candidate\" ] && printf '%s\\0' \"$candidate\" ;; esac; done; true";
+pub const EXECUTABLE_PROBE_COMMAND: &str = "printf 'boomux-executables-v1\\0'; path=$(command -v boomux 2>/dev/null || true); for candidate in \"$path\" /usr/local/bin/boomux /usr/bin/boomux /opt/homebrew/bin/boomux \"$HOME/.cargo/bin/boomux\" /home/linuxbrew/.linuxbrew/bin/boomux \"$HOME/.local/bin/boomux\" \"$HOME/.local/share/mise/shims/boomux\" \"$HOME/.nix-profile/bin/boomux\" /run/current-system/sw/bin/boomux; do case \"$candidate\" in /*) if [ \"$candidate\" = \"$HOME/.local/bin/boomux\" ] && [ -e \"$HOME/.local/bin/.boomux.bootstrap.lock\" ] && [ ! -d \"$HOME/.local/bin/.boomux.bootstrap.lock/committed\" ]; then continue; fi; [ -f \"$candidate\" ] && [ -x \"$candidate\" ] && printf '%s\\0' \"$candidate\" ;; esac; done; true";
 pub const INSTALL_DESTINATION_PROBE_COMMAND: &str = "case \"$HOME\" in /*) destination=$HOME/.local/bin/boomux; lock=$HOME/.local/bin/.boomux.bootstrap.lock; state=clear; if [ -d \"$lock\" ] && [ ! -d \"$lock/committed\" ]; then state=stale; txn=$(/bin/cat \"$lock/id\" 2>/dev/null || true); case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) transaction=$HOME/.local/bin/$txn; watchdog=$(/bin/cat \"$transaction/watchdog_pid\" 2>/dev/null || true); expected_start=$(/bin/cat \"$transaction/watchdog_start\" 2>/dev/null || true); case \"$watchdog\" in ''|*[!0-9]*) ;; *) probe_os=$(/usr/bin/uname -s 2>/dev/null || true); case \"$probe_os\" in Linux) watchdog_stat=$(/bin/cat \"/proc/$watchdog/stat\" 2>/dev/null || true); watchdog_tail=${watchdog_stat##*) }; set -- $watchdog_tail; if [ \"$#\" -ge 20 ] && [ \"$1\" != Z ]; then shift 19; current_start=$1; else current_start=; fi ;; Darwin) watchdog_info=$(/bin/ps -p \"$watchdog\" -o state= -o lstart= 2>/dev/null || true); set -- $watchdog_info; if [ \"$#\" -ge 6 ]; then case \"$1\" in Z*) current_start= ;; *) shift; current_start=$* ;; esac; else current_start=; fi ;; *) current_start= ;; esac; if [ -n \"$expected_start\" ] && [ \"$current_start\" = \"$expected_start\" ]; then state=recovering; fi ;; esac ;; esac; fi; printf 'boomux-install-destination-v1\\0%s\\0%s\\0' \"$destination\" \"$state\" ;; *) exit 1 ;; esac";
 
 fn remote_daemon_command(executable: &RemoteExecutable, arguments: &str) -> String {
@@ -250,15 +250,22 @@ fn remote_integration_cleanup_plan(
         .pointer("/data/integrations")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| invalid_probe("remote integration status omitted integrations"))?;
-    let allowed = ["opencode", "pi", "claude", "codex", "kiro"];
     let mut current = Vec::new();
     let mut preserved = Vec::new();
     for row in rows {
         let name = row
             .get("name")
             .and_then(serde_json::Value::as_str)
-            .filter(|name| allowed.contains(name))
-            .ok_or_else(|| invalid_probe("remote integration status returned an unknown name"))?;
+            .filter(|name| {
+                !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
+            })
+            .ok_or_else(|| invalid_probe("remote integration status returned an invalid name"))?;
+        if !crate::integrations::by_key(name)
+            .is_some_and(|descriptor| descriptor.installation.is_some())
+        {
+            preserved.push((name.to_owned(), None));
+            continue;
+        }
         let display_name = row
             .get("display_name")
             .and_then(serde_json::Value::as_str)
@@ -275,11 +282,7 @@ fn remote_integration_cleanup_plan(
             "current" => current.push(name.to_owned()),
             "modified" | "unavailable" => preserved.push((display_name.to_owned(), path)),
             "missing" => {}
-            _ => {
-                return Err(invalid_probe(
-                    "remote integration status returned an invalid state",
-                ));
-            }
+            _ => preserved.push((display_name.to_owned(), path)),
         }
     }
     Ok((current, preserved))
@@ -403,6 +406,12 @@ pub struct RemoteInstallPlan {
     intent: RemoteInstallIntent,
 }
 
+impl RemoteInstallPlan {
+    pub fn uses_recovery_helper(&self) -> bool {
+        matches!(self.intent, RemoteInstallIntent::RepairRegistered { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteUninstallPlan {
     pub target: SshTarget,
@@ -414,12 +423,19 @@ pub struct RemoteUninstallPlan {
     current_integrations: Vec<String>,
     expected_node_id: String,
     expected_executable: String,
+    recovery: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RemoteInstallIntent {
     AutomaticCompatibility,
-    ExplicitRegisteredUpgrade { expected_node_id: String },
+    ExplicitRegisteredUpgrade {
+        expected_node_id: String,
+    },
+    RepairRegistered {
+        expected_node_id: String,
+        token: String,
+    },
 }
 
 impl RemoteInstallIntent {
@@ -441,7 +457,7 @@ impl RemoteInstallIntent {
     fn daemon_restart_required(&self, status: &RemoteDaemonStatus) -> bool {
         match self {
             Self::AutomaticCompatibility => status.restart_required(),
-            Self::ExplicitRegisteredUpgrade { .. } => {
+            Self::ExplicitRegisteredUpgrade { .. } | Self::RepairRegistered { .. } => {
                 matches!(status, RemoteDaemonStatus::Present { .. })
             }
         }
@@ -1336,6 +1352,8 @@ pub struct BootstrapSession {
     master: Child,
     master_pid: i32,
     stderr_reader: Option<MasterStderrReader>,
+    recovery_runner: Option<RemoteExecutable>,
+    recovery_suffix: Option<String>,
 }
 
 struct TerminalForegroundGuard {
@@ -1495,7 +1513,12 @@ impl BootstrapSession {
             prepare_ssh_directory(runtime_directory, user_config)?;
         let mut command = Command::new(program);
         append_ssh_security_options(&mut command, &config_path, &control_path, authentication);
+        // Bound connection/key exchange separately from the time allowed for a
+        // person to complete password, browser, or host-key prompts.
+        let connection_seconds = timeout.as_secs().clamp(1, 15);
         command
+            .args(["-o", &format!("ConnectTimeout={connection_seconds}")])
+            .args(["-o", "ConnectionAttempts=1"])
             .args(["-o", "ControlMaster=yes"])
             .args(["-o", "ControlPersist=no"])
             .arg("-N")
@@ -1621,7 +1644,7 @@ impl BootstrapSession {
                 let _ = fs::remove_dir_all(&directory);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "SSH bootstrap authentication timed out",
+                    "SSH connection or sign-in did not complete before the deadline; check that the remote machine is online and reachable, then retry",
                 ));
             }
             thread::sleep(CHILD_POLL_INTERVAL);
@@ -1636,6 +1659,8 @@ impl BootstrapSession {
             master,
             master_pid,
             stderr_reader: Some(stderr_reader),
+            recovery_runner: None,
+            recovery_suffix: None,
         })
     }
 
@@ -1647,6 +1672,72 @@ impl BootstrapSession {
             &self.target,
             remote_command,
         )
+    }
+
+    fn prepare_recovery(
+        &mut self,
+        source: &RemoteInstallSource,
+        expected: &str,
+        timeout: Duration,
+    ) -> io::Result<(RemoteExecutable, serde_json::Value, String)> {
+        let suffix = Uuid::new_v4().simple().to_string();
+        self.recovery_suffix = Some(suffix.clone());
+        let command = recovery_upload_command(&suffix);
+        let output = run_streaming_command_capture(
+            self.command(&command),
+            source.bytes().to_vec(),
+            timeout,
+        )?;
+        let path = std::str::from_utf8(&output.stdout)
+            .map_err(|_| invalid_probe("recovery helper path invalid"))?;
+        let runner = RemoteExecutable::parse(path)?;
+        self.recovery_runner = Some(runner.clone());
+        let output = run_bounded_command(
+            self.command(&remote_daemon_command(
+                &runner,
+                &format!("__remote-maintenance probe {}", quote_posix_shell(expected)),
+            )),
+            timeout,
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| invalid_probe("recovery helper returned invalid metadata"))?;
+        let probe = value
+            .get("probe")
+            .filter(|p| {
+                p.get("version").and_then(|v| v.as_u64()) == Some(1)
+                    && p.get("node_id").and_then(|v| v.as_str()) == Some(expected)
+            })
+            .ok_or_else(|| invalid_probe("recovery helper identity mismatch"))?
+            .clone();
+        let token = value
+            .get("token")
+            .and_then(|v| v.as_str())
+            .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| invalid_probe("recovery authorization invalid"))?
+            .to_owned();
+        Ok((runner, probe, token))
+    }
+
+    fn run_recovery(
+        &self,
+        runner: &RemoteExecutable,
+        action: &str,
+        expected: &str,
+        token: &str,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        if self.recovery_runner.as_ref() != Some(runner) {
+            return Err(invalid_probe("recovery belongs to another session"));
+        }
+        let command = format!(
+            "{REMOTE_RUNTIME_PREFIX}if [ ! -x {} ]; then printf '%s\\n' 'boomux: recovery preparation expired; retry update or removal' >&2; exit 1; fi; exec {} __remote-maintenance {} {} {}",
+            quote_posix_shell(runner.as_str()),
+            quote_posix_shell(runner.as_str()),
+            quote_posix_shell(action),
+            quote_posix_shell(expected),
+            quote_posix_shell(token)
+        );
+        run_bounded_command(self.command(&command), timeout).map(|_| ())
     }
 
     pub fn plan(&mut self, timeout: Duration) -> io::Result<RemoteBootstrapPlan> {
@@ -1687,6 +1778,43 @@ impl BootstrapSession {
     ) -> io::Result<RemoteInstallPlan> {
         let discovery = discover_remote_in_session(self, timeout)?;
         let selection = inspect_remote_helpers_in_session(self, &discovery.executables, timeout)?;
+        if let Some(helper) = &selection.compatible {
+            RemoteInstallIntent::ExplicitRegisteredUpgrade {
+                expected_node_id: expected_node_id.into(),
+            }
+            .verify_helper_identity(helper)?;
+        }
+        if discovery.executables.is_empty()
+            || selection
+                .compatible
+                .as_ref()
+                .is_some_and(|helper| helper.executable != discovery.install_destination)
+        {
+            if let Some(error) = remote_recovery_error(discovery.recovery) {
+                return Err(error);
+            }
+            let source = select_install_source(discovery.platform)?;
+            let (runner, probe, token) =
+                self.prepare_recovery(&source, expected_node_id, timeout)?;
+            let destination = RemoteExecutable::parse(
+                probe
+                    .get("destination")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| invalid_probe("repair destination missing"))?,
+            )?;
+            return Ok(RemoteInstallPlan {
+                target: self.target.clone(),
+                destination,
+                source,
+                reason: RemoteInstallReason::Missing,
+                bootstrap_id: Some(self.id),
+                upgrade_helper: Some(runner),
+                intent: RemoteInstallIntent::RepairRegistered {
+                    expected_node_id: expected_node_id.into(),
+                    token,
+                },
+            });
+        }
         let helper = selection.compatible.ok_or_else(|| {
             if let Some(error) = remote_recovery_error(discovery.recovery) {
                 return error;
@@ -1719,6 +1847,46 @@ impl BootstrapSession {
             return Err(error);
         }
         let selection = inspect_remote_helpers_in_session(self, &discovery.executables, timeout)?;
+        if let Some(helper) = &selection.compatible {
+            RemoteInstallIntent::ExplicitRegisteredUpgrade {
+                expected_node_id: expected_node_id.into(),
+            }
+            .verify_helper_identity(helper)?;
+        }
+        if discovery.executables.is_empty()
+            || selection
+                .compatible
+                .as_ref()
+                .is_some_and(|helper| helper.executable != discovery.install_destination)
+        {
+            let source = select_install_source(discovery.platform)?;
+            let (runner, probe, token) =
+                self.prepare_recovery(&source, expected_node_id, timeout)?;
+            let destination = RemoteExecutable::parse(
+                probe
+                    .get("destination")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| invalid_probe("removal destination missing"))?,
+            )?;
+            return Ok(RemoteUninstallPlan {
+                target: self.target.clone(),
+                destination,
+                helper_version: "temporary recovery helper".into(),
+                preserved_integrations: probe
+                    .get("preserved")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(|name| (name.to_owned(), None)))
+                    .collect(),
+                helper: runner,
+                bootstrap_id: self.id,
+                current_integrations: vec![],
+                expected_node_id: expected_node_id.into(),
+                expected_executable: token,
+                recovery: true,
+            });
+        }
         let helper = selection.compatible.ok_or_else(|| {
             classified_error(
                 io::ErrorKind::Unsupported,
@@ -1774,6 +1942,7 @@ impl BootstrapSession {
             current_integrations,
             expected_node_id: expected_node_id.to_owned(),
             expected_executable,
+            recovery: false,
         })
     }
 
@@ -1785,7 +1954,7 @@ impl BootstrapSession {
     ) -> io::Result<()> {
         if plan.bootstrap_id != self.id
             || plan.target != self.target
-            || plan.helper != plan.destination
+            || (!plan.recovery && plan.helper != plan.destination)
         {
             return Err(classified_error(
                 io::ErrorKind::PermissionDenied,
@@ -1793,33 +1962,50 @@ impl BootstrapSession {
                 "remote uninstall authorization belongs to a different bootstrap endpoint",
             ));
         }
-        maintenance()?;
-        for integration in &plan.current_integrations {
-            let arguments = match integration.as_str() {
-                "opencode" => "integration uninstall opencode --json",
-                "pi" => "integration uninstall pi --json",
-                "claude" => "integration uninstall claude --json",
-                "codex" => "integration uninstall codex --json",
-                "kiro" => "integration uninstall kiro --json",
-                _ => {
-                    return Err(invalid_probe(
-                        "remote uninstall plan contains an unknown integration",
-                    ));
-                }
-            };
-            let output = run_bounded_command(
-                self.command(&remote_daemon_command(&plan.helper, arguments)),
+        if plan.recovery {
+            maintenance()?;
+            self.run_recovery(
+                &plan.helper,
+                "remove",
+                &plan.expected_node_id,
+                &plan.expected_executable,
                 timeout,
             )?;
-            let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-                .map_err(|_| invalid_probe("remote integration uninstall returned invalid JSON"))?;
-            if value.get("schema").and_then(serde_json::Value::as_str) != Some("boomux.cli/v1")
-                || value.get("command").and_then(serde_json::Value::as_str)
-                    != Some("integration.uninstall")
+            return Ok(());
+        }
+        maintenance()?;
+        for integration in &plan.current_integrations {
+            if !crate::integrations::by_key(integration)
+                .is_some_and(|descriptor| descriptor.installation.is_some())
             {
                 return Err(invalid_probe(
-                    "remote integration uninstall returned an invalid envelope",
+                    "remote uninstall plan contains an unknown integration",
                 ));
+            }
+            let arguments = format!("integration uninstall {} --json", integration);
+            let cleanup = (|| -> io::Result<()> {
+                let output = run_bounded_command(
+                    self.command(&remote_daemon_command(&plan.helper, &arguments)),
+                    timeout,
+                )?;
+                let value: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).map_err(|_| {
+                        invalid_probe("remote integration uninstall returned invalid JSON")
+                    })?;
+                if value.get("schema").and_then(serde_json::Value::as_str) != Some("boomux.cli/v1")
+                    || value.get("command").and_then(serde_json::Value::as_str)
+                        != Some("integration.uninstall")
+                {
+                    return Err(invalid_probe(
+                        "remote integration uninstall returned an invalid envelope",
+                    ));
+                }
+                Ok(())
+            })();
+            if cleanup.is_err() {
+                eprintln!(
+                    "boomux: could not clean up the {integration} integration; its remaining assets are preserved"
+                );
             }
             maintenance()?;
         }
@@ -1907,6 +2093,42 @@ impl BootstrapSession {
                 "remote install authorization belongs to a different bootstrap endpoint",
             ));
         }
+        if let RemoteInstallIntent::RepairRegistered {
+            expected_node_id,
+            token,
+        } = &plan.intent
+        {
+            let runner = plan
+                .upgrade_helper
+                .as_ref()
+                .ok_or_else(|| invalid_probe("repair helper missing"))?;
+            self.run_recovery(runner, "repair", expected_node_id, token, timeout)
+                .map_err(|error| {
+                    if recovery_disposition(&error)
+                        == BootstrapRecoveryDisposition::NoRemoteMutation
+                    {
+                        error
+                    } else {
+                        with_recovery(error, BootstrapRecoveryDisposition::OutcomeUnknown)
+                    }
+                })?;
+            maintenance()?;
+            let selection = inspect_remote_helpers_in_session(
+                &self,
+                std::slice::from_ref(&plan.destination),
+                timeout,
+            )?;
+            let helper = selection
+                .compatible
+                .ok_or_else(|| invalid_probe("repaired helper did not answer"))?;
+            RemoteInstallIntent::ExplicitRegisteredUpgrade {
+                expected_node_id: expected_node_id.clone(),
+            }
+            .verify_helper_identity(&helper)?;
+            let mut connection = self.connect(helper, timeout)?;
+            connection.ping_with_timeout(timeout)?;
+            return Ok(connection);
+        }
         let upgrade_helper = if plan.reason == RemoteInstallReason::Upgrade {
             Some(plan.upgrade_helper.as_ref().ok_or_else(|| {
                 classified_error(
@@ -1939,6 +2161,11 @@ impl BootstrapSession {
                 ));
             }
             Err(first_error) => {
+                // Exit 73 is an explicit refusal before this transaction owns
+                // the lock. Do not retry or claim an unknown mutation outcome.
+                if error_code(&first_error) == "busy" {
+                    return Err(first_error);
+                }
                 if let Err(error) = maintenance() {
                     let failure = post_install_failure("stream", error);
                     return Err(
@@ -2248,8 +2475,19 @@ fn slave_command(
     command
 }
 
+fn recovery_upload_command(suffix: &str) -> String {
+    format!(
+        "{REMOTE_RUNTIME_PREFIX}umask 077; /usr/bin/find \"$XDG_RUNTIME_DIR\" -maxdepth 1 -type f -name 'boomux-recovery-*' -mmin +9 -delete; count=0; for staged in \"$XDG_RUNTIME_DIR\"/boomux-recovery-*; do [ ! -e \"$staged\" ] || count=$((count + 1)); done; [ \"$count\" -lt 2 ] || {{ printf '%s\\n' 'boomux: temporary recovery helpers are still active; retry in ten minutes' >&2; exit 1; }}; runner=$XDG_RUNTIME_DIR/boomux-recovery-{suffix}; (set -C; /bin/cat > \"$runner\") || {{ /bin/rm -f -- \"$runner\"; exit 1; }}; /bin/chmod 700 \"$runner\" || exit 1; printf '%s' \"$runner\""
+    )
+}
+
 impl Drop for BootstrapSession {
     fn drop(&mut self) {
+        if let Some(suffix) = &self.recovery_suffix {
+            let _ = run_bounded_command(self.command(&format!(
+                "{REMOTE_RUNTIME_PREFIX}/bin/rm -f -- \"$XDG_RUNTIME_DIR/boomux-recovery-{suffix}\""
+            )), Duration::from_secs(2));
+        }
         let _ = kill_process_group(self.master_pid, &mut self.master);
         if let Some(reader) = self.stderr_reader.take() {
             let _ = reader.finish();
@@ -2489,6 +2727,27 @@ fn classify_ssh_start_failure(status: Option<i32>, stderr: &[u8]) -> io::Error {
             io::ErrorKind::PermissionDenied,
             "bootstrap_authentication_failed",
             "SSH authentication or host-key verification failed",
+        )
+    } else if stderr.contains("timed out") || stderr.contains("timeout") {
+        classified_error(
+            io::ErrorKind::TimedOut,
+            "bootstrap_transport_failed",
+            "SSH connection timed out; check that the remote machine is online, its network or VPN is connected, and SSH is reachable, then retry",
+        )
+    } else if stderr.contains("could not resolve hostname") {
+        classified_error(
+            io::ErrorKind::NotFound,
+            "bootstrap_transport_failed",
+            "SSH could not resolve the remote hostname; check the stored SSH route and network or VPN connection",
+        )
+    } else if stderr.contains("connection refused")
+        || stderr.contains("no route to host")
+        || stderr.contains("network is unreachable")
+    {
+        classified_error(
+            io::ErrorKind::ConnectionRefused,
+            "bootstrap_transport_failed",
+            "SSH could not reach the remote service; check that the machine is online and accepting SSH connections",
         )
     } else {
         classified_error(
@@ -3779,9 +4038,54 @@ fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<Ss
 }
 
 fn classify_ssh_command_failure(status: Option<i32>, stderr: &[u8]) -> io::Error {
+    if status == Some(2)
+        && stderr
+            .windows(b"__remote-maintenance".len())
+            .any(|w| w == b"__remote-maintenance")
+    {
+        return with_recovery(
+            classified_error(
+                io::ErrorKind::Unsupported,
+                "remote_recovery_unsupported",
+                "the selected binary does not support remote recovery; use a release that includes this workflow",
+            ),
+            BootstrapRecoveryDisposition::NoRemoteMutation,
+        );
+    }
     // Surface known ownership refusals without relaying arbitrary remote stderr
     // (which can contain secrets or terminal control sequences).
     if status == Some(1) {
+        for message in [
+            "recovery preparation expired; retry update or removal",
+            "remote configuration could not be read; repair it on the owner before updating",
+            "saved remote state cannot be read by this Boomux version; use a compatible release",
+            "temporary recovery helpers are still active; retry in ten minutes",
+            "package-managed executable; use its package manager",
+            "this executable belongs to a Desktop bundle; use its Desktop installer",
+            "remote Node identity changed; refusing maintenance",
+            "running daemon belongs to another Node",
+            "running daemon executable cannot be verified",
+            "installation changed after maintenance preparation; retry",
+            "another recovery operation is active; retry shortly",
+            "another update is finishing recovery; retry shortly",
+            "running daemon predates safe executable handoff; repair requires protocol 52 or newer",
+            "maintenance directory is not privately owned",
+            "installation record belongs to another Node or version",
+        ] {
+            if stderr
+                .split(|b| *b == b'\n')
+                .any(|line| line.strip_prefix(b"boomux: ") == Some(message.as_bytes()))
+            {
+                return with_recovery(
+                    classified_error(
+                        io::ErrorKind::PermissionDenied,
+                        "remote_maintenance_refused",
+                        message,
+                    ),
+                    BootstrapRecoveryDisposition::NoRemoteMutation,
+                );
+            }
+        }
         for (reason, message) in [
             (
                 "this Boomux executable is a source or development build; remove it through its build or installation workflow",
@@ -3823,7 +4127,7 @@ fn classify_ssh_command_failure(status: Option<i32>, stderr: &[u8]) -> io::Error
         return classified_error(
             io::ErrorKind::ResourceBusy,
             "busy",
-            "another remote Boomux bootstrap transaction is active",
+            "another remote Boomux update is active or finishing cleanup; wait up to three minutes and retry",
         );
     }
     if status == Some(92) {
@@ -5830,6 +6134,59 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_connection_has_short_deadline_without_shortening_signin() {
+        for (timeout, expected) in [(120, 15), (2, 2)] {
+            let runtime = runtime_directory();
+            fs::create_dir_all(&runtime).unwrap();
+            let ssh = write_master_stderr_ssh(
+                &runtime,
+                &format!(
+                    "found=false; attempts=false; for arg do [ \"$arg\" = ConnectTimeout={expected} ] && found=true; [ \"$arg\" = ConnectionAttempts=1 ] && attempts=true; done; $found && $attempts || exit 64; : > \"$control.ready\"; while :; do /bin/sleep 60; done"
+                ),
+            );
+            let session = BootstrapSession::open_at(
+                &runtime,
+                None,
+                SshTarget::parse("workbox").unwrap(),
+                SshAuthenticationMode::Interactive,
+                Duration::from_secs(timeout),
+                ssh.as_os_str(),
+            )
+            .unwrap();
+            drop(session);
+            assert!(
+                fs::read_dir(&runtime)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .all(|entry| !entry.file_type().unwrap().is_dir())
+            );
+            fs::remove_dir_all(runtime).unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_network_failures_are_actionable_and_do_not_echo_private_stderr() {
+        for stderr in [
+            "connect to host private-host port 22: Connection timed out SECRET",
+            "Connection refused SECRET",
+            "No route to host SECRET",
+            "Network is unreachable SECRET",
+            "Could not resolve hostname private-host SECRET",
+        ] {
+            let error = classify_ssh_start_failure(Some(255), stderr.as_bytes());
+            assert_eq!(error_code(&error), "bootstrap_transport_failed");
+            assert!(error.to_string().contains("check"));
+            assert!(!error.to_string().contains("SECRET"));
+            assert!(!error.to_string().contains("private-host"));
+            assert_ne!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+        assert_eq!(
+            error_code(&classify_ssh_start_failure(Some(255), b"Permission denied")),
+            "bootstrap_authentication_failed"
+        );
+    }
+
+    #[test]
     fn master_stderr_is_mirrored_live_only_for_interactive_authentication() {
         let challenge = b"To authenticate, visit:\nhttps://login.tailscale.test/a?c=123\n\xff";
         for authentication in [
@@ -6682,14 +7039,82 @@ mod tests {
     }
 
     #[test]
+    fn recovery_upload_bounds_staging_and_reclaims_expired_helpers() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let upload = |suffix: &str| {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", &recovery_upload_command(suffix)])
+                .env("HOME", &runtime)
+                .env("XDG_RUNTIME_DIR", &runtime);
+            run_streaming_command_capture(
+                command,
+                b"recovery candidate".to_vec(),
+                Duration::from_secs(2),
+            )
+        };
+        let first = upload("first").unwrap();
+        let first = PathBuf::from(String::from_utf8(first.stdout).unwrap());
+        let second = upload("second").unwrap();
+        let second = PathBuf::from(String::from_utf8(second.stdout).unwrap());
+        assert_eq!(fs::read(&first).unwrap(), b"recovery candidate");
+        assert_eq!(fs::metadata(&first).unwrap().mode() & 0o777, 0o700);
+        assert!(upload("third").is_err());
+        let old = std::time::SystemTime::now() - Duration::from_secs(12 * 60);
+        for file in [&first, &second] {
+            fs::File::open(file)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        upload("third").unwrap();
+        assert!(!first.exists());
+        assert!(!second.exists());
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_upgrade_missing_helper_prepares_identity_pinned_recovery() {
+        let runtime = runtime_directory();
+        let node = Uuid::new_v4().to_string();
+        let response = serde_json::json!({"probe":{"version":1,"node_id":node,
+            "destination":"/home/person/.local/bin/boomux","preserved":[]},"token":"a".repeat(64)});
+        let cases = format!(
+            "  *'__remote-maintenance probe '*) printf '%s' '{}' ;;\n  *'runner=$XDG_RUNTIME_DIR/boomux-recovery-'*) cat >/dev/null; printf /tmp/boomux-recovery-fixture ;;",
+            response
+        );
+        let ssh = write_session_bootstrap_ssh(&runtime, &cases, "");
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(5),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = session
+            .plan_explicit_upgrade(&node, Duration::from_secs(5))
+            .unwrap();
+        assert!(plan.uses_recovery_helper());
+        assert!(
+            matches!(plan.intent, RemoteInstallIntent::RepairRegistered { expected_node_id, .. } if expected_node_id == node)
+        );
+        drop(session);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
     fn explicit_upgrade_plans_replacement_for_a_compatible_registered_node() {
         let runtime = runtime_directory();
         let node_id = Uuid::new_v4().to_string();
         let helper = compatible_helper_script(&node_id);
         let ssh = write_session_bootstrap_ssh(
             &runtime,
-            &format!("  \"'/good/boomux' __federation-stdio\") {helper} ;;"),
-            "/good/boomux\\0",
+            &format!("  \"'/home/person/.local/bin/boomux' __federation-stdio\") {helper} ;;"),
+            "/home/person/.local/bin/boomux\\0",
         );
         let mut session = BootstrapSession::open_at(
             &runtime,
@@ -6707,7 +7132,7 @@ mod tests {
         assert_eq!(plan.reason, RemoteInstallReason::Upgrade);
         assert_eq!(
             plan.upgrade_helper.as_ref().unwrap().as_str(),
-            "/good/boomux"
+            "/home/person/.local/bin/boomux"
         );
         assert!(matches!(
             plan.source,
@@ -6755,47 +7180,67 @@ mod tests {
 
     #[test]
     fn explicit_uninstall_uses_one_session_and_preserves_modified_integrations() {
-        let runtime = runtime_directory();
-        let marker = runtime.join("uninstalled");
-        let node_id = Uuid::new_v4().to_string();
-        let helper = compatible_helper_script(&node_id);
-        let executable = "/home/person/.local/bin/boomux";
-        let status = r#"{"schema":"boomux.cli/v1","command":"integration.status","data":{"integrations":[{"name":"opencode","display_name":"OpenCode","asset":{"state":"current","path":"/current"}},{"name":"pi","display_name":"Pi","asset":{"state":"modified","path":"/modified"}}]}}"#;
-        let removed = r#"{"schema":"boomux.cli/v1","command":"integration.uninstall","data":{"integrations":[]}}"#;
-        let ssh = write_session_bootstrap_ssh(
-            &runtime,
-            &format!(
-                "  \"'{executable}' __federation-stdio\") {helper} ;;\n  \"'{executable}' --version\") printf 'boomux 1.0.1\\n' ;;\n  *'__uninstall-fingerprint'*) printf 'boomux-uninstall-fingerprint-v1 token\\n' ;;\n  *'integration status --json'*) printf '%s' '{status}' ;;\n  *'integration uninstall opencode --json'*) printf '%s' '{removed}' ;;\n  *'__uninstall-remote'*) : > {} ;;",
-                quote_posix_shell(marker.to_str().unwrap())
-            ),
-            "/home/person/.local/bin/boomux\\0",
-        );
-        let mut session = BootstrapSession::open_at(
-            &runtime,
-            None,
-            SshTarget::parse("workbox").unwrap(),
-            SshAuthenticationMode::Batch,
-            Duration::from_secs(1),
-            ssh.as_os_str(),
-        )
-        .unwrap();
-        let plan = session
-            .plan_explicit_uninstall(&node_id, Duration::from_secs(1))
+        for kiro in ["kiro-v3", "kiro"] {
+            let runtime = runtime_directory();
+            let marker = runtime.join("uninstalled");
+            let node_id = Uuid::new_v4().to_string();
+            let helper = compatible_helper_script(&node_id);
+            let executable = "/home/person/.local/bin/boomux";
+            let status = r#"{"schema":"boomux.cli/v1","command":"integration.status","data":{"integrations":[{"name":"opencode","display_name":"OpenCode","asset":{"state":"current","path":"/current"}},{"name":"pi","display_name":"Pi","asset":{"state":"modified","path":"/modified"}}]}}"#;
+            let mut status: serde_json::Value = serde_json::from_str(status).unwrap();
+            status["data"]["integrations"].as_array_mut().unwrap().push(serde_json::json!({
+            "name":kiro, "display_name":"Kiro CLI v3", "asset":{"state":"current","path":"/kiro"}
+        }));
+            status["data"]["integrations"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name":"future-host"}));
+            let status = serde_json::to_string(&status).unwrap();
+            let removed = r#"{"schema":"boomux.cli/v1","command":"integration.uninstall","data":{"integrations":[]}}"#;
+            let cleanup = if kiro == "kiro" {
+                "exit 1".to_owned()
+            } else {
+                format!("printf '%s' '{removed}'")
+            };
+            let ssh = write_session_bootstrap_ssh(
+                &runtime,
+                &format!(
+                    "  \"'{executable}' __federation-stdio\") {helper} ;;\n  \"'{executable}' --version\") printf 'boomux 1.0.1\\n' ;;\n  *'__uninstall-fingerprint'*) printf 'boomux-uninstall-fingerprint-v1 token\\n' ;;\n  *'integration status --json'*) printf '%s' '{status}' ;;\n  *'integration uninstall {kiro} --json'*) {cleanup} ;;\n  *'integration uninstall opencode --json'*) printf '%s' '{removed}' ;;\n  *'__uninstall-remote'*) : > {} ;;",
+                    quote_posix_shell(marker.to_str().unwrap())
+                ),
+                "/home/person/.local/bin/boomux\\0",
+            );
+            let mut session = BootstrapSession::open_at(
+                &runtime,
+                None,
+                SshTarget::parse("workbox").unwrap(),
+                SshAuthenticationMode::Batch,
+                Duration::from_secs(1),
+                ssh.as_os_str(),
+            )
             .unwrap();
-        assert_eq!(
-            plan.preserved_integrations,
-            vec![("Pi".into(), Some("/modified".into()))]
-        );
-        let mut renewals = 0;
-        session
-            .uninstall_registered(&plan, Duration::from_secs(1), || {
-                renewals += 1;
-                Ok(())
-            })
-            .unwrap();
-        assert!(renewals >= 3);
-        assert!(marker.exists());
-        fs::remove_dir_all(runtime).unwrap();
+            let plan = session
+                .plan_explicit_uninstall(&node_id, Duration::from_secs(1))
+                .unwrap();
+            assert!(plan.current_integrations.iter().any(|name| name == kiro));
+            assert_eq!(
+                plan.preserved_integrations,
+                vec![
+                    ("Pi".into(), Some("/modified".into())),
+                    ("future-host".into(), None)
+                ]
+            );
+            let mut renewals = 0;
+            session
+                .uninstall_registered(&plan, Duration::from_secs(1), || {
+                    renewals += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(renewals >= 3);
+            assert!(marker.exists());
+            fs::remove_dir_all(runtime).unwrap();
+        }
     }
 
     #[test]
@@ -7348,6 +7793,77 @@ mod tests {
         assert!(backup.exists());
         assert_eq!(fs::read_to_string(&count).unwrap(), "2");
         drop(connection);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_upgrade_busy_upload_does_not_retry_or_claim_unknown_outcome() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let destination = runtime.join("destination");
+        let backup = runtime.join("backup");
+        let count = runtime.join("count");
+        let committed = runtime.join("committed");
+        let restarted = runtime.join("restarted");
+        fs::write(&destination, b"previous-helper").unwrap();
+        let node_id = Uuid::new_v4().to_string();
+        let helper = compatible_helper_script(&node_id);
+        let ssh = runtime.join("ssh");
+        fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\n{control}\nlast=\nfor arg do last=$arg; done\ncase \"$last\" in\n  *'boomux-install-transaction-v1'*) printf x >> {committed}; exit 73 ;;\n  *'committed=$lock/committed'*) cat >/dev/null; [ \"$(cat {count})\" -eq 3 ]; : > {committed}; printf 'boomux-install-commit-v1\\0committed\\0' ;;\n  *': > \"$transaction/restarted\"'*) cat >/dev/null; : > {restarted} ;;\n  *'transaction/watchdog_pid'*'restore_install'*) cat >/dev/null; rm -f {destination}; mv {backup} {destination} ;;\n  *'daemon status --json'*) printf '%s' '{{\"schema\":\"boomux.cli/v1\",\"command\":\"daemon.status\",\"data\":{{\"protocol_version\":38}}}}' ;;\n  *'daemon restart'*) : > {restarted} ;;\n  *\"'/home/person/.local/bin/boomux' __federation-stdio\") n=0; [ ! -f {count} ] || n=$(cat {count}); n=$((n + 1)); printf '%s' \"$n\" > {count}; {helper} ;;\n  *) exit 64 ;;\nesac\n",
+                control = CONTROL_MASTER_SCRIPT,
+                destination = quote_posix_shell(destination.to_str().unwrap()),
+                backup = quote_posix_shell(backup.to_str().unwrap()),
+                count = quote_posix_shell(count.to_str().unwrap()),
+                committed = quote_posix_shell(committed.to_str().unwrap()),
+                restarted = quote_posix_shell(restarted.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        add_fake_daemon_identity(&ssh, "/home/person/.local/bin/boomux");
+        let session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let plan = RemoteInstallPlan {
+            target: SshTarget::parse("workbox").unwrap(),
+            destination: RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            source: RemoteInstallSource::CurrentBinary {
+                path: runtime.join("pinned"),
+                sha256: format!("{:x}", Sha256::digest(b"replacement")),
+                bytes: b"replacement".to_vec(),
+            },
+            reason: RemoteInstallReason::Upgrade,
+            bootstrap_id: Some(session.id),
+            upgrade_helper: Some(
+                RemoteExecutable::parse("/home/person/.local/bin/boomux").unwrap(),
+            ),
+            intent: RemoteInstallIntent::ExplicitRegisteredUpgrade {
+                expected_node_id: node_id,
+            },
+        };
+
+        let error = session
+            .install_and_connect(&plan, Duration::from_secs(1))
+            .err()
+            .expect("busy upload must fail");
+        assert_eq!(error_code(&error), "busy");
+        assert_eq!(
+            recovery_disposition(&error),
+            BootstrapRecoveryDisposition::NoRemoteMutation
+        );
+        assert!(error.to_string().contains("three minutes"));
+        assert_eq!(fs::read(&committed).unwrap(), b"x");
+        assert!(!restarted.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"previous-helper");
         fs::remove_dir_all(runtime).unwrap();
     }
 

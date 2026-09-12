@@ -53,6 +53,7 @@ mod macos_terminal;
 mod mobile_web;
 mod process_adapter;
 mod projects;
+mod remote_maintenance;
 mod session_projection;
 mod setup;
 mod tailscale_serve;
@@ -499,6 +500,12 @@ enum Commands {
     },
     #[command(name = "__uninstall-fingerprint", hide = true)]
     UninstallFingerprint,
+    #[command(name = "__remote-maintenance", hide = true)]
+    RemoteMaintenance {
+        action: String,
+        expected_node_id: String,
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1378,6 +1385,7 @@ command_keys! {
     ResumeSessionInternal => ("resume-session-internal", HumanOnly),
     UninstallRemote => ("uninstall-remote", HumanOnly),
     UninstallFingerprint => ("uninstall-fingerprint", HumanOnly),
+    RemoteMaintenance => ("remote-maintenance", HumanOnly),
 }
 
 impl Cli {
@@ -1647,6 +1655,7 @@ impl Cli {
             Some(Commands::GuidedNodeReauthenticate { .. }) => CommandKey::NodeReauthenticate,
             Some(Commands::UninstallRemote { .. }) => CommandKey::UninstallRemote,
             Some(Commands::UninstallFingerprint) => CommandKey::UninstallFingerprint,
+            Some(Commands::RemoteMaintenance { .. }) => CommandKey::RemoteMaintenance,
             Some(Commands::BootstrapActivate { .. }) => CommandKey::Daemon,
         }
     }
@@ -2109,6 +2118,11 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             expected_node_id,
             expected_executable,
         }) => uninstall::remote_uninstall(&expected_node_id, &expected_executable),
+        Some(Commands::RemoteMaintenance {
+            action,
+            expected_node_id,
+            token,
+        }) => remote_maintenance::run(&action, &expected_node_id, token.as_deref()),
         Some(Commands::UninstallFingerprint) => {
             let target = update::remote_uninstall_target()?;
             println!(
@@ -2263,9 +2277,15 @@ fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
     println!("Remote target: {}", registration.target);
     println!("Install source: {}", plan.source.description());
     println!("Install destination: {}", plan.destination.as_str());
-    println!(
-        "Process impact: this workflow requires an already protocol-compatible helper; the pinned binary is uploaded privately first, activation requires proof that the running daemon uses this destination, the previous executable is retained for rollback, and any present compatible daemon is restarted"
-    );
+    if plan.uses_recovery_helper() {
+        println!(
+            "Process impact: a temporary recovery helper repairs the verified user installation and hands any compatible running daemon over to it. Saved Workspace data and Node identity are preserved."
+        );
+    } else {
+        println!(
+            "Process impact: the pinned binary is uploaded privately, the previous executable is retained for rollback, and any compatible running daemon is restarted after its installation is verified."
+        );
+    }
     if !confirm_setup("Upgrade Boomux on this registered Node?")? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -2423,6 +2443,7 @@ fn uninstall_node(selector: &str) -> Result<(), Box<dyn Error>> {
 
 fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
     const TIMEOUT: Duration = Duration::from_secs(120);
+    const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::new(
@@ -2442,7 +2463,7 @@ fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
     println!("Node: {} ({})", registration.alias, registration.node_id);
     println!("Stored SSH route: {}", registration.target);
     println!(
-        "Complete any SSH authentication prompt or login URL shown in this terminal. Boomux will not install, upgrade, retarget, or modify the registration."
+        "Connecting to the remote machine (15-second SSH connection timeout). Sign-in prompts or a login URL will appear here if required; allow up to 2 minutes to complete sign-in. Press Ctrl+C to cancel."
     );
     io::Write::flush(&mut io::stdout())?;
 
@@ -2453,21 +2474,25 @@ fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
         TIMEOUT,
     )
     .map_err(bootstrap_cli_failure)?;
+    println!("SSH sign-in succeeded. Checking the remote Boomux identity (up to 30 seconds)...");
+    io::Write::flush(&mut io::stdout())?;
     let connection = session
-        .connect_existing_verified(&registration.node_id, TIMEOUT)
+        .connect_existing_verified(&registration.node_id, VERIFY_TIMEOUT)
         .map_err(bootstrap_cli_failure)?;
     drop(connection);
 
-    println!("Verifying that background observation can reconnect without prompts...");
+    println!(
+        "Remote identity verified. Checking background access without prompts (up to 30 seconds per check)..."
+    );
     io::Write::flush(&mut io::stdout())?;
     let session = ssh_bootstrap::BootstrapSession::open(
         target,
         ssh_bootstrap::SshAuthenticationMode::Batch,
-        TIMEOUT,
+        VERIFY_TIMEOUT,
     )
     .map_err(bootstrap_cli_failure)?;
     let connection = session
-        .connect_existing_verified(&registration.node_id, TIMEOUT)
+        .connect_existing_verified(&registration.node_id, VERIFY_TIMEOUT)
         .map_err(bootstrap_cli_failure)?;
 
     let current = local.node_registration(&registration.node_id)?;

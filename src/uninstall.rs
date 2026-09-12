@@ -226,7 +226,7 @@ pub(crate) fn remote_uninstall(
     Ok(())
 }
 
-fn stop_web_gateways() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn stop_web_gateways() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = client::socket_path()?
         .parent()
         .ok_or_else(|| io::Error::other("Boomux runtime socket has no parent"))?

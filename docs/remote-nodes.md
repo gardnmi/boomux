@@ -123,6 +123,19 @@ existing batch observer without starting an overlapping worker or changing
 remote authority. Daemon protocol 38 or newer is required for that explicit
 observer wake.
 
+Sign-in first connects to SSH with one attempt and a 15-second connection/key
+exchange timeout (or the shorter operation budget). Interactive prompts retain
+up to two minutes. The terminal shows when SSH sign-in succeeds, when the pinned
+Boomux identity is checked, and when prompt-free background access is checked.
+Each subsequent verification operation has a 30-second budget. DNS, proxy
+commands, and interactive authentication remain subject to the outer operation
+budget. Network timeouts report reachability guidance rather than implying a
+password prompt is waiting. Press Ctrl+C to cancel the sign-in attempt.
+
+The connection deadline uses OpenSSH's
+[`ConnectTimeout`](https://man.openbsd.org/ssh_config#ConnectTimeout); it does not
+shorten the time available to answer interactive authentication prompts.
+
 ### Prepared Operations And Recovery
 
 Prepared operations are isolated and serialized by operation UUID, so concurrent
@@ -253,8 +266,10 @@ NODE` verifies the pinned identity and, after
 confirmation, transactionally replaces a compatible registered helper without
 changing the registration. Immediately before activation it acquires a bounded
 local maintenance lease, drains admitted operations, and prevents rename,
-retarget, forget, projection, and routed operations until remote commit or
-rollback completes. The lease expires fail-open if the upgrading client dies.
+retarget, projection, and routed operations until remote commit or
+rollback completes. Local `node forget` can remove the registration during
+maintenance; it neither contacts the owner nor cancels an already-authorized
+remote operation. The lease expires fail-open if the upgrading client dies.
 
 The CLI renews it during a live transaction; local daemon restart and stop are
 busy while it remains active so handoff cannot silently reopen admission.
@@ -264,11 +279,13 @@ rollback whose completion cannot be confirmed leaves it closed until bounded
 expiry so the remote watchdog settles before local routing resumes.
 
 Human-only `node uninstall NODE` uses the same admission-closing maintenance
-lease after explicit process and data-impact confirmation. It requires an
-existing protocol-48 helper at the canonical user install destination, proves a
-present daemon executes that exact destination, performs Node-ID-conditional
-normal daemon stop, and owner-validates the regular single-link executable
-against its pre-confirmation fingerprint before removal. Remote state, config, modified
+lease after explicit process and data-impact confirmation. The normal path uses
+an existing protocol-48 helper at the canonical user install destination. If
+that helper is missing or runs from a different user installation, a temporary
+recovery helper inspects the existing Node identity and installation instead.
+Both paths identify a present daemon, perform Node-ID-conditional normal daemon
+stop, and revalidate the executable before removal. Already-missing executables
+are a successful removal condition after identity verification. Remote state, config, modified
 integrations, and the Agent Skill remain. Confirmed removal atomically deletes
 the local registration while admission is still closed, then best-effort removes
 its now-inaccessible disposable projection. Any failure retains the registration
@@ -540,8 +557,9 @@ Forget and retarget use prepare, drain, and commit phases. Prepare closes
 admission without changing the revision, then releases the mutation gate.
 Already admitted operations retain their reservation and can finish against the
 old registration. If the bounded drain cannot reach a completed or explicit
-unknown-outcome boundary, the operation reopens admission and returns `busy`
-without changing the route, revision, or tombstone epoch. After a successful
+unknown-outcome boundary, the operation restores admission to its previous
+maintenance-constrained state and returns `busy` without changing the route,
+revision, or tombstone epoch. After a successful
 drain, commit revalidates the unchanged registration under the gate, advances its
 revision or tombstone epoch, and removes the old cache. Retarget then installs the
 verified new route with admission closed until a fresh baseline succeeds. It
@@ -1079,3 +1097,69 @@ The initial contract excludes:
 - Remote TCP control listeners or forwarding the local daemon socket.
 - Treating a local daemon stop, restart, or Node removal as remote process
   authority.
+
+### Repairing a missing or moved executable
+
+**Update remote** (`node upgrade NODE`) can use a privately uploaded, temporary
+helper when the installed CLI is missing or a compatible helper is found at a
+noncanonical path. It reads the saved Node identity without creating a new
+identity or starting a daemon. A running owner supplies its kernel-verified
+executable path; otherwise recovery uses its owner-only installation record,
+then defaults to `~/.local/bin/boomux` when no record exists. Package-managed and
+Desktop-bundled executables remain owned by their installers.
+
+The confirmation displays the actual installation path. Repair validates
+readable saved state before a cold start and requires protocol 52 or newer for
+handoff from a running daemon. Existing binaries use a rollback transaction;
+missing binaries use atomic no-replace installation. A handoff is successful
+only after the running executable matches the installed inode and content.
+Recovery never resets saved state to bypass an incompatibility. Protocol-46
+owners still require the documented cold upgrade.
+
+Recovery records the verified path in `installation.json` beside `node.json`.
+This separate version-1 record contains only the Node identity and absolute
+installation path; it is bounded to 8 KiB, owner-only, and atomically replaced.
+A verified running daemon takes precedence over a stale record. This adds no
+registration, daemon-state, or wire-schema fields.
+
+Recovery operations serialize using a kernel lock on a regular
+`~/.local/bin/.boomux.bootstrap.lock` file. This also excludes legacy installers
+that acquire a directory at that path. A later recovery can reclaim a file lock
+after its process dies; it never deletes a legacy transaction directory. One
+reserved candidate and one rollback copy bound local recovery artifacts and
+avoid leaving the installed executable hard-linked after interruption.
+Temporary uploaded helpers are removed when the SSH session closes. A later
+preparation prunes abandoned helpers older than ten minutes and refuses staging
+when two helpers remain. Long-delayed confirmations may need fresh preparation.
+
+**Remove machine & uninstall Boomux** also uses recovery for missing executables.
+It preserves durable state and modified, unavailable, or unrecognized integration
+assets. Failed optional integration cleanup does not prevent verified executable
+removal. An unavailable owner still cannot be uninstalled remotely; **Forget
+connection only** always remains a local operation, including during an update's
+maintenance lease. Forgetting does not claim that remote software was removed.
+
+### Hiding an unavailable Workspace in Desktop
+
+A remote Workspace's three-dot menu offers **Hide from sidebar**. This changes
+only this Desktop's saved presentation and detaches its open panes. It works
+without contacting the owner and does not stop processes, delete Workspace
+state, or forget the machine. In **Remotes → Hidden Workspaces**, select
+**Show** to restore an entry from the normal cached overview refresh.
+
+**Remove** still deletes the Workspace and its Shells on the remote owner and
+requires connectivity. **Forget connection only** on the machine card removes
+all that machine's cached entries and its local registration without contacting
+the owner. These operations have distinct scopes.
+
+A completed remote update retains its transaction lock and rollback files for
+up to three minutes while watchdog cleanup finishes. Another update during
+that window returns `busy` before uploading or replacing anything. This explicit
+refusal releases the attempted update's local maintenance window; it must not
+be presented as an unknown upgrade outcome. Wait for cleanup before retrying.
+
+An ambiguous update failure can retain a separate local Node maintenance lease
+for up to ten minutes after its last renewal. This is distinct from the remote
+cleanup window. Rename, retarget, and new update/uninstall attempts report
+the remaining local lease time and resume after expiry. Local forget remains
+available during this lease.

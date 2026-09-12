@@ -28,6 +28,7 @@ This is the implementation reference. For product usage, see the
 | `src/node_projection.rs` | Disposable owner-only remote projection cache, deterministic bounds, health, generation CAS, quarantine, and atomic storage |
 | `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
 | `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, bounded interactive authentication presentation, deadline-bound remote discovery, and helper compatibility selection |
+| `src/remote_maintenance.rs` | Temporary owner-side repair/removal, existing-identity verification, user installation records, and retryable recovery serialization |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, takeover waiting, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
