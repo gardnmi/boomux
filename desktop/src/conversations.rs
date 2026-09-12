@@ -20,6 +20,29 @@ pub(crate) struct Panel {
     attempt: Option<(String, String, String)>,
 }
 
+fn conversation_button(id: impl Into<gpui::ElementId>, label: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .text_xs()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(0x45475a))
+        .bg(rgb(0x242432))
+        .text_color(rgb(0xcdd6f4))
+        .cursor_pointer()
+        .hover(|button| {
+            button
+                .bg(rgb(0x45475a))
+                .border_color(rgb(0x89b4fa))
+                .text_color(rgb(0xffffff))
+        })
+        .child(label)
+}
+
 fn filtered_entries(
     entries: &[Conversation],
     preferences: &[layout_state::ConversationPreference],
@@ -353,15 +376,6 @@ impl Workspace {
         }
         let selected = self.conversation_workspace();
         let current = selected == self.conversations.workspace;
-        let name = selected
-            .as_ref()
-            .and_then(|id| {
-                self.boomux_overview
-                    .workspaces
-                    .iter()
-                    .find(|workspace| &workspace.id == id)
-            })
-            .map(|w| w.name.clone());
         let mut list = div()
             .id("workspace-conversations")
             .flex_1()
@@ -369,13 +383,10 @@ impl Workspace {
             .overflow_y_scroll()
             .track_scroll(&self.conversations.scroll)
             .px_3()
-            .pb_3()
-            .child(
-                div()
-                    .py_2()
-                    .text_sm()
-                    .child(name.unwrap_or_else(|| "Select a Workspace".into())),
-            );
+            .pb_3();
+        if selected.is_none() {
+            list = list.child(div().py_2().text_sm().child("Select a Workspace"));
+        }
         if self.conversations.opening {
             list = list.child(div().text_sm().child("Opening conversation…"));
         }
@@ -459,19 +470,12 @@ impl Workspace {
                                 .pt_2()
                                 .when(can_open, |actions| {
                                     actions.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "open-{}",
-                                                entry.agent_id
-                                            )))
-                                            .role(gpui::Role::Button)
-                                            .text_xs()
-                                            .px_2()
-                                            .border_1()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .child(label)
-                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                        conversation_button(
+                                            SharedString::from(format!("open-{}", entry.agent_id)),
+                                            label,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
                                                 cx.stop_propagation();
                                                 this.open_conversation(
                                                     open_key.clone(),
@@ -479,34 +483,31 @@ impl Workspace {
                                                     window,
                                                     cx,
                                                 );
-                                            })),
+                                            }),
+                                        ),
                                     )
                                 })
                                 .child(
-                                    div()
-                                        .id(SharedString::from(format!("pin-{}", entry.agent_id)))
-                                        .role(gpui::Role::Button)
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .child(if pinned { "Unpin" } else { "Pin" })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                    conversation_button(
+                                        SharedString::from(format!("pin-{}", entry.agent_id)),
+                                        if pinned { "Unpin" } else { "Pin" },
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.change_conversation_preference(
                                                 &pin_key, &pin_entry, false, cx,
                                             );
-                                        })),
+                                        },
+                                    )),
                                 )
                                 .child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "archive-{}",
-                                            entry.agent_id
-                                        )))
-                                        .role(gpui::Role::Button)
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .child(if archived { "Restore" } else { "Archive" })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                    conversation_button(
+                                        SharedString::from(format!("archive-{}", entry.agent_id)),
+                                        if archived { "Restore" } else { "Archive" },
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.change_conversation_preference(
                                                 &archive_key,
@@ -514,7 +515,8 @@ impl Workspace {
                                                 true,
                                                 cx,
                                             );
-                                        })),
+                                        },
+                                    )),
                                 ),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -538,15 +540,12 @@ impl Workspace {
             }
             if self.conversations.filtered.len() > self.conversations.visible.max(50) {
                 list = list.child(
-                    div()
-                        .id("more-conversations")
-                        .py_2()
-                        .cursor_pointer()
-                        .child("Show more")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                    conversation_button("more-conversations", "Show more").on_click(cx.listener(
+                        |this, _, _, cx| {
                             this.conversations.visible = this.conversations.visible.max(50) + 50;
                             cx.notify();
-                        })),
+                        },
+                    )),
                 );
             }
         } else if selected.is_some() {
@@ -576,15 +575,13 @@ impl Workspace {
                         .py_3()
                         .child("Conversations")
                         .child(
-                            div()
-                                .id("close-conversations")
-                                .cursor_pointer()
-                                .child("Close")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                            conversation_button("close-conversations", "Close").on_click(
+                                cx.listener(|this, _, _, cx| {
                                     this.conversations.open = false;
                                     this.conversations.search_focused = false;
                                     cx.notify();
-                                })),
+                                }),
+                            ),
                         ),
                 )
                 .child(
@@ -630,6 +627,10 @@ impl Workspace {
                                 .role(gpui::Role::Button)
                                 .text_sm()
                                 .cursor_pointer()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .hover(|tab| tab.bg(rgb(0x313244)).text_color(rgb(0xffffff)))
                                 .border_b_2()
                                 .border_color(rgb(if self.conversations.archived == archived {
                                     0x89b4fa
