@@ -113,6 +113,7 @@ pub struct TerminalCell {
     pub foreground: u32,
     pub background: u32,
     pub bold: bool,
+    pub faint: bool,
     pub italic: bool,
     pub underline: bool,
     pub wide: bool,
@@ -122,6 +123,7 @@ pub struct TerminalCell {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalScreen {
+    pub background: u32,
     pub rows: u16,
     pub cols: u16,
     pub cells: Vec<TerminalCell>,
@@ -1814,6 +1816,7 @@ impl EmulatorCore {
                     foreground: rgb_value(foreground),
                     background: rgb_value(background),
                     bold: style.bold,
+                    faint: style.faint,
                     italic: style.italic,
                     underline: style.underline != Underline::None,
                     wide: wide == CellWide::Wide,
@@ -1826,6 +1829,7 @@ impl EmulatorCore {
         }
 
         Ok(TerminalScreen {
+            background: rgb_value(colors.background),
             rows,
             cols,
             cells: output,
@@ -2258,6 +2262,7 @@ fn configure_terminal(
 fn blank_screen(rows: u16, cols: u16) -> TerminalScreen {
     let theme = crate::theme::current_terminal();
     TerminalScreen {
+        background: theme.background,
         rows,
         cols,
         cells: vec![
@@ -2266,6 +2271,7 @@ fn blank_screen(rows: u16, cols: u16) -> TerminalScreen {
                 foreground: theme.foreground,
                 background: theme.background,
                 bold: false,
+                faint: false,
                 italic: false,
                 underline: false,
                 wide: false,
@@ -3888,6 +3894,46 @@ mod tests {
         assert_eq!(indexed_color(231), 0xffffff);
         assert_eq!(indexed_color(232), 0x080808);
         assert_eq!(indexed_color(255), 0xeeeeee);
+    }
+
+    #[test]
+    fn terminal_colors_preserve_faint_and_resolved_background() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(2, 10, 100, 40)));
+        let mut core = EmulatorCore::new(&shared, 2, 10, 100, 40).unwrap();
+        let theme = TerminalTheme {
+            foreground: 0xdcd7ba,
+            background: 0x1f1f28,
+            cursor: 0xdcd7ba,
+            ansi: [0x7e9cd8; 16],
+        };
+        configure_terminal(&mut core.terminal, theme).unwrap();
+        core.apply(EmulatorCommand::Output(
+            b"\x1b[34mA\x1b[2mB\x1b[22mC\x1b[0mD".to_vec(),
+        ))
+        .unwrap();
+        let screen = core.screen().unwrap();
+        assert_eq!(screen.background, theme.background);
+        assert_eq!(screen.cells[0].foreground, theme.ansi[4]);
+        assert_eq!(screen.cells[1].foreground, theme.ansi[4]);
+        assert!(!screen.cells[0].faint);
+        assert!(screen.cells[1].faint);
+        assert!(!screen.cells[2].faint);
+        assert_eq!(screen.cells[3].foreground, theme.foreground);
+        assert!(
+            screen
+                .cells
+                .iter()
+                .all(|cell| cell.background == screen.background)
+        );
+
+        core.apply(EmulatorCommand::Output(b"\x1b]11;#123456\x07".to_vec()))
+            .unwrap();
+        let screen = core.screen().unwrap();
+        assert_eq!(screen.background, 0x123456);
+        assert_eq!(screen.cells[0].background, screen.background);
+        core.apply(EmulatorCommand::Output(b"\x1b]111\x07".to_vec()))
+            .unwrap();
+        assert_eq!(core.screen().unwrap().background, theme.background);
     }
 
     #[test]
