@@ -9,6 +9,7 @@ mod layout_persistence;
 mod layout_state;
 mod nodes;
 mod remote;
+mod remote_visibility;
 mod runtime;
 mod settings;
 mod subprocess;
@@ -1702,10 +1703,14 @@ impl Workspace {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
-        let (boomux_overview, boomux_error) = match terminal::discover_overview() {
+        let (mut boomux_overview, boomux_error) = match terminal::discover_overview() {
             Ok(overview) => (overview, None),
             Err(error) => (BoomuxOverview::default(), Some(error)),
         };
+        remote_visibility::filter(
+            &mut boomux_overview,
+            &layout_session.document.hidden_remote_workspaces,
+        );
         let boomux_shells = boomux_overview
             .workspaces
             .iter()
@@ -2432,6 +2437,10 @@ impl Workspace {
     }
 
     fn set_boomux_overview(&mut self, mut overview: BoomuxOverview) {
+        remote_visibility::filter(
+            &mut overview,
+            &self.layout_document.hidden_remote_workspaces,
+        );
         reconcile_workspace_order(&mut self.workspace_order, &mut overview);
         reconcile_completed_agents(
             &mut self.previous_agent_states,
@@ -2959,19 +2968,31 @@ impl Workspace {
     }
 
     fn remove_resource_panes(&mut self, target: &SidebarResource, window: &mut Window) {
-        let pane_ids = self
-            .terminals
-            .iter()
-            .filter_map(|(id, pane)| {
-                let shell = pane.shell.as_ref()?;
-                let matches = match target {
-                    SidebarResource::Workspace { id, .. } => shell.workspace_id == *id,
-                    SidebarResource::Shell { id, .. } => shell.id == *id,
-                    SidebarResource::Connection { .. } => false,
-                };
-                matches.then_some(*id)
-            })
-            .collect::<Vec<_>>();
+        let pane_ids =
+            self.terminals
+                .iter()
+                .filter_map(|(id, pane)| {
+                    let workspace_id = pane
+                        .shell
+                        .as_ref()
+                        .map(|shell| &shell.workspace_id)
+                        .or_else(|| {
+                            pane.restored
+                                .as_ref()
+                                .and_then(|pane| pane.workspace.as_ref())
+                        });
+                    let shell_id =
+                        pane.shell.as_ref().map(|shell| &shell.id).or_else(|| {
+                            pane.restored.as_ref().and_then(|pane| pane.shell.as_ref())
+                        });
+                    let matches = match target {
+                        SidebarResource::Workspace { id, .. } => workspace_id == Some(id),
+                        SidebarResource::Shell { id, .. } => shell_id == Some(id),
+                        SidebarResource::Connection { .. } => false,
+                    };
+                    matches.then_some(*id)
+                })
+                .collect::<Vec<_>>();
         for id in &pane_ids {
             if let Some(pane) = self.terminals.remove(id) {
                 for image in pane.render_images.into_values() {
@@ -6699,6 +6720,30 @@ impl Workspace {
                         .child("REMOTE MACHINES"),
                 )
                 .children(rows)
+                .when(
+                    !self.layout_document.hidden_remote_workspaces.is_empty(),
+                    |panel| {
+                        panel
+                            .child(div().text_sm().child("HIDDEN WORKSPACES"))
+                            .children(self.layout_document.hidden_remote_workspaces.iter().map(
+                                |(id, name)| {
+                                    let id = id.clone();
+                                    Self::settings_option(
+                                        SharedString::from(format!("show-{id}")),
+                                        &format!("Show {name}"),
+                                        false,
+                                    )
+                                    .flex_none()
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.show_remote_workspace(&id, cx);
+                                        },
+                                    ))
+                                },
+                            ))
+                    },
+                )
                 .into_any_element(),
         )
     }
@@ -7801,6 +7846,12 @@ impl Workspace {
             SidebarResource::Workspace { id, .. } => Some(id.clone()),
             SidebarResource::Shell { .. } | SidebarResource::Connection { .. } => None,
         };
+        let hide_target = match &target {
+            SidebarResource::Workspace { id, .. } if remote::identity(id).is_some() => {
+                Some(target.clone())
+            }
+            _ => None,
+        };
         let rename_target = target.clone();
         let remove_target = target.clone();
 
@@ -7880,6 +7931,16 @@ impl Workspace {
                         .child("Rename")
                         .child(div().text_xs().text_color(rgb(0x6c7086)).child("F2")),
                 )
+                .when_some(hide_target, |element, target| {
+                    element.child(
+                        sidebar_menu_row("sidebar-menu-hide-workspace")
+                            .child("Hide from sidebar")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.hide_remote_workspace(target.clone(), window, cx);
+                            })),
+                    )
+                })
                 .child(
                     div()
                         .id("sidebar-menu-remove")
@@ -8973,8 +9034,9 @@ impl Workspace {
                     .find(|workspace| workspace.id == *id)
                     .map_or(0, |workspace| workspace.shells.len());
                 format!(
-                    "This permanently removes “{name}” and its {shell_count} Boomux shell{}.",
-                    if shell_count == 1 { "" } else { "s" }
+                    "This permanently removes “{name}” and its {shell_count} Boomux shell{}.{}",
+                    if shell_count == 1 { "" } else { "s" },
+                    if remote::identity(id).is_some() { " The remote machine must be reachable. To remove only this sidebar entry, cancel and choose Hide from sidebar in its menu." } else { "" }
                 )
             }
         };

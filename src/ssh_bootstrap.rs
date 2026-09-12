@@ -1495,7 +1495,12 @@ impl BootstrapSession {
             prepare_ssh_directory(runtime_directory, user_config)?;
         let mut command = Command::new(program);
         append_ssh_security_options(&mut command, &config_path, &control_path, authentication);
+        // Bound connection/key exchange separately from the time allowed for a
+        // person to complete password, browser, or host-key prompts.
+        let connection_seconds = timeout.as_secs().clamp(1, 15);
         command
+            .args(["-o", &format!("ConnectTimeout={connection_seconds}")])
+            .args(["-o", "ConnectionAttempts=1"])
             .args(["-o", "ControlMaster=yes"])
             .args(["-o", "ControlPersist=no"])
             .arg("-N")
@@ -1621,7 +1626,7 @@ impl BootstrapSession {
                 let _ = fs::remove_dir_all(&directory);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "SSH bootstrap authentication timed out",
+                    "SSH connection or sign-in did not complete before the deadline; check that the remote machine is online and reachable, then retry",
                 ));
             }
             thread::sleep(CHILD_POLL_INTERVAL);
@@ -1690,6 +1695,9 @@ impl BootstrapSession {
         let helper = selection.compatible.ok_or_else(|| {
             if let Some(error) = remote_recovery_error(discovery.recovery) {
                 return error;
+            }
+            if discovery.executables.is_empty() {
+                return install_presence_required("No Boomux executable was found on this remote machine. Reinstall the standalone Boomux CLI on the owner, then retry Update remote. Existing Workspace state does not need to be reset merely because the executable is missing.");
             }
             incompatible_helper_cold_upgrade_required()
         })?;
@@ -2489,6 +2497,27 @@ fn classify_ssh_start_failure(status: Option<i32>, stderr: &[u8]) -> io::Error {
             io::ErrorKind::PermissionDenied,
             "bootstrap_authentication_failed",
             "SSH authentication or host-key verification failed",
+        )
+    } else if stderr.contains("timed out") || stderr.contains("timeout") {
+        classified_error(
+            io::ErrorKind::TimedOut,
+            "bootstrap_transport_failed",
+            "SSH connection timed out; check that the remote machine is online, its network or VPN is connected, and SSH is reachable, then retry",
+        )
+    } else if stderr.contains("could not resolve hostname") {
+        classified_error(
+            io::ErrorKind::NotFound,
+            "bootstrap_transport_failed",
+            "SSH could not resolve the remote hostname; check the stored SSH route and network or VPN connection",
+        )
+    } else if stderr.contains("connection refused")
+        || stderr.contains("no route to host")
+        || stderr.contains("network is unreachable")
+    {
+        classified_error(
+            io::ErrorKind::ConnectionRefused,
+            "bootstrap_transport_failed",
+            "SSH could not reach the remote service; check that the machine is online and accepting SSH connections",
         )
     } else {
         classified_error(
@@ -5830,6 +5859,59 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_connection_has_short_deadline_without_shortening_signin() {
+        for (timeout, expected) in [(120, 15), (2, 2)] {
+            let runtime = runtime_directory();
+            fs::create_dir_all(&runtime).unwrap();
+            let ssh = write_master_stderr_ssh(
+                &runtime,
+                &format!(
+                    "found=false; attempts=false; for arg do [ \"$arg\" = ConnectTimeout={expected} ] && found=true; [ \"$arg\" = ConnectionAttempts=1 ] && attempts=true; done; $found && $attempts || exit 64; : > \"$control.ready\"; while :; do /bin/sleep 60; done"
+                ),
+            );
+            let session = BootstrapSession::open_at(
+                &runtime,
+                None,
+                SshTarget::parse("workbox").unwrap(),
+                SshAuthenticationMode::Interactive,
+                Duration::from_secs(timeout),
+                ssh.as_os_str(),
+            )
+            .unwrap();
+            drop(session);
+            assert!(
+                fs::read_dir(&runtime)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .all(|entry| !entry.file_type().unwrap().is_dir())
+            );
+            fs::remove_dir_all(runtime).unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_network_failures_are_actionable_and_do_not_echo_private_stderr() {
+        for stderr in [
+            "connect to host private-host port 22: Connection timed out SECRET",
+            "Connection refused SECRET",
+            "No route to host SECRET",
+            "Network is unreachable SECRET",
+            "Could not resolve hostname private-host SECRET",
+        ] {
+            let error = classify_ssh_start_failure(Some(255), stderr.as_bytes());
+            assert_eq!(error_code(&error), "bootstrap_transport_failed");
+            assert!(error.to_string().contains("check"));
+            assert!(!error.to_string().contains("SECRET"));
+            assert!(!error.to_string().contains("private-host"));
+            assert_ne!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+        assert_eq!(
+            error_code(&classify_ssh_start_failure(Some(255), b"Permission denied")),
+            "bootstrap_authentication_failed"
+        );
+    }
+
+    #[test]
     fn master_stderr_is_mirrored_live_only_for_interactive_authentication() {
         let challenge = b"To authenticate, visit:\nhttps://login.tailscale.test/a?c=123\n\xff";
         for authentication in [
@@ -6678,6 +6760,30 @@ mod tests {
         };
         assert_eq!(error_code(&error), "node_identity_changed");
         assert!(!mutated.exists());
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn explicit_upgrade_missing_helper_requests_install_without_cold_reset() {
+        let runtime = runtime_directory();
+        let ssh = write_session_bootstrap_ssh(&runtime, "", "");
+        let mut session = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_secs(1),
+            ssh.as_os_str(),
+        )
+        .unwrap();
+        let error = session
+            .plan_explicit_upgrade(&Uuid::new_v4().to_string(), Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(error_code(&error), "install_required");
+        assert!(error.to_string().contains("Reinstall the standalone"));
+        assert!(!error.to_string().contains("pre-protocol-47"));
+        assert!(!error.to_string().contains("daemon stop"));
+        drop(session);
         fs::remove_dir_all(runtime).unwrap();
     }
 

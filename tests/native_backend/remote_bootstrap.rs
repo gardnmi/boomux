@@ -923,6 +923,14 @@ fn registered_node_reauthentication_is_interactive_read_only_and_requests_projec
         String::from_utf8_lossy(&output)
             .contains("Authenticated work and requested a fresh background observation")
     );
+    let output = String::from_utf8_lossy(&output);
+    for stage in [
+        "15-second SSH connection timeout",
+        "SSH sign-in succeeded",
+        "Remote identity verified",
+    ] {
+        assert!(output.contains(stage), "missing progress stage: {stage}");
+    }
     assert_eq!(fs::read(&registration_path).unwrap(), registration_before);
     let ssh_log = fs::read_to_string(directory.join("ssh.log")).unwrap();
     for forbidden in [

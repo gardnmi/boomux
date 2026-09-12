@@ -123,6 +123,19 @@ existing batch observer without starting an overlapping worker or changing
 remote authority. Daemon protocol 38 or newer is required for that explicit
 observer wake.
 
+Sign-in first connects to SSH with one attempt and a 15-second connection/key
+exchange timeout (or the shorter operation budget). Interactive prompts retain
+up to two minutes. The terminal shows when SSH sign-in succeeds, when the pinned
+Boomux identity is checked, and when prompt-free background access is checked.
+Each subsequent verification operation has a 30-second budget. DNS, proxy
+commands, and interactive authentication remain subject to the outer operation
+budget. Network timeouts report reachability guidance rather than implying a
+password prompt is waiting. Press Ctrl+C to cancel the sign-in attempt.
+
+The connection deadline uses OpenSSH's
+[`ConnectTimeout`](https://man.openbsd.org/ssh_config#ConnectTimeout); it does not
+shorten the time available to answer interactive authentication prompts.
+
 ### Prepared Operations And Recovery
 
 Prepared operations are isolated and serialized by operation UUID, so concurrent
@@ -1079,3 +1092,24 @@ The initial contract excludes:
 - Remote TCP control listeners or forwarding the local daemon socket.
 - Treating a local daemon stop, restart, or Node removal as remote process
   authority.
+
+### Missing executable during an update
+
+If a registered owner's executable has been removed, Update remote reports
+`install_required`. Missing executables are not evidence of pre-protocol-47
+state and do not require a state reset. Reinstall the standalone CLI on the
+owner using the [release installer](install.md), then retry. Existing pinned
+identity checks still apply; an update cannot silently adopt a different Node.
+
+### Hiding an unavailable Workspace in Desktop
+
+A remote Workspace's three-dot menu offers **Hide from sidebar**. This changes
+only this Desktop's saved presentation and detaches its open panes. It works
+without contacting the owner and does not stop processes, delete Workspace
+state, or forget the machine. In **Remotes → Hidden Workspaces**, select
+**Show** to restore an entry from the normal cached overview refresh.
+
+**Remove** still deletes the Workspace and its Shells on the remote owner and
+requires connectivity. **Forget connection only** on the machine card removes
+all that machine's cached entries and its local registration without contacting
+the owner. These operations have distinct scopes.

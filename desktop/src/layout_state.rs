@@ -50,17 +50,20 @@ pub struct Document {
     pub arrangements: BTreeMap<String, Arrangement>,
     pub minimized: Vec<String>,
     pub workspace_order: Vec<String>,
+    #[serde(default)]
+    pub hidden_remote_workspaces: BTreeMap<String, String>,
 }
 impl Default for Document {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             revision: String::new(),
             owner: String::new(),
             active: String::new(),
             arrangements: BTreeMap::new(),
             minimized: Vec::new(),
             workspace_order: Vec::new(),
+            hidden_remote_workspaces: BTreeMap::new(),
         }
     }
 }
@@ -128,14 +131,24 @@ impl Tree {
 }
 impl Document {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1 {
+        if self.version != 2 {
             return Err("unsupported layout state version; saved file retained".into());
         }
         if self.arrangements.len() > 256
             || self.minimized.len() > MAX_PANES
+            || self.hidden_remote_workspaces.len() > 256
             || self.workspace_order.len() > 4096
         {
             return Err("layout state exceeds bounds".into());
+        }
+        for (key, name) in &self.hidden_remote_workspaces {
+            if key.len() > 1024
+                || name.len() > 1024
+                || crate::remote::identity(key)
+                    .is_none_or(|id| id.node_id.is_empty() || id.inner_id.is_empty())
+            {
+                return Err("invalid hidden remote Workspace".into());
+            }
         }
         let mut total = 0;
         for arrangement in self.arrangements.values() {
@@ -203,7 +216,13 @@ fn read(path: &PathBuf) -> Result<Document, String> {
     if bytes.len() > MAX_BYTES {
         return Err("layout state exceeds 2 MiB".into());
     }
-    let document: Document = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let mut document: Document = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if document.version == 1 {
+        // Version 1 had no sidebar visibility preferences. Preserve its geometry
+        // and revision while explicitly migrating to an empty hidden set.
+        document.hidden_remote_workspaces.clear();
+        document.version = 2;
+    }
     document.validate()?;
     Ok(document)
 }
@@ -357,6 +376,37 @@ mod tests {
         fs::create_dir(&path).unwrap();
         path
     }
+    #[test]
+    fn hidden_remote_workspaces_migrate_and_survive_reload() {
+        let root = temporary();
+        let path = root.join("layout.json");
+        let mut old = serde_json::to_value(fixture()).unwrap();
+        old["version"] = 1.into();
+        old.as_object_mut()
+            .unwrap()
+            .remove("hidden_remote_workspaces");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let mut doc = read(&path).unwrap();
+        assert_eq!(doc.version, 2);
+        assert!(doc.hidden_remote_workspaces.is_empty());
+        assert_eq!(doc.arrangements, fixture().arrangements);
+        doc.hidden_remote_workspaces
+            .insert("remote:node-a:workspace-a".into(), "Offline work".into());
+        let mut store = Store {
+            path: path.clone(),
+            revision: doc.revision.clone(),
+        };
+        store.save(doc.clone()).unwrap();
+        assert_eq!(
+            read(&path).unwrap().hidden_remote_workspaces,
+            doc.hidden_remote_workspaces
+        );
+        doc.hidden_remote_workspaces
+            .insert("local-workspace".into(), "Local".into());
+        assert!(doc.validate().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn layout_round_trip_preserves_geometry_identity_and_minimized_state() {
         let doc = fixture();

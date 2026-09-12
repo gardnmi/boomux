@@ -2423,6 +2423,7 @@ fn uninstall_node(selector: &str) -> Result<(), Box<dyn Error>> {
 
 fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
     const TIMEOUT: Duration = Duration::from_secs(120);
+    const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::new(
@@ -2442,7 +2443,7 @@ fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
     println!("Node: {} ({})", registration.alias, registration.node_id);
     println!("Stored SSH route: {}", registration.target);
     println!(
-        "Complete any SSH authentication prompt or login URL shown in this terminal. Boomux will not install, upgrade, retarget, or modify the registration."
+        "Connecting to the remote machine (15-second SSH connection timeout). Sign-in prompts or a login URL will appear here if required; allow up to 2 minutes to complete sign-in. Press Ctrl+C to cancel."
     );
     io::Write::flush(&mut io::stdout())?;
 
@@ -2453,21 +2454,25 @@ fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
         TIMEOUT,
     )
     .map_err(bootstrap_cli_failure)?;
+    println!("SSH sign-in succeeded. Checking the remote Boomux identity (up to 30 seconds)...");
+    io::Write::flush(&mut io::stdout())?;
     let connection = session
-        .connect_existing_verified(&registration.node_id, TIMEOUT)
+        .connect_existing_verified(&registration.node_id, VERIFY_TIMEOUT)
         .map_err(bootstrap_cli_failure)?;
     drop(connection);
 
-    println!("Verifying that background observation can reconnect without prompts...");
+    println!(
+        "Remote identity verified. Checking background access without prompts (up to 30 seconds per check)..."
+    );
     io::Write::flush(&mut io::stdout())?;
     let session = ssh_bootstrap::BootstrapSession::open(
         target,
         ssh_bootstrap::SshAuthenticationMode::Batch,
-        TIMEOUT,
+        VERIFY_TIMEOUT,
     )
     .map_err(bootstrap_cli_failure)?;
     let connection = session
-        .connect_existing_verified(&registration.node_id, TIMEOUT)
+        .connect_existing_verified(&registration.node_id, VERIFY_TIMEOUT)
         .map_err(bootstrap_cli_failure)?;
 
     let current = local.node_registration(&registration.node_id)?;
