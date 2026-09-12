@@ -250,14 +250,16 @@ fn remote_integration_cleanup_plan(
         .pointer("/data/integrations")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| invalid_probe("remote integration status omitted integrations"))?;
-    let allowed = ["opencode", "pi", "claude", "codex", "kiro"];
     let mut current = Vec::new();
     let mut preserved = Vec::new();
     for row in rows {
         let name = row
             .get("name")
             .and_then(serde_json::Value::as_str)
-            .filter(|name| allowed.contains(name))
+            .filter(|name| {
+                crate::integrations::by_key(name)
+                    .is_some_and(|descriptor| descriptor.installation.is_some())
+            })
             .ok_or_else(|| invalid_probe("remote integration status returned an unknown name"))?;
         let display_name = row
             .get("display_name")
@@ -1809,6 +1811,7 @@ impl BootstrapSession {
                 "claude" => "integration uninstall claude --json",
                 "codex" => "integration uninstall codex --json",
                 "kiro" => "integration uninstall kiro --json",
+                "kiro-v3" => "integration uninstall kiro-v3 --json",
                 _ => {
                     return Err(invalid_probe(
                         "remote uninstall plan contains an unknown integration",
@@ -6866,47 +6869,55 @@ mod tests {
 
     #[test]
     fn explicit_uninstall_uses_one_session_and_preserves_modified_integrations() {
-        let runtime = runtime_directory();
-        let marker = runtime.join("uninstalled");
-        let node_id = Uuid::new_v4().to_string();
-        let helper = compatible_helper_script(&node_id);
-        let executable = "/home/person/.local/bin/boomux";
-        let status = r#"{"schema":"boomux.cli/v1","command":"integration.status","data":{"integrations":[{"name":"opencode","display_name":"OpenCode","asset":{"state":"current","path":"/current"}},{"name":"pi","display_name":"Pi","asset":{"state":"modified","path":"/modified"}}]}}"#;
-        let removed = r#"{"schema":"boomux.cli/v1","command":"integration.uninstall","data":{"integrations":[]}}"#;
-        let ssh = write_session_bootstrap_ssh(
-            &runtime,
-            &format!(
-                "  \"'{executable}' __federation-stdio\") {helper} ;;\n  \"'{executable}' --version\") printf 'boomux 1.0.1\\n' ;;\n  *'__uninstall-fingerprint'*) printf 'boomux-uninstall-fingerprint-v1 token\\n' ;;\n  *'integration status --json'*) printf '%s' '{status}' ;;\n  *'integration uninstall opencode --json'*) printf '%s' '{removed}' ;;\n  *'__uninstall-remote'*) : > {} ;;",
-                quote_posix_shell(marker.to_str().unwrap())
-            ),
-            "/home/person/.local/bin/boomux\\0",
-        );
-        let mut session = BootstrapSession::open_at(
-            &runtime,
-            None,
-            SshTarget::parse("workbox").unwrap(),
-            SshAuthenticationMode::Batch,
-            Duration::from_secs(1),
-            ssh.as_os_str(),
-        )
-        .unwrap();
-        let plan = session
-            .plan_explicit_uninstall(&node_id, Duration::from_secs(1))
+        for kiro in ["kiro-v3", "kiro"] {
+            let runtime = runtime_directory();
+            let marker = runtime.join("uninstalled");
+            let node_id = Uuid::new_v4().to_string();
+            let helper = compatible_helper_script(&node_id);
+            let executable = "/home/person/.local/bin/boomux";
+            let status = r#"{"schema":"boomux.cli/v1","command":"integration.status","data":{"integrations":[{"name":"opencode","display_name":"OpenCode","asset":{"state":"current","path":"/current"}},{"name":"pi","display_name":"Pi","asset":{"state":"modified","path":"/modified"}}]}}"#;
+            let mut status: serde_json::Value = serde_json::from_str(status).unwrap();
+            status["data"]["integrations"].as_array_mut().unwrap().push(serde_json::json!({
+            "name":kiro, "display_name":"Kiro CLI v3", "asset":{"state":"current","path":"/kiro"}
+        }));
+            let status = serde_json::to_string(&status).unwrap();
+            let removed = r#"{"schema":"boomux.cli/v1","command":"integration.uninstall","data":{"integrations":[]}}"#;
+            let ssh = write_session_bootstrap_ssh(
+                &runtime,
+                &format!(
+                    "  \"'{executable}' __federation-stdio\") {helper} ;;\n  \"'{executable}' --version\") printf 'boomux 1.0.1\\n' ;;\n  *'__uninstall-fingerprint'*) printf 'boomux-uninstall-fingerprint-v1 token\\n' ;;\n  *'integration status --json'*) printf '%s' '{status}' ;;\n  *'integration uninstall {kiro} --json'*) printf '%s' '{removed}' ;;\n  *'integration uninstall opencode --json'*) printf '%s' '{removed}' ;;\n  *'__uninstall-remote'*) : > {} ;;",
+                    quote_posix_shell(marker.to_str().unwrap())
+                ),
+                "/home/person/.local/bin/boomux\\0",
+            );
+            let mut session = BootstrapSession::open_at(
+                &runtime,
+                None,
+                SshTarget::parse("workbox").unwrap(),
+                SshAuthenticationMode::Batch,
+                Duration::from_secs(1),
+                ssh.as_os_str(),
+            )
             .unwrap();
-        assert_eq!(
-            plan.preserved_integrations,
-            vec![("Pi".into(), Some("/modified".into()))]
-        );
-        let mut renewals = 0;
-        session
-            .uninstall_registered(&plan, Duration::from_secs(1), || {
-                renewals += 1;
-                Ok(())
-            })
-            .unwrap();
-        assert!(renewals >= 3);
-        assert!(marker.exists());
-        fs::remove_dir_all(runtime).unwrap();
+            let plan = session
+                .plan_explicit_uninstall(&node_id, Duration::from_secs(1))
+                .unwrap();
+            assert!(plan.current_integrations.iter().any(|name| name == kiro));
+            assert_eq!(
+                plan.preserved_integrations,
+                vec![("Pi".into(), Some("/modified".into()))]
+            );
+            let mut renewals = 0;
+            session
+                .uninstall_registered(&plan, Duration::from_secs(1), || {
+                    renewals += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(renewals >= 3);
+            assert!(marker.exists());
+            fs::remove_dir_all(runtime).unwrap();
+        }
     }
 
     #[test]
