@@ -7316,6 +7316,7 @@ impl Workspace {
                 self.pane_layout_mode,
             )
         };
+        let compact_sidebar = self.sidebar_content_width() < 280.0;
         let workspace_order_animation = self.workspace_order_animation.clone();
         let workspace_order_animation_duration = self.motion_speed.duration();
         let workspace_rows = workspaces
@@ -7334,118 +7335,123 @@ impl Workspace {
                     .as_ref()
                     .and_then(|id| self.node_views.iter().find(|node| node.id == id.node_id));
                 let shell_count = workspace.shells.len();
-                let shell_rows =
-                    workspace
-                        .shells
-                        .iter()
-                        .filter(|_| expanded && self.pane_layout_mode != PaneLayoutMode::Tabbed)
-                        .cloned()
-                        .map(|shell| {
-                            let shell_id = shell.id.clone();
-                            let shell_target = SidebarResource::Shell {
-                                id: shell.id.clone(),
-                                workspace_id: workspace.id.clone(),
-                                name: shell.name.clone(),
-                            };
-                            let shell_item = SidebarItem::Shell {
-                                workspace_id: workspace.id.clone(),
-                                shell_id: shell.id.clone(),
-                            };
-                            let keyboard_selected = self.navigation_region
-                                == NavigationRegion::Sidebar
-                                && self.sidebar_item.as_ref() == Some(&shell_item);
-                            let selected = focused_shell_id == Some(shell.id.as_str());
-                            let pane_open = open_shell_ids.contains(shell.id.as_str());
-                            let pane_presence = shell_pane_presence(selected, pane_open);
-                            let status = shell.status_label();
-                            div()
-                                .id(SharedString::from(format!("sidebar-shell-{}", shell.id)))
-                                .ml_8()
-                                .h(px(39.0))
-                                .px_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .rounded_md()
-                                .anchor_scroll(
-                                    keyboard_selected.then(|| self.sidebar_scroll_anchor.clone()),
-                                )
-                                .bg(if keyboard_selected {
-                                    rgb(0x45475a)
-                                } else if selected {
-                                    rgb(0x252536)
-                                } else {
-                                    rgb(0x181825)
-                                })
-                                .hover(|element| element.bg(rgb(0x29293d)))
-                                .cursor_pointer()
-                                .button_chrome()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.activate_sidebar_shell(&shell_id, window, cx);
-                                }))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(
-                                            if pane_presence != ShellPanePresence::Minimized {
-                                                0x89b4fa
-                                            } else {
-                                                0x6c7086
-                                            },
-                                        ))
-                                        .child(if self.shell_has_agent(&shell) {
-                                            "✦"
+                let shell_rows = workspace
+                    .shells
+                    .iter()
+                    .filter(|_| expanded && self.pane_layout_mode != PaneLayoutMode::Tabbed)
+                    .cloned()
+                    .map(|shell| {
+                        let shell_id = shell.id.clone();
+                        let shell_target = SidebarResource::Shell {
+                            id: shell.id.clone(),
+                            workspace_id: workspace.id.clone(),
+                            name: shell.name.clone(),
+                        };
+                        let shell_item = SidebarItem::Shell {
+                            workspace_id: workspace.id.clone(),
+                            shell_id: shell.id.clone(),
+                        };
+                        let keyboard_selected = self.navigation_region == NavigationRegion::Sidebar
+                            && self.sidebar_item.as_ref() == Some(&shell_item);
+                        let selected = focused_shell_id == Some(shell.id.as_str());
+                        let pane_open = open_shell_ids.contains(shell.id.as_str());
+                        let pane_presence = shell_pane_presence(selected, pane_open);
+                        let status = shell.status_label();
+                        div()
+                            .id(SharedString::from(format!("sidebar-shell-{}", shell.id)))
+                            .ml(px(if compact_sidebar { 12.0 } else { 32.0 }))
+                            .h(px(SIDEBAR_SHELL_ROW_HEIGHT))
+                            .flex_none()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap(px(if compact_sidebar { 4.0 } else { 8.0 }))
+                            .rounded_md()
+                            .anchor_scroll(
+                                keyboard_selected.then(|| self.sidebar_scroll_anchor.clone()),
+                            )
+                            .bg(if keyboard_selected {
+                                rgb(0x45475a)
+                            } else if selected {
+                                rgb(0x252536)
+                            } else {
+                                rgb(0x181825)
+                            })
+                            .hover(|element| element.bg(rgb(0x29293d)))
+                            .cursor_pointer()
+                            .button_chrome()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.activate_sidebar_shell(&shell_id, window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgb(
+                                        if pane_presence != ShellPanePresence::Minimized {
+                                            0x89b4fa
                                         } else {
-                                            pane_presence.glyph()
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(gpui::FontWeight::NORMAL)
-                                                .text_color(rgb(0xcdd6f4))
-                                                .child(shell.name),
-                                        )
-                                        .child(div().text_xs().text_color(rgb(0x6c7086)).child(
-                                            format!("{} · {status}", pane_presence.label()),
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "sidebar-shell-menu-{}",
-                                            shell.id
-                                        )))
-                                        .w(px(24.0))
-                                        .h(px(28.0))
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .text_color(rgb(0x7f849c))
-                                        .hover(|element| {
-                                            element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
-                                        })
-                                        .button_chrome()
-                                        .on_click(cx.listener(move |this, event, window, cx| {
-                                            this.open_sidebar_menu(
-                                                shell_target.clone(),
-                                                event,
-                                                window,
-                                                cx,
-                                            );
-                                        }))
-                                        .child("⋮"),
-                                )
-                        })
-                        .collect::<Vec<_>>();
+                                            0x6c7086
+                                        },
+                                    ))
+                                    .child(if self.shell_has_agent(&shell) {
+                                        "✦"
+                                    } else {
+                                        pane_presence.glyph()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::NORMAL)
+                                            .text_color(rgb(0xcdd6f4))
+                                            .child(shell.name),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(rgb(0x6c7086))
+                                            .child(format!("{} · {status}", pane_presence.label())),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "sidebar-shell-menu-{}",
+                                        shell.id
+                                    )))
+                                    .w(px(24.0))
+                                    .h(px(28.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_color(rgb(0x7f849c))
+                                    .hover(|element| {
+                                        element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
+                                    })
+                                    .button_chrome()
+                                    .on_click(cx.listener(move |this, event, window, cx| {
+                                        this.open_sidebar_menu(
+                                            shell_target.clone(),
+                                            event,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .child("⋮"),
+                            )
+                    })
+                    .collect::<Vec<_>>();
 
                 let workspace_target = SidebarResource::Workspace {
                     id: workspace.id.clone(),
@@ -7578,6 +7584,7 @@ impl Workspace {
                                         div()
                                             .text_sm()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .truncate()
                                             .child(workspace.name.clone()),
                                     )
                                     .child(
