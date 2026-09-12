@@ -28,7 +28,7 @@ fn conversation_button(id: impl Into<gpui::ElementId>, label: &'static str) -> S
         .text_xs()
         .px_2()
         .py_1()
-        .rounded_md()
+        .rounded(px(3.0))
         .border_1()
         .border_color(rgb(0x45475a))
         .bg(rgb(0x242432))
@@ -474,6 +474,7 @@ impl Workspace {
                                             SharedString::from(format!("open-{}", entry.agent_id)),
                                             label,
                                         )
+                                        .button_chrome()
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
                                                 cx.stop_propagation();
@@ -492,6 +493,7 @@ impl Workspace {
                                         SharedString::from(format!("pin-{}", entry.agent_id)),
                                         if pinned { "Unpin" } else { "Pin" },
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             cx.stop_propagation();
@@ -506,6 +508,7 @@ impl Workspace {
                                         SharedString::from(format!("archive-{}", entry.agent_id)),
                                         if archived { "Restore" } else { "Archive" },
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             cx.stop_propagation();
@@ -540,12 +543,12 @@ impl Workspace {
             }
             if self.conversations.filtered.len() > self.conversations.visible.max(50) {
                 list = list.child(
-                    conversation_button("more-conversations", "Show more").on_click(cx.listener(
-                        |this, _, _, cx| {
+                    conversation_button("more-conversations", "Show more")
+                        .button_chrome()
+                        .on_click(cx.listener(|this, _, _, cx| {
                             this.conversations.visible = this.conversations.visible.max(50) + 50;
                             cx.notify();
-                        },
-                    )),
+                        })),
                 );
             }
         } else if selected.is_some() {
@@ -575,13 +578,13 @@ impl Workspace {
                         .py_3()
                         .child("Conversations")
                         .child(
-                            conversation_button("close-conversations", "Close").on_click(
-                                cx.listener(|this, _, _, cx| {
+                            conversation_button("close-conversations", "Close")
+                                .button_chrome()
+                                .on_click(cx.listener(|this, _, _, cx| {
                                     this.conversations.open = false;
                                     this.conversations.search_focused = false;
                                     cx.notify();
-                                }),
-                            ),
+                                })),
                         ),
                 )
                 .child(
@@ -604,6 +607,7 @@ impl Workspace {
                         } else {
                             self.conversations.search.clone()
                         })
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.conversations.search_focused = true;
                             window.focus(&this.focus_handle, cx);
@@ -642,6 +646,7 @@ impl Workspace {
                                 } else {
                                     "Recent · pinned first"
                                 })
+                                .button_chrome()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.conversations.archived = archived;
                                     this.conversations.visible = 50;

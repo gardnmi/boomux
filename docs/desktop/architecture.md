@@ -591,3 +591,14 @@ entries and sorts pinned entries first, then by latest observed activity; Archiv
 is separately searchable. Search matches title and harness. A dedicated keyboard
 recipient prevents search typing from reaching terminals and yields to resource
 dialogs. Open and Resume are explicit row actions; unavailable resume is not invoked.
+
+## Button feedback
+
+`src/buttons.rs` supplies shared 3-pixel button corners and a diagonal hover fill
+using existing theme accents. Buttons retain their semantic colors and handlers.
+Hover transitions reverse from their current position, respect Desktop Instant
+motion and system reduced motion, and request frames only while transitioning.
+State is owned by the visible element and reclaimed when it disappears. Switches
+and text fields keep their distinct input shapes; disabled controls do not animate.
+The Agents/Git/Remotes tabs divide their row equally, with selected backgrounds and
+underlines. Git toolbar actions occupy a separate row to preserve tab widths.
