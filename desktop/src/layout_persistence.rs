@@ -78,6 +78,17 @@ fn decode_tree(node: &Tree, ids: &HashMap<u64, usize>) -> Node {
     }
 }
 impl TerminalPane {
+    fn blocks_workspace_capture(&self) -> bool {
+        // A new Workspace has no identity until creation succeeds. Saving its
+        // loading/error pane under the previous active key erases that layout.
+        !self.temporary_setup
+            && !self.shell.as_ref().is_some_and(|shell| shell.desktop_setup)
+            && self
+                .saved_reference()
+                .and_then(|pane| pane.workspace)
+                .is_none()
+    }
+
     fn saved_reference(&self) -> Option<Pane> {
         if self.temporary_setup || self.shell.as_ref().is_some_and(|shell| shell.desktop_setup) {
             return None;
@@ -163,6 +174,14 @@ impl Workspace {
 
     pub(super) fn capture_arrangement(&mut self) -> bool {
         if self.layout_frozen || self.layout_restoring || self.pointer_drag.is_some() {
+            return false;
+        }
+        if self.workspace_pane_mode == WorkspacePaneMode::Workspace
+            && self
+                .terminals
+                .get(&self.focused)
+                .is_some_and(TerminalPane::blocks_workspace_capture)
+        {
             return false;
         }
         let key = if self.workspace_pane_mode == WorkspacePaneMode::Mixed {
@@ -634,6 +653,26 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workspace_creation_wait_and_failure_cannot_overwrite_previous_layout() {
+        let mut pane = TerminalPane {
+            attaching: true,
+            ..TerminalPane::default()
+        };
+        assert!(pane.blocks_workspace_capture());
+        pane.attaching = false;
+        pane.error = Some("remote unavailable".into());
+        assert!(pane.blocks_workspace_capture());
+        pane.restored = Some(Pane {
+            shell: Some("shell".into()),
+            workspace: Some("remote-workspace".into()),
+        });
+        assert!(!pane.blocks_workspace_capture());
+        pane.restored = None;
+        pane.temporary_setup = true;
+        assert!(!pane.blocks_workspace_capture());
+    }
+
     #[test]
     fn setup_overlay_does_not_replace_saved_workspace_or_panes() {
         let reference = Pane {
