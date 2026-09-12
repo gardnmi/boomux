@@ -420,10 +420,7 @@ impl NodeRegistrationManager {
         let index = find_index(current, selector)?;
         require_revision(&current.registrations[index], expected_revision)?;
         if !current.registrations[index].admission_open {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Node registration change is already in progress",
-            ));
+            return Err(registration_busy(&current.registrations[index]));
         }
         current.registrations[index].admission_epoch = next(
             current.registrations[index].admission_epoch,
@@ -597,10 +594,7 @@ impl NodeRegistrationManager {
         let index = find_index(current, selector)?;
         require_revision(&current.registrations[index], expected_revision)?;
         if !current.registrations[index].admission_open {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Node registration change is already in progress",
-            ));
+            return Err(registration_busy(&current.registrations[index]));
         }
         current.registrations[index].admission_epoch = next(
             current.registrations[index].admission_epoch,
@@ -714,6 +708,21 @@ fn available_mut(state: &mut ManagerState) -> io::Result<&mut RegistrationState>
             format!("Node registration routing is disabled: {reason}"),
         )),
     }
+}
+
+fn registration_busy(registration: &Registration) -> io::Error {
+    let message = match &registration.maintenance {
+        Some(lease) => {
+            let remaining = lease.deadline.saturating_duration_since(Instant::now());
+            let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+            format!(
+                "This Node is reserved by an update or uninstall; its local maintenance lease expires in {seconds} seconds unless renewed. A failed update may retain this lease while remote recovery settles; wait and retry."
+            )
+        }
+        None => "Node registration change is already in progress; wait for it to finish and retry"
+            .into(),
+    };
+    io::Error::new(io::ErrorKind::WouldBlock, message)
 }
 
 fn expire_maintenance(state: &mut RegistrationState) {
@@ -1209,6 +1218,22 @@ mod tests {
         manager
             .renew_upgrade_maintenance(&registration.node_id, &token, Duration::from_secs(1))
             .unwrap();
+        let blocked = manager
+            .begin_upgrade_maintenance_if(
+                "work",
+                registration.revision,
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                || true,
+            )
+            .unwrap_err();
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            blocked
+                .to_string()
+                .contains("local maintenance lease expires in")
+        );
+        assert!(blocked.to_string().contains("seconds unless renewed"));
         thread::sleep(Duration::from_millis(2));
         assert!(!manager.admit(&registration).unwrap());
         assert_eq!(

@@ -1119,3 +1119,8 @@ up to three minutes while watchdog cleanup finishes. Another update during
 that window returns `busy` before uploading or replacing anything. This explicit
 refusal releases the attempted update's local maintenance window; it must not
 be presented as an unknown upgrade outcome. Wait for cleanup before retrying.
+
+An ambiguous update failure can retain a separate local Node maintenance lease
+for up to ten minutes after its last renewal. This is distinct from the remote
+cleanup window. Registration changes and new update/uninstall attempts report
+the remaining local lease time and resume after expiry.
