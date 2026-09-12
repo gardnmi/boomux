@@ -474,6 +474,12 @@ impl Workspace {
                                             SharedString::from(format!("open-{}", entry.agent_id)),
                                             label,
                                         )
+                                        .w(px(80.0))
+                                        .h(px(28.0))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .button_chrome()
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
@@ -493,6 +499,12 @@ impl Workspace {
                                         SharedString::from(format!("pin-{}", entry.agent_id)),
                                         if pinned { "Unpin" } else { "Pin" },
                                     )
+                                    .w(px(80.0))
+                                    .h(px(28.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .button_chrome()
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
@@ -508,6 +520,12 @@ impl Workspace {
                                         SharedString::from(format!("archive-{}", entry.agent_id)),
                                         if archived { "Restore" } else { "Archive" },
                                     )
+                                    .w(px(80.0))
+                                    .h(px(28.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .button_chrome()
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
