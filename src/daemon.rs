@@ -3463,6 +3463,27 @@ struct CachedHostSessionCatalog {
     last_used: u64,
 }
 
+// Generated OpenCode titles often arrive just after the first catalog read.
+// Retry provisional titles briefly, then return to the normal idle cadence.
+fn host_session_catalog_ttl(
+    sessions: Option<&[crate::host_session_titles::HostSession]>,
+    now_ms: u64,
+) -> Duration {
+    match sessions {
+        None => HOST_SESSION_CATALOG_FAILURE_TTL,
+        Some(sessions)
+            if sessions.iter().any(|session| {
+                session.integration == "opencode"
+                    && session.title.starts_with("New session - ")
+                    && now_ms.saturating_sub(session.created_at_ms) < 30_000
+            }) =>
+        {
+            Duration::from_secs(3)
+        }
+        Some(_) => HOST_SESSION_CATALOG_TTL,
+    }
+}
+
 impl HostSessionCatalogCache {
     fn records(
         &self,
@@ -3484,15 +3505,12 @@ impl HostSessionCatalogCache {
         loop {
             let mut state = lock(&self.state)?;
             let now = Instant::now();
+            let wall_time_ms = unix_time_ms();
             let stale = requests
                 .iter()
                 .filter(|request| {
                     state.entries.get(*request).is_none_or(|entry| {
-                        let ttl = if entry.sessions.is_some() {
-                            HOST_SESSION_CATALOG_TTL
-                        } else {
-                            HOST_SESSION_CATALOG_FAILURE_TTL
-                        };
+                        let ttl = host_session_catalog_ttl(entry.sessions.as_deref(), wall_time_ms);
                         now.duration_since(entry.inspected_at) >= ttl
                     })
                 })
@@ -19555,6 +19573,51 @@ status=$?
         drop(catalog);
         fs::remove_dir_all(selected_cwd).unwrap();
         fs::remove_dir_all(unrelated_cwd).unwrap();
+    }
+
+    #[test]
+    fn provisional_opencode_titles_refresh_quickly_without_permanent_fast_polling() {
+        let cache = HostSessionCatalogCache::default();
+        let request = crate::host_session_titles::ProjectionRequest {
+            integration: "opencode".into(),
+            directory: "/repo".into(),
+        };
+        let mut session = crate::host_session_titles::HostSession {
+            integration: "opencode".into(),
+            root_id: "session-1".into(),
+            title: "New session - 2026-09-12T05:08:10.407Z".into(),
+            directory: "/repo".into(),
+            created_at_ms: unix_time_ms(),
+            updated_at_ms: unix_time_ms(),
+        };
+        let requests = [request.clone()];
+        cache
+            .records_with(&requests, &|_| vec![Some(vec![session.clone()])])
+            .unwrap();
+        lock(&cache.state)
+            .unwrap()
+            .entries
+            .get_mut(&request)
+            .unwrap()
+            .inspected_at = Instant::now() - Duration::from_secs(4);
+        session.title = "Casual greeting".into();
+        let refreshed = cache
+            .records_with(&requests, &|_| vec![Some(vec![session.clone()])])
+            .unwrap();
+        assert_eq!(refreshed[0].title, "Casual greeting");
+        assert_eq!(
+            host_session_catalog_ttl(Some(&refreshed), unix_time_ms()),
+            HOST_SESSION_CATALOG_TTL
+        );
+        session.title = "New session - old untitled conversation".into();
+        assert_eq!(
+            host_session_catalog_ttl(Some(&[session.clone()]), session.created_at_ms + 30_000),
+            HOST_SESSION_CATALOG_TTL
+        );
+        assert_eq!(
+            host_session_catalog_ttl(None, unix_time_ms()),
+            HOST_SESSION_CATALOG_FAILURE_TTL
+        );
     }
 
     #[test]

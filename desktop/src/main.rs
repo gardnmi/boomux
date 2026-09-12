@@ -7700,6 +7700,20 @@ impl Workspace {
                             )
                             .child(
                                 sidebar_header_button(
+                                    "open-workspace-conversations",
+                                    "Workspace conversations",
+                                    "☷",
+                                    self.conversations.open,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_conversations(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                sidebar_header_button(
                                     "open-settings",
                                     "Settings",
                                     "⚙",
@@ -7801,18 +7815,6 @@ impl Workspace {
                                         this.git_panel.resizing = true;
                                         cx.stop_propagation();
                                     }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("open-workspace-conversations")
-                                .px_3()
-                                .py_2()
-                                .text_sm()
-                                .cursor_pointer()
-                                .child("Conversations →")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.open_conversations(cx)),
                                 ),
                         )
                         .child(

@@ -52,8 +52,9 @@ The launcher starts or reuses the Boomux service automatically.
 
 ## Conversations
 
-Select a Workspace and click **Conversations →** above the sidebar tabs to open
-the right-side panel. Conversations observed by Boomux integrations appear together across supported harnesses. Click
+Select a Workspace and click the **Workspace conversations** button beside Settings
+in the sidebar header to open the right-side panel. Conversations observed by
+Boomux integrations appear together across supported harnesses. Click
 **Open** to focus a running conversation or **Resume** to open its original
 harness in a floating terminal pane. Remote conversations stay on their owner;
 connect unavailable machines from Remotes first. Resume requires protocol 55 on
@@ -65,8 +66,9 @@ keeps the association. Removing the Workspace removes its entries from Boomux,
 but does not delete the harness's own history files. A new Workspace with the
 same name starts empty. The first version lists conversations observed inside
 Boomux. Titles come from the original harness when available, with the recorded
-Agent name as a fallback. Renames can take about 30 seconds to refresh. Outside
-harness history is not imported.
+Agent name as a fallback. New OpenCode sessions briefly refresh more frequently
+while their generated titles are pending; later renames can take about 30 seconds
+to refresh. Outside harness history is not imported.
 
 ## Workspaces And Shells
 
