@@ -104,6 +104,19 @@ impl Render for HeaderTooltip {
 }
 
 // Keep the collapsed edge reachable while retaining the normal readable width.
+fn sidebar_brand_text_fits(width: f32, title_width: f32) -> bool {
+    // Header padding, logo, brand gap, action gap, four controls and their gaps.
+    width >= 32.0 + 32.0 + 12.0 + title_width + 8.0 + 4.0 * 28.0 + 3.0 * 4.0 + 1.0
+}
+
+fn workspace_navigation_anchor<'a>(
+    sidebar: Option<&'a str>,
+    expanded: Option<&'a str>,
+    focused: Option<&'a str>,
+) -> Option<&'a str> {
+    sidebar.or(expanded).or(focused)
+}
+
 fn sidebar_drag_target(pointer_x: f32) -> Option<f32> {
     (pointer_x > 48.0).then(|| pointer_x.clamp(280.0, 600.0))
 }
@@ -2358,11 +2371,27 @@ impl Workspace {
     }
 
     fn cycle_workspace(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let current_workspace_id = self
+        let sidebar = if self.navigation_region == NavigationRegion::Sidebar {
+            match self.sidebar_item.as_ref() {
+                Some(SidebarItem::Workspace(id))
+                | Some(SidebarItem::Shell {
+                    workspace_id: id, ..
+                }) => Some(id.as_str()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let expanded = (self.workspace_pane_mode == WorkspacePaneMode::Workspace
+            && self.expanded_workspaces.len() == 1)
+            .then(|| self.expanded_workspaces.iter().next().map(String::as_str))
+            .flatten();
+        let focused = self
             .terminals
             .get(&self.focused)
             .and_then(|pane| pane.shell.as_ref())
             .map(|shell| shell.workspace_id.as_str());
+        let current_workspace_id = workspace_navigation_anchor(sidebar, expanded, focused);
         let Some(workspace_id) =
             cycled_workspace_id(&self.workspace_order, current_workspace_id, backwards)
                 .map(str::to_owned)
@@ -2384,7 +2413,15 @@ impl Workspace {
                     .find(|shell| !self.minimized_shells.contains(&shell.id))
             })
             .map(|shell| shell.id.clone());
+        let from_sidebar = self.navigation_region == NavigationRegion::Sidebar;
         self.open_workspace(&workspace_id, preferred_shell_id.as_deref(), window, cx);
+        self.sidebar_item = Some(SidebarItem::Workspace(workspace_id));
+        if from_sidebar {
+            self.navigation_region = NavigationRegion::Sidebar;
+        }
+        self.reveal_sidebar_item(window, cx);
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn focus_terminal_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -7627,6 +7664,30 @@ impl Workspace {
             })
             .collect::<Vec<_>>();
 
+        let text_style = window.text_style();
+        let mut title_font = text_style.font();
+        title_font.weight = gpui::FontWeight::BOLD;
+        let title_width = window
+            .text_system()
+            .shape_line(
+                "BOOMUX".into(),
+                text_style.font_size.to_pixels(window.rem_size()),
+                &[TextRun {
+                    len: 6,
+                    font: title_font,
+                    color: text_style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                    ..Default::default()
+                }],
+                None,
+            )
+            .width;
+        let show_brand_text = sidebar_brand_text_fits(
+            self.sidebar_width().min(self.sidebar_content_width()),
+            f32::from(title_width),
+        );
         let agent_rows = agents
             .iter()
             .cloned()
@@ -7666,61 +7727,70 @@ impl Workspace {
                             .items_center()
                             .gap_3()
                             .child(sidebar_brand_mark())
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div().font_weight(gpui::FontWeight::BOLD).child("BOOMUX"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("sidebar-node-status")
-                                            .truncate()
-                                            .text_xs()
-                                            .text_color(rgb(0x89b4fa))
-                                            .cursor_pointer()
-                                            .button_chrome()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.open_nodes(cx);
-                                            }))
-                                            .child(
-                                                if self.node_views.iter().any(|node| !node.local) {
-                                                    let unavailable = self
+                            .when(show_brand_text, |brand| {
+                                brand.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .whitespace_nowrap()
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .child("BOOMUX"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("sidebar-node-status")
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(rgb(0x89b4fa))
+                                                .cursor_pointer()
+                                                .button_chrome()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_nodes(cx);
+                                                }))
+                                                .child(
+                                                    if self
                                                         .node_views
                                                         .iter()
-                                                        .filter(|node| !node.connected())
-                                                        .count();
-                                                    if unavailable == 0 {
-                                                        format!(
-                                                            "{} remotes · connected",
-                                                            self.node_views
-                                                                .iter()
-                                                                .filter(|node| !node.local)
-                                                                .count()
-                                                        )
+                                                        .any(|node| !node.local)
+                                                    {
+                                                        let unavailable = self
+                                                            .node_views
+                                                            .iter()
+                                                            .filter(|node| !node.connected())
+                                                            .count();
+                                                        if unavailable == 0 {
+                                                            format!(
+                                                                "{} remotes · connected",
+                                                                self.node_views
+                                                                    .iter()
+                                                                    .filter(|node| !node.local)
+                                                                    .count()
+                                                            )
+                                                        } else {
+                                                            format!(
+                                                                "{} remotes · {} unavailable",
+                                                                self.node_views
+                                                                    .iter()
+                                                                    .filter(|node| !node.local)
+                                                                    .count(),
+                                                                unavailable
+                                                            )
+                                                        }
                                                     } else {
                                                         format!(
-                                                            "{} remotes · {} unavailable",
-                                                            self.node_views
-                                                                .iter()
-                                                                .filter(|node| !node.local)
-                                                                .count(),
-                                                            unavailable
+                                                            "active · {} workspaces",
+                                                            self.boomux_overview.workspaces.len()
                                                         )
-                                                    }
-                                                } else {
-                                                    format!(
-                                                        "active · {} workspaces",
-                                                        self.boomux_overview.workspaces.len()
-                                                    )
-                                                },
-                                            ),
-                                    ),
-                            ),
+                                                    },
+                                                ),
+                                        ),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -11459,6 +11529,10 @@ fn main() {
             KeyBinding::new("ctrl-c", CenterFloating, Some("Layout")),
             KeyBinding::new("ctrl-tab", CyclePaneNext, Some("Layout")),
             KeyBinding::new("ctrl-shift-tab", CyclePanePrevious, Some("Layout")),
+            KeyBinding::new("pagedown", CycleWorkspaceNext, Some("Sidebar")),
+            KeyBinding::new("pageup", CycleWorkspacePrevious, Some("Sidebar")),
+            KeyBinding::new("ctrl-pagedown", CycleWorkspaceNext, Some("Sidebar")),
+            KeyBinding::new("ctrl-pageup", CycleWorkspacePrevious, Some("Sidebar")),
             KeyBinding::new("ctrl-pagedown", CycleWorkspaceNext, Some("Layout")),
             KeyBinding::new("ctrl-pageup", CycleWorkspacePrevious, Some("Layout")),
             KeyBinding::new("ctrl-o", ToggleFloating, Some("Layout")),
@@ -11625,6 +11699,32 @@ fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: 
 #[cfg(test)]
 mod pointer_tests {
     use super::*;
+
+    #[test]
+    fn sidebar_brand_collapses_before_title_or_controls_wrap() {
+        assert!(!sidebar_brand_text_fits(280.0, 85.0));
+        assert!(sidebar_brand_text_fits(340.0, 85.0));
+        assert!(!sidebar_brand_text_fits(340.0, 140.0));
+        assert!(!sidebar_brand_text_fits(0.0, 85.0));
+    }
+
+    #[test]
+    fn workspace_navigation_uses_selection_and_empty_workspace_before_old_terminal() {
+        let order = vec!["first".into(), "empty".into(), "third".into()];
+        let sidebar = workspace_navigation_anchor(Some("empty"), Some("first"), Some("first"));
+        assert_eq!(cycled_workspace_id(&order, sidebar, false), Some("third"));
+        let empty = workspace_navigation_anchor(None, Some("empty"), None);
+        assert_eq!(cycled_workspace_id(&order, empty, true), Some("first"));
+        let transitioning = workspace_navigation_anchor(None, Some("empty"), Some("first"));
+        assert_eq!(
+            cycled_workspace_id(&order, transitioning, false),
+            Some("third")
+        );
+        assert_eq!(
+            workspace_navigation_anchor(None, None, Some("third")),
+            Some("third")
+        );
+    }
 
     #[test]
     fn layout_leader_release_distinguishes_taps_holds_and_toggle_off() {

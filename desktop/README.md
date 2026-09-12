@@ -185,7 +185,7 @@ These shortcuts apply **inside layout mode**.
 | **J** or **S** | Toggle split orientation |
 | **E / R** | Equalize / swap the nearest split |
 | **O / F / B** | Toggle floating / expand pane / toggle sidebar |
-| **Page Up / Page Down** | Switch Workspaces in sidebar order |
+| **Page Up / Page Down** | Switch Workspaces in sidebar order; also works when the sidebar has keyboard focus |
 
 For floating panes, **Alt + Shift + Arrow keys** aligns to a canvas edge and
 **C** centers the pane. Note that **J toggles a split**; use Down to focus below.
