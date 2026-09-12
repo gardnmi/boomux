@@ -309,7 +309,7 @@ a service restart produce one reminder after you finish editing.
 | Area | Options |
 | --- | --- |
 | Layout | Tree/Tabs, Workspace/Mixed scope, pane headings |
-| Appearance | Rounded/square/mixed corners, pane spacing, focus emphasis |
+| Appearance | Square corners by default; rounded/mixed options, pane spacing, focus emphasis |
 | Button hover animations | On by default; turn off for instant hover highlights without changing pane motion |
 | Motion | Instant, Fast, or Smooth — the default |
 | Clipboard | Copy on select (enabled by default) |

@@ -793,8 +793,8 @@ enum PointerOperation {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PaneCornerStyle {
-    #[default]
     Rounded,
+    #[default]
     Square,
     Mixed,
 }

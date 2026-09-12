@@ -37,7 +37,7 @@ impl Default for Settings {
             sidebar_git_tab: false,
             sidebar_width: crate::SIDEBAR_WIDTH,
             pane_headings_visible: true,
-            pane_corner_style: PaneCornerStyle::Rounded,
+            pane_corner_style: PaneCornerStyle::default(),
             pane_gap: 8.0,
             focus_highlight_strength: 100,
             motion_speed: MotionSpeed::Smooth,
