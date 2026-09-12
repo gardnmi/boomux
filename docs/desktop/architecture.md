@@ -271,7 +271,7 @@ floating panes over the current arrangement. They do not detach existing panes,
 change the expanded Workspace, or enter the saved arrangement. Closing a failed
 or cancelled setup leaves the underlying panes available.
 
-The lower sidebar has Agents, Git, and Remotes tabs. Remotes contains the scrollable
+The lower sidebar has Agents, Conversations, Git, and Remotes tabs. Remotes contains the scrollable
 machine cards with selected-machine details and create/update/sign-in controls.
 The general connect action sits above the cards, outside any machine's controls;
 it is no longer an overflow-menu popover. Node shortcuts apply only while the
@@ -512,8 +512,10 @@ executable gets a finish-installation reminder after launching a new bundle.
 ## Edge Resizing
 
 The sidebar exposes a five-pixel right-edge handle. Its preferred width is bounded
-to 280–600 logical pixels and stored in Desktop preferences when dragging ends;
-older preference files retain the 300-pixel default. The displayed width also
+to 200–600 logical pixels and stored in Desktop preferences when dragging ends;
+older preference files retain the 300-pixel default. The compact minimum fits
+the logo and header controls after the brand text hides; dragging below that
+minimum retains the existing rebound and far-edge collapse behavior. The displayed width also
 reserves terminal canvas space on narrow windows. Sidebar content, Settings,
 menus, and terminal pointer coordinates use the same effective width.
 
@@ -560,3 +562,47 @@ Desktop layout document version 2 adds `hidden_remote_workspaces`. Version 1 is
 explicitly migrated with an empty hidden map while preserving its revision and
 arrangements. Unknown versions remain rejected. This is separate from daemon
 persistence and wire versions, which are unchanged.
+
+## Workspace Conversations
+
+`src/conversations.rs` owns the selected Workspace's conversation panel, loading,
+error, and open-request state. It fetches owner-scoped conversation lists with cached harness titles in
+background work driven by the existing overview loop, at most every three seconds
+while visible. Selection changes discard the previous Workspace's entries; late
+responses are ignored. Rendering pages 50 entries at a time bounds UI work.
+
+The shared core projection groups recorded Agent runs by harness and exact
+conversation ID within one immutable Workspace. It does not inspect external
+history. Opening uses protocol 55 owner validation, focuses an existing exact-run
+pane, or attaches a tiled pane without detaching the current layout. A failed
+or ambiguous open surfaces an error; retry retains its requested Shell ID.
+Missing/old remote owners never cause local execution. Overview refresh is read-only: all user Workspaces remain until explicitly
+removed, including those without Shells or recorded conversations. The exact
+creation-receipt cleanup of temporary setup Workspaces remains separate.
+
+Conversation organization is Desktop presentation state. Layout document version 3
+adds up to 4096 pin/archive preferences keyed by owner-scoped Workspace, integration,
+and external conversation ID. Versions 1 and 2 migrate explicitly with no
+conversation preferences, preserving existing layout and visibility data. Preferences
+use the existing bounded atomic layout writer and are saved even when no terminal
+arrangement is active. Explicit Workspace removal clears its preferences. They do
+not sync across Desktop installations or affect Agent lifecycle or harness history.
+
+The panel caches filtered row indices outside rendering. Recent excludes archived
+entries and sorts pinned entries first, then by latest observed activity; Archived
+is separately searchable. Search matches title and harness. A dedicated keyboard
+recipient prevents search typing from reaching terminals and yields to resource
+dialogs. Open and Resume are explicit row actions; unavailable resume is not invoked.
+
+## Button feedback
+
+`src/buttons.rs` supplies shared 3-pixel button corners and a diagonal hover fill
+using existing theme accents. Buttons retain their semantic colors and handlers.
+Hover transitions reverse from their current position, respect Desktop Instant
+motion and system reduced motion, and request frames only while transitioning.
+The persisted `button_hover_animations` preference defaults to enabled; disabling
+it makes hover feedback immediate without changing pane transition speed.
+State is owned by the visible element and reclaimed when it disappears. Switches
+and text fields keep their distinct input shapes; disabled controls do not animate.
+The Agents/Git/Remotes tabs divide their row equally, with selected backgrounds and
+underlines. Git toolbar actions occupy a separate row to preserve tab widths.

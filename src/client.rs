@@ -2159,6 +2159,38 @@ impl Client {
         attachment_from_response(stream, protocol_version, response)
     }
 
+    pub fn open_workspace_conversation(
+        &self,
+        node_id: Option<&str>,
+        workspace_id: &str,
+        agent_id: &str,
+        shell_id: &str,
+    ) -> Result<ShellSnapshot> {
+        if !self.supports(protocol::ProtocolFeature::WorkspaceConversations)? {
+            return Err(unsupported_version(
+                "Update Boomux to use Workspace conversations",
+            ));
+        }
+        let operation = RoutedOperation::OpenWorkspaceConversation {
+            workspace_id: workspace_id.into(),
+            agent_id: agent_id.into(),
+            shell_id: shell_id.into(),
+        };
+        if let Some(node_id) = node_id {
+            return match self.route_node_operation(node_id, operation)? {
+                RoutedOperationResult::Shell { shell } => Ok(shell),
+                response => Err(io::Error::other(format!(
+                    "unexpected conversation response: {response:?}"
+                ))
+                .into()),
+            };
+        }
+        match self.request(operation.owner_request())? {
+            Response::Shell { shell } => Ok(shell),
+            response => unexpected(response),
+        }
+    }
+
     pub fn resume_agent_session(
         &self,
         node_id: Option<&str>,
@@ -2730,6 +2762,48 @@ mod tests {
             );
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn conversation_open_negotiates_without_sending_mutation_to_old_peer() {
+        let directory =
+            env::temp_dir().join(format!("boomux-conversation-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for version in (54..=protocol::PROTOCOL_VERSION).rev() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.message, Request::Ping);
+                let response = if version == 54 {
+                    Response::Pong
+                } else {
+                    Response::Error {
+                        code: Some(ErrorCode::UnsupportedVersion),
+                        message: "older daemon".into(),
+                    }
+                };
+                protocol::write_message(&mut stream, &Envelope::with_version(54, response))
+                    .unwrap();
+            }
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let client = Client::from_socket_path(socket);
+        let error = client
+            .open_workspace_conversation(None, "workspace", "agent", "shell")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Protocol(ProtocolError::UnsupportedVersion(_))
+        ));
+        let listener = server.join().unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -1,5 +1,8 @@
 mod boomux_settings;
+mod buttons;
+use buttons::ButtonChrome;
 mod bundle_update;
+mod conversations;
 mod project_search;
 use boomux::generated_names;
 mod git_panel;
@@ -46,6 +49,9 @@ const TERMINAL_CELL_WIDTH: f32 = 8.4;
 const TERMINAL_CELL_HEIGHT: f32 = 17.0;
 const TERMINAL_PADDING: f32 = 16.0;
 const SIDEBAR_WIDTH: f32 = 300.0;
+// Fits header padding, the logo, four controls, their gaps, and the border.
+const SIDEBAR_MIN_WIDTH: f32 = 200.0;
+const SIDEBAR_MAX_WIDTH: f32 = 600.0;
 const DRAWER_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const SCROLLBAR_FADE_IN_DURATION: Duration = Duration::from_millis(180);
 const SCROLLBAR_FADE_OUT_DURATION: Duration = Duration::from_millis(360);
@@ -100,9 +106,21 @@ impl Render for HeaderTooltip {
     }
 }
 
-// Keep the collapsed edge reachable while retaining the normal readable width.
+fn sidebar_brand_text_fits(width: f32, title_width: f32) -> bool {
+    // Header padding, logo, brand gap, action gap, four controls and their gaps.
+    width >= 32.0 + 32.0 + 12.0 + title_width + 8.0 + 4.0 * 28.0 + 3.0 * 4.0 + 1.0
+}
+
+fn workspace_navigation_anchor<'a>(
+    sidebar: Option<&'a str>,
+    expanded: Option<&'a str>,
+    focused: Option<&'a str>,
+) -> Option<&'a str> {
+    sidebar.or(expanded).or(focused)
+}
+
 fn sidebar_drag_target(pointer_x: f32) -> Option<f32> {
-    (pointer_x > 48.0).then(|| pointer_x.clamp(280.0, 600.0))
+    (pointer_x > 48.0).then(|| pointer_x.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH))
 }
 
 fn sidebar_header_button(
@@ -121,7 +139,7 @@ fn sidebar_header_button(
         .flex()
         .items_center()
         .justify_center()
-        .rounded_md()
+        .rounded(px(3.0))
         .border_1()
         .border_color(rgb(if active { 0xcba6f7 } else { 0x45475a }))
         .cursor_pointer()
@@ -775,8 +793,8 @@ enum PointerOperation {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PaneCornerStyle {
-    #[default]
     Rounded,
+    #[default]
     Square,
     Mixed,
 }
@@ -1593,6 +1611,7 @@ struct Workspace {
     project_folder_picker_pending: bool,
     project_folder_picker_open: bool,
     nodes_open: bool,
+    conversations: conversations::Panel,
     node_views: Vec<nodes::NodeView>,
     nodes_error: Option<String>,
     node_forget_confirm: Option<String>,
@@ -1613,6 +1632,7 @@ struct Workspace {
     pane_gap: f32,
     focus_highlight_strength: u8,
     motion_speed: MotionSpeed,
+    button_hover_animations: bool,
     layout_overlay_visible: bool,
     copy_on_select: bool,
     workspace_pane_mode: WorkspacePaneMode,
@@ -1822,6 +1842,7 @@ impl Workspace {
             project_folder_picker_pending: false,
             project_folder_picker_open: false,
             nodes_open: false,
+            conversations: conversations::Panel::default(),
             node_views: Vec::new(),
             nodes_error: None,
             node_forget_confirm: None,
@@ -1842,6 +1863,7 @@ impl Workspace {
             pane_gap: saved.pane_gap,
             focus_highlight_strength: saved.focus_highlight_strength,
             motion_speed: saved.motion_speed,
+            button_hover_animations: saved.button_hover_animations,
             layout_overlay_visible: saved.layout_overlay_visible,
             copy_on_select: saved.copy_on_select,
             workspace_pane_mode: saved.workspace_pane_mode,
@@ -1963,6 +1985,7 @@ impl Workspace {
                 pane_gap: self.pane_gap,
                 focus_highlight_strength: self.focus_highlight_strength,
                 motion_speed: self.motion_speed,
+                button_hover_animations: self.button_hover_animations,
                 layout_overlay_visible: self.layout_overlay_visible,
                 copy_on_select: self.copy_on_select,
                 workspace_pane_mode: self.workspace_pane_mode,
@@ -2130,6 +2153,7 @@ impl Workspace {
                                 .h(px(24.0))
                                 .px_2()
                                 .text_xs()
+                                .button_chrome()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if !this.updates_checking && !this.update_busy {
                                         this.updates_status = None;
@@ -2151,9 +2175,9 @@ impl Workspace {
                 .child(div().text_xs().text_color(rgb(0xa6adc8))
                     .child("Restart the app and its background service to finish updating. Running terminals and commands will be preserved."))
                 .child(Self::settings_option("restart-update", if self.update_busy { "Restarting…" } else { "Restart now" }, true)
-                    .on_click(cx.listener(|this, _, _, cx| this.restart_for_update(cx))))
+                    .button_chrome().on_click(cx.listener(|this, _, _, cx| this.restart_for_update(cx))))
                 .child(Self::settings_option("later-update", "Later", false)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .button_chrome().on_click(cx.listener(move |this, _, _, cx| {
                         if !this.update_busy {
                             this.dismissed_desktop_update = version.clone();
                             this.dismissed_boomux_update = version.clone();
@@ -2199,6 +2223,7 @@ impl Workspace {
                             .gap_2()
                             .child(
                                 Self::settings_option("view-update", "View release", false)
+                                    .button_chrome()
                                     .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
                             )
                             .when(
@@ -2219,6 +2244,7 @@ impl Workspace {
                                             },
                                             true,
                                         )
+                                        .button_chrome()
                                         .on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 this.download_update(download_version.clone(), cx)
@@ -2228,14 +2254,14 @@ impl Workspace {
                                 },
                             )
                             .child(
-                                Self::settings_option("dismiss-update", "Dismiss", false).on_click(
-                                    cx.listener(move |this, _, _, cx| {
+                                Self::settings_option("dismiss-update", "Dismiss", false)
+                                    .button_chrome()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         this.dismissed_desktop_update = version.clone();
                                         this.dismissed_boomux_update = version.clone();
                                         this.save_settings();
                                         cx.notify();
-                                    }),
-                                ),
+                                    })),
                             ),
                     )
                     .into_any_element(),
@@ -2350,11 +2376,27 @@ impl Workspace {
     }
 
     fn cycle_workspace(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let current_workspace_id = self
+        let sidebar = if self.navigation_region == NavigationRegion::Sidebar {
+            match self.sidebar_item.as_ref() {
+                Some(SidebarItem::Workspace(id))
+                | Some(SidebarItem::Shell {
+                    workspace_id: id, ..
+                }) => Some(id.as_str()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let expanded = (self.workspace_pane_mode == WorkspacePaneMode::Workspace
+            && self.expanded_workspaces.len() == 1)
+            .then(|| self.expanded_workspaces.iter().next().map(String::as_str))
+            .flatten();
+        let focused = self
             .terminals
             .get(&self.focused)
             .and_then(|pane| pane.shell.as_ref())
             .map(|shell| shell.workspace_id.as_str());
+        let current_workspace_id = workspace_navigation_anchor(sidebar, expanded, focused);
         let Some(workspace_id) =
             cycled_workspace_id(&self.workspace_order, current_workspace_id, backwards)
                 .map(str::to_owned)
@@ -2376,10 +2418,19 @@ impl Workspace {
                     .find(|shell| !self.minimized_shells.contains(&shell.id))
             })
             .map(|shell| shell.id.clone());
+        let from_sidebar = self.navigation_region == NavigationRegion::Sidebar;
         self.open_workspace(&workspace_id, preferred_shell_id.as_deref(), window, cx);
+        self.sidebar_item = Some(SidebarItem::Workspace(workspace_id));
+        if from_sidebar {
+            self.navigation_region = NavigationRegion::Sidebar;
+        }
+        self.reveal_sidebar_item(window, cx);
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn focus_terminal_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         if !self.terminals.contains_key(&pane_id) {
             return;
@@ -2764,6 +2815,7 @@ impl Workspace {
 
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.project_menu_open = false;
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         if self.settings_open {
@@ -3127,6 +3179,14 @@ impl Workspace {
                                 this.node_views.iter_mut().find(|node| node.id == *id)
                         {
                             node.label = value.clone();
+                        }
+                        if kind == ResourceDialogKind::Remove
+                            && let SidebarResource::Workspace { id, .. } = &target
+                        {
+                            this.layout_document
+                                .conversations
+                                .retain(|entry| &entry.workspace != id);
+                            this.save_presentation_preferences(cx);
                         }
                         this.set_boomux_overview(overview);
                         this.resource_dialog = None;
@@ -3854,6 +3914,7 @@ impl Workspace {
     ) {
         self.capture_arrangement();
         self.layout_changed(cx);
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         self.floating_animation = None;
         self.focused = id;
@@ -4396,7 +4457,8 @@ impl Workspace {
     ) {
         if self.sidebar_resizing {
             if event.pressed_button == Some(MouseButton::Left) {
-                self.sidebar_drag_width = Some(f32::from(event.position.x).clamp(0.0, 600.0));
+                self.sidebar_drag_width =
+                    Some(f32::from(event.position.x).clamp(0.0, SIDEBAR_MAX_WIDTH));
                 if let Some(width) = sidebar_drag_target(f32::from(event.position.x)) {
                     self.sidebar_visible = true;
                     self.sidebar_preferred_width = width;
@@ -4404,6 +4466,7 @@ impl Workspace {
                     self.sidebar_visible = false;
                     self.sidebar_menu = None;
                     self.sidebar_header_menu_open = false;
+                    self.conversations.search_focused = false;
                     self.git_panel.search_focused = false;
                     self.nodes_open = false;
                     if self.navigation_region == NavigationRegion::Sidebar {
@@ -4957,6 +5020,9 @@ impl Workspace {
             remote_picker: self.project_menu_open && self.remote_picker_open,
             project_search: self.project_menu_open,
             git_search: self.git_panel.search_focused,
+            conversation_search: self.conversations.open
+                && !self.settings_open
+                && self.conversations.search_focused,
             remotes: self.nodes_open && self.navigation_region == NavigationRegion::Sidebar,
             settings_restart: self.settings_restart_confirm,
             settings_input: self.boomux_setting_input.is_some(),
@@ -5059,6 +5125,10 @@ impl Workspace {
             }
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        if input_target == InputTarget::ConversationSearch {
+            self.conversation_search_key(event, cx);
             return;
         }
         if input_target == InputTarget::GitSearch {
@@ -5322,7 +5392,7 @@ impl Workspace {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let attached_shell = shell.clone();
+            let mut attached_shell = shell.clone();
             let result = cx
                 .background_spawn(async move {
                     TerminalSession::attach(shell, rows, cols, pixel_width, pixel_height)
@@ -5335,6 +5405,7 @@ impl Workspace {
                 pane.attaching = false;
                 match result {
                     Ok(terminal) => {
+                        attached_shell.run_id = terminal.run_id.clone();
                         let shell_id = terminal.shell_id.clone();
                         pane.screen = Some(terminal.screen());
                         pane.shell = Some(attached_shell);
@@ -5632,7 +5703,7 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let result = cx
-                    .background_spawn(async { terminal::refresh_overview_and_nodes() })
+                    .background_spawn(async { terminal::discover_overview_and_nodes() })
                     .await;
                 let mut removed_setup_shells = Vec::new();
                 let mut setup_workspace_cleanups = Vec::new();
@@ -5705,6 +5776,7 @@ impl Workspace {
                                 cx.notify();
                             }
                         }
+                        this.refresh_conversations(cx);
                         true
                     })
                     .unwrap_or(false);
@@ -6389,6 +6461,7 @@ impl Workspace {
 
     fn open_nodes(&mut self, cx: &mut Context<Self>) {
         self.project_menu_open = false;
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
@@ -6476,6 +6549,7 @@ impl Workspace {
                         node.status(),
                         node.primary_action().label()
                     )))
+                    .button_chrome()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.activate_remote_machine(&id, window, cx);
@@ -6521,6 +6595,7 @@ impl Workspace {
                         0x1e1e2e
                     }))
                     .child("Connect another machine…")
+                    .button_chrome()
                     .on_click(cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
                         this.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
@@ -6603,7 +6678,7 @@ impl Workspace {
                         0x1e1e2e
                     }))
                     .hover(|row| row.bg(rgb(0x313244)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .button_chrome().on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.selected_node = Some(id.clone());
                         this.expanded_node = if this.expanded_node.as_ref() == Some(&id) {
@@ -6626,7 +6701,7 @@ impl Workspace {
             .when(!node.connected(), |panel| {
                 let id = node.id.clone();
                 panel.child(Self::settings_option("remote-recovery", node.primary_action().label(), false)
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .button_chrome().on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
                         this.activate_remote_machine(&id, window, cx);
                     })))
@@ -6645,7 +6720,7 @@ impl Workspace {
                     .when(!node.connected(), |detail| detail.child(node.last_seen(now_ms)).child(node.guidance()))
                     .child(Self::settings_option("rename-remote-connection", "Rename connection…", false)
                         .flex_none()
-                        .on_click(cx.listener({
+                        .button_chrome().on_click(cx.listener({
                             let id = node.id.clone();
                             let name = node.label.clone();
                             move |this, _, _, cx| {
@@ -6661,7 +6736,7 @@ impl Workspace {
                         let upgrade_id = node.id.clone();
                         detail.child(Self::settings_option("create-remote-workspace", "New workspace", false)
                             .flex_none()
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                            .button_chrome().on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 let name = terminal::project_workspace_name(&name, this.boomux_overview.workspaces.iter()
                                     .filter(|w| remote::identity(&w.id).is_some_and(|id| id.node_id == node_id))
@@ -6670,7 +6745,7 @@ impl Workspace {
                             })))
                             .child(Self::settings_option("update-remote", "Update Boomux", false)
                             .flex_none()
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                            .button_chrome().on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.launch_node_action(terminal::WorkspaceLaunch::UpgradeNode(upgrade_id.clone()), window, cx);
                             })))
@@ -6680,7 +6755,7 @@ impl Workspace {
                         .child(Self::settings_option("remove-remote-machine", "Remove machine & uninstall Boomux…", false)
                             .flex_none()
                             .text_color(rgb(0xf38ba8))
-                            .on_click(cx.listener({
+                            .button_chrome().on_click(cx.listener({
                                 let id = node.id.clone();
                                 move |this, _, window, cx| {
                                     cx.stop_propagation();
@@ -6690,7 +6765,7 @@ impl Workspace {
                         .child(format!("Stops all managed shells on {}. Opens a terminal for confirmation.", node.label))
                         .child(Self::settings_control("forget-remote-machine", "Forget connection only…", false, !self.node_forget_busy)
                             .flex_none()
-                            .on_click(cx.listener({
+                            .button_chrome().on_click(cx.listener({
                                 let id = node.id.clone();
                                 move |this, _, _, cx| {
                                     cx.stop_propagation();
@@ -6704,7 +6779,7 @@ impl Workspace {
                                 .child("Remove this connection and its cached workspaces from this computer? This does not contact the machine, uninstall Boomux, or stop remote work.")
                                 .child(Self::settings_control("confirm-forget-remote", if self.node_forget_busy { "Forgetting…" } else { "Forget connection" }, false, !self.node_forget_busy)
                                     .flex_none().text_color(rgb(0xf38ba8))
-                                    .on_click(cx.listener({
+                                    .button_chrome().on_click(cx.listener({
                                         let id = node.id.clone();
                                         move |this, _, _, cx| {
                                             cx.stop_propagation();
@@ -6712,7 +6787,7 @@ impl Workspace {
                                         }
                                     })))
                                 .child(Self::settings_option("cancel-forget-remote", "Cancel", false).flex_none()
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .button_chrome().on_click(cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
                                         if !this.node_forget_busy { this.node_forget_confirm = None; }
                                         cx.notify();
@@ -6744,6 +6819,7 @@ impl Workspace {
                 .child(
                     Self::settings_option("add-remote-node", "Connect another machine…", false)
                         .flex_none()
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
                         })),
@@ -6781,6 +6857,7 @@ impl Workspace {
                                         false,
                                     )
                                     .flex_none()
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             cx.stop_propagation();
@@ -6801,6 +6878,7 @@ impl Workspace {
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
         self.project_search.clear();
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         window.focus(&self.focus_handle, cx);
         if self.project_menu_open && !self.projects_loading {
@@ -6957,6 +7035,7 @@ impl Workspace {
                                         .text_color(rgb(0x9399b2))
                                         .child(project.path.display().to_string()),
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.project_menu_open = false;
@@ -7014,6 +7093,7 @@ impl Workspace {
                 .child(
                     sidebar_menu_row("project-new-workspace")
                         .child("New Workspace")
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             if this.settings_open {
@@ -7025,6 +7105,7 @@ impl Workspace {
                 .child(
                     sidebar_menu_row("project-new-remote-workspace")
                         .child("New remote workspace…")
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             if this.settings_open {
@@ -7056,6 +7137,7 @@ impl Workspace {
                     div()
                         .id("project-search")
                         .role(gpui::Role::SearchInput)
+                        .role(gpui::Role::SearchInput)
                         .aria_label("Filter projects by name or path")
                         .mx_2()
                         .my_1()
@@ -7067,6 +7149,7 @@ impl Workspace {
                         .items_center()
                         .gap_2()
                         .text_sm()
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             window.focus(&this.focus_handle, cx);
@@ -7096,6 +7179,7 @@ impl Workspace {
                                     .cursor_pointer()
                                     .px_1()
                                     .child("×")
+                                    .button_chrome()
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         cx.stop_propagation();
                                         this.project_search.clear();
@@ -7114,6 +7198,7 @@ impl Workspace {
                         } else {
                             "Add project folder…"
                         })
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.open_project_settings(window, cx);
@@ -7147,6 +7232,7 @@ impl Workspace {
                         } else {
                             "Check for updates"
                         })
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.sidebar_header_menu_open = false;
@@ -7161,6 +7247,7 @@ impl Workspace {
                     sidebar_menu_row("header-menu-help")
                         .justify_between()
                         .gap_3()
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.sidebar_header_menu_open = false;
@@ -7180,6 +7267,7 @@ impl Workspace {
                     sidebar_menu_row("header-menu-hide-sidebar")
                         .justify_between()
                         .gap_3()
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.sidebar_header_menu_open = false;
@@ -7228,6 +7316,7 @@ impl Workspace {
                 self.pane_layout_mode,
             )
         };
+        let compact_sidebar = self.sidebar_content_width() < 280.0;
         let workspace_order_animation = self.workspace_order_animation.clone();
         let workspace_order_animation_duration = self.motion_speed.duration();
         let workspace_rows = workspaces
@@ -7246,116 +7335,123 @@ impl Workspace {
                     .as_ref()
                     .and_then(|id| self.node_views.iter().find(|node| node.id == id.node_id));
                 let shell_count = workspace.shells.len();
-                let shell_rows =
-                    workspace
-                        .shells
-                        .iter()
-                        .filter(|_| expanded && self.pane_layout_mode != PaneLayoutMode::Tabbed)
-                        .cloned()
-                        .map(|shell| {
-                            let shell_id = shell.id.clone();
-                            let shell_target = SidebarResource::Shell {
-                                id: shell.id.clone(),
-                                workspace_id: workspace.id.clone(),
-                                name: shell.name.clone(),
-                            };
-                            let shell_item = SidebarItem::Shell {
-                                workspace_id: workspace.id.clone(),
-                                shell_id: shell.id.clone(),
-                            };
-                            let keyboard_selected = self.navigation_region
-                                == NavigationRegion::Sidebar
-                                && self.sidebar_item.as_ref() == Some(&shell_item);
-                            let selected = focused_shell_id == Some(shell.id.as_str());
-                            let pane_open = open_shell_ids.contains(shell.id.as_str());
-                            let pane_presence = shell_pane_presence(selected, pane_open);
-                            let status = shell.status_label();
-                            div()
-                                .id(SharedString::from(format!("sidebar-shell-{}", shell.id)))
-                                .ml_8()
-                                .h(px(39.0))
-                                .px_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .rounded_md()
-                                .anchor_scroll(
-                                    keyboard_selected.then(|| self.sidebar_scroll_anchor.clone()),
-                                )
-                                .bg(if keyboard_selected {
-                                    rgb(0x45475a)
-                                } else if selected {
-                                    rgb(0x252536)
-                                } else {
-                                    rgb(0x181825)
-                                })
-                                .hover(|element| element.bg(rgb(0x29293d)))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.activate_sidebar_shell(&shell_id, window, cx);
-                                }))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(
-                                            if pane_presence != ShellPanePresence::Minimized {
-                                                0x89b4fa
-                                            } else {
-                                                0x6c7086
-                                            },
-                                        ))
-                                        .child(if self.shell_has_agent(&shell) {
-                                            "✦"
+                let shell_rows = workspace
+                    .shells
+                    .iter()
+                    .filter(|_| expanded && self.pane_layout_mode != PaneLayoutMode::Tabbed)
+                    .cloned()
+                    .map(|shell| {
+                        let shell_id = shell.id.clone();
+                        let shell_target = SidebarResource::Shell {
+                            id: shell.id.clone(),
+                            workspace_id: workspace.id.clone(),
+                            name: shell.name.clone(),
+                        };
+                        let shell_item = SidebarItem::Shell {
+                            workspace_id: workspace.id.clone(),
+                            shell_id: shell.id.clone(),
+                        };
+                        let keyboard_selected = self.navigation_region == NavigationRegion::Sidebar
+                            && self.sidebar_item.as_ref() == Some(&shell_item);
+                        let selected = focused_shell_id == Some(shell.id.as_str());
+                        let pane_open = open_shell_ids.contains(shell.id.as_str());
+                        let pane_presence = shell_pane_presence(selected, pane_open);
+                        let status = shell.status_label();
+                        div()
+                            .id(SharedString::from(format!("sidebar-shell-{}", shell.id)))
+                            .ml(px(if compact_sidebar { 12.0 } else { 32.0 }))
+                            .h(px(SIDEBAR_SHELL_ROW_HEIGHT))
+                            .flex_none()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap(px(if compact_sidebar { 4.0 } else { 8.0 }))
+                            .rounded_md()
+                            .anchor_scroll(
+                                keyboard_selected.then(|| self.sidebar_scroll_anchor.clone()),
+                            )
+                            .bg(if keyboard_selected {
+                                rgb(0x45475a)
+                            } else if selected {
+                                rgb(0x252536)
+                            } else {
+                                rgb(0x181825)
+                            })
+                            .hover(|element| element.bg(rgb(0x29293d)))
+                            .cursor_pointer()
+                            .button_chrome()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.activate_sidebar_shell(&shell_id, window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgb(
+                                        if pane_presence != ShellPanePresence::Minimized {
+                                            0x89b4fa
                                         } else {
-                                            pane_presence.glyph()
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(gpui::FontWeight::NORMAL)
-                                                .text_color(rgb(0xcdd6f4))
-                                                .child(shell.name),
-                                        )
-                                        .child(div().text_xs().text_color(rgb(0x6c7086)).child(
-                                            format!("{} · {status}", pane_presence.label()),
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "sidebar-shell-menu-{}",
-                                            shell.id
-                                        )))
-                                        .w(px(24.0))
-                                        .h(px(28.0))
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .text_color(rgb(0x7f849c))
-                                        .hover(|element| {
-                                            element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
-                                        })
-                                        .on_click(cx.listener(move |this, event, window, cx| {
-                                            this.open_sidebar_menu(
-                                                shell_target.clone(),
-                                                event,
-                                                window,
-                                                cx,
-                                            );
-                                        }))
-                                        .child("⋮"),
-                                )
-                        })
-                        .collect::<Vec<_>>();
+                                            0x6c7086
+                                        },
+                                    ))
+                                    .child(if self.shell_has_agent(&shell) {
+                                        "✦"
+                                    } else {
+                                        pane_presence.glyph()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::NORMAL)
+                                            .text_color(rgb(0xcdd6f4))
+                                            .child(shell.name),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(rgb(0x6c7086))
+                                            .child(format!("{} · {status}", pane_presence.label())),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "sidebar-shell-menu-{}",
+                                        shell.id
+                                    )))
+                                    .w(px(24.0))
+                                    .h(px(28.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_color(rgb(0x7f849c))
+                                    .hover(|element| {
+                                        element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
+                                    })
+                                    .button_chrome()
+                                    .on_click(cx.listener(move |this, event, window, cx| {
+                                        this.open_sidebar_menu(
+                                            shell_target.clone(),
+                                            event,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .child("⋮"),
+                            )
+                    })
+                    .collect::<Vec<_>>();
 
                 let workspace_target = SidebarResource::Workspace {
                     id: workspace.id.clone(),
@@ -7403,6 +7499,7 @@ impl Workspace {
                                 },
                                 |drag, _, _, cx| cx.new(|_| drag.clone()),
                             )
+                            .button_chrome()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.navigation_region = NavigationRegion::Sidebar;
                                 this.sidebar_item = Some(workspace_item.clone());
@@ -7487,6 +7584,7 @@ impl Workspace {
                                         div()
                                             .text_sm()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .truncate()
                                             .child(workspace.name.clone()),
                                     )
                                     .child(
@@ -7533,6 +7631,7 @@ impl Workspace {
                                     .hover(|element| {
                                         element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
                                     })
+                                    .button_chrome()
                                     .on_click(cx.listener(move |this, event, window, cx| {
                                         this.open_sidebar_menu(
                                             workspace_target.clone(),
@@ -7578,6 +7677,30 @@ impl Workspace {
             })
             .collect::<Vec<_>>();
 
+        let text_style = window.text_style();
+        let mut title_font = text_style.font();
+        title_font.weight = gpui::FontWeight::BOLD;
+        let title_width = window
+            .text_system()
+            .shape_line(
+                "BOOMUX".into(),
+                text_style.font_size.to_pixels(window.rem_size()),
+                &[TextRun {
+                    len: 6,
+                    font: title_font,
+                    color: text_style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                    ..Default::default()
+                }],
+                None,
+            )
+            .width;
+        let show_brand_text = sidebar_brand_text_fits(
+            self.sidebar_width().min(self.sidebar_content_width()),
+            f32::from(title_width),
+        );
         let agent_rows = agents
             .iter()
             .cloned()
@@ -7617,60 +7740,70 @@ impl Workspace {
                             .items_center()
                             .gap_3()
                             .child(sidebar_brand_mark())
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div().font_weight(gpui::FontWeight::BOLD).child("BOOMUX"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("sidebar-node-status")
-                                            .truncate()
-                                            .text_xs()
-                                            .text_color(rgb(0x89b4fa))
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.open_nodes(cx);
-                                            }))
-                                            .child(
-                                                if self.node_views.iter().any(|node| !node.local) {
-                                                    let unavailable = self
+                            .when(show_brand_text, |brand| {
+                                brand.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .whitespace_nowrap()
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .child("BOOMUX"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("sidebar-node-status")
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(rgb(0x89b4fa))
+                                                .cursor_pointer()
+                                                .button_chrome()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_nodes(cx);
+                                                }))
+                                                .child(
+                                                    if self
                                                         .node_views
                                                         .iter()
-                                                        .filter(|node| !node.connected())
-                                                        .count();
-                                                    if unavailable == 0 {
-                                                        format!(
-                                                            "{} remotes · connected",
-                                                            self.node_views
-                                                                .iter()
-                                                                .filter(|node| !node.local)
-                                                                .count()
-                                                        )
+                                                        .any(|node| !node.local)
+                                                    {
+                                                        let unavailable = self
+                                                            .node_views
+                                                            .iter()
+                                                            .filter(|node| !node.connected())
+                                                            .count();
+                                                        if unavailable == 0 {
+                                                            format!(
+                                                                "{} remotes · connected",
+                                                                self.node_views
+                                                                    .iter()
+                                                                    .filter(|node| !node.local)
+                                                                    .count()
+                                                            )
+                                                        } else {
+                                                            format!(
+                                                                "{} remotes · {} unavailable",
+                                                                self.node_views
+                                                                    .iter()
+                                                                    .filter(|node| !node.local)
+                                                                    .count(),
+                                                                unavailable
+                                                            )
+                                                        }
                                                     } else {
                                                         format!(
-                                                            "{} remotes · {} unavailable",
-                                                            self.node_views
-                                                                .iter()
-                                                                .filter(|node| !node.local)
-                                                                .count(),
-                                                            unavailable
+                                                            "active · {} workspaces",
+                                                            self.boomux_overview.workspaces.len()
                                                         )
-                                                    }
-                                                } else {
-                                                    format!(
-                                                        "active · {} workspaces",
-                                                        self.boomux_overview.workspaces.len()
-                                                    )
-                                                },
-                                            ),
-                                    ),
-                            ),
+                                                    },
+                                                ),
+                                        ),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -7685,6 +7818,7 @@ impl Workspace {
                                     "+",
                                     self.project_menu_open,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, window, cx| {
                                         cx.stop_propagation();
@@ -7695,11 +7829,27 @@ impl Workspace {
                             )
                             .child(
                                 sidebar_header_button(
+                                    "open-workspace-conversations",
+                                    "Workspace conversations",
+                                    "☷",
+                                    self.conversations.open,
+                                )
+                                .button_chrome()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_conversations(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                sidebar_header_button(
                                     "open-settings",
                                     "Settings",
                                     "⚙",
                                     self.settings_open,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -7714,6 +7864,7 @@ impl Workspace {
                                     "⋯",
                                     self.sidebar_header_menu_open,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -7818,9 +7969,15 @@ impl Workspace {
                                             1 => "sidebar-git-tab",
                                             _ => "sidebar-nodes-tab",
                                         })
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .py_2()
+                                        .bg(rgb(if selected { 0x313244 } else { 0x181825 }))
                                         .cursor_pointer()
                                         .text_sm()
-                                        .pb_1()
                                         .border_b_2()
                                         .border_color(rgb(if selected {
                                             0x89b4fa
@@ -7837,6 +7994,7 @@ impl Workspace {
                                         } else {
                                             "Agents".to_owned()
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             window.focus(&this.focus_handle, cx);
                                             if tab == 2 {
@@ -7845,12 +8003,18 @@ impl Workspace {
                                                 this.select_git_tab(tab == 1, cx);
                                             }
                                         }))
-                                }))
-                                .child(div().flex_1())
-                                .when(self.git_panel.open, |tabs| {
-                                    tabs.child(self.render_git_controls(cx))
-                                }),
+                                })),
                         )
+                        .when(self.git_panel.open, |section| {
+                            section.child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .px_3()
+                                    .py_1()
+                                    .child(self.render_git_controls(cx)),
+                            )
+                        })
                         .when_some(self.render_git_panel(cx), |section, git| section.child(git))
                         .when_some(self.nodes_panel(cx), |section, nodes| section.child(nodes))
                         .when(!self.git_panel.open && !self.nodes_open, |section| {
@@ -7927,6 +8091,7 @@ impl Workspace {
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|row| row.bg(rgb(0x313244)))
+                            .button_chrome()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.open_workspace(&workspace_id, None, window, cx);
@@ -7945,6 +8110,7 @@ impl Workspace {
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|row| row.bg(rgb(0x313244)))
+                            .button_chrome()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.create_and_attach_workspace_terminal(
@@ -7967,6 +8133,7 @@ impl Workspace {
                         .rounded_md()
                         .cursor_pointer()
                         .hover(|row| row.bg(rgb(0x313244)))
+                        .button_chrome()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.open_resource_dialog(
@@ -7982,6 +8149,7 @@ impl Workspace {
                     element.child(
                         sidebar_menu_row("sidebar-menu-hide-workspace")
                             .child("Hide from sidebar")
+                            .button_chrome()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.hide_remote_workspace(target.clone(), window, cx);
@@ -7999,6 +8167,7 @@ impl Workspace {
                         .text_color(rgb(0xf38ba8))
                         .cursor_pointer()
                         .hover(|row| row.bg(rgb(0x313244)))
+                        .button_chrome()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.request_remove_resource(remove_target.clone(), window, cx);
@@ -8032,7 +8201,7 @@ impl Workspace {
             .flex()
             .items_center()
             .justify_center()
-            .rounded_md()
+            .rounded(px(3.0))
             .border_1()
             .border_color(rgb(if selected { 0x89b4fa } else { 0x313244 }))
             .bg(rgb(if selected { 0x313244 } else { 0x181825 }))
@@ -8102,6 +8271,7 @@ impl Workspace {
                             .cursor_pointer()
                             .hover(|button| button.bg(rgb(0x313244)))
                             .child("×")
+                            .button_chrome()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.close_settings(cx);
                             })),
@@ -8219,6 +8389,7 @@ impl Workspace {
             .when(self.settings_restart_pending, |panel| {
                 panel.child(
                     Self::settings_option("settings-restart", "↻ Restart to apply changes", true)
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             if !this.boomux_settings_busy {
                                 this.settings_restart_confirm = true;
@@ -8233,14 +8404,18 @@ impl Workspace {
                         .flex()
                         .gap_2()
                         .child(
-                            Self::settings_option("retry-settings", "Retry save", false).on_click(
-                                cx.listener(|this, _, _, cx| this.save_boomux_settings(cx)),
-                            ),
+                            Self::settings_option("retry-settings", "Retry save", false)
+                                .button_chrome()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.save_boomux_settings(cx)),
+                                ),
                         )
                         .child(
-                            Self::settings_option("reload-settings", "Reload", false).on_click(
-                                cx.listener(|this, _, _, cx| this.load_boomux_settings(cx)),
-                            ),
+                            Self::settings_option("reload-settings", "Reload", false)
+                                .button_chrome()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.load_boomux_settings(cx)),
+                                ),
                         ),
                 )
             })
@@ -8285,9 +8460,9 @@ impl Workspace {
                     .child(div().text_sm().child("The terminal service will restart. Running shells and commands stay alive; terminal views reconnect briefly."))
                     .child(div().flex().gap_2()
                         .child(Self::settings_option("cancel-settings-restart", "Later", false)
-                            .on_click(cx.listener(|this, _, _, cx| { this.settings_restart_confirm = false; cx.notify(); })))
+                            .button_chrome().on_click(cx.listener(|this, _, _, cx| { this.settings_restart_confirm = false; cx.notify(); })))
                         .child(Self::settings_option("confirm-settings-restart", "Restart now", true)
-                            .on_click(cx.listener(|this, _, _, cx| this.restart_settings_service(cx))))))
+                            .button_chrome().on_click(cx.listener(|this, _, _, cx| this.restart_settings_service(cx))))))
                 .into_any_element()
         })
     }
@@ -8446,6 +8621,7 @@ impl Workspace {
                         snapshot.control_text(index) == "true",
                         enabled && !self.boomux_settings_busy,
                     )
+                    .button_chrome()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.boomux_settings_busy {
                             return;
@@ -8517,7 +8693,7 @@ impl Workspace {
                         ))
                         .child(
                             Self::settings_option(("accept-boomux-field", index), "Done", true)
-                                .on_click(
+                                .button_chrome().on_click(
                                     cx.listener(|this, _, _, cx| this.accept_boomux_setting(cx)),
                                 ),
                         );
@@ -8595,7 +8771,7 @@ impl Workspace {
                                 (SharedString::from(format!("boomux-field-{index}")), option_index),
                                 label, selected, enabled,
                             )
-                                .on_click(cx.listener(move |this, _, window, cx| {
+                                .button_chrome().on_click(cx.listener(move |this, _, window, cx| {
                                     if this.boomux_settings_busy || !enabled {
                                         return;
                                     }
@@ -8651,6 +8827,7 @@ impl Workspace {
                                         self.pane_layout_mode == PaneLayoutMode::Tiled,
                                         true,
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
                                             this.set_pane_layout_mode(
@@ -8668,6 +8845,7 @@ impl Workspace {
                                         self.pane_layout_mode == PaneLayoutMode::Tabbed,
                                         true,
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
                                             this.set_pane_layout_mode(
@@ -8693,6 +8871,7 @@ impl Workspace {
                                         self.workspace_pane_mode == WorkspacePaneMode::Workspace,
                                         true,
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
                                             this.capture_arrangement();
@@ -8726,6 +8905,7 @@ impl Workspace {
                                             WorkspacePaneMode::Mixed,
                                         ),
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
                                             if pane_layout_supports_scope(
@@ -8771,6 +8951,7 @@ impl Workspace {
                         self.pane_headings_visible,
                         true,
                     )
+                    .button_chrome()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.pane_headings_visible = !this.pane_headings_visible;
                         this.save_settings();
@@ -8789,6 +8970,7 @@ impl Workspace {
                                     self.pane_corner_style == PaneCornerStyle::Rounded,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.pane_corner_style = PaneCornerStyle::Rounded;
@@ -8804,6 +8986,7 @@ impl Workspace {
                                     self.pane_corner_style == PaneCornerStyle::Square,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.pane_corner_style = PaneCornerStyle::Square;
@@ -8819,6 +9002,7 @@ impl Workspace {
                                     self.pane_corner_style == PaneCornerStyle::Mixed,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.pane_corner_style = PaneCornerStyle::Mixed;
@@ -8836,6 +9020,7 @@ impl Workspace {
                             .gap_1()
                             .child(
                                 Self::settings_control("decrease-pane-gap", "−", false, true)
+                                    .button_chrome()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.pane_gap = (this.pane_gap - 2.0).max(0.0);
                                         this.save_settings();
@@ -8856,6 +9041,7 @@ impl Workspace {
                             )
                             .child(
                                 Self::settings_control("increase-pane-gap", "+", false, true)
+                                    .button_chrome()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.pane_gap = (this.pane_gap + 2.0).min(32.0);
                                         this.save_settings();
@@ -8875,8 +9061,24 @@ impl Workspace {
                         self.layout_overlay_visible,
                         true,
                     )
+                    .button_chrome()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.layout_overlay_visible = !this.layout_overlay_visible;
+                        this.save_settings();
+                        cx.notify();
+                    })),
+                ))
+                .child(Self::settings_toggle_row(
+                    "Button hover animations",
+                    "Animate button highlights on hover. Turn off for instant feedback.",
+                    Self::settings_switch(
+                        "button-hover-animations",
+                        "Button hover animations",
+                        self.button_hover_animations,
+                        true,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.button_hover_animations = !this.button_hover_animations;
                         this.save_settings();
                         cx.notify();
                     })),
@@ -8893,6 +9095,7 @@ impl Workspace {
                                     self.motion_speed == MotionSpeed::Instant,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.motion_speed = MotionSpeed::Instant;
@@ -8910,6 +9113,7 @@ impl Workspace {
                                     self.motion_speed == MotionSpeed::Fast,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.motion_speed = MotionSpeed::Fast;
@@ -8925,6 +9129,7 @@ impl Workspace {
                                     self.motion_speed == MotionSpeed::Smooth,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.motion_speed = MotionSpeed::Smooth;
@@ -8951,6 +9156,7 @@ impl Workspace {
                                     false,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.focus_highlight_strength =
                                         this.focus_highlight_strength.saturating_sub(10);
@@ -8977,6 +9183,7 @@ impl Workspace {
                                     false,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.focus_highlight_strength =
                                         this.focus_highlight_strength.saturating_add(10).min(100);
@@ -9002,7 +9209,7 @@ impl Workspace {
                     "Copy on select",
                     "Copy selected terminal text to the clipboard when you release the mouse.",
                     Self::settings_switch("copy-on-select", "Copy on select", self.copy_on_select, true)
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .button_chrome().on_click(cx.listener(|this, _, _, cx| {
                             this.copy_on_select = !this.copy_on_select;
                             this.save_settings();
                             cx.notify();
@@ -9013,12 +9220,12 @@ impl Workspace {
                 .child(Self::settings_category("Recovery & history"))
                 .child(Self::settings_group().children(self.shared_settings_rows(&[6, 7], cx)))
                 .child(Self::settings_category("Safety"))
-                .child(Self::settings_group().child(Self::settings_toggle_row("Confirm removals", "Ask before permanently removing a Shell or Workspace.", Self::settings_switch("removal-confirmation", "Confirm removals", self.confirm_destructive_actions, true).on_click(cx.listener(|this, _, _, cx| { this.confirm_destructive_actions = !this.confirm_destructive_actions; this.save_settings(); cx.notify(); })))))
+                .child(Self::settings_group().child(Self::settings_toggle_row("Confirm removals", "Ask before permanently removing a Shell or Workspace.", Self::settings_switch("removal-confirmation", "Confirm removals", self.confirm_destructive_actions, true).button_chrome().on_click(cx.listener(|this, _, _, cx| { this.confirm_destructive_actions = !this.confirm_destructive_actions; this.save_settings(); cx.notify(); })))))
                 .child(Self::settings_category("Projects"))
                 .child(div().text_xs().text_color(rgb(0x9399b2)).child("Scan these folders for projects to open from the + menu. Local Node only; no restart needed."))
                 .child(Self::settings_group()
                     .child(Self::settings_row().child(Self::settings_control("browse-project-folders", "Browse for folders…", false, !self.boomux_settings_busy && !self.project_folder_picker_open)
-                        .on_click(cx.listener(|this, _, _, cx| this.browse_project_folders(cx)))))
+                        .button_chrome().on_click(cx.listener(|this, _, _, cx| this.browse_project_folders(cx)))))
                     .children(self.shared_settings_rows(&[10, 11], cx)))
                 .child(Self::settings_category("Advanced"))
                 .child(Self::settings_group().child(
@@ -9028,14 +9235,14 @@ impl Workspace {
                                 .child(snapshot.path.display().to_string())
                         ))
                         .child(Self::settings_control("open-config-file", "Open config file", false, !self.boomux_settings_busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .button_chrome().on_click(cx.listener(|this, _, window, cx| {
                                 if this.boomux_settings_busy { return; }
                                 this.close_settings(cx);
                                 this.create_workspace_terminal(terminal::WorkspaceLaunch::ConfigEdit, window, cx);
                             })))
                 ))
                 .child(Self::settings_control("manual-setup", "Open advanced setup in terminal", false, true)
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .button_chrome().on_click(cx.listener(|this, _, window, cx| {
                         this.close_settings(cx);
                         this.create_workspace_terminal(terminal::WorkspaceLaunch::Setup, window, cx);
                     })));
@@ -9168,6 +9375,7 @@ impl Workspace {
                                             button
                                                 .cursor_pointer()
                                                 .hover(|hovered| hovered.bg(rgb(0x313244)))
+                                                .button_chrome()
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
                                                     this.resource_dialog = None;
@@ -9193,6 +9401,7 @@ impl Workspace {
                                             button
                                                 .cursor_pointer()
                                                 .hover(|hovered| hovered.opacity(0.85))
+                                                .button_chrome()
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     cx.stop_propagation();
                                                     this.submit_resource_dialog(window, cx);
@@ -9339,6 +9548,7 @@ impl Workspace {
                                         .cursor_pointer()
                                         .text_color(rgb(0xa6adc8))
                                         .hover(|button| button.bg(rgb(0x313244)))
+                                        .button_chrome()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.help_open = false;
@@ -9435,6 +9645,7 @@ impl Workspace {
             })
             .hover(|element| element.bg(rgb(0x29293d)))
             .cursor_pointer()
+            .button_chrome()
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.activate_sidebar_shell(&shell_id, window, cx);
             }))
@@ -9513,6 +9724,7 @@ impl Workspace {
                         .cursor_pointer()
                         .hover(|element| element.bg(rgb(0x313244)))
                         .child(if dismissing { "…" } else { "Dismiss" })
+                        .button_chrome()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.dismiss_agent_notification(
@@ -9655,6 +9867,7 @@ impl Workspace {
                             "Reconnect / start Shell",
                             false,
                         )
+                        .button_chrome()
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
                                 this.reconnect_saved_pane(pane_id, window, cx)
@@ -9945,6 +10158,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.request_pane_shell_dialog(
@@ -9989,6 +10203,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.focus_terminal_pane(id, window, cx);
@@ -10013,6 +10228,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.focus_terminal_pane(id, window, cx);
@@ -10037,6 +10253,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.minimize_pane(id, window, cx);
@@ -10062,6 +10279,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.request_pane_shell_dialog(
@@ -10162,6 +10380,7 @@ impl Workspace {
                     .text_color(rgb(0xcdd6f4))
                     .cursor_pointer()
                     .hover(|tab| tab.bg(rgb(0x29293d)).border_color(rgb(0x585b70)))
+                    .button_chrome()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.activate_sidebar_shell(&shell_id, window, cx);
                     }))
@@ -10201,6 +10420,7 @@ impl Workspace {
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation();
                                     })
+                                    .button_chrome()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
                                         this.open_resource_dialog(
@@ -10240,6 +10460,7 @@ impl Workspace {
                         .text_color(rgb(0xa6adc8))
                         .cursor_pointer()
                         .hover(|button| button.bg(rgb(0x29293d)))
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.scroll_minimized_tabs(-1, cx);
                         }))
@@ -10273,6 +10494,7 @@ impl Workspace {
                         .text_color(rgb(0xa6adc8))
                         .cursor_pointer()
                         .hover(|button| button.bg(rgb(0x29293d)))
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.scroll_minimized_tabs(1, cx);
                         }))
@@ -10334,6 +10556,11 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        cx.set_global(buttons::Motion(
+            self.motion_speed
+                .duration()
+                .filter(|_| self.button_hover_animations),
+        ));
         self.sidebar_viewport_width = f32::from(window.viewport_size().width);
         self.layout_canvas = self.panel_size(window);
         let workspace_name = self
@@ -10709,6 +10936,9 @@ impl Render for Workspace {
             .flex()
             .child(drawer)
             .child(terminal_area)
+            .when_some(self.conversations_panel(cx), |content, panel| {
+                content.child(panel)
+            })
             .when(!self.sidebar_visible, |content| {
                 content.child(
                     div()
@@ -11331,6 +11561,10 @@ fn main() {
             KeyBinding::new("ctrl-c", CenterFloating, Some("Layout")),
             KeyBinding::new("ctrl-tab", CyclePaneNext, Some("Layout")),
             KeyBinding::new("ctrl-shift-tab", CyclePanePrevious, Some("Layout")),
+            KeyBinding::new("pagedown", CycleWorkspaceNext, Some("Sidebar")),
+            KeyBinding::new("pageup", CycleWorkspacePrevious, Some("Sidebar")),
+            KeyBinding::new("ctrl-pagedown", CycleWorkspaceNext, Some("Sidebar")),
+            KeyBinding::new("ctrl-pageup", CycleWorkspacePrevious, Some("Sidebar")),
             KeyBinding::new("ctrl-pagedown", CycleWorkspaceNext, Some("Layout")),
             KeyBinding::new("ctrl-pageup", CycleWorkspacePrevious, Some("Layout")),
             KeyBinding::new("ctrl-o", ToggleFloating, Some("Layout")),
@@ -11499,6 +11733,32 @@ mod pointer_tests {
     use super::*;
 
     #[test]
+    fn sidebar_brand_collapses_before_title_or_controls_wrap() {
+        assert!(!sidebar_brand_text_fits(280.0, 85.0));
+        assert!(sidebar_brand_text_fits(340.0, 85.0));
+        assert!(!sidebar_brand_text_fits(340.0, 140.0));
+        assert!(!sidebar_brand_text_fits(0.0, 85.0));
+    }
+
+    #[test]
+    fn workspace_navigation_uses_selection_and_empty_workspace_before_old_terminal() {
+        let order = vec!["first".into(), "empty".into(), "third".into()];
+        let sidebar = workspace_navigation_anchor(Some("empty"), Some("first"), Some("first"));
+        assert_eq!(cycled_workspace_id(&order, sidebar, false), Some("third"));
+        let empty = workspace_navigation_anchor(None, Some("empty"), None);
+        assert_eq!(cycled_workspace_id(&order, empty, true), Some("first"));
+        let transitioning = workspace_navigation_anchor(None, Some("empty"), Some("first"));
+        assert_eq!(
+            cycled_workspace_id(&order, transitioning, false),
+            Some("third")
+        );
+        assert_eq!(
+            workspace_navigation_anchor(None, None, Some("third")),
+            Some("third")
+        );
+    }
+
+    #[test]
     fn layout_leader_release_distinguishes_taps_holds_and_toggle_off() {
         assert!(!layout_leader_release_exits(
             true,
@@ -11536,13 +11796,16 @@ mod pointer_tests {
         for x in [-20.0, 0.0, 48.0] {
             assert_eq!(sidebar_drag_target(x), None);
         }
-        assert_eq!(sidebar_drag_target(49.0), Some(280.0));
+        assert_eq!(sidebar_drag_target(49.0), Some(200.0));
+        assert_eq!(sidebar_drag_target(199.0), Some(200.0));
+        assert_eq!(sidebar_drag_target(200.0), Some(200.0));
+        assert_eq!(sidebar_drag_target(240.0), Some(240.0));
         assert_eq!(sidebar_drag_target(420.0), Some(420.0));
         assert_eq!(sidebar_drag_target(900.0), Some(600.0));
         // A single drag can cross the collapse boundary in either direction.
         assert_eq!(
             [320.0, 20.0, 100.0].map(sidebar_drag_target),
-            [Some(320.0), None, Some(280.0)]
+            [Some(320.0), None, Some(200.0)]
         );
     }
 

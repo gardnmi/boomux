@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 54;
+pub const PROTOCOL_VERSION: u32 = 55;
 pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -201,6 +201,7 @@ define_protocol_features! {
         "workspace_session_hiding",
     ]),
     GitWorkOverview => (53, "Git work overview", ["protocol_53", "git_work_overview"]),
+    WorkspaceConversations => (55, "Workspace conversations", ["protocol_55", "workspace_conversations"]),
     CreateStartedShell => (54, "atomic Shell creation and start", ["protocol_54", "create_started_shell"]),
     RestartExecutable => (52, "restart executable", ["protocol_52", "restart_executable"]),
 }
@@ -259,6 +260,9 @@ pub enum HostServiceOperation {
         integration: String,
         shell_id: String,
         run_id: String,
+    },
+    ListWorkspaceConversations {
+        workspace_id: String,
     },
     ListAgentSessions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -485,6 +489,9 @@ pub enum HostServiceResult {
         shell_id: String,
         run_id: String,
         agents: Vec<AgentInstanceSnapshot>,
+    },
+    WorkspaceConversations {
+        conversations: Vec<crate::conversations::Conversation>,
     },
     AgentSessions {
         sessions: Vec<HostAgentSessionSummary>,
@@ -1158,6 +1165,12 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RoutedOperation {
+    OpenWorkspaceConversation {
+        workspace_id: String,
+        agent_id: String,
+        shell_id: String,
+    },
+
     CreateWorkspaceShell {
         workspace_id: String,
         workspace_name: String,
@@ -1272,12 +1285,12 @@ impl RoutedOperation {
             WorkspaceRevisionAndOperationId,
         };
         match self {
-            Self::CreateWorkspaceShell { .. } | Self::CreateWorkspaceLauncher { .. } => {
-                RoutedOperationClass {
-                    guard: ExactId,
-                    ambiguity: RetrySameRequest,
-                }
-            }
+            Self::OpenWorkspaceConversation { .. }
+            | Self::CreateWorkspaceShell { .. }
+            | Self::CreateWorkspaceLauncher { .. } => RoutedOperationClass {
+                guard: ExactId,
+                ambiguity: RetrySameRequest,
+            },
             Self::GetWorkspace { .. }
             | Self::GetShell { .. }
             | Self::GetLauncher { .. }
@@ -1343,6 +1356,15 @@ impl RoutedOperation {
 
     pub fn owner_request(&self) -> Request {
         match self.clone() {
+            Self::OpenWorkspaceConversation {
+                workspace_id,
+                agent_id,
+                shell_id,
+            } => Request::OpenWorkspaceConversation {
+                workspace_id,
+                agent_id,
+                shell_id,
+            },
             Self::CreateWorkspaceShell {
                 workspace_id,
                 workspace_name,
@@ -1688,6 +1710,12 @@ impl ShellSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
+    OpenWorkspaceConversation {
+        workspace_id: String,
+        agent_id: String,
+        shell_id: String,
+    },
+
     Ping,
     GetNodeIdentity,
     OpenFederationChannel,
@@ -2136,6 +2164,11 @@ impl Request {
 
     pub fn required_feature(&self) -> Option<ProtocolFeature> {
         match self {
+            Self::OpenWorkspaceConversation { .. }
+            | Self::RouteNodeOperation {
+                operation: RoutedOperation::OpenWorkspaceConversation { .. },
+                ..
+            } => Some(ProtocolFeature::WorkspaceConversations),
             Self::GetNodeIdentity => Some(ProtocolFeature::NodeIdentity),
             Self::OpenFederationChannel => Some(ProtocolFeature::FederationChannel),
             Self::RekeyNode { .. } => Some(ProtocolFeature::NodeRekey),
@@ -2212,6 +2245,13 @@ impl Request {
                 operation: HostServiceOperation::GitOverview { .. },
                 ..
             } => Some(ProtocolFeature::GitWorkOverview),
+            Self::HostService {
+                operation: HostServiceOperation::ListWorkspaceConversations { .. },
+            }
+            | Self::RouteNodeHostService {
+                operation: HostServiceOperation::ListWorkspaceConversations { .. },
+                ..
+            } => Some(ProtocolFeature::WorkspaceConversations),
             Self::HostService { .. }
             | Self::RouteNodeHostService { .. }
             | Self::ResumeAgentSession { .. }
@@ -2857,9 +2897,53 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_fifty_four_with_forty_seven_floor() {
-        assert_eq!(PROTOCOL_VERSION, 54);
+    fn protocol_version_is_fifty_five_with_forty_seven_floor() {
+        assert_eq!(PROTOCOL_VERSION, 55);
         assert_eq!(MIN_PROTOCOL_VERSION, 47);
+    }
+
+    #[test]
+    fn workspace_conversations_require_fifty_five_locally_and_remotely() {
+        let operation = RoutedOperation::OpenWorkspaceConversation {
+            workspace_id: "w".into(),
+            agent_id: "a".into(),
+            shell_id: "s".into(),
+        };
+        for request in [
+            operation.owner_request(),
+            Request::RouteNodeOperation {
+                node_id: "owner".into(),
+                operation,
+            },
+        ] {
+            assert_eq!(request.minimum_protocol_version(), 55);
+            let encoded = serde_json::to_vec(&request).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Request>(&encoded).unwrap(),
+                request
+            );
+        }
+        for request in [
+            Request::HostService {
+                operation: HostServiceOperation::ListWorkspaceConversations {
+                    workspace_id: "w".into(),
+                },
+            },
+            Request::RouteNodeHostService {
+                node_id: "owner".into(),
+                operation: HostServiceOperation::ListWorkspaceConversations {
+                    workspace_id: "w".into(),
+                },
+            },
+        ] {
+            assert_eq!(request.minimum_protocol_version(), 55);
+            assert_eq!(
+                serde_json::from_slice::<Request>(&serde_json::to_vec(&request).unwrap()).unwrap(),
+                request
+            );
+        }
+        assert!(!ProtocolFeature::WorkspaceConversations.is_supported_by(54));
+        assert!(ProtocolFeature::WorkspaceConversations.is_supported_by(55));
     }
 
     #[test]
@@ -4529,6 +4613,7 @@ mod tests {
             ),
             (51, &["workspace_session_hiding"][..]),
             (53, &["protocol_53", "git_work_overview"][..]),
+            (55, &["protocol_55", "workspace_conversations"][..]),
             (54, &["protocol_54", "create_started_shell"][..]),
             (52, &["protocol_52", "restart_executable"][..]),
         ];

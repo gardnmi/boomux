@@ -50,14 +50,43 @@ boomux-desktop
 
 The launcher starts or reuses the Boomux service automatically.
 
+## Conversations
+
+Select a Workspace and click the **Workspace conversations** button beside Settings
+in the sidebar header to open the right-side panel. Conversations observed by
+Boomux integrations appear together across supported harnesses. Click
+**Open** to focus a running conversation or **Resume** to open its original
+harness in a tiled terminal pane. Remote conversations stay on their owner;
+connect unavailable machines from Remotes first. Resume requires protocol 55 on
+the local daemon and remote owner. Harness history and the saved directory must
+still be available to the harness.
+
+The panel opens on **Recent**, with pinned conversations first and the rest
+ordered by their latest observed activity. Search filters titles and harness names
+within the current view. **Open** focuses or attaches a running conversation;
+**Resume** starts its original harness in a tiled pane.
+
+Use **Pin / Unpin** to keep a conversation handy. **Archive** moves it out of Recent;
+open **Archived** and choose **Restore** to bring it back. Archiving does not stop
+an agent, close a terminal, or delete harness history. Pins and archive preferences
+are saved on this Desktop, separately for each Workspace and harness conversation,
+and survive harness restarts. They do not sync between computers.
+
+Closing a terminal or Shell keeps its conversation entry. Renaming the Workspace
+keeps the association. Removing the Workspace removes its entries from Boomux,
+but does not delete the harness's own history files. A new Workspace with the
+same name starts empty. The first version lists conversations observed inside
+Boomux. Titles come from the original harness when available, with the recorded
+Agent name as a fallback. New OpenCode sessions briefly refresh more frequently
+while their generated titles are pending; later renames can take about 30 seconds
+to refresh. Outside harness history is not imported.
+
 ## Workspaces And Shells
 
-Desktop automatically removes Workspaces that have no Shells, including empty
-entries left from earlier use. Opening a project again creates a fresh Workspace;
-project shortcuts and files on disk are preserved. Workspace-specific launchers,
-folder defaults, and retained Agent history are removed with the Workspace.
-Exited Shells still count as Shells until explicitly removed. Unavailable remote
-Workspaces remain visible until their owning machine can confirm they are empty.
+Workspaces remain until you explicitly remove them, even when they have no
+Shells or conversations. Closing the last Shell preserves the Workspace's
+identity, conversations, launchers, and folder defaults for later use. This
+applies to local and remote Workspaces.
 
 | To… | Use… |
 | --- | --- |
@@ -156,7 +185,7 @@ These shortcuts apply **inside layout mode**.
 | **J** or **S** | Toggle split orientation |
 | **E / R** | Equalize / swap the nearest split |
 | **O / F / B** | Toggle floating / expand pane / toggle sidebar |
-| **Page Up / Page Down** | Switch Workspaces in sidebar order |
+| **Page Up / Page Down** | Switch Workspaces in sidebar order; also works when the sidebar has keyboard focus |
 
 For floating panes, **Alt + Shift + Arrow keys** aligns to a canvas edge and
 **C** centers the pane. Note that **J toggles a split**; use Down to focus below.
@@ -280,7 +309,8 @@ a service restart produce one reminder after you finish editing.
 | Area | Options |
 | --- | --- |
 | Layout | Tree/Tabs, Workspace/Mixed scope, pane headings |
-| Appearance | Rounded/square/mixed corners, pane spacing, focus emphasis |
+| Appearance | Square corners by default; rounded/mixed options, pane spacing, focus emphasis |
+| Button hover animations | On by default; turn off for instant hover highlights without changing pane motion |
 | Motion | Instant, Fast, or Smooth — the default |
 | Clipboard | Copy on select (enabled by default) |
 | Projects | Browse for folders and set search depth |

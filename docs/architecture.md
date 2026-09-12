@@ -41,6 +41,7 @@ This is the implementation reference. For product usage, see the
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
 | `src/host_services.rs` | Owner-local project, launcher, integration, Session-catalog, and bounded Git working-context services |
 | `src/hook_input.rs` | Shared allowlist for structured absolute cwd and tool-path observations from lifecycle integrations |
+| `src/conversations.rs` | Workspace-owned conversation projection and owner-side open/resume planning |
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
@@ -325,6 +326,18 @@ event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
 default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
 unchanged because owner Workspaces already persist `default_cwd`.
+Protocol 55 adds `workspace_conversations`: `OpenWorkspaceConversation` and its
+routed equivalent take an exact Workspace, recorded Agent, and caller-generated
+Shell ID. The owner validates membership and prepares or reuses a native resume
+Shell inside the durable mutation gate, publishing only after persistence.
+It never creates a Workspace. Local clients, coordinators, and remote owners
+require protocol 55 for this operation; old versions receive `unsupported_version`.
+Ordinary Workspace snapshots supply the recorded conversation inputs, with no
+new persistence fields or remote projection fields. The protocol-55
+`ListWorkspaceConversations` host service adds owner-local title enrichment using
+bounded cached harness readers; it never imports catalog-only conversations.
+ADR 0018 defines this narrower feature separately from the retired Session APIs.
+
 Protocol 54 adds `create_started_shell`: local `CreateStartedShell` creates a
 Shell and its first ShellRun in one durable state replacement. The PTY reader
 stays paused until persistence succeeds; `shell_created` then `run_started` are
@@ -1083,8 +1096,8 @@ Protocol 51 and state schema 17 remain decodable during this compatibility stage
 Legacy Session wire variants, projection helpers, and persisted presentation
 metadata are inert implementation detail, not supported APIs. Exact external
 session IDs remain on Agent instances because integrations use them as opaque
-run-scoped lifecycle authority and exact cold-recovery input. They do not define
-a browseable, resumable, nameable, or hideable Boomux resource.
+run-scoped lifecycle authority and exact cold-recovery input. They do not define a machine-wide history resource. ADR 0018 now permits a
+Workspace-owned Conversations view over those existing records.
 
 Session list/inspect requires a negotiated protocol-12 snapshot because the
 projection depends on that complete Agent state model. Protocol 13 adds an

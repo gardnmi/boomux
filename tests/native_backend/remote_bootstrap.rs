@@ -657,7 +657,12 @@ fn public_remote_uses_verified_stdio_protocol_channel() {
     fs::create_dir_all(directory.join("runtime")).unwrap();
     fake_ssh(&directory, "/remote/boomux\\0", false);
 
-    let output = command(&directory).output().unwrap();
+    // Own and join the local daemon before removing files it may still write.
+    let mut daemon = crate::support::TestDaemon::start();
+    let output = command(&directory)
+        .env("XDG_RUNTIME_DIR", &daemon.runtime_dir)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "remote command failed: {}",
@@ -673,11 +678,12 @@ fn public_remote_uses_verified_stdio_protocol_channel() {
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(control_paths.len(), 1);
     assert!(
-        fs::read_dir(directory.join("runtime/boomux"))
+        fs::read_dir(daemon.runtime_dir.join("boomux"))
             .unwrap()
             .filter_map(Result::ok)
             .all(|entry| !entry.file_name().to_string_lossy().starts_with("ssh-"))
     );
+    daemon.stop_with_cli();
     fs::remove_dir_all(directory).unwrap();
 }
 

@@ -2305,3 +2305,128 @@ fn versioned_request(
     assert_eq!(response.version, version);
     response.message
 }
+
+#[test]
+fn workspace_conversations_open_resume_and_disappear_with_owner_workspace() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "conversations",
+            vec![ShellSpec {
+                name: "original".into(),
+                cwd: std::env::temp_dir(),
+                command: vec!["/bin/sleep".into(), "300".into()],
+            }],
+        )
+        .unwrap();
+    let operation = boomux::protocol::HostServiceOperation::ListWorkspaceConversations {
+        workspace_id: workspace.id.clone(),
+    };
+    assert!(
+        matches!(daemon.client.host_service(operation.clone()).unwrap(),
+        boomux::protocol::HostServiceResult::WorkspaceConversations { conversations } if conversations.is_empty())
+    );
+    let old = versioned_request(&daemon.client, 54, Request::HostService { operation });
+    assert!(matches!(
+        old,
+        Response::Error {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }
+    ));
+    let original = &workspace.shells[0];
+    let attachment = daemon
+        .client
+        .attach(&original.id, false, profile())
+        .unwrap();
+    let run = daemon.client.get_shell(&original.id).unwrap().run.unwrap();
+    let agent = daemon
+        .client
+        .register_agent(
+            &original.id,
+            &run.id,
+            AgentRegistrationSpec {
+                name: "Investigate a bug".into(),
+                integration: "codex".into(),
+                external_session_id: Some("exact-thread".into()),
+                report: AgentReport {
+                    state: AgentState::Idle,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "test hook".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+    let key = Uuid::new_v4().to_string();
+    let opened = daemon
+        .client
+        .open_workspace_conversation(None, &workspace.id, &agent.id, &key)
+        .unwrap();
+    assert_eq!(opened.id, original.id);
+    assert_eq!(opened.run.unwrap().id, run.id);
+    let old_request = Request::OpenWorkspaceConversation {
+        workspace_id: workspace.id.clone(),
+        agent_id: agent.id.clone(),
+        shell_id: key.clone(),
+    };
+    assert!(matches!(
+        versioned_request(&daemon.client, 54, old_request),
+        Response::Error {
+            code: Some(ErrorCode::UnsupportedVersion),
+            ..
+        }
+    ));
+    drop(attachment);
+    daemon.client.close_shell(&original.id).unwrap();
+    daemon.client.restart().unwrap();
+    let saved = daemon.client.get_workspace(&workspace.id).unwrap();
+    assert_eq!(boomux::conversations::list(&saved).len(), 1);
+    let resumed = daemon
+        .client
+        .open_workspace_conversation(None, &workspace.id, &agent.id, &key)
+        .unwrap();
+    assert_eq!(resumed.workspace_id, workspace.id);
+    assert_eq!(resumed.command, ["codex", "resume", "exact-thread"]);
+    assert_eq!(resumed.id, key);
+    let repeated = daemon
+        .client
+        .open_workspace_conversation(None, &workspace.id, &agent.id, &Uuid::new_v4().to_string())
+        .unwrap();
+    assert_eq!(repeated.id, resumed.id);
+    let unrelated = daemon.client.create_workspace("unrelated", vec![]).unwrap();
+    assert!(
+        daemon
+            .client
+            .open_workspace_conversation(
+                None,
+                &unrelated.id,
+                &agent.id,
+                &Uuid::new_v4().to_string()
+            )
+            .is_err()
+    );
+    assert!(
+        daemon
+            .client
+            .get_workspace(&unrelated.id)
+            .unwrap()
+            .shells
+            .is_empty()
+    );
+    daemon.client.close_workspace(&workspace.id).unwrap();
+    assert!(
+        daemon
+            .client
+            .open_workspace_conversation(None, &workspace.id, &agent.id, &key)
+            .is_err()
+    );
+    let recreated = daemon
+        .client
+        .create_workspace("conversations", vec![])
+        .unwrap();
+    assert_ne!(recreated.id, workspace.id);
+    assert!(boomux::conversations::list(&recreated).is_empty());
+    daemon.stop_with_cli();
+}

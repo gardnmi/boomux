@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted.
+Accepted. Partially superseded by [ADR 0018](0018-workspace-owned-conversations.md)
+for Workspace-owned conversation listing and resume only.
 
 ## Context
 

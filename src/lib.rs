@@ -5,6 +5,7 @@ pub mod attach;
 #[doc(hidden)]
 pub mod benchmark_support;
 pub mod client;
+pub mod conversations;
 pub mod daemon;
 #[doc(hidden)]
 pub mod desktop_connect;

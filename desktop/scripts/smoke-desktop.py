@@ -237,10 +237,12 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
             env["DBUS_SESSION_BUS_ADDRESS"] = bus_address.read_text().strip()
             # Xvfb chooses a free display number. Weston uses its X11 backend
             # to provide the input seat GPUI requires, still without hardware.
+            # Readiness probes disconnect between launches. Keep Xvfb from
+            # resetting when the last client leaves and racing the next connection.
             display_file = root / "display"
             with display_file.open("wb") as descriptor:
                 display = start(["Xvfb", "-displayfd", str(descriptor.fileno()), "-screen", "0",
-                                 "1280x800x24", "-nolisten", "tcp", "-ac"], "xvfb",
+                                 "1280x800x24", "-nolisten", "tcp", "-ac", "-noreset"], "xvfb",
                                 pass_fds=(descriptor.fileno(),))
             wait_for("Xvfb readiness", lambda: display_file.read_text().strip(), [display])
             env["DISPLAY"] = ":" + display_file.read_text().strip()

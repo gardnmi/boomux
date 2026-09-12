@@ -3294,6 +3294,10 @@ fn routed_response_timeout(operation: &RoutedOperation) -> Duration {
 }
 
 fn routed_owner_feature(operation: &RoutedOperation) -> Option<protocol::ProtocolFeature> {
+    if matches!(operation, RoutedOperation::OpenWorkspaceConversation { .. }) {
+        return Some(protocol::ProtocolFeature::WorkspaceConversations);
+    }
+
     if matches!(
         operation,
         RoutedOperation::SetAgentSessionDisplayName { .. }
@@ -3459,6 +3463,27 @@ struct CachedHostSessionCatalog {
     last_used: u64,
 }
 
+// Generated OpenCode titles often arrive just after the first catalog read.
+// Retry provisional titles briefly, then return to the normal idle cadence.
+fn host_session_catalog_ttl(
+    sessions: Option<&[crate::host_session_titles::HostSession]>,
+    now_ms: u64,
+) -> Duration {
+    match sessions {
+        None => HOST_SESSION_CATALOG_FAILURE_TTL,
+        Some(sessions)
+            if sessions.iter().any(|session| {
+                session.integration == "opencode"
+                    && session.title.starts_with("New session - ")
+                    && now_ms.saturating_sub(session.created_at_ms) < 30_000
+            }) =>
+        {
+            Duration::from_secs(3)
+        }
+        Some(_) => HOST_SESSION_CATALOG_TTL,
+    }
+}
+
 impl HostSessionCatalogCache {
     fn records(
         &self,
@@ -3480,15 +3505,12 @@ impl HostSessionCatalogCache {
         loop {
             let mut state = lock(&self.state)?;
             let now = Instant::now();
+            let wall_time_ms = unix_time_ms();
             let stale = requests
                 .iter()
                 .filter(|request| {
                     state.entries.get(*request).is_none_or(|entry| {
-                        let ttl = if entry.sessions.is_some() {
-                            HOST_SESSION_CATALOG_TTL
-                        } else {
-                            HOST_SESSION_CATALOG_FAILURE_TTL
-                        };
+                        let ttl = host_session_catalog_ttl(entry.sessions.as_deref(), wall_time_ms);
                         now.duration_since(entry.inspected_at) >= ttl
                     })
                 })
@@ -9898,6 +9920,27 @@ impl DaemonService {
                 shell_id,
                 run_id,
             }),
+            HostServiceOperation::ListWorkspaceConversations { workspace_id } => {
+                let workspace = self.workspace(&workspace_id)?.snapshot(&self.durable)?;
+                let mut conversations = crate::conversations::list(&workspace);
+                if !conversations.is_empty() {
+                    let snapshot = Snapshot {
+                        workspaces: vec![workspace],
+                        focused_terminal: None,
+                    };
+                    let integrations = conversations
+                        .iter()
+                        .map(|entry| entry.integration.as_str())
+                        .collect::<HashSet<_>>();
+                    let requests = host_services::session_catalog_requests(&snapshot)
+                        .into_iter()
+                        .filter(|request| integrations.contains(request.integration.as_str()))
+                        .collect::<Vec<_>>();
+                    let catalog = self.host_session_catalog.records(&requests)?;
+                    crate::conversations::enrich_titles(&mut conversations, &catalog);
+                }
+                Ok(HostServiceResult::WorkspaceConversations { conversations })
+            }
             HostServiceOperation::ListAgentSessions { .. }
             | HostServiceOperation::InspectAgentSession { .. }
             | HostServiceOperation::ResolveAgentSession { .. } => Err(DaemonError::lifecycle(
@@ -10276,7 +10319,8 @@ impl DaemonService {
         );
         let response_timeout = match &operation {
             HostServiceOperation::ListAgentSessions { .. }
-            | HostServiceOperation::InspectAgentSession { .. } => {
+            | HostServiceOperation::InspectAgentSession { .. }
+            | HostServiceOperation::ListWorkspaceConversations { .. } => {
                 REGISTERED_NODE_SESSION_RESPONSE_TIMEOUT
             }
             _ => REGISTERED_NODE_RESPONSE_TIMEOUT,
@@ -13400,6 +13444,44 @@ impl DaemonService {
                 let workspace = self.create_workspace_mutation(undo, name, default_cwd, shells)?;
                 let events = workspace_created_events(&workspace);
                 Ok((Response::Workspace { workspace }, events))
+            }),
+            Request::OpenWorkspaceConversation {
+                workspace_id,
+                agent_id,
+                shell_id,
+            } => self.durable_mutation_outcome(|undo| {
+                validate_uuid(&shell_id, "conversation Shell key")?;
+                let workspace = self
+                    .durable
+                    .workspace(&workspace_id)?
+                    .snapshot(&self.durable)?;
+                let plan = crate::conversations::plan(&workspace, &agent_id, &shell_id)
+                    .map_err(|message| DaemonError::lifecycle(ErrorCode::NotFound, message))?;
+                match plan {
+                    crate::conversations::OpenPlan::Existing(shell) => {
+                        Ok(DurableMutation::Unchanged(Response::Shell {
+                            shell: *shell,
+                        }))
+                    }
+                    crate::conversations::OpenPlan::Resume(spec) => {
+                        let (shell, record) =
+                            self.durable
+                                .create_shell_exact(&workspace_id, &shell_id, spec)?;
+                        let Some(record) = record else {
+                            return Ok(DurableMutation::Unchanged(Response::Shell { shell }));
+                        };
+                        undo.record(record);
+                        let event = DaemonEventKind::ShellCreated {
+                            workspace_id,
+                            shell_id: shell.id.clone(),
+                            name: shell.name.clone(),
+                        };
+                        Ok(DurableMutation::Changed(
+                            Response::Shell { shell },
+                            vec![event],
+                        ))
+                    }
+                }
             }),
             Request::CreateWorkspaceShell {
                 workspace_id,
@@ -19491,6 +19573,51 @@ status=$?
         drop(catalog);
         fs::remove_dir_all(selected_cwd).unwrap();
         fs::remove_dir_all(unrelated_cwd).unwrap();
+    }
+
+    #[test]
+    fn provisional_opencode_titles_refresh_quickly_without_permanent_fast_polling() {
+        let cache = HostSessionCatalogCache::default();
+        let request = crate::host_session_titles::ProjectionRequest {
+            integration: "opencode".into(),
+            directory: "/repo".into(),
+        };
+        let mut session = crate::host_session_titles::HostSession {
+            integration: "opencode".into(),
+            root_id: "session-1".into(),
+            title: "New session - 2026-09-12T05:08:10.407Z".into(),
+            directory: "/repo".into(),
+            created_at_ms: unix_time_ms(),
+            updated_at_ms: unix_time_ms(),
+        };
+        let requests = [request.clone()];
+        cache
+            .records_with(&requests, &|_| vec![Some(vec![session.clone()])])
+            .unwrap();
+        lock(&cache.state)
+            .unwrap()
+            .entries
+            .get_mut(&request)
+            .unwrap()
+            .inspected_at = Instant::now() - Duration::from_secs(4);
+        session.title = "Casual greeting".into();
+        let refreshed = cache
+            .records_with(&requests, &|_| vec![Some(vec![session.clone()])])
+            .unwrap();
+        assert_eq!(refreshed[0].title, "Casual greeting");
+        assert_eq!(
+            host_session_catalog_ttl(Some(&refreshed), unix_time_ms()),
+            HOST_SESSION_CATALOG_TTL
+        );
+        session.title = "New session - old untitled conversation".into();
+        assert_eq!(
+            host_session_catalog_ttl(Some(&[session.clone()]), session.created_at_ms + 30_000),
+            HOST_SESSION_CATALOG_TTL
+        );
+        assert_eq!(
+            host_session_catalog_ttl(None, unix_time_ms()),
+            HOST_SESSION_CATALOG_FAILURE_TTL
+        );
     }
 
     #[test]
