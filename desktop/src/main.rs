@@ -5585,10 +5585,6 @@ impl Workspace {
         self.sidebar_menu = None;
         self.navigation_region = NavigationRegion::Terminal;
         let temporary_setup = launch.temporary_setup();
-        if !temporary_setup {
-            self.fullscreen = None;
-            self.layout_animation = None;
-        }
         let pane_id = if temporary_setup {
             // A setup terminal is an overlay, not navigation to another Workspace.
             self.capture_arrangement();
@@ -5611,6 +5607,8 @@ impl Workspace {
             if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
                 self.detach_all_panes(window);
             }
+            self.fullscreen = None;
+            self.layout_animation = None;
             self.insert_pane()
         };
         self.focused = pane_id;
