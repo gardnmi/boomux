@@ -118,7 +118,11 @@ impl Settings {
                         .as_float()
                         .or_else(|| value.as_integer().map(|n| n as f64))
                         .ok_or_else(invalid)?;
-                    if !n.is_finite() || !(280.0..=600.0).contains(&n) {
+                    if !n.is_finite()
+                        || !(f64::from(crate::SIDEBAR_MIN_WIDTH)
+                            ..=f64::from(crate::SIDEBAR_MAX_WIDTH))
+                            .contains(&n)
+                    {
                         return Err(invalid());
                     }
                     s.sidebar_width = n as f32;
@@ -292,7 +296,14 @@ mod tests {
             Settings::parse("").unwrap().sidebar_width,
             crate::SIDEBAR_WIDTH
         );
-        for value in ["279", "601", "nan", "inf", "'wide'"] {
+        for width in [200.0, 240.0, 280.0, 600.0] {
+            let compact = Settings {
+                sidebar_width: width,
+                ..Settings::default()
+            };
+            assert_eq!(Settings::parse(&compact.encode()).unwrap(), compact);
+        }
+        for value in ["199", "601", "nan", "inf", "'wide'"] {
             assert!(Settings::parse(&format!("sidebar_width = {value}")).is_err());
         }
     }

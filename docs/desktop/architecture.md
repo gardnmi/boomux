@@ -512,8 +512,10 @@ executable gets a finish-installation reminder after launching a new bundle.
 ## Edge Resizing
 
 The sidebar exposes a five-pixel right-edge handle. Its preferred width is bounded
-to 280–600 logical pixels and stored in Desktop preferences when dragging ends;
-older preference files retain the 300-pixel default. The displayed width also
+to 200–600 logical pixels and stored in Desktop preferences when dragging ends;
+older preference files retain the 300-pixel default. The compact minimum fits
+the logo and header controls after the brand text hides; dragging below that
+minimum retains the existing rebound and far-edge collapse behavior. The displayed width also
 reserves terminal canvas space on narrow windows. Sidebar content, Settings,
 menus, and terminal pointer coordinates use the same effective width.
 

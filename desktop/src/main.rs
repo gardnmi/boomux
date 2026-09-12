@@ -49,6 +49,9 @@ const TERMINAL_CELL_WIDTH: f32 = 8.4;
 const TERMINAL_CELL_HEIGHT: f32 = 17.0;
 const TERMINAL_PADDING: f32 = 16.0;
 const SIDEBAR_WIDTH: f32 = 300.0;
+// Fits header padding, the logo, four controls, their gaps, and the border.
+const SIDEBAR_MIN_WIDTH: f32 = 200.0;
+const SIDEBAR_MAX_WIDTH: f32 = 600.0;
 const DRAWER_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const SCROLLBAR_FADE_IN_DURATION: Duration = Duration::from_millis(180);
 const SCROLLBAR_FADE_OUT_DURATION: Duration = Duration::from_millis(360);
@@ -103,7 +106,6 @@ impl Render for HeaderTooltip {
     }
 }
 
-// Keep the collapsed edge reachable while retaining the normal readable width.
 fn sidebar_brand_text_fits(width: f32, title_width: f32) -> bool {
     // Header padding, logo, brand gap, action gap, four controls and their gaps.
     width >= 32.0 + 32.0 + 12.0 + title_width + 8.0 + 4.0 * 28.0 + 3.0 * 4.0 + 1.0
@@ -118,7 +120,7 @@ fn workspace_navigation_anchor<'a>(
 }
 
 fn sidebar_drag_target(pointer_x: f32) -> Option<f32> {
-    (pointer_x > 48.0).then(|| pointer_x.clamp(280.0, 600.0))
+    (pointer_x > 48.0).then(|| pointer_x.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH))
 }
 
 fn sidebar_header_button(
@@ -4452,7 +4454,8 @@ impl Workspace {
     ) {
         if self.sidebar_resizing {
             if event.pressed_button == Some(MouseButton::Left) {
-                self.sidebar_drag_width = Some(f32::from(event.position.x).clamp(0.0, 600.0));
+                self.sidebar_drag_width =
+                    Some(f32::from(event.position.x).clamp(0.0, SIDEBAR_MAX_WIDTH));
                 if let Some(width) = sidebar_drag_target(f32::from(event.position.x)) {
                     self.sidebar_visible = true;
                     self.sidebar_preferred_width = width;
@@ -11764,13 +11767,16 @@ mod pointer_tests {
         for x in [-20.0, 0.0, 48.0] {
             assert_eq!(sidebar_drag_target(x), None);
         }
-        assert_eq!(sidebar_drag_target(49.0), Some(280.0));
+        assert_eq!(sidebar_drag_target(49.0), Some(200.0));
+        assert_eq!(sidebar_drag_target(199.0), Some(200.0));
+        assert_eq!(sidebar_drag_target(200.0), Some(200.0));
+        assert_eq!(sidebar_drag_target(240.0), Some(240.0));
         assert_eq!(sidebar_drag_target(420.0), Some(420.0));
         assert_eq!(sidebar_drag_target(900.0), Some(600.0));
         // A single drag can cross the collapse boundary in either direction.
         assert_eq!(
             [320.0, 20.0, 100.0].map(sidebar_drag_target),
-            [Some(320.0), None, Some(280.0)]
+            [Some(320.0), None, Some(200.0)]
         );
     }
 
