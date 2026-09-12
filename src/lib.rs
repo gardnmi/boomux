@@ -1,5 +1,6 @@
 extern crate self as boomux;
 
+pub mod agent_inspection;
 pub mod attach;
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]

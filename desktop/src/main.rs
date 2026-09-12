@@ -1,3 +1,4 @@
+mod agent_details;
 mod boomux_settings;
 mod bundle_update;
 mod project_search;
@@ -1538,6 +1539,8 @@ struct Workspace {
     restore_pointer_guard: layout_persistence::PointerGuard,
     layout_restoring: bool,
     git_panel: git_panel::Model,
+    agent_details: Option<agent_details::Model>,
+    agent_details_generation: u64,
     layout: Option<Node>,
     floating: Vec<FloatingPane>,
     pointer_drag: Option<PointerDrag>,
@@ -1758,6 +1761,8 @@ impl Workspace {
             layout: Some(layout),
             floating: Vec::new(),
             git_panel: git_panel::Model::default(),
+            agent_details: None,
+            agent_details_generation: 0,
             pointer_drag: None,
             terminal_scrollbar_drag: None,
             terminal_selection_release: None,
@@ -4251,6 +4256,10 @@ impl Workspace {
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.agent_details.is_some() {
+            cx.stop_propagation();
+            return;
+        }
         if self.copy_scrollback_selection(self.focused, true, cx) {
             cx.stop_propagation();
             return;
@@ -4270,6 +4279,10 @@ impl Workspace {
     }
 
     fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
+        if self.agent_details.is_some() {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             if self.project_menu_open {
                 project_search::append(&mut self.project_search, &text);
@@ -4903,6 +4916,32 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.agent_details.is_some() {
+            self.agent_details_key_down(event, cx);
+            return;
+        }
+        if self.navigation_region == NavigationRegion::Sidebar
+            && event.keystroke.key == "i"
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.platform
+            && !event.keystroke.modifiers.function
+            && !event.keystroke.modifiers.shift
+            && !event.is_held
+        {
+            if let Some(SidebarItem::Agent { agent_id, .. }) = &self.sidebar_item
+                && let Some(agent) = self
+                    .boomux_overview
+                    .agents
+                    .iter()
+                    .find(|a| &a.id == agent_id)
+                    .cloned()
+            {
+                self.open_agent_details(agent, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         if event.keystroke.key == "space" && self.layout_leader_pressed_at.is_some() {
             self.layout_leader_release_task = None;
             cx.stop_propagation();
@@ -9009,6 +9048,7 @@ impl Workspace {
         focused_shell_id: Option<&str>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
+        let details_agent = agent.clone();
         let shell_id = agent.shell_id.clone();
         let agent_item = SidebarItem::Agent {
             agent_id: agent.id.clone(),
@@ -9120,6 +9160,25 @@ impl Workspace {
                                 agent.integration
                             )),
                     ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "agent-details-{}",
+                        details_agent.id
+                    )))
+                    .role(gpui::Role::Button)
+                    .aria_label("Agent details")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .hover(|row| row.bg(rgb(0x313244)))
+                    .child("ⓘ")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_agent_details(details_agent.clone(), window, cx);
+                    })),
             )
             .when(dismissible, |row| {
                 row.child(
@@ -10356,6 +10415,7 @@ impl Render for Workspace {
             })
             .into_any_element();
         let sidebar_menu = self.sidebar_menu_overlay(cx);
+        let agent_details = self.agent_details_overlay(cx);
         let resource_dialog = self.resource_dialog_overlay(cx);
         let settings_restart = self.settings_restart_overlay(cx);
         let help = self.help_overlay(cx);
@@ -10381,6 +10441,7 @@ impl Render for Workspace {
                     || self.project_menu_open
                     || self.boomux_setting_input.is_some()
                     || self.settings_restart_confirm
+                    || self.agent_details.is_some()
                 {
                     "BoomuxSettingsInput"
                 } else {
@@ -10466,6 +10527,7 @@ impl Render for Workspace {
             .text_color(rgb(0xcdd6f4))
             .child(content)
             .when_some(sidebar_menu, |element, menu| element.child(menu))
+            .when_some(agent_details, |element, drawer| element.child(drawer))
             .when_some(resource_dialog, |element, dialog| element.child(dialog))
             .when_some(settings_restart, |element, dialog| element.child(dialog))
             .when_some(help, |element, help| element.child(help))

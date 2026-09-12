@@ -115,6 +115,9 @@ and history but does not remove project shortcuts or filesystem contents.
 - `src/terminal.rs`: Boomux discovery/attachment adapter, per-pane terminal
   worker, Ghostty VT state, scrollback, key/paste encoding, and Kitty graphics
   extraction.
+- `src/agent_details.rs`: on-demand Agent drawer, exact owner/run inspection,
+  generation-guarded background refresh, and one disposable inventory snapshot;
+  see [Agent details](agent-details.md).
 - `src/git_panel.rs`: demand-driven Node Git overview, filtering, lower sidebar tab,
   and exact local Shell navigation; see [Git panel](git-panel.md).
 - `src/nodes.rs`: read-only Node identity, health, and resource-count presentation

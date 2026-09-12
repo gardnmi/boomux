@@ -1076,3 +1076,12 @@ The initial contract excludes:
 - Remote TCP control listeners or forwarding the local daemon socket.
 - Treating a local daemon stop, restart, or Node removal as remote process
   authority.
+
+## Agent configuration inspection
+
+Desktop [Agent details](desktop/agent-details.md) uses protocol-55 `InspectAgent`
+through the existing verified owner host-service route. The exact Agent ID and
+expected ShellRun ID select the snapshot. Skills and MCP configuration are read
+on the owner without changing state. Older or unreachable owners produce an
+inspection error while basic sidebar information remains available; Desktop
+never substitutes local configuration for a remote Agent.

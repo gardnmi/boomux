@@ -9764,6 +9764,21 @@ impl DaemonService {
         _requester_version: u32,
     ) -> DaemonResult<HostServiceResult> {
         match operation {
+            HostServiceOperation::InspectAgent {
+                agent_id,
+                expected_run_id,
+            } => {
+                let agent = self.agent(&agent_id)?.snapshot()?;
+                if agent.run_id != expected_run_id {
+                    return Err(DaemonError::lifecycle(
+                        ErrorCode::RevisionChanged,
+                        "Agent run changed; reopen its details",
+                    ));
+                }
+                Ok(HostServiceResult::AgentInspection {
+                    inspection: crate::agent_inspection::inspect(agent),
+                })
+            }
             HostServiceOperation::GitOverview { refresh } => {
                 if let Some(overview) = self.git_work.cached_if_fresh(refresh) {
                     return Ok(HostServiceResult::GitOverview { overview });

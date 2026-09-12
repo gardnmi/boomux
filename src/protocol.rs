@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 54;
+pub const PROTOCOL_VERSION: u32 = 55;
 pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -201,6 +201,7 @@ define_protocol_features! {
         "workspace_session_hiding",
     ]),
     GitWorkOverview => (53, "Git work overview", ["protocol_53", "git_work_overview"]),
+    AgentInspection => (55, "Agent details inventory", ["protocol_55", "agent_inspection"]),
     CreateStartedShell => (54, "atomic Shell creation and start", ["protocol_54", "create_started_shell"]),
     RestartExecutable => (52, "restart executable", ["protocol_52", "restart_executable"]),
 }
@@ -228,6 +229,10 @@ pub enum HostServiceIntegrationAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostServiceOperation {
+    InspectAgent {
+        agent_id: String,
+        expected_run_id: String,
+    },
     DiscoverProjects,
     GitOverview {
         #[serde(default)]
@@ -454,6 +459,9 @@ pub struct HostAgentSessionResumePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostServiceResult {
+    AgentInspection {
+        inspection: crate::agent_inspection::Inspection,
+    },
     GitOverview {
         overview: crate::git_work::Overview,
     },
@@ -2206,6 +2214,13 @@ impl Request {
             | Self::GuardedRestartShell { .. }
             | Self::GuardedRemoveLauncher { .. } => Some(ProtocolFeature::GuardedNodeRouting),
             Self::HostService {
+                operation: HostServiceOperation::InspectAgent { .. },
+            }
+            | Self::RouteNodeHostService {
+                operation: HostServiceOperation::InspectAgent { .. },
+                ..
+            } => Some(ProtocolFeature::AgentInspection),
+            Self::HostService {
                 operation: HostServiceOperation::GitOverview { .. },
             }
             | Self::RouteNodeHostService {
@@ -2857,8 +2872,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_fifty_four_with_forty_seven_floor() {
-        assert_eq!(PROTOCOL_VERSION, 54);
+    fn protocol_version_is_fifty_five_with_forty_seven_floor() {
+        assert_eq!(PROTOCOL_VERSION, 55);
         assert_eq!(MIN_PROTOCOL_VERSION, 47);
     }
 
@@ -2884,6 +2899,32 @@ mod tests {
         assert!(encoded.get("environment").is_none());
         assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
         assert!(!ProtocolFeature::CreateStartedShell.is_supported_by(53));
+    }
+
+    #[test]
+    fn agent_inspection_requires_fifty_five_locally_and_when_routed() {
+        for request in [
+            Request::HostService {
+                operation: HostServiceOperation::InspectAgent {
+                    agent_id: "a".into(),
+                    expected_run_id: "r".into(),
+                },
+            },
+            Request::RouteNodeHostService {
+                node_id: "owner".into(),
+                operation: HostServiceOperation::InspectAgent {
+                    agent_id: "a".into(),
+                    expected_run_id: "r".into(),
+                },
+            },
+        ] {
+            assert_eq!(request.minimum_protocol_version(), 55);
+            assert!(!request.required_feature().unwrap().is_supported_by(54));
+            assert_eq!(
+                serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+                request
+            );
+        }
     }
 
     #[test]
@@ -4529,6 +4570,7 @@ mod tests {
             ),
             (51, &["workspace_session_hiding"][..]),
             (53, &["protocol_53", "git_work_overview"][..]),
+            (55, &["protocol_55", "agent_inspection"][..]),
             (54, &["protocol_54", "create_started_shell"][..]),
             (52, &["protocol_52", "restart_executable"][..]),
         ];

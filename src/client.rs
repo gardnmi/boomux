@@ -1142,6 +1142,42 @@ impl Client {
         }
     }
 
+    /// Read a bounded configuration inventory from the exact Agent owner/run.
+    pub fn inspect_agent(
+        &self,
+        node_id: Option<&str>,
+        agent_id: &str,
+        expected_run_id: &str,
+        timeout: Duration,
+    ) -> Result<crate::agent_inspection::Inspection> {
+        // Probe at the required version before serializing a new operation to an old peer.
+        self.send_with_version_timeout(
+            Request::Ping,
+            protocol::ProtocolFeature::AgentInspection.minimum_version(),
+            Some(timeout),
+        )?;
+        let operation = protocol::HostServiceOperation::InspectAgent {
+            agent_id: agent_id.into(),
+            expected_run_id: expected_run_id.into(),
+        };
+        let request = match node_id {
+            Some(node_id) => Request::RouteNodeHostService {
+                node_id: node_id.into(),
+                operation,
+            },
+            None => Request::HostService { operation },
+        };
+        match self
+            .send_with_version_timeout(request, protocol::PROTOCOL_VERSION, Some(timeout))?
+            .1
+        {
+            Response::HostService {
+                result: protocol::HostServiceResult::AgentInspection { inspection },
+            } => Ok(inspection),
+            response => unexpected(response),
+        }
+    }
+
     pub fn host_service(
         &self,
         operation: crate::protocol::HostServiceOperation,
@@ -2643,6 +2679,43 @@ mod tests {
             })
         ));
 
+        server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn agent_inspection_probes_old_peer_without_sending_new_operation() {
+        let directory = env::temp_dir().join(format!("boomux-inspect-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            assert_eq!(request.version, 55);
+            assert_eq!(request.message, Request::Ping);
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    54,
+                    Response::Error {
+                        code: Some(ErrorCode::UnsupportedVersion),
+                        message: "old peer".into(),
+                    },
+                ),
+            )
+            .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert!(listener.accept().is_err());
+        });
+        let client = Client::from_socket_path(socket);
+        assert!(matches!(
+            client.inspect_agent(None, "a", "r", Duration::from_secs(1)),
+            Err(ClientError::Remote(RemoteError {
+                code: Some(ErrorCode::UnsupportedVersion),
+                ..
+            }))
+        ));
         server.join().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }

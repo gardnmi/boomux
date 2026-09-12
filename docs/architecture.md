@@ -17,6 +17,7 @@ This is the implementation reference. For product usage, see the
 | `src/main.rs` | CLI schema, process composition, command dispatch, and dashboard backend orchestration |
 | `src/dashboard_projection.rs` | Typed snapshot/session-to-dashboard classification, view construction, and title enrichment |
 | `src/protocol.rs` | Versioned control and attachment wire models, framing, and request version requirements |
+| `src/agent_inspection.rs` | Bounded, read-only skill and MCP file inventory for an exact Agent on its owner |
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
 | `src/platform/` | Linux and Darwin process identity, monitoring, runtime paths, descriptor and filesystem operations |
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
@@ -324,6 +325,15 @@ event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
 default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
 unchanged because owner Workspaces already persist `default_cwd`.
+Protocol 55 adds `agent_inspection`: the read-only `InspectAgent` host-service
+operation requires an exact Agent ID and expected ShellRun ID, locally or through
+verified Node routing. The owner snapshots the Agent, releases registry locks,
+and reads bounded configuration metadata. A mismatched run is rejected. Clients
+probe version support before sending the new operation; both local and routed
+requests require 55. Only this new request returns `AgentInspection`, so older
+request response shapes are unchanged. No persistence schema or event changes
+are required. See [Agent details](desktop/agent-details.md) for inventory coverage.
+
 Protocol 54 adds `create_started_shell`: local `CreateStartedShell` creates a
 Shell and its first ShellRun in one durable state replacement. The PTY reader
 stays paused until persistence succeeds; `shell_created` then `run_started` are

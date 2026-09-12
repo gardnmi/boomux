@@ -204,6 +204,11 @@ Drag the divider above **Agents | Git | Remotes** to resize this section.
 
 ### Agents
 
+Select **ⓘ** on an Agent row (or press **i** with the row selected) for
+[Agent details](../docs/desktop/agent-details.md): overview, discovered skills,
+and MCP definitions with source files. Configuration findings are labeled
+separately from live state; MCP connections are not currently reported.
+
 Click an Agent to focus or open its Shell. When an observed working Agent
 becomes idle, its row stays marked **finished** until dismissed.
 

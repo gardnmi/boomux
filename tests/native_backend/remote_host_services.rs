@@ -194,6 +194,40 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
             },
         )
         .unwrap();
+    for (home, name) in [
+        ("owner-home", "owner-skill"),
+        ("local-home", "wrong-local-skill"),
+    ] {
+        let directory = root.join(home).join(".pi/agent/skills").join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: fixture\n---\n"),
+        )
+        .unwrap();
+    }
+    let inspection = local
+        .client
+        .inspect_agent(Some(&owner_id), &agent.id, &run_id, Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(inspection.agent.id, agent.id);
+    assert!(inspection.skills.iter().any(|s| s.name == "owner-skill"));
+    assert!(
+        !inspection
+            .skills
+            .iter()
+            .any(|s| s.name == "wrong-local-skill")
+    );
+    let error = local
+        .client
+        .inspect_agent(
+            Some(&owner_id),
+            &agent.id,
+            "wrong-run",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+    assert_remote_code(&error, ErrorCode::RevisionChanged);
     for operation in [
         HostServiceOperation::ListAgentSessions {
             workspace_id: Some(session_workspace.id.clone()),

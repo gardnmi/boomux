@@ -126,6 +126,12 @@ unsupported owners fail visibly and are never emulated against local PATH,
 configuration, catalogs, or filesystems. Responses are live and transient and do
 not update the cached Node projection.
 
+Protocol 55 advertises `agent_inspection` for the read-only `InspectAgent`
+host-service operation used by Desktop. It requires the exact Agent and expected
+ShellRun IDs and returns bounded owner-side configuration metadata. This adds no
+CLI JSON method. See [Agent details](desktop/agent-details.md) for coverage and
+the distinction between file configuration and runtime capabilities.
+
 `capabilities` advertises only what the installed local CLI can speak and never
 reports negotiated state for a registered Node. `node.list` and `node.inspect`
 return registration data only. `node.snapshot` carries each Node's observed
