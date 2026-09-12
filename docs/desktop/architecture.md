@@ -268,12 +268,22 @@ use the registered owner's existing guarded APIs. Cached directories are not
 invented from local paths. Remote creation resolves the owner's starting directory
 and creates the owner-local Workspace and first pending Shell with fresh exact IDs;
 ambiguous mutation failures are surfaced without automatic replay.
-The initial connect flow creates this Workspace after successful registration.
-Open its Shell from the sidebar; creating another Workspace from Remotes also
-attaches its first Shell. Multi-placement coordinator metadata is left unchanged.
+The initial connect flow attempts to create this Workspace after successful
+registration. An owner-confirmed `already_exists` result leaves the connection
+successful and directs the user to existing Workspaces in the sidebar, without
+selecting or modifying one by name. Other failures remain errors and are not
+replayed. When creation succeeds, Desktop opens its exact Shell after the user
+acknowledges the setup result.
+The Workspace menu's remote picker uses the existing Node summaries and creates
+and attaches the first Shell on the selected connected machine. Unavailable
+machines offer recovery instead of attempting creation. Multi-placement
+coordinator metadata is left unchanged.
 
 The Remotes tab retains sign-in actions and adds an explicitly confirmed
-remote update action. No background installation or upgrade is performed.
+remote update action. Expanded machine cards also expose connection renaming,
+including while disconnected. Rename uses the exact registered Node ID and a
+revision guard; it changes only the local alias, preserving the SSH route and
+remote Workspace names. No background installation or upgrade is performed.
 Once remote
 Nodes are registered, the existing sidebar subtitle shows a compact Node count
 and connection summary. Selection uses stable Node IDs, including when aliases
@@ -299,6 +309,24 @@ and protocol compatibility remain owned by that interactive flow. After the
 result acknowledgment, the exact dedicated command Shell/run is removed with a
 revision guard. Desktop removes its temporary Workspace only with ephemeral
 creation proof, the expected post-removal revision, and no remaining resources.
+
+For a Desktop-owned connect launch, a private one-shot Unix datagram socket
+returns only the exact qualified identity of the created Shell. Its random
+short `/tmp` directory is mode 0700; the receiver is owned by that terminal
+session, accepts at most 1 KiB, and removes its socket and directory on drop.
+No terminal output, names, new-row detection, or persisted connection intent is
+used to infer the result. There is no extra worker or polling loop: after the
+existing overview worker confirms setup-Shell removal and output completion,
+it consumes the receipt and resolves the Shell from its registered owner off
+the UI thread before attaching. Failed or cancelled setup without a receipt
+causes no navigation. Closing/detaching the setup pane drops the receiver.
+A failed result delivery or attachment directs the user to the sidebar and never
+replays Workspace creation. This is an ephemeral matching-CLI/Desktop channel,
+not a daemon wire or persistence change.
+
+Collapsed unavailable machine cards expose sign-in, update review, or connection
+details according to the existing typed health. Update review uses the guarded
+CLI flow; it does not bypass incompatible-helper or identity checks.
 
 Ordinary Shells invoking the CLI are not cleanup targets. Remotes does not launch
 the separate terminal dashboard. Healthy cards omit generic lifecycle guidance;

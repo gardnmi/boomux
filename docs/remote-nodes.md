@@ -303,6 +303,9 @@ discovery, candidate checks, authorization, installation, daemon status and
 restart, final identity-pinned handshake, and live channel creation. Every
 command is a slave of that private owner-only control socket; an observation from
 one endpoint or account can never authorize mutation through another connection.
+When the local runtime path would exceed the SSH control socket limit, its
+configuration and socket use an exclusively created mode-`0700` directory under
+`/tmp`, with the same cleanup lifecycle. The daemon runtime stays unchanged.
 The private configuration terminates any trailing `Match` scope inherited from
 the included user configuration before clearing `SendEnv`, so even an included
 file ending in a nonmatching block cannot retain environment forwarding.

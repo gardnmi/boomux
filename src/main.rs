@@ -473,7 +473,10 @@ enum Commands {
     #[command(name = "__federation-stdio", hide = true)]
     FederationStdio,
     #[command(name = "__guided-node-add", hide = true)]
-    GuidedNodeAdd,
+    GuidedNodeAdd {
+        #[arg(long)]
+        result_socket: Option<PathBuf>,
+    },
     #[command(name = "__guided-node-upgrade", hide = true)]
     GuidedNodeUpgrade { selector: String },
     #[command(name = "__guided-node-uninstall", hide = true)]
@@ -566,6 +569,8 @@ enum NodeCommands {
         target: Option<String>,
         #[arg(long, hide = true)]
         desktop_workspace: bool,
+        #[arg(long, hide = true, requires = "desktop_workspace")]
+        desktop_result_socket: Option<PathBuf>,
     },
     /// List registered remote Nodes
     List,
@@ -1636,7 +1641,7 @@ impl Cli {
             Some(Commands::Attach { .. } | Commands::AwaitAttach { .. }) => CommandKey::Attach,
             Some(Commands::ResumeSession { .. }) => CommandKey::ResumeSessionInternal,
             Some(Commands::FederationStdio) => CommandKey::Attach,
-            Some(Commands::GuidedNodeAdd) => CommandKey::NodeAdd,
+            Some(Commands::GuidedNodeAdd { .. }) => CommandKey::NodeAdd,
             Some(Commands::GuidedNodeUpgrade { .. }) => CommandKey::NodeUpgrade,
             Some(Commands::GuidedNodeUninstall { .. }) => CommandKey::NodeUninstall,
             Some(Commands::GuidedNodeReauthenticate { .. }) => CommandKey::NodeReauthenticate,
@@ -1885,8 +1890,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             federation::run_stdio_helper()?;
             return Ok(CliExit::Success);
         }
-        Some(Commands::GuidedNodeAdd) => {
-            return finish_guided_shell(guided_node_add()?).map(CliExit::Child);
+        Some(Commands::GuidedNodeAdd { result_socket }) => {
+            return finish_guided_shell(guided_node_add(result_socket.as_deref())?)
+                .map(CliExit::Child);
         }
         Some(Commands::GuidedNodeUpgrade { selector }) => {
             return finish_guided_shell(guided_node_upgrade(selector)?).map(CliExit::Child);
@@ -2095,7 +2101,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Attach { .. } | Commands::AwaitAttach { .. }) => unreachable!(),
         Some(Commands::ResumeSession { .. }) => unreachable!(),
         Some(Commands::FederationStdio) => unreachable!(),
-        Some(Commands::GuidedNodeAdd) => unreachable!(),
+        Some(Commands::GuidedNodeAdd { .. }) => unreachable!(),
         Some(Commands::GuidedNodeUpgrade { .. }) => unreachable!(),
         Some(Commands::GuidedNodeUninstall { .. }) => unreachable!(),
         Some(Commands::GuidedNodeReauthenticate { .. }) => unreachable!(),
@@ -2492,6 +2498,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             alias,
             target,
             desktop_workspace,
+            desktop_result_socket,
         } => {
             if desktop_workspace && json {
                 return Err(
@@ -2507,12 +2514,36 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             )?;
             print_node_registration(CommandKey::NodeAdd, &registration, json)?;
             if desktop_workspace {
-                let shell = client::connect_or_start()?
-                    .create_remote_workspace(&registration.node_id, &registration.alias)?;
-                println!(
-                    "Remote workspace created with Shell {}. Open it from the Desktop sidebar.",
-                    shell.name
-                );
+                let Some(shell) = client::connect_or_start()?
+                    .create_initial_remote_workspace(&registration.node_id, &registration.alias)?
+                else {
+                    println!(
+                        "Connected to {}. The starter Workspace name is already in use. Press Enter at the next prompt, then open an existing Workspace from the Desktop sidebar or create a new one from the + menu.",
+                        registration.alias
+                    );
+                    return Ok(());
+                };
+                if let Some(path) = desktop_result_socket {
+                    let identity = protocol::QualifiedIdentity {
+                        node_id: registration.node_id.clone(),
+                        inner_id: shell.id.clone(),
+                    };
+                    match boomux::desktop_connect::send_result(&path, &identity) {
+                        Ok(()) => println!(
+                            "Connected to {}. Press Enter at the next prompt to open your remote workspace.",
+                            registration.alias
+                        ),
+                        Err(error) => eprintln!(
+                            "Connected, but Desktop could not receive the new Shell: {error}. Open {} from the sidebar; do not repeat setup.",
+                            shell.name
+                        ),
+                    }
+                } else {
+                    println!(
+                        "Remote workspace created with Shell {}. Open it from the Desktop sidebar.",
+                        shell.name
+                    );
+                }
             }
             Ok(())
         }
@@ -2729,7 +2760,9 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
     }
 }
 
-fn guided_node_add() -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+fn guided_node_add(
+    result_socket: Option<&Path>,
+) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     let executable = env::current_exe()?;
     let stdin = io::stdin();
     let interactive = stdin.is_terminal() && io::stdout().is_terminal();
@@ -2741,6 +2774,7 @@ fn guided_node_add() -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
         &mut output,
         interactive,
         interactive.then(|| stdin.as_raw_fd()),
+        result_socket,
     )
 }
 
@@ -2768,7 +2802,10 @@ fn guided_shell_close_request(
     executable: &Path,
 ) -> Option<protocol::Request> {
     let command_matches = match shell.command.get(1).map(String::as_str) {
-        Some("__guided-node-add") => shell.command.len() == 2,
+        Some("__guided-node-add") => {
+            shell.command.len() == 2
+                || (shell.command.len() == 4 && shell.command[2] == "--result-socket")
+        }
         Some(
             "__guided-node-upgrade" | "__guided-node-reauthenticate" | "__guided-node-uninstall",
         ) => shell.command.len() == 3,
@@ -2859,11 +2896,19 @@ fn guided_node_add_with(
     output: &mut impl io::Write,
     wait_for_newline: bool,
     terminal_fd: Option<i32>,
+    result_socket: Option<&Path>,
 ) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let mut arguments = vec!["node", "add", "--desktop-workspace"];
+    if let Some(path) = result_socket {
+        arguments.extend([
+            "--desktop-result-socket",
+            path.to_str().ok_or("Invalid Desktop result path")?,
+        ]);
+    }
     guided_node_command_with(
         executable,
-        &["node", "add", "--desktop-workspace"],
-        "Node setup",
+        &arguments,
+        "Remote connection",
         input,
         output,
         wait_for_newline,
@@ -3029,11 +3074,13 @@ fn resolve_node_add_inputs(
         .into());
     }
 
-    println!("Add a remote Boomux Node");
-    println!("Boomux uses your normal OpenSSH configuration and keeps remote work on its owner.");
+    println!("Connect a remote machine");
+    println!(
+        "Use an SSH host name or user@hostname. Your terminals and processes will run on that machine."
+    );
     let target = prompt_node_value("SSH target (for example user@workbox): ", None)?;
     let suggested_alias = target.rsplit('@').next().filter(|value| !value.is_empty());
-    let alias = prompt_node_value("Local alias", suggested_alias)?;
+    let alias = prompt_node_value("Display name", suggested_alias)?;
     Ok((alias, target))
 }
 
@@ -12805,6 +12852,7 @@ mod tests {
                     alias: Some(alias),
                     target: Some(target),
                     desktop_workspace: false,
+                    desktop_result_socket: None,
                 }
             }) if alias == "work" && target == "user@host"
         ));
@@ -12816,6 +12864,7 @@ mod tests {
                     alias: None,
                     target: None,
                     desktop_workspace: false,
+                    desktop_result_socket: None,
                 }
             })
         ));
@@ -12827,7 +12876,7 @@ mod tests {
         assert!(resolve_node_add_inputs(None, None, true).is_err());
 
         let held = Cli::try_parse_from(["boomux", "__guided-node-add"]).unwrap();
-        assert!(matches!(held.command, Some(Commands::GuidedNodeAdd)));
+        assert!(matches!(held.command, Some(Commands::GuidedNodeAdd { .. })));
         assert_eq!(held.command_descriptor().key, "node.add");
     }
 
@@ -12862,6 +12911,13 @@ mod tests {
         shell.command[0] = "/other/boomux".into();
         assert!(request(&shell).is_none());
         shell.command[0] = "/bin/boomux".into();
+        shell
+            .command
+            .extend(["--result-socket".into(), "/tmp/setup result".into()]);
+        assert!(request(&shell).is_some());
+        shell.command[2] = "--unexpected".into();
+        assert!(request(&shell).is_none());
+        shell.command.truncate(2);
         shell.command[1] = "__guided-node-uninstall".into();
         assert!(request(&shell).is_none());
         shell.command.push("exact-owner".into());
@@ -12883,11 +12939,12 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let child = directory.join("child");
         let child_output = directory.join("child-output");
+        let child_arguments = directory.join("child-arguments");
         fs::write(
             &child,
             format!(
-                "#!/bin/sh\nprintf 'child failed\\n'\nprintf 'child failed\\n' > '{}'\nexit 7\n",
-                child_output.display()
+                "#!/bin/sh\nprintf 'child failed\\n'\nprintf 'child failed\\n' > '{}'\nprintf '%s\\n' \"$@\" > '{}'\nexit 7\n",
+                child_output.display(), child_arguments.display()
             ),
         )
         .unwrap();
@@ -12896,19 +12953,31 @@ mod tests {
         let mut newline = io::Cursor::new(b"\n");
         let mut output = Vec::new();
         assert_eq!(
-            guided_node_add_with(&child, &mut newline, &mut output, true, None).unwrap(),
+            guided_node_add_with(
+                &child,
+                &mut newline,
+                &mut output,
+                true,
+                None,
+                Some(Path::new("/tmp/result with spaces; literal"))
+            )
+            .unwrap(),
             process_adapter::ProcessExit::Code(7)
         );
         let output = String::from_utf8(output).unwrap();
         assert_eq!(fs::read_to_string(&child_output).unwrap(), "child failed\n");
-        assert!(output.contains("Node setup failed (exit 7)."));
+        assert_eq!(
+            fs::read_to_string(&child_arguments).unwrap(),
+            "node\nadd\n--desktop-workspace\n--desktop-result-socket\n/tmp/result with spaces; literal\n"
+        );
+        assert!(output.contains("Remote connection failed (exit 7)."));
         assert!(output.contains("Press Enter to close."));
         assert!(!output.contains("Input closed before a newline"));
 
         let mut eof = io::Cursor::new(b"partial");
         let mut output = Vec::new();
         assert_eq!(
-            guided_node_add_with(&child, &mut eof, &mut output, true, None).unwrap(),
+            guided_node_add_with(&child, &mut eof, &mut output, true, None, None).unwrap(),
             process_adapter::ProcessExit::Code(7)
         );
         assert!(
@@ -12925,6 +12994,7 @@ mod tests {
                 &mut eof,
                 &mut output,
                 true,
+                None,
                 None,
             )
             .unwrap(),
@@ -12951,6 +13021,7 @@ mod tests {
             &mut output,
             true,
             Some(stdin.as_raw_fd()),
+            None,
         )
         .unwrap();
         std::process::exit(match outcome {
@@ -13036,7 +13107,7 @@ mod tests {
         let status = wrapper.wait().unwrap();
         assert_eq!(status.code(), Some(130));
         let output = String::from_utf8_lossy(&output);
-        assert!(output.contains("Node setup failed (signal 2)."));
+        assert!(output.contains("Remote connection failed (signal 2)."));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -13104,7 +13175,7 @@ mod tests {
         read_pty_until(
             &mut master,
             &mut output,
-            b"Node setup failed to continue",
+            b"Remote connection failed to continue",
             Duration::from_secs(3),
         );
         read_pty_until(

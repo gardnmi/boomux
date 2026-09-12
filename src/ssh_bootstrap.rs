@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -2395,43 +2395,8 @@ impl SshInvocation {
         authentication: SshAuthenticationMode,
         program: &OsStr,
     ) -> io::Result<Self> {
-        secure_runtime_directory(runtime_directory)?;
-        let nonce = Uuid::new_v4().simple().to_string();
-        let directory = runtime_directory.join(format!("ssh-{}", &nonce[..16]));
-        fs::create_dir(&directory)?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        let config_path = directory.join("config");
-        let control_path = directory.join("c");
-        if control_path.as_os_str().as_bytes().len() > MAX_CONTROL_PATH_BYTES {
-            let _ = fs::remove_dir_all(&directory);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SSH control socket path exceeds the safe Unix socket bound",
-            ));
-        }
-        validate_option_path(&control_path, "SSH control socket")?;
-        let result = (|| {
-            let mut config = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&config_path)?;
-            if let Some(user_config) = user_config {
-                writeln!(config, "Include {}", quote_ssh_config_path(user_config)?)?;
-                writeln!(config, "Match all")?;
-            }
-            // SendEnv is list-valued, so clear user entries after their config.
-            writeln!(config, "SendEnv -*")?;
-            writeln!(config, "Host *")?;
-            writeln!(config, "    ServerAliveInterval 15")?;
-            writeln!(config, "    ServerAliveCountMax 3")?;
-            config.sync_all()?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            let _ = fs::remove_dir_all(&directory);
-            return Err(error);
-        }
+        let (directory, config_path, control_path) =
+            prepare_ssh_directory(runtime_directory, user_config)?;
         Ok(Self {
             program: program.to_owned(),
             directory,
@@ -2481,19 +2446,16 @@ fn prepare_ssh_directory(
 ) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
     secure_runtime_directory(runtime_directory)?;
     let nonce = Uuid::new_v4().simple().to_string();
-    let directory = runtime_directory.join(format!("ssh-{}", &nonce[..16]));
-    fs::create_dir(&directory)?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let mut directory = runtime_directory.join(format!("ssh-{}", &nonce[..16]));
+    if directory.join("c").as_os_str().as_bytes().len() > MAX_CONTROL_PATH_BYTES {
+        // Keep the daemon's runtime unchanged. TMPDIR can itself be too long
+        // (especially on macOS), so use a short, exclusively created directory.
+        directory = Path::new("/tmp").join(format!("boomux-ssh-{nonce}"));
+    }
     let config_path = directory.join("config");
     let control_path = directory.join("c");
-    if control_path.as_os_str().as_bytes().len() > MAX_CONTROL_PATH_BYTES {
-        let _ = fs::remove_dir_all(&directory);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "SSH control socket path exceeds the safe Unix socket bound",
-        ));
-    }
     validate_option_path(&control_path, "SSH control socket")?;
+    fs::DirBuilder::new().mode(0o700).create(&directory)?;
     let result = (|| {
         let mut config = OpenOptions::new()
             .write(true)
@@ -5298,6 +5260,37 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+
+    #[test]
+    fn long_runtime_uses_private_short_ssh_directory_and_cleans_up() {
+        let runtime = runtime_directory();
+        let long_runtime = runtime.join("long-runtime-".repeat(8));
+        let invocation = SshInvocation::prepare_at(
+            &long_runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            RemoteExecutable::parse("/usr/bin/boomux").unwrap(),
+            SshAuthenticationMode::Interactive,
+        )
+        .unwrap();
+        let directory = invocation.directory.clone();
+        assert!(!directory.starts_with(&long_runtime));
+        assert!(invocation.control_path().as_os_str().as_bytes().len() <= MAX_CONTROL_PATH_BYTES);
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(invocation.config_path()).unwrap().mode() & 0o777,
+            0o600
+        );
+        let listener = std::os::unix::net::UnixListener::bind(invocation.control_path()).unwrap();
+        let second = prepare_ssh_directory(&long_runtime, None).unwrap();
+        assert_ne!(directory, second.0);
+        fs::remove_dir_all(second.0).unwrap();
+        drop(listener);
+        drop(invocation);
+        assert!(!directory.exists());
+        assert!(long_runtime.exists());
+        assert_eq!(fs::read_dir(&long_runtime).unwrap().count(), 0);
     }
 
     #[test]

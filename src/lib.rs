@@ -6,6 +6,8 @@ pub mod attach;
 pub mod benchmark_support;
 pub mod client;
 pub mod daemon;
+#[doc(hidden)]
+pub mod desktop_connect;
 mod desktop_notifications;
 mod fd_transfer;
 pub mod federation;

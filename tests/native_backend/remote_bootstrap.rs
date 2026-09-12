@@ -991,7 +991,7 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
     }
     let mut child = command.spawn().unwrap();
     let mut master = fs::File::from(master);
-    master.write_all(b"work\nworkbox\n").unwrap();
+    master.write_all(b"workbox\nwork\n").unwrap();
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert_ne!(flags, -1);
     assert_ne!(
@@ -1025,7 +1025,10 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
         output.contains("https://login.tailscale.test/challenge"),
         "{output}"
     );
-    assert!(output.contains("Node setup failed (exit 1)."), "{output}");
+    assert!(
+        output.contains("Remote connection failed (exit 1)."),
+        "{output}"
+    );
     assert!(child.try_wait().unwrap().is_none());
     master.write_all(b"\n").unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(1));
@@ -1055,7 +1058,10 @@ fn guided_node_add_allows_ssh_to_read_authentication_from_the_terminal() {
         fs::read(directory.join("authentication")).unwrap(),
         b"secret"
     );
-    assert!(output.contains("Node setup failed (exit 1)."), "{output}");
+    assert!(
+        output.contains("Remote connection failed (exit 1)."),
+        "{output}"
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 

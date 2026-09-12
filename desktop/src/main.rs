@@ -223,6 +223,10 @@ enum SidebarItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SidebarResource {
+    Connection {
+        id: String,
+        name: String,
+    },
     Workspace {
         id: String,
         name: String,
@@ -237,12 +241,15 @@ enum SidebarResource {
 impl SidebarResource {
     fn name(&self) -> &str {
         match self {
-            Self::Workspace { name, .. } | Self::Shell { name, .. } => name,
+            Self::Workspace { name, .. }
+            | Self::Shell { name, .. }
+            | Self::Connection { name, .. } => name,
         }
     }
 
     fn kind_label(&self) -> &'static str {
         match self {
+            Self::Connection { .. } => "connection",
             Self::Workspace { .. } => "Workspace",
             Self::Shell { .. } => "Shell",
         }
@@ -1575,6 +1582,8 @@ struct Workspace {
     sidebar_menu: Option<SidebarMenu>,
     sidebar_header_menu_open: bool,
     project_menu_open: bool,
+    remote_picker_open: bool,
+    remote_picker_scroll_handle: ScrollHandle,
     project_search: String,
     projects_loading: bool,
     projects_result: Option<Result<boomux::protocol::HostProjectDiscovery, String>>,
@@ -1797,6 +1806,8 @@ impl Workspace {
             sidebar_menu: None,
             sidebar_header_menu_open: false,
             project_menu_open: false,
+            remote_picker_open: false,
+            remote_picker_scroll_handle: ScrollHandle::new(),
             project_search: String::new(),
             projects_loading: false,
             projects_result: None,
@@ -2956,6 +2967,7 @@ impl Workspace {
                 let matches = match target {
                     SidebarResource::Workspace { id, .. } => shell.workspace_id == *id,
                     SidebarResource::Shell { id, .. } => shell.id == *id,
+                    SidebarResource::Connection { .. } => false,
                 };
                 matches.then_some(*id)
             })
@@ -3043,6 +3055,12 @@ impl Workspace {
             let result = cx
                 .background_spawn(async move {
                     match (&operation_target, kind) {
+                        (SidebarResource::Connection { id, name }, ResourceDialogKind::Rename) => {
+                            terminal::rename_connection(id, name, &operation_value)?;
+                        }
+                        (SidebarResource::Connection { .. }, ResourceDialogKind::Remove) => {
+                            return Err("Use Forget connection on the machine card".into());
+                        }
                         (SidebarResource::Workspace { id, .. }, ResourceDialogKind::Rename) => {
                             terminal::rename_workspace(id, &operation_value)?;
                         }
@@ -3079,6 +3097,12 @@ impl Workspace {
                                     session.shell_name = value.clone();
                                 }
                             }
+                        }
+                        if let SidebarResource::Connection { id, .. } = &target
+                            && let Some(node) =
+                                this.node_views.iter_mut().find(|node| node.id == *id)
+                        {
+                            node.label = value.clone();
                         }
                         this.set_boomux_overview(overview);
                         this.resource_dialog = None;
@@ -4272,7 +4296,9 @@ impl Workspace {
     fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             if self.project_menu_open {
-                project_search::append(&mut self.project_search, &text);
+                if !self.remote_picker_open {
+                    project_search::append(&mut self.project_search, &text);
+                }
                 cx.stop_propagation();
                 cx.notify();
                 return;
@@ -4917,6 +4943,51 @@ impl Workspace {
         } else if !event.is_held {
             self.layout_suppressed_keys.remove(&event.keystroke.key);
         }
+        if self.project_menu_open && self.remote_picker_open {
+            let modifiers = event.keystroke.modifiers;
+            if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+                cx.stop_propagation();
+                return;
+            }
+            match event.keystroke.key.as_str() {
+                "escape" => self.project_menu_open = false,
+                "up" | "down" => {
+                    let nodes = self
+                        .node_views
+                        .iter()
+                        .filter(|n| !n.local)
+                        .collect::<Vec<_>>();
+                    // The final keyboard item is “Connect another machine”.
+                    let len = nodes.len() + 1;
+                    let current = nodes
+                        .iter()
+                        .position(|n| Some(&n.id) == self.selected_node.as_ref())
+                        .unwrap_or(nodes.len());
+                    let next = if event.keystroke.key == "up" {
+                        (current + len - 1) % len
+                    } else {
+                        (current + 1) % len
+                    };
+                    self.selected_node = nodes.get(next).map(|node| node.id.clone());
+                    if next < nodes.len() {
+                        let maximum = self.remote_picker_scroll_handle.max_offset();
+                        self.remote_picker_scroll_handle
+                            .set_offset(point(px(0.0), -px(next as f32 * 52.0).min(maximum.y)));
+                    }
+                }
+                "enter" if !event.is_held => {
+                    if let Some(id) = self.selected_node.clone() {
+                        self.activate_remote_machine(&id, window, cx);
+                    } else {
+                        self.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
+                    }
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.project_menu_open {
             match event.keystroke.key.as_str() {
                 "escape" => self.project_menu_open = false,
@@ -5417,6 +5488,19 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
+                    let connect_result = if matches!(launch, terminal::WorkspaceLaunch::AddNode) {
+                        Some(
+                            boomux::desktop_connect::ConnectResultReceiver::new()
+                                .map_err(|error| error.to_string())?,
+                        )
+                    } else {
+                        None
+                    };
+                    let launch = if let Some(receiver) = &connect_result {
+                        terminal::WorkspaceLaunch::AddNodeResult(receiver.path())
+                    } else {
+                        launch
+                    };
                     let (shell, setup_workspace_cleanup) =
                         terminal::create_workspace_with_shell(launch)?;
                     let mut session = match TerminalSession::attach(
@@ -5436,6 +5520,7 @@ impl Workspace {
                         }
                     };
                     session.setup_workspace_cleanup = setup_workspace_cleanup;
+                    session.connect_result = connect_result;
                     // The existing overview worker refreshes sidebar resources.
                     // Do not hold an attached terminal behind that extra request.
                     Ok::<_, String>((shell, session))
@@ -5483,6 +5568,7 @@ impl Workspace {
                     .await;
                 let mut removed_setup_shells = Vec::new();
                 let mut setup_workspace_cleanups = Vec::new();
+                let mut connect_results = Vec::new();
                 let keep_watching = this
                     .update(cx, |this, cx| {
                         let (result, nodes) = result;
@@ -5498,6 +5584,7 @@ impl Workspace {
                         };
                         if this.node_views != node_views || this.nodes_error != nodes_error {
                             let visible_change = this.nodes_open
+                                || (this.project_menu_open && this.remote_picker_open)
                                 || this.nodes_error != nodes_error
                                 || this.node_views.len() != node_views.len()
                                 || this.node_views.iter().zip(&node_views).any(
@@ -5532,6 +5619,9 @@ impl Workspace {
                                         name: shell.name.clone(),
                                         workspace_id: shell.workspace_id.clone(),
                                     });
+                                    if let Some(receiver) = session.connect_result.take() {
+                                        connect_results.push(receiver);
+                                    }
                                     if let Some(cleanup) = session.setup_workspace_cleanup.take() {
                                         setup_workspace_cleanups.push(cleanup);
                                     }
@@ -5563,6 +5653,24 @@ impl Workspace {
                                 this.remove_resource_panes(&shell, window);
                             }
                             cx.notify();
+                        })
+                    });
+                }
+                for receiver in connect_results {
+                    let result = cx.background_spawn(async move {
+                        receiver.receive().map_err(|e| e.to_string())?
+                            .map(terminal::connected_shell).transpose()
+                    }).await;
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(Some(shell)) => this.open_shell_choice(shell, window, cx),
+                                Ok(None) => {}, // Cancelled or failed setup creates no navigation intent.
+                                Err(error) => {
+                                    this.boomux_error = Some(format!("Could not open the new remote workspace: {error}. Open it from the sidebar; do not repeat setup."));
+                                    cx.notify();
+                                }
+                            }
                         })
                     });
                 }
@@ -5969,6 +6077,16 @@ impl Workspace {
             cx.notify();
             return;
         };
+        self.open_shell_choice(shell, window, cx);
+    }
+
+    fn open_shell_choice(
+        &mut self,
+        shell: ShellChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_menu_open = false;
         self.minimized_shells.remove(&shell.id);
         let open_workspace_ids = self
             .terminals
@@ -6228,6 +6346,121 @@ impl Workspace {
         cx.notify();
     }
 
+    fn activate_remote_machine(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.node_views.iter().find(|n| !n.local && n.id == id) else {
+            return;
+        };
+        let node_id = node.id.clone();
+        match node.primary_action() {
+            nodes::PrimaryAction::NewWorkspace => {
+                let name = terminal::project_workspace_name(
+                    &node.label,
+                    self.boomux_overview
+                        .workspaces
+                        .iter()
+                        .filter(|w| remote::identity(&w.id).is_some_and(|id| id.node_id == node_id))
+                        .map(|w| w.name.as_str()),
+                );
+                self.launch_node_action(
+                    terminal::WorkspaceLaunch::RemoteWorkspace { node_id, name },
+                    window,
+                    cx,
+                );
+            }
+            nodes::PrimaryAction::SignIn => self.launch_node_action(
+                terminal::WorkspaceLaunch::ReauthenticateNode(node_id),
+                window,
+                cx,
+            ),
+            nodes::PrimaryAction::Update => {
+                self.launch_node_action(terminal::WorkspaceLaunch::UpgradeNode(node_id), window, cx)
+            }
+            nodes::PrimaryAction::Review => {
+                self.open_nodes(cx);
+                self.selected_node = Some(node_id.clone());
+                self.expanded_node = Some(node_id);
+            }
+        }
+    }
+
+    fn remote_workspace_picker(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut list = div()
+            .id("remote-picker-list")
+            .track_scroll(&self.remote_picker_scroll_handle)
+            .max_h(px(320.0))
+            .overflow_y_scroll();
+        for node in self.node_views.iter().filter(|n| !n.local) {
+            let id = node.id.clone();
+            list = list.child(
+                sidebar_menu_row(SharedString::from(format!("remote-picker-{}", node.id)))
+                    .bg(rgb(if self.selected_node.as_ref() == Some(&node.id) {
+                        0x313244
+                    } else {
+                        0x1e1e2e
+                    }))
+                    .h(px(52.0))
+                    .flex_col()
+                    .justify_center()
+                    .items_start()
+                    .child(div().w_full().truncate().child(node.label.clone()))
+                    .child(div().text_xs().text_color(rgb(0xa6adc8)).child(format!(
+                        "{} · {}",
+                        node.status(),
+                        node.primary_action().label()
+                    )))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.activate_remote_machine(&id, window, cx);
+                    })),
+            );
+        }
+        div()
+            .id("remote-workspace-picker")
+            .role(gpui::Role::Menu)
+            .aria_label("Choose remote machine")
+            .absolute()
+            .occlude()
+            .top(px(54.0))
+            .left(px(10.0))
+            .right(px(10.0))
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .bg(rgb(0x1e1e2e))
+            .shadow_lg()
+            .child(div().p_2().text_sm().child("Choose a machine"))
+            .child(
+                div()
+                    .px_2()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(rgb(0xa6adc8))
+                    .child("Your new workspace and terminal will run there."),
+            )
+            .when_some(self.nodes_error.clone(), |menu, error| {
+                menu.child(div().p_2().text_xs().text_color(rgb(0xf9e2af)).child(error))
+            })
+            .child(list)
+            .when(!self.node_views.iter().any(|n| !n.local), |menu| {
+                menu.child(div().p_2().text_xs().child("No machines connected yet."))
+            })
+            .child(
+                sidebar_menu_row("remote-picker-connect")
+                    .bg(rgb(if self.selected_node.is_none() {
+                        0x313244
+                    } else {
+                        0x1e1e2e
+                    }))
+                    .child("Connect another machine…")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn launch_node_action(
         &mut self,
         launch: terminal::WorkspaceLaunch,
@@ -6235,6 +6468,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.nodes_open = false;
+        self.project_menu_open = false;
+        self.remote_picker_open = false;
         if self.layout_mode {
             self.leave_layout_mode(cx);
         }
@@ -6320,6 +6555,14 @@ impl Workspace {
                             .text_color(rgb(if node.connected() { 0xa6e3a1 } else { 0xf9e2af }))
                             .child(node.status()),
                     )
+            .when(!node.connected(), |panel| {
+                let id = node.id.clone();
+                panel.child(Self::settings_option("remote-recovery", node.primary_action().label(), false)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.activate_remote_machine(&id, window, cx);
+                    })))
+            })
             .when(self.expanded_node.as_ref() == Some(&node.id), |panel| {
                 panel.child(div().mt_2().pt_2().border_t_1().border_color(rgb(0x45475a))
                     .id("remote-machine-details")
@@ -6332,6 +6575,18 @@ impl Workspace {
                         if node.connected() { "" } else { " · cached" }))
                     .when_some(node.version.clone(), |detail, version| detail.child(format!("Boomux {version}")))
                     .when(!node.connected(), |detail| detail.child(node.last_seen(now_ms)).child(node.guidance()))
+                    .child(Self::settings_option("rename-remote-connection", "Rename connection…", false)
+                        .flex_none()
+                        .on_click(cx.listener({
+                            let id = node.id.clone();
+                            let name = node.label.clone();
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_resource_dialog(ResourceDialogKind::Rename,
+                                    SidebarResource::Connection { id: id.clone(), name: name.clone() });
+                                cx.notify();
+                            }
+                        })))
                     .when(!node.local && node.connected(), |detail| {
                         let node_id = node.id.clone();
                         let name = node.label.clone();
@@ -6350,15 +6605,6 @@ impl Workspace {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.launch_node_action(terminal::WorkspaceLaunch::UpgradeNode(upgrade_id.clone()), window, cx);
-                            })))
-                    })
-                    .when(!node.local && node.health == boomux::protocol::NodeProjectionHealthCode::AuthenticationRequired, |detail| {
-                        let id = node.id.clone();
-                        detail.child(Self::settings_option("reauthenticate-node", "Sign in…", false)
-                            .flex_none()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.launch_node_action(terminal::WorkspaceLaunch::ReauthenticateNode(id.clone()), window, cx);
                             })))
                     })
                     .child(div().mt_2().pt_2().border_t_1().border_color(rgb(0x45475a))
@@ -6459,6 +6705,7 @@ impl Workspace {
 
     fn toggle_project_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.project_menu_open = !self.project_menu_open;
+        self.remote_picker_open = false;
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
         self.project_search.clear();
@@ -6545,6 +6792,9 @@ impl Workspace {
     fn project_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.project_menu_open {
             return None;
+        }
+        if self.remote_picker_open {
+            return Some(self.remote_workspace_picker(cx));
         }
         let mut entries = div()
             .id("project-menu-list")
@@ -6688,7 +6938,17 @@ impl Workspace {
                             if this.settings_open {
                                 this.close_settings(cx);
                             }
-                            this.open_nodes(cx);
+                            this.project_menu_open = true;
+                            this.remote_picker_open = true;
+                            this.remote_picker_scroll_handle
+                                .set_offset(point(px(0.0), px(0.0)));
+                            this.nodes_open = false;
+                            this.selected_node = this
+                                .node_views
+                                .iter()
+                                .find(|n| !n.local)
+                                .map(|n| n.id.clone());
+                            cx.notify();
                         })),
                 )
                 .child(div().mx_2().my_1().h(px(1.0)).bg(rgb(0x313244)))
@@ -7535,11 +7795,11 @@ impl Workspace {
         let target = menu.target.clone();
         let open_workspace_id = match &target {
             SidebarResource::Workspace { id, .. } => Some(id.clone()),
-            SidebarResource::Shell { .. } => None,
+            SidebarResource::Shell { .. } | SidebarResource::Connection { .. } => None,
         };
         let create_workspace_id = match &target {
             SidebarResource::Workspace { id, .. } => Some(id.clone()),
-            SidebarResource::Shell { .. } => None,
+            SidebarResource::Shell { .. } | SidebarResource::Connection { .. } => None,
         };
         let rename_target = target.clone();
         let remove_target = target.clone();
@@ -8693,6 +8953,12 @@ impl Workspace {
             ResourceDialogKind::Remove => format!("Remove {kind_label}?"),
         };
         let detail = match (&dialog.target, dialog.kind) {
+            (SidebarResource::Connection { .. }, ResourceDialogKind::Rename) => {
+                "Change this connection’s display name on this computer. The SSH address and remote Workspace names stay the same.".into()
+            }
+            (SidebarResource::Connection { .. }, ResourceDialogKind::Remove) => {
+                "Use Forget connection on the machine card.".into()
+            }
             (_, ResourceDialogKind::Rename) => {
                 "Type a new name, then press Enter to save it.".to_string()
             }
