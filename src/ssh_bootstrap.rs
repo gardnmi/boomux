@@ -163,6 +163,14 @@ const REMOTE_INSTALL_COMMIT_COMMAND: &str = concat!(
     remote_process_identity_function!(),
     "if [ -d \"$committed\" ]; then printf 'boomux-install-commit-v1\\0committed\\0'; exit; fi; claim_acquire || exit 73; trap claim_release EXIT HUP INT TERM; if [ -d \"$committed\" ]; then :; elif [ -d \"$transaction\" ]; then /bin/mv \"$transaction\" \"$committed\"; else exit 1; fi; trap - EXIT HUP INT TERM; claim_release; printf 'boomux-install-commit-v1\\0committed\\0'"
 );
+// Called only after the coordinator has received the commit acknowledgement.
+// Retire the claimed directory before deleting it so delayed cleanup cannot
+// remove a new install's lock at the same canonical path.
+const REMOTE_INSTALL_FINALIZE_COMMAND: &str = concat!(
+    "PATH=/usr/bin:/bin; export PATH; set -eu; IFS= read -r txn; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; ",
+    remote_claim_functions!(),
+    "[ \"$(/bin/cat \"$lock/id\" 2>/dev/null || true)\" = \"$txn\" ] || exit 0; [ -d \"$lock/committed\" ] || exit 73; claim_acquire || exit 73; trap claim_release EXIT HUP INT TERM; [ \"$(/bin/cat \"$lock/id\")\" = \"$txn\" ]; [ -d \"$lock/committed\" ]; [ ! -e \"$transaction\" ] && [ ! -L \"$transaction\" ]; watchdog=$(/bin/cat \"$lock/committed/watchdog_pid\"); watchdog_start=$(/bin/cat \"$lock/committed/watchdog_start\"); case \"$watchdog\" in ''|*[!0-9]*) exit 1 ;; esac; [ \"$watchdog\" -gt 1 ]; current_start=$(claim_process_start \"$watchdog\" 2>/dev/null || true); /bin/mv \"$lock\" \"$transaction\"; trap '/bin/rm -rf \"$transaction\"' EXIT HUP INT TERM; /bin/rm -rf \"$transaction\"; trap - EXIT HUP INT TERM; if [ -n \"$watchdog_start\" ] && [ \"$current_start\" = \"$watchdog_start\" ]; then /bin/kill \"$watchdog\" 2>/dev/null || true; fi"
+);
 #[doc(hidden)]
 pub const REMOTE_INSTALL_MARK_RESTARTED_COMMAND: &str = "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; [ \"$(cat \"$lock/id\")\" = \"$txn\" ]; : > \"$transaction/restarted\"";
 const REMOTE_INSTALL_MARK_DAEMON_CONTACTED_COMMAND: &str = "set -eu; case \"$HOME\" in /*) ;; *) exit 1 ;; esac; IFS= read -r txn; case \"$txn\" in .boomux.bootstrap.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;; *) exit 2 ;; esac; directory=$HOME/.local/bin; lock=$directory/.boomux.bootstrap.lock; transaction=$directory/$txn; [ \"$(cat \"$lock/id\")\" = \"$txn\" ]; : > \"$transaction/daemon_contacted\"";
@@ -908,6 +916,17 @@ impl RemoteConnection {
             return Err(invalid_probe("remote response version mismatch"));
         }
         Ok(response.message)
+    }
+
+    /// Observe the verified owner's Workspaces before offering first-time setup.
+    /// Connection aliases never identify an existing owner Workspace.
+    pub fn has_workspaces(&mut self, timeout: Duration) -> io::Result<bool> {
+        match self.request(Request::Snapshot, timeout)? {
+            Response::Snapshot { snapshot } => Ok(!snapshot.workspaces.is_empty()),
+            _ => Err(invalid_probe(
+                "remote Workspace discovery returned an unexpected response",
+            )),
+        }
     }
 
     pub fn ping(&mut self) -> io::Result<()> {
@@ -2433,6 +2452,13 @@ impl BootstrapSession {
                 BootstrapRecoveryDisposition::OutcomeUnknown,
             ));
         }
+        // Cleanup failure cannot undo an acknowledged commit. The watchdog
+        // remains the bounded fallback if this final SSH exchange is lost.
+        let _ = run_streaming_command(
+            self.command(REMOTE_INSTALL_FINALIZE_COMMAND),
+            transaction.input(),
+            timeout.min(Duration::from_secs(5)),
+        );
         connection._bootstrap_session = Some(self);
         Ok(connection)
     }
@@ -6651,6 +6677,59 @@ mod tests {
     }
 
     #[test]
+    fn starter_workspace_discovery_uses_owner_state_not_connection_alias() {
+        for (workspaces, expected) in [
+            (serde_json::json!([]), false),
+            (
+                serde_json::json!([{"id":"existing", "name":"original-hostname", "revision":1,
+                "shells":[], "launchers":[], "agents":[]}]),
+                true,
+            ),
+        ] {
+            let handshake = FederationHandshake {
+                version: FEDERATION_VERSION,
+                node_id: Uuid::new_v4().to_string(),
+                helper_version: env!("CARGO_PKG_VERSION").into(),
+                core_protocol_version: protocol::PROTOCOL_VERSION,
+                connection_mode: FederationConnectionMode::AdHoc,
+            };
+            let mut handshake_bytes = Vec::new();
+            crate::federation::write_handshake(&mut handshake_bytes, &handshake).unwrap();
+            let mut request = Vec::new();
+            protocol::write_message(&mut request, &Envelope::new(Request::Snapshot)).unwrap();
+            let snapshot =
+                serde_json::from_value(serde_json::json!({"workspaces":workspaces})).unwrap();
+            let mut response = Vec::new();
+            protocol::write_message(
+                &mut response,
+                &Envelope::new(Response::Snapshot { snapshot }),
+            )
+            .unwrap();
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                &format!(
+                    "{}; dd bs=1 count={} of=/dev/null 2>/dev/null; {}; cat >/dev/null",
+                    shell_printf(&handshake_bytes),
+                    request.len(),
+                    shell_printf(&response)
+                ),
+            ]);
+            let helper = CompatibleRemoteHelper {
+                executable: RemoteExecutable::parse("/remote/boomux").unwrap(),
+                handshake,
+                bootstrap_id: None,
+            };
+            let mut connection =
+                connect_remote_command(command, helper, Duration::from_secs(2), None).unwrap();
+            assert_eq!(
+                connection.has_workspaces(Duration::from_secs(2)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn helper_probe_verifies_handshake_and_ping_on_one_channel() {
         let handshake = FederationHandshake {
             version: FEDERATION_VERSION,
@@ -8388,6 +8467,48 @@ mod tests {
                 .join(".local/bin/.boomux.bootstrap.lock/committed/backup")
                 .exists()
         );
+        directory.reap_watchdogs();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn acknowledged_install_cleanup_allows_immediate_remove_and_reinstall() {
+        let directory = runtime_directory();
+        fs::create_dir_all(directory.join(".local/bin")).unwrap();
+        let destination = directory.join(".local/bin/boomux");
+        let lock = directory.join(".local/bin/.boomux.bootstrap.lock");
+        let install = gate_watchdog(REMOTE_INSTALL_COMMAND);
+        let first = run_local_upload_with_command(&directory, b"first", "sh", &install);
+        run_local_activation(&directory, "sh", &first, RemoteInstallReason::Missing);
+        run_local_transaction(&directory, REMOTE_INSTALL_COMMIT_COMMAND, &first);
+        run_local_transaction(&directory, REMOTE_INSTALL_FINALIZE_COMMAND, &first);
+        assert!(!lock.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"first");
+        fs::remove_file(&destination).unwrap();
+        let second = run_local_upload_with_command(&directory, b"second", "sh", &install);
+        // A delayed cleanup from the first install cannot remove this new lock.
+        run_local_transaction(&directory, REMOTE_INSTALL_FINALIZE_COMMAND, &first);
+        assert!(lock.exists());
+        assert_eq!(
+            fs::read_to_string(lock.join("id")).unwrap().trim(),
+            second.0
+        );
+        // Neither a live upload nor a verified but uncommitted activation is cleanup authority.
+        for activated in [false, true] {
+            if activated {
+                run_local_activation(&directory, "sh", &second, RemoteInstallReason::Missing);
+            }
+            let mut command = local_shell_command("sh", &directory);
+            command.args(["-c", REMOTE_INSTALL_FINALIZE_COMMAND]);
+            assert!(
+                run_streaming_command(command, second.input(), Duration::from_secs(5)).is_err()
+            );
+            assert!(lock.exists());
+        }
+        run_local_transaction(&directory, REMOTE_INSTALL_COMMIT_COMMAND, &second);
+        run_local_transaction(&directory, REMOTE_INSTALL_FINALIZE_COMMAND, &second);
+        assert_eq!(fs::read(&destination).unwrap(), b"second");
+        assert!(!lock.exists());
         directory.reap_watchdogs();
         fs::remove_dir_all(directory).unwrap();
     }

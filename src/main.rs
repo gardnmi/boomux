@@ -2531,7 +2531,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                 );
             }
             let (alias, target) = resolve_node_add_inputs(alias, target, json)?;
-            let remote = verified_remote_connection(&target, !json)?;
+            let mut remote = verified_remote_connection(&target, !json)?;
             let registration = client::connect_or_start()?.add_node_registration(
                 alias,
                 target,
@@ -2539,6 +2539,13 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             )?;
             print_node_registration(CommandKey::NodeAdd, &registration, json)?;
             if desktop_workspace {
+                if remote.has_workspaces(Duration::from_secs(15))? {
+                    println!(
+                        "Connected to {}. Existing remote Workspaces are available in the Desktop sidebar; no starter Workspace was created.",
+                        registration.alias
+                    );
+                    return Ok(());
+                }
                 let Some(shell) = client::connect_or_start()?
                     .create_initial_remote_workspace(&registration.node_id, &registration.alias)?
                 else {

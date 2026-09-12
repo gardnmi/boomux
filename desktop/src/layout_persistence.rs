@@ -77,6 +77,21 @@ fn decode_tree(node: &Tree, ids: &HashMap<u64, usize>) -> Node {
         },
     }
 }
+impl TerminalPane {
+    fn saved_reference(&self) -> Option<Pane> {
+        if self.temporary_setup || self.shell.as_ref().is_some_and(|shell| shell.desktop_setup) {
+            return None;
+        }
+        self.shell
+            .as_ref()
+            .map(|shell| Pane {
+                shell: Some(shell.id.clone()),
+                workspace: Some(shell.workspace_id.clone()),
+            })
+            .or_else(|| self.restored.clone())
+    }
+}
+
 impl Workspace {
     pub(super) fn initialize_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_viewport_width = f32::from(window.viewport_size().width);
@@ -155,12 +170,8 @@ impl Workspace {
         } else {
             self.terminals
                 .get(&self.focused)
-                .and_then(|p| {
-                    p.shell
-                        .as_ref()
-                        .map(|s| s.workspace_id.clone())
-                        .or_else(|| p.restored.as_ref().and_then(|p| p.workspace.clone()))
-                })
+                .and_then(TerminalPane::saved_reference)
+                .and_then(|pane| pane.workspace)
                 .map(|w| format!("workspace:{w}"))
                 .unwrap_or_else(|| self.layout_document.active.clone())
         };
@@ -172,18 +183,10 @@ impl Workspace {
             .iter()
             .filter_map(|id| {
                 self.terminals.get(id).map(|pane| {
-                    let reference = pane
-                        .shell
-                        .as_ref()
-                        .map(|shell| Pane {
-                            shell: Some(shell.id.clone()),
-                            workspace: Some(shell.workspace_id.clone()),
-                        })
-                        .or_else(|| pane.restored.clone())
-                        .unwrap_or(Pane {
-                            shell: None,
-                            workspace: None,
-                        });
+                    let reference = pane.saved_reference().unwrap_or(Pane {
+                        shell: None,
+                        workspace: None,
+                    });
                     (*id as u64, reference)
                 })
             })
@@ -631,6 +634,53 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn setup_overlay_does_not_replace_saved_workspace_or_panes() {
+        let reference = Pane {
+            shell: Some("original-shell".into()),
+            workspace: Some("original-workspace".into()),
+        };
+        let mut pane = TerminalPane {
+            restored: Some(reference.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            pane.saved_reference().unwrap().workspace,
+            reference.workspace
+        );
+        pane.temporary_setup = true;
+        assert!(pane.saved_reference().is_none());
+        // Saving while setup has focus must prune only the overlay and retain
+        // the underlying tiled geometry, identity, and maximized state.
+        let mut arrangement = Arrangement {
+            tree: Some(Tree::Pane(1)),
+            floating: vec![Floating {
+                pane: 2,
+                rect: [10.0, 10.0, 500.0, 400.0],
+            }],
+            panes: [
+                (1, reference),
+                (
+                    2,
+                    pane.saved_reference().unwrap_or(Pane {
+                        shell: None,
+                        workspace: None,
+                    }),
+                ),
+            ]
+            .into(),
+            focused: Some(2),
+            expanded: Some(1),
+            canvas: [1200.0, 800.0],
+        };
+        arrangement.discard_unbound_panes();
+        assert!(matches!(arrangement.tree, Some(Tree::Pane(1))));
+        assert!(arrangement.floating.is_empty());
+        assert_eq!(arrangement.panes.len(), 1);
+        assert_eq!(arrangement.focused, Some(1));
+        assert_eq!(arrangement.expanded, Some(1));
+    }
+
     #[test]
     fn layout_reuse_requires_the_same_owner_shell_and_running_instance() {
         let current = ShellChoice {

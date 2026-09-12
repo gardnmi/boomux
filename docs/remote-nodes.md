@@ -1152,11 +1152,14 @@ requires connectivity. **Forget connection only** on the machine card removes
 all that machine's cached entries and its local registration without contacting
 the owner. These operations have distinct scopes.
 
-A completed remote update retains its transaction lock and rollback files for
-up to three minutes while watchdog cleanup finishes. Another update during
-that window returns `busy` before uploading or replacing anything. This explicit
-refusal releases the attempted update's local maintenance window; it must not
-be presented as an unknown upgrade outcome. Wait for cleanup before retrying.
+After receiving a successful install/update commit acknowledgement, the coordinator
+promptly releases the exact transaction lock and rollback files. Cleanup claims
+and retires only that committed transaction; delayed cleanup cannot remove a
+new install's lock. This allows immediate uninstall and reinstall. If the final
+cleanup exchange is interrupted, the watchdog remains the bounded fallback
+(up to three minutes). An active or recovering transaction still returns `busy`
+before another upload or replacement. This explicit refusal releases the attempted
+update's local maintenance window and is not an unknown upgrade outcome.
 
 An ambiguous update failure can retain a separate local Node maintenance lease
 for up to ten minutes after its last renewal. This is distinct from the remote

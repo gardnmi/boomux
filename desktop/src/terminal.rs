@@ -1229,7 +1229,7 @@ pub enum WorkspaceLaunch {
 }
 
 impl WorkspaceLaunch {
-    fn temporary_setup(&self) -> bool {
+    pub(crate) fn temporary_setup(&self) -> bool {
         matches!(
             self,
             Self::Setup

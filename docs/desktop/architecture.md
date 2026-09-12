@@ -266,6 +266,11 @@ Workspace authority.
 
 ## Remote Node Entry Points
 
+Connection, sign-in, update, uninstall, and agent setup terminals open as temporary
+floating panes over the current arrangement. They do not detach existing panes,
+change the expanded Workspace, or enter the saved arrangement. Closing a failed
+or cancelled setup leaves the underlying panes available.
+
 The lower sidebar has Agents, Git, and Remotes tabs. Remotes contains the scrollable
 machine cards with selected-machine details and create/update/sign-in controls.
 The general connect action sits above the cards, outside any machine's controls;
@@ -280,8 +285,9 @@ use the registered owner's existing guarded APIs. Cached directories are not
 invented from local paths. Remote creation resolves the owner's starting directory
 and creates the owner-local Workspace and first pending Shell with fresh exact IDs;
 ambiguous mutation failures are surfaced without automatic replay.
-The initial connect flow attempts to create this Workspace after successful
-registration. An owner-confirmed `already_exists` result leaves the connection
+The initial connect flow reads the verified owner's live Workspace snapshot after
+registration and offers a starter only when the owner has no Workspaces. Reconnecting
+with a different connection alias does not create an additional Workspace. An owner-confirmed `already_exists` result leaves the connection
 successful and directs the user to existing Workspaces in the sidebar, without
 selecting or modifying one by name. Other failures remain errors and are not
 replayed. When creation succeeds, Desktop opens its exact Shell after the user
