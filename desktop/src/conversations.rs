@@ -158,10 +158,8 @@ impl Workspace {
                                 window.focus(&this.focus_handle, cx);
                             } else {
                                 this.fullscreen = None;
-                                let id = this.next_id;
-                                this.next_id += 1;
-                                this.terminals.insert(id, TerminalPane::default());
-                                this.floating.push(centered_floating_pane(id, this.panel_size(window), this.pane_gap));
+                                this.layout_animation = None;
+                                let id = this.insert_pane();
                                 this.focused = id;
                                 this.minimized_shells.remove(&shell.id);
                                 this.navigation_region = NavigationRegion::Terminal;

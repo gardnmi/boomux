@@ -26,7 +26,7 @@ operation; remote conversations are never launched on the coordinator.
 Desktop performs discovery and requests off the UI thread only while the tab is
 open. The existing overview worker drives a single refresh, at most once every
 three seconds, for the selected Workspace. Entries are rendered in pages of 50.
-Opening focuses an existing pane or adds a floating pane in the selected Workspace.
+Opening focuses an existing pane or adds a tiled pane in the selected Workspace.
 The owner-scoped `ListWorkspaceConversations` host service enriches recorded
 entries using bounded, cached harness title readers. Only exact harness and
 external-session identities are matched; catalog-only records are discarded.

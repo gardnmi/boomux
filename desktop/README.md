@@ -56,7 +56,7 @@ Select a Workspace and click the **Workspace conversations** button beside Setti
 in the sidebar header to open the right-side panel. Conversations observed by
 Boomux integrations appear together across supported harnesses. Click
 **Open** to focus a running conversation or **Resume** to open its original
-harness in a floating terminal pane. Remote conversations stay on their owner;
+harness in a tiled terminal pane. Remote conversations stay on their owner;
 connect unavailable machines from Remotes first. Resume requires protocol 55 on
 the local daemon and remote owner. Harness history and the saved directory must
 still be available to the harness.
