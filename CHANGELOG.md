@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.19.2](https://github.com/gardnmi/boomux/compare/v1.19.1...v1.19.2) (2026-09-12)
+
+
+### Bug Fixes
+
+* **remote:** preserve workspace state across connection setup ([#423](https://github.com/gardnmi/boomux/issues/423)) ([6468da8](https://github.com/gardnmi/boomux/commit/6468da819dd51e9d2d776b03325c7b65db47c4dc))
+
 ## [1.19.1](https://github.com/gardnmi/boomux/compare/v1.19.0...v1.19.1) (2026-09-12)
 
 
