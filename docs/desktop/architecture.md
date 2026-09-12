@@ -600,6 +600,8 @@ dialogs. Open and Resume are explicit row actions; unavailable resume is not inv
 using existing theme accents. Buttons retain their semantic colors and handlers.
 Hover transitions reverse from their current position, respect Desktop Instant
 motion and system reduced motion, and request frames only while transitioning.
+The persisted `button_hover_animations` preference defaults to enabled; disabling
+it makes hover feedback immediate without changing pane transition speed.
 State is owned by the visible element and reclaimed when it disappears. Switches
 and text fields keep their distinct input shapes; disabled controls do not animate.
 The Agents/Git/Remotes tabs divide their row equally, with selected backgrounds and

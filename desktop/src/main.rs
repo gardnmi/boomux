@@ -1632,6 +1632,7 @@ struct Workspace {
     pane_gap: f32,
     focus_highlight_strength: u8,
     motion_speed: MotionSpeed,
+    button_hover_animations: bool,
     layout_overlay_visible: bool,
     copy_on_select: bool,
     workspace_pane_mode: WorkspacePaneMode,
@@ -1862,6 +1863,7 @@ impl Workspace {
             pane_gap: saved.pane_gap,
             focus_highlight_strength: saved.focus_highlight_strength,
             motion_speed: saved.motion_speed,
+            button_hover_animations: saved.button_hover_animations,
             layout_overlay_visible: saved.layout_overlay_visible,
             copy_on_select: saved.copy_on_select,
             workspace_pane_mode: saved.workspace_pane_mode,
@@ -1983,6 +1985,7 @@ impl Workspace {
                 pane_gap: self.pane_gap,
                 focus_highlight_strength: self.focus_highlight_strength,
                 motion_speed: self.motion_speed,
+                button_hover_animations: self.button_hover_animations,
                 layout_overlay_visible: self.layout_overlay_visible,
                 copy_on_select: self.copy_on_select,
                 workspace_pane_mode: self.workspace_pane_mode,
@@ -9058,6 +9061,21 @@ impl Workspace {
                         cx.notify();
                     })),
                 ))
+                .child(Self::settings_toggle_row(
+                    "Button hover animations",
+                    "Animate button highlights on hover. Turn off for instant feedback.",
+                    Self::settings_switch(
+                        "button-hover-animations",
+                        "Button hover animations",
+                        self.button_hover_animations,
+                        true,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.button_hover_animations = !this.button_hover_animations;
+                        this.save_settings();
+                        cx.notify();
+                    })),
+                ))
                 .child(
                     Self::settings_field("Motion", "Speed of pane transitions.").child(
                         div()
@@ -10531,7 +10549,11 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        cx.set_global(buttons::Motion(self.motion_speed.duration()));
+        cx.set_global(buttons::Motion(
+            self.motion_speed
+                .duration()
+                .filter(|_| self.button_hover_animations),
+        ));
         self.sidebar_viewport_width = f32::from(window.viewport_size().width);
         self.layout_canvas = self.panel_size(window);
         let workspace_name = self
