@@ -1660,6 +1660,7 @@ struct Workspace {
 
 #[derive(Default)]
 struct TerminalPane {
+    temporary_setup: bool,
     shell: Option<ShellChoice>,
     restored: Option<layout_state::Pane>,
     restore_attempt: Option<String>,
@@ -3598,7 +3599,9 @@ impl Workspace {
     }
 
     fn focus_after_removal(&mut self) {
-        if let Some(pane) = self.floating.last() {
+        if let Some(id) = self.fullscreen.filter(|id| self.terminals.contains_key(id)) {
+            self.focused = id;
+        } else if let Some(pane) = self.floating.last() {
             self.focused = pane.id;
         } else if let Some(layout) = &self.layout {
             self.focused = layout.pane_ids()[0];
@@ -3913,7 +3916,12 @@ impl Workspace {
             return;
         }
         // Keep the dragged pane focused even while it crosses other panes.
-        if self.fullscreen.is_some_and(|expanded| expanded != id) {
+        if self.fullscreen.is_some_and(|expanded| expanded != id)
+            && !self
+                .terminals
+                .get(&id)
+                .is_some_and(|pane| pane.temporary_setup)
+        {
             return;
         }
         if !self
@@ -5505,12 +5513,35 @@ impl Workspace {
     ) {
         self.sidebar_menu = None;
         self.navigation_region = NavigationRegion::Terminal;
-        self.fullscreen = None;
-        self.layout_animation = None;
-        if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
-            self.detach_all_panes(window);
+        let temporary_setup = launch.temporary_setup();
+        if !temporary_setup {
+            self.fullscreen = None;
+            self.layout_animation = None;
         }
-        let pane_id = self.insert_pane();
+        let pane_id = if temporary_setup {
+            // A setup terminal is an overlay, not navigation to another Workspace.
+            self.capture_arrangement();
+            let id = self.next_id;
+            self.next_id += 1;
+            self.terminals.insert(
+                id,
+                TerminalPane {
+                    temporary_setup: true,
+                    ..TerminalPane::default()
+                },
+            );
+            self.floating.push(centered_floating_pane(
+                id,
+                self.panel_size(window),
+                self.pane_gap,
+            ));
+            id
+        } else {
+            if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
+                self.detach_all_panes(window);
+            }
+            self.insert_pane()
+        };
         self.focused = pane_id;
         let size = self.terminal_grid_size(pane_id, window);
         if let Some(pane) = self.terminals.get_mut(&pane_id) {
@@ -5573,11 +5604,13 @@ impl Workspace {
                         pane.screen = Some(session.screen());
                         pane.shell = Some(shell);
                         pane.session = Some(session);
-                        reveal_opened_workspace(
-                            this.workspace_pane_mode,
-                            &mut this.expanded_workspaces,
-                            &workspace_id,
-                        );
+                        if !temporary_setup {
+                            reveal_opened_workspace(
+                                this.workspace_pane_mode,
+                                &mut this.expanded_workspaces,
+                                &workspace_id,
+                            );
+                        }
                         if !this.workspace_order.contains(&workspace_id) {
                             this.workspace_order.push(workspace_id.clone());
                         }
@@ -10388,10 +10421,21 @@ impl Render for Workspace {
                 .as_ref()
                 .is_some_and(|layout| layout.contains(id))
             {
-                // A maximized tiled pane covers the floating layer as well.
-                floating_panes.clear();
+                // Setup overlays remain usable without unmaximizing the current pane.
+                floating_panes.retain(|pane| {
+                    self.terminals
+                        .get(&pane.id)
+                        .is_some_and(|terminal| terminal.temporary_setup)
+                });
             } else {
-                floating_panes.sort_by_key(|pane| pane.id == id);
+                floating_panes.sort_by_key(|pane| {
+                    (
+                        self.terminals
+                            .get(&pane.id)
+                            .is_some_and(|terminal| terminal.temporary_setup),
+                        pane.id == id,
+                    )
+                });
             }
         }
         let floating = floating_panes
