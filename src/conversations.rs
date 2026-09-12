@@ -120,6 +120,11 @@ pub fn list(workspace: &WorkspaceSnapshot) -> Vec<Conversation> {
     entries
 }
 
+/// Resolve only registered aliases; unknown harness keys remain distinct.
+pub(crate) fn canonical_integration(key: &str) -> &str {
+    crate::integrations::by_key(key).map_or(key, |descriptor| descriptor.key)
+}
+
 /// Enrich recorded entries from an owner-scoped catalog by exact harness and external identity.
 /// Catalog-only history never creates a Workspace conversation.
 pub(crate) fn enrich_titles(
@@ -130,7 +135,10 @@ pub(crate) fn enrich_titles(
         .iter()
         .map(|session| {
             (
-                (session.integration.as_str(), session.root_id.as_str()),
+                (
+                    canonical_integration(&session.integration),
+                    session.root_id.as_str(),
+                ),
                 (session.title.trim(), session.updated_at_ms),
             )
         })
@@ -138,7 +146,7 @@ pub(crate) fn enrich_titles(
         .collect();
     for entry in entries.iter_mut() {
         if let Some((title, updated_at_ms)) = titles.get(&(
-            entry.integration.as_str(),
+            canonical_integration(&entry.integration),
             entry.external_session_id.as_str(),
         )) {
             entry.title = (*title).to_owned();
@@ -326,6 +334,30 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "Renamed thread");
     }
+    #[test]
+    fn kiro_legacy_lifecycle_key_matches_v3_catalog_only() {
+        assert_eq!(canonical_integration("kiro"), "kiro-v3");
+        assert_eq!(canonical_integration("kiro-v2"), "kiro-v2");
+        assert_eq!(canonical_integration("unknown"), "unknown");
+        let mut entries = list(&workspace());
+        entries[0].integration = "kiro".into();
+        let mut title = crate::host_session_titles::HostSession {
+            integration: "kiro-v3".into(),
+            root_id: entries[0].external_session_id.clone(),
+            title: "Saved Kiro title".into(),
+            directory: "/tmp".into(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        enrich_titles(&mut entries, &[title.clone()]);
+        assert_eq!(entries[0].title, "Saved Kiro title");
+        assert_eq!(entries[0].integration, "kiro");
+        title.integration = "kiro-v2".into();
+        title.title = "Wrong engine".into();
+        enrich_titles(&mut entries, &[title]);
+        assert_eq!(entries[0].title, "Saved Kiro title");
+    }
+
     #[test]
     fn conversation_recency_includes_harness_activity_without_importing_entries() {
         let mut entries = list(&workspace());
