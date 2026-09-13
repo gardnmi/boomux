@@ -16384,6 +16384,7 @@ impl ShellRuntimeManager {
                 let mut pause_cancellation: Option<Arc<AtomicBool>> = None;
                 let mut pending_output_revision = None;
                 let mut output_publication_deadline = None;
+                let mut pty_closed = false;
                 loop {
                     wake.clear();
                     if paused {
@@ -16467,8 +16468,18 @@ impl ShellRuntimeManager {
                         }
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
-                    match reader.read(&mut buffer) {
-                        Ok(0) => break,
+                    // EOF can precede waitpid readiness. Stop polling the closed
+                    // PTY, but retain the command/process wakeups until exit is known.
+                    let read_result = if pty_closed {
+                        Err(io::Error::from(io::ErrorKind::WouldBlock))
+                    } else {
+                        reader.read(&mut buffer)
+                    };
+                    match read_result {
+                        Ok(0) => {
+                            pty_closed = true;
+                            continue;
+                        }
                         Ok(count) => {
                             let bytes = &buffer[..count];
                             let Some(active_registry) = registry.upgrade() else {
@@ -16563,7 +16574,14 @@ impl ShellRuntimeManager {
                                     .is_none()
                                     .then(|| Instant::now() + Duration::from_millis(100))
                             });
-                            wake.wait(Some(&reader), process_wake.as_ref(), deadline)?;
+                            wake.wait(
+                                (!pty_closed).then_some(&reader),
+                                process_wake.as_ref(),
+                                deadline,
+                            )?;
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                            pty_closed = true;
                         }
                         Err(_) => break,
                     }
