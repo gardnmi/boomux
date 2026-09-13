@@ -201,7 +201,13 @@ refresh the cached System palette without applying it. Returning to System uses
 that cache immediately. A failed reload retains the last valid palette. The
 picker keeps its candidate separate from the applied preference, so preview and
 Cancel never reconfigure terminals. Apply uses the same bounded terminal update
-path as a System theme change.
+path as a System theme change. The carousel renders only three synthetic previews
+and wraps through System and the bundled catalog. Applying a palette uses one
+bounded, two-phase transition: clipped copies of the existing visible pane views
+slide apart, the palette commits at the midpoint, and the halves return. These
+views share existing terminal paint caches; there is no screenshot capture,
+extra PTY attachment, or layout/terminal resize mutation. The temporary reveal
+state is cleared at completion; Instant motion skips it entirely.
 
 ## Rendering
 

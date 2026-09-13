@@ -101,6 +101,22 @@ fn resolve_selection(id: &str, system: Option<AppTheme>, light: bool) -> AppThem
     )
 }
 
+pub(super) struct Reveal {
+    generation: u64,
+    duration: Duration,
+    closing: bool,
+    target: AppTheme,
+}
+
+fn carousel_index(index: usize, delta: isize) -> usize {
+    (index as isize + delta).rem_euclid((presets().len() + 1) as isize) as usize
+}
+
+fn split_half_left(right: bool, closing: bool, progress: f32) -> f32 {
+    let distance = if closing { 1.0 - progress } else { progress } * 0.5;
+    if right { 0.5 + distance } else { -distance }
+}
+
 impl Workspace {
     pub(super) fn selected_theme_label(&self) -> String {
         if self.color_theme == "system" {
@@ -149,15 +165,136 @@ impl Workspace {
         cx.notify();
     }
 
+    fn commit_theme(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.color_theme = if index == 0 {
+            "system".into()
+        } else {
+            presets()[index - 1].id.clone()
+        };
+        self.apply_selected_theme(cx);
+        self.save_settings();
+    }
+
     fn apply_theme_candidate(&mut self, cx: &mut Context<Self>) {
-        if let Some(index) = self.theme_candidate.take() {
-            self.color_theme = if index == 0 {
-                "system".into()
-            } else {
-                presets()[index - 1].id.clone()
-            };
-            self.apply_selected_theme(cx);
-            self.save_settings();
+        let Some(index) = self.theme_candidate.take() else {
+            return;
+        };
+        self.close_settings(cx);
+        let target = self.candidate_theme(index);
+        let Some(duration) = self
+            .motion_speed
+            .duration()
+            .filter(|_| target != self.theme)
+        else {
+            self.commit_theme(index, cx);
+            return;
+        };
+        self.theme_carousel_generation = self.theme_carousel_generation.wrapping_add(1);
+        let generation = self.theme_carousel_generation;
+        self.theme_reveal = Some(Reveal {
+            generation,
+            duration: duration / 2,
+            closing: false,
+            target,
+        });
+        cx.notify();
+        // One bounded transition per window, with no polling or terminal snapshots.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(duration / 2).await;
+            let applied = this
+                .update(cx, |this, cx| {
+                    if !this
+                        .theme_reveal
+                        .as_ref()
+                        .is_some_and(|r| r.generation == generation)
+                    {
+                        return false;
+                    }
+                    this.commit_theme(index, cx);
+                    this.theme_reveal.as_mut().unwrap().closing = true;
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !applied {
+                return;
+            }
+            cx.background_executor().timer(duration / 2).await;
+            this.update(cx, |this, cx| {
+                if this
+                    .theme_reveal
+                    .as_ref()
+                    .is_some_and(|r| r.generation == generation)
+                {
+                    this.theme_reveal = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn theme_split_pane(&self, id: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(reveal) = &self.theme_reveal else {
+            return self
+                .pane_with_heading(id, self.pane_headings_visible, cx)
+                .into_any_element();
+        };
+        let halves = [false, true].map(|right| {
+            let closing = reveal.closing;
+            let content = self.pane_with_heading(id, self.pane_headings_visible, cx);
+            div()
+                .id((if right { "theme-right" } else { "theme-left" }, id))
+                .absolute()
+                .top_0()
+                .h_full()
+                .w(relative(0.5))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .h_full()
+                        .w(relative(2.0))
+                        .left(relative(if right { -1.0 } else { 0.0 }))
+                        .child(content),
+                )
+                .with_animation(
+                    SharedString::from(format!(
+                        "theme-split-{}-{id}-{right}-{closing}",
+                        reveal.generation
+                    )),
+                    Animation::new(reveal.duration).with_easing(ease_out_quint()),
+                    move |element, progress| {
+                        element.left(relative(split_half_left(right, closing, progress)))
+                    },
+                )
+                .into_any_element()
+        });
+        div()
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .bg(gpui::rgb(reveal.target.terminal.background))
+            .children(halves)
+            // Animated copies are visual only; do not expose duplicate pane controls.
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+            )
+            .into_any_element()
+    }
+
+    fn step_theme(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(index) = self.theme_candidate {
+            self.theme_candidate = Some(carousel_index(index, delta));
+            self.theme_carousel_direction = delta.signum() as f32;
+            self.theme_carousel_generation = self.theme_carousel_generation.wrapping_add(1);
+            cx.notify();
         }
     }
 
@@ -167,20 +304,250 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.theme_candidate else {
+        if self.theme_candidate.is_none() {
             return;
-        };
+        }
         match event.keystroke.key.as_str() {
             "escape" => self.theme_candidate = None,
             "enter" => self.apply_theme_candidate(cx),
-            "up" | "left" => self.theme_candidate = Some(index.saturating_sub(1)),
-            "down" | "right" => self.theme_candidate = Some((index + 1).min(presets().len())),
+            "up" | "left" => self.step_theme(-1, cx),
+            "down" | "right" => self.step_theme(1, cx),
             "home" => self.theme_candidate = Some(0),
             "end" => self.theme_candidate = Some(presets().len()),
             _ => {}
         }
         self.theme_scroll_anchor.scroll_to(window, cx);
         cx.notify();
+    }
+
+    fn theme_card(&self, index: usize) -> Div {
+        let palette = self.candidate_theme(index);
+        let name = if index == 0 {
+            "System"
+        } else {
+            &presets()[index - 1].name
+        };
+        div()
+            .size_full()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .bg(gpui::rgb(palette.canvas))
+            .text_color(gpui::rgb(palette.text))
+            .child(
+                div()
+                    .flex_none()
+                    .p_3()
+                    .bg(gpui::rgb(palette.panel))
+                    .border_b_1()
+                    .border_color(gpui::rgb(palette.border))
+                    .child(format!("▣  Boomux  ·  {name}")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(
+                        div()
+                            .w(relative(0.28))
+                            .flex_none()
+                            .p_3()
+                            .bg(gpui::rgb(palette.panel))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(gpui::rgb(palette.text_muted))
+                                    .child("WORKSPACES"),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .p_2()
+                                    .bg(gpui::rgb(palette.selection))
+                                    .child("Project"),
+                            )
+                            .child(div().mt_2().text_sm().child("●  Shell")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .p_3()
+                            .bg(gpui::rgb(palette.terminal.background))
+                            .text_color(gpui::rgb(palette.terminal.foreground))
+                            .text_sm()
+                            .child(
+                                div()
+                                    .text_color(gpui::rgb(palette.accent))
+                                    .child("●  Terminal"),
+                            )
+                            .child(div().mt_4().child("$ git status"))
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .text_color(gpui::rgb(palette.success))
+                                    .child("Working tree clean"),
+                            )
+                            .child(div().mt_3().child("$ boomux"))
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .text_color(gpui::rgb(palette.warning))
+                                    .child("Waiting for input ▌"),
+                            ),
+                    ),
+            )
+            .child(
+                div().flex_none().p_2().flex().gap_1().children(
+                    palette.terminal.ansi[..8]
+                        .iter()
+                        .map(|color| div().h(px(5.0)).flex_1().bg(gpui::rgb(*color))),
+                ),
+            )
+    }
+
+    fn theme_carousel_preview(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = self.theme_candidate.unwrap_or_default();
+        // Paint the center last. Only three synthetic cards exist, regardless of catalog size.
+        let cards = [-1_isize, 1, 0].map(|offset| {
+            let index = carousel_index(selected, offset);
+            let center = offset == 0;
+            let palette = self.candidate_theme(index);
+            let name = if index == 0 {
+                "System"
+            } else {
+                &presets()[index - 1].name
+            };
+            div()
+                .id(SharedString::from(format!("theme-card-{offset}")))
+                .absolute()
+                .left(relative(match offset {
+                    -1 => 0.0,
+                    1 => 0.46,
+                    _ => 0.23,
+                }))
+                .top(relative(if center { 0.02 } else { 0.14 }))
+                .w(relative(0.54))
+                .h(relative(if center { 0.96 } else { 0.72 }))
+                .occlude()
+                .overflow_hidden()
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(gpui::rgb(palette.accent))
+                .shadow_lg()
+                .opacity(if center { 1.0 } else { 0.48 })
+                .hover(|card| card.opacity(1.0))
+                .cursor_pointer()
+                .role(gpui::Role::Button)
+                .aria_label(format!(
+                    "{} {name}",
+                    if center { "Apply" } else { "Preview" }
+                ))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if center {
+                        this.apply_theme_candidate(cx);
+                    } else {
+                        this.step_theme(offset, cx);
+                    }
+                }))
+                .child(self.theme_card(index))
+        });
+        let deck = div().relative().size_full().children(cards);
+        let deck = if let Some(duration) = self.motion_speed.duration() {
+            let direction = self.theme_carousel_direction;
+            deck.with_animation(
+                SharedString::from(format!("theme-carousel-{}", self.theme_carousel_generation)),
+                Animation::new(duration).with_easing(ease_out_quint()),
+                move |element, progress| {
+                    element
+                        .left(px(direction * 55.0 * (1.0 - progress)))
+                        .opacity(0.45 + 0.55 * progress)
+                },
+            )
+            .into_any_element()
+        } else {
+            deck.into_any_element()
+        };
+        let name = if selected == 0 {
+            "System"
+        } else {
+            &presets()[selected - 1].name
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Self::settings_control("theme-previous", "‹", false, true)
+                            .button_chrome()
+                            .on_click(cx.listener(|this, _, _, cx| this.step_theme(-1, cx))),
+                    )
+                    .child(
+                        div()
+                            .id("theme-carousel")
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &ScrollWheelEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    let delta = event.delta.pixel_delta(px(24.0));
+                                    let delta = if delta.y.abs() > delta.x.abs() {
+                                        f32::from(delta.y)
+                                    } else {
+                                        f32::from(delta.x)
+                                    };
+                                    if delta.abs() < 1.0
+                                        || this.theme_wheel_at.is_some_and(|time| {
+                                            time.elapsed() < Duration::from_millis(140)
+                                        })
+                                    {
+                                        return;
+                                    }
+                                    this.theme_wheel_at = Some(Instant::now());
+                                    this.step_theme(if delta < 0.0 { 1 } else { -1 }, cx);
+                                },
+                            ))
+                            .child(deck),
+                    )
+                    .child(
+                        Self::settings_control("theme-next", "›", false, true)
+                            .button_chrome()
+                            .on_click(cx.listener(|this, _, _, cx| this.step_theme(1, cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_center()
+                    .child(div().text_xs().text_color(rgb(0x7f849c)).child(format!(
+                        "{:02} / {}",
+                        selected + 1,
+                        presets().len() + 1
+                    )))
+                    .child(div().mt_2().text_2xl().child(name.to_owned()))
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_sm()
+                            .text_color(rgb(0x7f849c))
+                            .child("Preview a palette · Click the center card to apply"),
+                    ),
+            )
+            .into_any_element()
     }
 
     pub(super) fn theme_picker_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -333,9 +700,9 @@ impl Workspace {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     div()
-                        .w(px(680.0))
+                        .w(px(if self.theme_carousel { 1040.0 } else { 680.0 }))
                         .max_w_full()
-                        .h(px(490.0))
+                        .h(px(if self.theme_carousel { 580.0 } else { 490.0 }))
                         .max_h_full()
                         .m_3()
                         .p_4()
@@ -346,8 +713,36 @@ impl Workspace {
                         .border_1()
                         .border_color(rgb(0x45475a))
                         .rounded(px(3.0))
-                        .child(div().flex_none().text_lg().child("Color theme"))
                         .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().text_lg().child("Color theme"))
+                                .child(
+                                    Self::settings_control(
+                                        "theme-view",
+                                        if self.theme_carousel {
+                                            "List view"
+                                        } else {
+                                            "Carousel"
+                                        },
+                                        false,
+                                        true,
+                                    )
+                                    .button_chrome()
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.theme_carousel = !this.theme_carousel;
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        )
+                        .child(if self.theme_carousel {
+                            self.theme_carousel_preview(cx)
+                        } else {
                             div()
                                 .flex_1()
                                 .min_h_0()
@@ -362,14 +757,15 @@ impl Workspace {
                                         .track_scroll(&self.theme_scroll_handle)
                                         .children(rows),
                                 )
-                                .child(sample),
-                        )
+                                .child(sample)
+                                .into_any_element()
+                        })
                         .child(
                             div()
                                 .flex_none()
                                 .text_xs()
                                 .text_color(rgb(0x7f849c))
-                                .child("↑ ↓ Preview · Enter Apply · Esc Cancel"),
+                                .child("Scroll or ← → Preview · Enter Apply · Esc Cancel"),
                         )
                         .child(
                             div()
@@ -404,6 +800,29 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn split_halves_open_symmetrically_and_return_to_original_bounds() {
+        for right in [false, true] {
+            let original = if right { 0.5 } else { 0.0 };
+            assert_eq!(split_half_left(right, false, 0.0), original);
+            assert_eq!(split_half_left(right, true, 1.0), original);
+            assert_eq!(
+                split_half_left(right, false, 1.0),
+                split_half_left(right, true, 0.0)
+            );
+        }
+        assert_eq!(split_half_left(false, false, 1.0), -0.5);
+        assert_eq!(split_half_left(true, false, 1.0), 1.0);
+    }
+
+    #[test]
+    fn carousel_wraps_in_both_directions_including_system() {
+        assert_eq!(carousel_index(0, -1), presets().len());
+        assert_eq!(carousel_index(presets().len(), 1), 0);
+        assert_eq!(carousel_index(0, 1), 1);
+        assert_eq!(carousel_index(1, -1), 0);
+    }
+
     #[test]
     fn system_tracks_source_while_presets_remain_fixed() {
         let omarchy = presets()[3].theme;

@@ -334,9 +334,16 @@ not also invoke a harness's mouse-based copy handler.
 ### Themes And Saved Preferences
 
 Choose **Settings → Appearance → Color theme** to preview and apply one of 23
-bundled palettes. Selecting a palette only changes the preview; **Apply** updates
-the interface and terminal palette without restarting your Shells. Use the arrow
-keys to browse, Enter to apply, or Escape to cancel.
+bundled palettes. The default carousel shows overlapping workspace previews:
+scroll, use the arrow buttons/keys, or click a neighboring card to browse. Click
+the center card or **Apply** to select it; Escape cancels. **List view** provides
+the compact palette list.
+
+Selecting a palette only changes the preview. Applying it closes Settings and
+splits the visible panes into halves, changes their colors, then brings them
+back together. Shells keep running and pane sizes and saved layouts stay intact.
+The transition and carousel motion follow the **Motion** preference; **Instant**
+applies colors immediately.
 
 **System** is the default. It follows the active Omarchy theme live when available,
 or the desktop’s light/dark appearance otherwise. A selected preset stays fixed

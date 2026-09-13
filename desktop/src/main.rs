@@ -1643,6 +1643,11 @@ struct Workspace {
     theme: AppTheme,
     color_theme: String,
     theme_candidate: Option<usize>,
+    theme_carousel: bool,
+    theme_carousel_generation: u64,
+    theme_carousel_direction: f32,
+    theme_wheel_at: Option<Instant>,
+    theme_reveal: Option<theme_picker::Reveal>,
     theme_scroll_handle: ScrollHandle,
     theme_scroll_anchor: ScrollAnchor,
     system_theme: Option<AppTheme>,
@@ -1882,6 +1887,11 @@ impl Workspace {
             theme: AppTheme::default(),
             color_theme: saved.color_theme.clone(),
             theme_candidate: None,
+            theme_carousel: true,
+            theme_carousel_generation: 0,
+            theme_carousel_direction: 1.0,
+            theme_wheel_at: None,
+            theme_reveal: None,
             theme_scroll_handle,
             theme_scroll_anchor,
             system_theme: None,
@@ -10089,8 +10099,8 @@ impl Workspace {
         })
     }
 
-    fn pane(&self, id: usize, cx: &mut Context<Self>) -> Stateful<Div> {
-        self.pane_with_heading(id, self.pane_headings_visible, cx)
+    fn pane(&self, id: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.theme_split_pane(id, cx)
     }
 
     fn pane_with_heading(
