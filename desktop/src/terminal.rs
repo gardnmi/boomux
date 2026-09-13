@@ -1478,7 +1478,13 @@ fn attach_shell(
                 shell.run_id.clone(),
                 profile,
             )
-            .map_err(|error| format!("could not attach {}: {error}", shell.name));
+            .map_err(|error| match &error {
+                client::ClientError::Transport(cause) if matches!(cause.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset) => format!(
+                    "Connection to the remote machine ended while opening {}. Check Remotes for connection status and sign in if required, then retry.", shell.name),
+                _ => format!("could not attach {}: {error}", shell.name),
+            });
     }
     let result = match (&shell.status, shell.run_id.as_deref()) {
         (ShellStatus::Running, Some(run_id)) => {
