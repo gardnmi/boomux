@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.20.2](https://github.com/gardnmi/boomux/compare/v1.20.1...v1.20.2) (2026-09-13)
+
+
+### Bug Fixes
+
+* **desktop:** preserve layouts while creating workspaces ([#429](https://github.com/gardnmi/boomux/issues/429)) ([6becfbe](https://github.com/gardnmi/boomux/commit/6becfbe7be4721beabf565ba03cefce9cfefc763))
+* **remote:** expose sign-in recovery and usable connection details ([#432](https://github.com/gardnmi/boomux/issues/432)) ([a1b4818](https://github.com/gardnmi/boomux/commit/a1b48189d7e3a48402f8ee3386049ed343d775e8))
+
 ## [1.20.1](https://github.com/gardnmi/boomux/compare/v1.20.0...v1.20.1) (2026-09-12)
 
 
