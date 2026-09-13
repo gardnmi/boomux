@@ -14,6 +14,7 @@ SCENARIOS = [
     "explicit_executable_handoff_preserves_live_runs_and_rolls_back_on_failure",
     "attachment_client_reconnects_across_daemon_restart",
     "graceful_restart_preserves_exited_run_and_terminal_state",
+    "closing_pty_before_process_exit_preserves_final_exit_code",
     "native_daemon_recovers_reproducible_metadata_after_restart",
     "graceful_restart_preserves_opencode_shared_runtime_and_stop_cleans_it_up",
     "graceful_restart_transfers_live_kiro_holder_authority_and_rolls_back_safely",

@@ -1723,6 +1723,9 @@ commands and pause cancellation, and a pidfd for process exit. Only pending
 output publication supplies a timer; if pidfd acquisition is unavailable, a
 100-millisecond process-check fallback applies. The eventfd and pidfd are
 runtime-local, close on reader teardown, and are recreated after handoff.
+PTY EOF or EIO can precede process exit; the reader then waits on process/control
+wakeups without polling the closed PTY, and records the final exit status only
+after the managed process has exited.
 
 The dashboard Git cache uses one worker, at most 64 outstanding inspections,
 bounded request/result queues, and 256 entries evicted by least recent access.
