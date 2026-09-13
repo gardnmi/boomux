@@ -6666,6 +6666,8 @@ impl Workspace {
                 let id = node.id.clone();
                 div()
                     .id(SharedString::from(format!("node-row-{}", node.id)))
+                    // Keep expanded actions in the parent's scrollable content.
+                    .flex_none()
                     .px_2()
                     .py_2()
                     .rounded_md()
