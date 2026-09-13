@@ -15,13 +15,7 @@ pub(crate) fn send_descriptor(
     let descriptors = [descriptor.as_raw_fd()];
     let control = [ControlMessage::ScmRights(&descriptors)];
     loop {
-        match sendmsg::<()>(
-            stream.as_raw_fd(),
-            &data,
-            &control,
-            MsgFlags::MSG_NOSIGNAL,
-            None,
-        ) {
+        match sendmsg::<()>(stream.as_raw_fd(), &data, &control, send_flags(), None) {
             Ok(1) => return Ok(()),
             Ok(count) => {
                 return Err(io::Error::new(
@@ -38,13 +32,20 @@ pub(crate) fn send_descriptor(
 pub(crate) fn receive_descriptor(stream: &UnixStream, expected_marker: u8) -> io::Result<OwnedFd> {
     let mut marker = [0_u8];
     let mut data = [IoSliceMut::new(&mut marker)];
+    #[cfg(target_os = "linux")]
     let mut control = nix::cmsg_space!([RawFd; 1]);
+    // Darwin externalizes every descriptor before truncating the control bytes,
+    // retaining the original cmsg_len. Reserve the kernel's complete 512-FD
+    // limit so malformed multi-FD sends can be closed without reading past the
+    // control buffer (or leaking descriptors omitted by truncation).
+    #[cfg(target_os = "macos")]
+    let mut control = nix::cmsg_space!([RawFd; 512]);
     let (bytes, flags, descriptors) = loop {
         match recvmsg::<()>(
             stream.as_raw_fd(),
             &mut data,
             Some(&mut control),
-            MsgFlags::MSG_CMSG_CLOEXEC,
+            receive_flags(),
         ) {
             Ok(message) => {
                 let mut descriptors = Vec::new();
@@ -71,6 +72,12 @@ pub(crate) fn receive_descriptor(stream: &UnixStream, expected_marker: u8) -> io
         }
     };
 
+    #[cfg(target_os = "macos")]
+    for fd in &descriptors {
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     if bytes == 0 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -97,13 +104,34 @@ fn errno(error: Errno) -> io::Error {
     io::Error::from_raw_os_error(error as i32)
 }
 
+fn send_flags() -> MsgFlags {
+    #[cfg(target_os = "linux")]
+    {
+        MsgFlags::MSG_NOSIGNAL
+    }
+    #[cfg(target_os = "macos")]
+    {
+        MsgFlags::empty()
+    }
+}
+fn receive_flags() -> MsgFlags {
+    #[cfg(target_os = "linux")]
+    {
+        MsgFlags::MSG_CMSG_CLOEXEC
+    }
+    #[cfg(target_os = "macos")]
+    {
+        MsgFlags::empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
 
     use super::*;
-    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+    use nix::sys::socket::{ControlMessage, sendmsg};
 
     const MARKER: u8 = 0x42;
 
@@ -156,14 +184,7 @@ mod tests {
         let data = [IoSlice::new(&marker)];
         let descriptors = [first.as_raw_fd(), second.as_raw_fd()];
         let control = [ControlMessage::ScmRights(&descriptors)];
-        sendmsg::<()>(
-            sender.as_raw_fd(),
-            &data,
-            &control,
-            MsgFlags::MSG_NOSIGNAL,
-            None,
-        )
-        .unwrap();
+        sendmsg::<()>(sender.as_raw_fd(), &data, &control, send_flags(), None).unwrap();
 
         let error = receive_descriptor(&receiver, MARKER).unwrap_err();
 

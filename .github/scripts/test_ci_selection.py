@@ -129,7 +129,7 @@ class SelectionTests(unittest.TestCase):
                 self.git("reset", "--hard", self.base)
 
     def test_embedded_and_packaged_markdown_cannot_skip(self):
-        for path in ["README.md", "THIRD_PARTY_NOTICES.md", ".agents/skills/boomux/SKILL.md"]:
+        for path in ["README.md", "THIRD_PARTY_NOTICES.md", ".agents/skills/boomux/SKILL.md", "docs/platforms/macos-testing.md"]:
             with self.subTest(path=path):
                 self.write(path, "updated")
                 result = self.classify()
@@ -234,6 +234,7 @@ class SelectionTests(unittest.TestCase):
                     ["Run Clippy", "Run Rust unit tests", "Run configuration CLI tests", "Run native backend tests"]
                 ]}]}
                 for name, steps in {
+                    "macos / Native macOS": ["Run native Clippy", "Test descriptor transfer", "Test native process identity", "Test native lifecycle and recovery", "Test native Desktop"],
                     "Desktop Rust": ["Run Desktop Clippy", "Run Desktop tests"],
                     "Integrations": ["Verify embedded web terminal assets", "Run integration tests"],
                     "Dependency policy": ["Audit advisories, licenses, and dependency sources"],
@@ -288,8 +289,17 @@ class SelectionTests(unittest.TestCase):
     def test_desktop_run_inherits_unchanged_backend_components(self):
         self.write("desktop/src/main.rs", "new Desktop")
         desktop = self.commit()
-        result, _ = self.evidence(desktop, [(desktop, {"desktop"}), (self.base, set(selection.COMPONENT_STEPS))])
+        result, _ = self.evidence(desktop, [(desktop, {"desktop", "macos"}), (self.base, set(selection.COMPONENT_STEPS))])
         self.assertTrue(result)
+
+    def test_desktop_changes_cannot_reuse_old_macos_validation(self):
+        self.write("desktop/src/main.rs", "new Desktop")
+        desktop = self.commit()
+        self.assertFalse(self.evidence(desktop, [(desktop, {"desktop"}),
+                                                (self.base, set(selection.COMPONENT_STEPS))])[0])
+
+    def test_pre_port_ci_cannot_justify_release_reuse(self):
+        self.assertFalse(self.evidence(self.base, [(self.base, set(selection.COMPONENT_STEPS) - {"macos"})])[0])
 
     def test_docs_runs_can_inherit_actual_ancestor_checks(self):
         self.write("docs/ci.md", "new guidance")
@@ -301,7 +311,7 @@ class SelectionTests(unittest.TestCase):
         self.write("desktop/src/main.rs", "new Desktop")
         self.write("docs/ci.md", "guidance")
         head = self.commit()
-        self.assertTrue(self.evidence(head, [(head, {"desktop"}), (self.base, set(selection.COMPONENT_STEPS))])[0])
+        self.assertTrue(self.evidence(head, [(head, {"desktop", "macos"}), (self.base, set(selection.COMPONENT_STEPS))])[0])
 
     def test_shared_changes_and_missing_components_cannot_inherit(self):
         self.write("src/lib.rs", "backend change")

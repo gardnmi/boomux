@@ -1,13 +1,22 @@
 mod boomux_settings;
+mod buttons;
+use buttons::ButtonChrome;
 mod bundle_update;
+mod conversations;
+mod project_search;
 use boomux::generated_names;
 mod git_panel;
+mod input_routing;
 mod layout;
 mod layout_badge;
+mod layout_persistence;
+mod layout_state;
 mod nodes;
 mod remote;
+mod remote_visibility;
 mod runtime;
 mod settings;
+mod subprocess;
 mod terminal;
 mod theme;
 mod updates;
@@ -25,6 +34,7 @@ use gpui::{
     UnderlineStyle, Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint,
     fill, font, point, prelude::*, px, relative, rgb_to_hsla, rgba, size,
 };
+use input_routing::{InputOverlays, InputTarget};
 use layout::{Axis, Direction, Node, Rect};
 use terminal::{
     AgentChoice, BoomuxOverview, ShellChoice, TerminalImagePlacement, TerminalScreen,
@@ -39,6 +49,9 @@ const TERMINAL_CELL_WIDTH: f32 = 8.4;
 const TERMINAL_CELL_HEIGHT: f32 = 17.0;
 const TERMINAL_PADDING: f32 = 16.0;
 const SIDEBAR_WIDTH: f32 = 300.0;
+// Fits header padding, the logo, four controls, their gaps, and the border.
+const SIDEBAR_MIN_WIDTH: f32 = 200.0;
+const SIDEBAR_MAX_WIDTH: f32 = 600.0;
 const DRAWER_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const SCROLLBAR_FADE_IN_DURATION: Duration = Duration::from_millis(180);
 const SCROLLBAR_FADE_OUT_DURATION: Duration = Duration::from_millis(360);
@@ -93,9 +106,21 @@ impl Render for HeaderTooltip {
     }
 }
 
-// Keep the collapsed edge reachable while retaining the normal readable width.
+fn sidebar_brand_text_fits(width: f32, title_width: f32) -> bool {
+    // Header padding, logo, brand gap, action gap, four controls and their gaps.
+    width >= 32.0 + 32.0 + 12.0 + title_width + 8.0 + 4.0 * 28.0 + 3.0 * 4.0 + 1.0
+}
+
+fn workspace_navigation_anchor<'a>(
+    sidebar: Option<&'a str>,
+    expanded: Option<&'a str>,
+    focused: Option<&'a str>,
+) -> Option<&'a str> {
+    sidebar.or(expanded).or(focused)
+}
+
 fn sidebar_drag_target(pointer_x: f32) -> Option<f32> {
-    (pointer_x > 48.0).then(|| pointer_x.clamp(280.0, 600.0))
+    (pointer_x > 48.0).then(|| pointer_x.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH))
 }
 
 fn sidebar_header_button(
@@ -114,7 +139,7 @@ fn sidebar_header_button(
         .flex()
         .items_center()
         .justify_center()
-        .rounded_md()
+        .rounded(px(3.0))
         .border_1()
         .border_color(rgb(if active { 0xcba6f7 } else { 0x45475a }))
         .cursor_pointer()
@@ -219,6 +244,10 @@ enum SidebarItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SidebarResource {
+    Connection {
+        id: String,
+        name: String,
+    },
     Workspace {
         id: String,
         name: String,
@@ -233,12 +262,15 @@ enum SidebarResource {
 impl SidebarResource {
     fn name(&self) -> &str {
         match self {
-            Self::Workspace { name, .. } | Self::Shell { name, .. } => name,
+            Self::Workspace { name, .. }
+            | Self::Shell { name, .. }
+            | Self::Connection { name, .. } => name,
         }
     }
 
     fn kind_label(&self) -> &'static str {
         match self {
+            Self::Connection { .. } => "connection",
             Self::Workspace { .. } => "Workspace",
             Self::Shell { .. } => "Shell",
         }
@@ -348,17 +380,29 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Enter",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Enter"
+        } else {
+            "Ctrl + Enter"
+        },
         description: "Create a Shell in the focused terminal's Workspace",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + W",
+        keys: if cfg!(target_os = "macos") {
+            "Command + W"
+        } else {
+            "Ctrl + W"
+        },
         description: "Minimize and detach; preserve its Boomux Shell",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Shift + W",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Shift + W"
+        } else {
+            "Ctrl + Shift + W"
+        },
         description: "Permanently remove the selected Shell",
     },
     ShortcutSpec {
@@ -423,7 +467,11 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Terminal,
-        keys: "Ctrl + Shift + C / V",
+        keys: if cfg!(target_os = "macos") {
+            "Command + C / V"
+        } else {
+            "Ctrl + Shift + C / V"
+        },
         description: "Copy selection or paste clipboard",
     },
     ShortcutSpec {
@@ -473,12 +521,20 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Sidebar,
-        keys: "Ctrl + Enter",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Enter"
+        } else {
+            "Ctrl + Enter"
+        },
         description: "Create a Shell in the selected row's Workspace",
     },
     ShortcutSpec {
         section: ShortcutSection::Sidebar,
-        keys: "Ctrl + Shift + Up / Down",
+        keys: if cfg!(target_os = "macos") {
+            "Command + Shift + Up / Down"
+        } else {
+            "Ctrl + Shift + Up / Down"
+        },
         description: "Move the selected Workspace",
     },
     ShortcutSpec {
@@ -737,8 +793,8 @@ enum PointerOperation {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PaneCornerStyle {
-    #[default]
     Rounded,
+    #[default]
     Square,
     Mixed,
 }
@@ -969,6 +1025,24 @@ impl Render for WorkspaceRowDrag {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SelectionAutoscroll {
+    pane_id: usize,
+    position: gpui::Point<gpui::Pixels>,
+    bounds: Bounds<gpui::Pixels>,
+}
+
+fn selection_scroll_delta(y: f32, top: f32, bottom: f32) -> isize {
+    let distance = if y < top {
+        y - top
+    } else if y >= bottom {
+        y - bottom + 1.0
+    } else {
+        return 0;
+    };
+    (distance.signum() * (1.0 + distance.abs() / TERMINAL_CELL_HEIGHT).min(6.0)) as isize
+}
+
 impl TerminalSelectionDrag {
     fn selection(
         &self,
@@ -991,8 +1065,14 @@ impl TerminalSelectionDrag {
             )
         };
         Some(TerminalSelection {
-            anchor: cell(anchor?),
-            head: cell(position),
+            anchor: {
+                let (row, col) = cell(anchor?);
+                (row + screen.scroll_offset as usize, col)
+            },
+            head: {
+                let (row, col) = cell(position);
+                (row + screen.scroll_offset as usize, col)
+            },
         })
     }
 }
@@ -1325,19 +1405,20 @@ fn selection_indices(selection: TerminalSelection, cols: usize) -> (usize, usize
 fn terminal_selected_text(screen: &TerminalScreen, selection: TerminalSelection) -> String {
     let cols = usize::from(screen.cols);
     let (start, end) = selection_indices(selection, cols);
-    let first_row = start / cols;
-    let last_row = end / cols;
+    let offset = screen.scroll_offset as usize;
+    let first_row = (start / cols).max(offset);
+    let last_row = (end / cols).min(offset + usize::from(screen.rows).saturating_sub(1));
     (first_row..=last_row)
         .map(|row| {
-            let start_col = if row == first_row { start % cols } else { 0 };
-            let end_col = if row == last_row {
+            let start_col = if row == start / cols { start % cols } else { 0 };
+            let end_col = if row == end / cols {
                 end % cols
             } else {
                 cols.saturating_sub(1)
             };
             let mut line = String::new();
             for col in start_col..=end_col {
-                let cell = &screen.cells[row * cols + col];
+                let cell = &screen.cells[(row - offset) * cols + col];
                 if !cell.continuation {
                     line.push_str(&cell.text);
                 }
@@ -1474,12 +1555,25 @@ fn desktop_window_title(workspace_name: Option<&str>) -> String {
 }
 
 struct Workspace {
+    layout_document: layout_state::Document,
+    layout_writer: Option<async_channel::Sender<layout_state::Write>>,
+    layout_save_task: Option<gpui::Task<()>>,
+    layout_error: Option<String>,
+    layout_canvas: (f32, f32),
+    layout_generation: u64,
+    layout_frozen: bool,
+    layout_closing: bool,
+    restore_pointer_guard: layout_persistence::PointerGuard,
+    layout_restoring: bool,
     git_panel: git_panel::Model,
     layout: Option<Node>,
     floating: Vec<FloatingPane>,
     pointer_drag: Option<PointerDrag>,
     terminal_scrollbar_drag: Option<TerminalScrollbarPointerDrag>,
     terminal_selection_release: Option<usize>,
+    selection_autoscroll: Option<SelectionAutoscroll>,
+    selection_autoscroll_task: Option<gpui::Task<()>>,
+    selection_copy_task: Option<gpui::Task<()>>,
     copied_pane: Option<usize>,
     copied_cleanup: Option<gpui::Task<()>>,
     layout_animation: Option<LayoutAnimation>,
@@ -1509,11 +1603,15 @@ struct Workspace {
     sidebar_menu: Option<SidebarMenu>,
     sidebar_header_menu_open: bool,
     project_menu_open: bool,
+    remote_picker_open: bool,
+    remote_picker_scroll_handle: ScrollHandle,
+    project_search: String,
     projects_loading: bool,
     projects_result: Option<Result<boomux::protocol::HostProjectDiscovery, String>>,
     project_folder_picker_pending: bool,
     project_folder_picker_open: bool,
     nodes_open: bool,
+    conversations: conversations::Panel,
     node_views: Vec<nodes::NodeView>,
     nodes_error: Option<String>,
     node_forget_confirm: Option<String>,
@@ -1534,6 +1632,7 @@ struct Workspace {
     pane_gap: f32,
     focus_highlight_strength: u8,
     motion_speed: MotionSpeed,
+    button_hover_animations: bool,
     layout_overlay_visible: bool,
     copy_on_select: bool,
     workspace_pane_mode: WorkspacePaneMode,
@@ -1581,7 +1680,12 @@ struct Workspace {
 
 #[derive(Default)]
 struct TerminalPane {
+    temporary_setup: bool,
     shell: Option<ShellChoice>,
+    restored: Option<layout_state::Pane>,
+    restore_attempt: Option<String>,
+    restore_retry_after: Option<Instant>,
+    restore_failures: u8,
     session: Option<TerminalSession>,
     screen: Option<Arc<TerminalScreen>>,
     attaching: bool,
@@ -1618,13 +1722,18 @@ impl Workspace {
         cx: &mut Context<Self>,
         saved: settings::Settings,
         settings_error: Option<String>,
+        layout_session: layout_state::Session,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
-        let (boomux_overview, boomux_error) = match terminal::discover_overview() {
+        let (mut boomux_overview, boomux_error) = match terminal::discover_overview() {
             Ok(overview) => (overview, None),
             Err(error) => (BoomuxOverview::default(), Some(error)),
         };
+        remote_visibility::filter(
+            &mut boomux_overview,
+            &layout_session.document.hidden_remote_workspaces,
+        );
         let boomux_shells = boomux_overview
             .workspaces
             .iter()
@@ -1673,12 +1782,25 @@ impl Workspace {
         let minimized_tab_scroll_handle = ScrollHandle::new();
         let help_scroll_handle = ScrollHandle::new();
         let mut workspace = Self {
+            layout_document: layout_session.document,
+            layout_writer: layout_session.writer,
+            layout_save_task: None,
+            layout_error: layout_session.error,
+            layout_canvas: (1.0, 1.0),
+            layout_generation: 0,
+            layout_frozen: false,
+            layout_closing: false,
+            restore_pointer_guard: layout_persistence::PointerGuard::Inactive,
+            layout_restoring: false,
             layout: Some(layout),
             floating: Vec::new(),
             git_panel: git_panel::Model::default(),
             pointer_drag: None,
             terminal_scrollbar_drag: None,
             terminal_selection_release: None,
+            selection_autoscroll: None,
+            selection_autoscroll_task: None,
+            selection_copy_task: None,
             copied_pane: None,
             copied_cleanup: None,
             layout_animation: None,
@@ -1712,11 +1834,15 @@ impl Workspace {
             sidebar_menu: None,
             sidebar_header_menu_open: false,
             project_menu_open: false,
+            remote_picker_open: false,
+            remote_picker_scroll_handle: ScrollHandle::new(),
+            project_search: String::new(),
             projects_loading: false,
             projects_result: None,
             project_folder_picker_pending: false,
             project_folder_picker_open: false,
             nodes_open: false,
+            conversations: conversations::Panel::default(),
             node_views: Vec::new(),
             nodes_error: None,
             node_forget_confirm: None,
@@ -1737,6 +1863,7 @@ impl Workspace {
             pane_gap: saved.pane_gap,
             focus_highlight_strength: saved.focus_highlight_strength,
             motion_speed: saved.motion_speed,
+            button_hover_animations: saved.button_hover_animations,
             layout_overlay_visible: saved.layout_overlay_visible,
             copy_on_select: saved.copy_on_select,
             workspace_pane_mode: saved.workspace_pane_mode,
@@ -1781,7 +1908,10 @@ impl Workspace {
             next_id: 2,
             focus_handle,
         };
-        if let Some(shell) = initial_shell {
+        workspace.initialize_layout(window, cx);
+        if workspace.layout_document.active.is_empty()
+            && let Some(shell) = initial_shell
+        {
             let workspace_id = shell.workspace_id.clone();
             let shell_id = shell.id.clone();
             workspace.open_workspace(&workspace_id, Some(&shell_id), window, cx);
@@ -1816,10 +1946,15 @@ impl Workspace {
             })
             .detach();
         }
+        if let Some(requested) = requested_shell_id.as_deref() {
+            workspace.activate_sidebar_shell(requested, window, cx);
+        }
         workspace.watch_updates(cx);
         cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
                 this.terminal_selection_release = None;
+                this.selection_autoscroll = None;
+                this.selection_autoscroll_task = None;
                 this.layout_leader_release_task = None;
                 if this.layout_leader_pressed_at.take().is_some() && this.layout_leader_entered {
                     this.leave_layout_mode(cx);
@@ -1850,6 +1985,7 @@ impl Workspace {
                 pane_gap: self.pane_gap,
                 focus_highlight_strength: self.focus_highlight_strength,
                 motion_speed: self.motion_speed,
+                button_hover_animations: self.button_hover_animations,
                 layout_overlay_visible: self.layout_overlay_visible,
                 copy_on_select: self.copy_on_select,
                 workspace_pane_mode: self.workspace_pane_mode,
@@ -1954,15 +2090,39 @@ impl Workspace {
         let Some(prepared) = self.prepared_update.clone() else {
             return;
         };
+        self.capture_arrangement();
+        if self.layout_error.as_deref() == Some("Saved layout limit reached") {
+            self.updates_status =
+                Some("Reduce the saved layout before restarting; its limit was reached.".into());
+            cx.notify();
+            return;
+        }
+        self.layout_save_task.take();
+        self.layout_frozen = true;
+        let layout_flush = self
+            .layout_writer
+            .as_ref()
+            .map(|writer| layout_state::submit(writer, self.layout_document.clone()));
         self.update_busy = true;
         self.updates_status = Some("Restarting Boomux and reopening Desktop…".into());
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { prepared.restart() }).await;
+            let saved = match layout_flush {
+                Some(flush) => flush
+                    .recv()
+                    .await
+                    .unwrap_or_else(|_| Err("Layout save was interrupted".into())),
+                None => Ok(()),
+            };
+            let result = match saved {
+                Ok(()) => cx.background_spawn(async move { prepared.restart() }).await,
+                Err(error) => Err(format!("Could not save layout before restart: {error}")),
+            };
             this.update(cx, |this, cx| {
                 this.update_busy = false;
                 match result {
                     Ok(()) => cx.quit(),
                     Err(error) => {
+                        this.layout_frozen = false;
                         this.updates_status = Some(error);
                         cx.notify();
                     }
@@ -1993,6 +2153,7 @@ impl Workspace {
                                 .h(px(24.0))
                                 .px_2()
                                 .text_xs()
+                                .button_chrome()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if !this.updates_checking && !this.update_busy {
                                         this.updates_status = None;
@@ -2014,9 +2175,9 @@ impl Workspace {
                 .child(div().text_xs().text_color(rgb(0xa6adc8))
                     .child("Restart the app and its background service to finish updating. Running terminals and commands will be preserved."))
                 .child(Self::settings_option("restart-update", if self.update_busy { "Restarting…" } else { "Restart now" }, true)
-                    .on_click(cx.listener(|this, _, _, cx| this.restart_for_update(cx))))
+                    .button_chrome().on_click(cx.listener(|this, _, _, cx| this.restart_for_update(cx))))
                 .child(Self::settings_option("later-update", "Later", false)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .button_chrome().on_click(cx.listener(move |this, _, _, cx| {
                         if !this.update_busy {
                             this.dismissed_desktop_update = version.clone();
                             this.dismissed_boomux_update = version.clone();
@@ -2062,6 +2223,7 @@ impl Workspace {
                             .gap_2()
                             .child(
                                 Self::settings_option("view-update", "View release", false)
+                                    .button_chrome()
                                     .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
                             )
                             .when(
@@ -2082,6 +2244,7 @@ impl Workspace {
                                             },
                                             true,
                                         )
+                                        .button_chrome()
                                         .on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 this.download_update(download_version.clone(), cx)
@@ -2091,14 +2254,14 @@ impl Workspace {
                                 },
                             )
                             .child(
-                                Self::settings_option("dismiss-update", "Dismiss", false).on_click(
-                                    cx.listener(move |this, _, _, cx| {
+                                Self::settings_option("dismiss-update", "Dismiss", false)
+                                    .button_chrome()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         this.dismissed_desktop_update = version.clone();
                                         this.dismissed_boomux_update = version.clone();
                                         this.save_settings();
                                         cx.notify();
-                                    }),
-                                ),
+                                    })),
                             ),
                     )
                     .into_any_element(),
@@ -2185,6 +2348,7 @@ impl Workspace {
             .and_then(|layout| layout.neighbor(self.focused, direction))
         {
             self.focused = id;
+            self.layout_changed(cx);
             cx.notify();
         } else if direction == Direction::Left {
             self.enter_sidebar(window, cx);
@@ -2212,11 +2376,27 @@ impl Workspace {
     }
 
     fn cycle_workspace(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let current_workspace_id = self
+        let sidebar = if self.navigation_region == NavigationRegion::Sidebar {
+            match self.sidebar_item.as_ref() {
+                Some(SidebarItem::Workspace(id))
+                | Some(SidebarItem::Shell {
+                    workspace_id: id, ..
+                }) => Some(id.as_str()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let expanded = (self.workspace_pane_mode == WorkspacePaneMode::Workspace
+            && self.expanded_workspaces.len() == 1)
+            .then(|| self.expanded_workspaces.iter().next().map(String::as_str))
+            .flatten();
+        let focused = self
             .terminals
             .get(&self.focused)
             .and_then(|pane| pane.shell.as_ref())
             .map(|shell| shell.workspace_id.as_str());
+        let current_workspace_id = workspace_navigation_anchor(sidebar, expanded, focused);
         let Some(workspace_id) =
             cycled_workspace_id(&self.workspace_order, current_workspace_id, backwards)
                 .map(str::to_owned)
@@ -2238,10 +2418,19 @@ impl Workspace {
                     .find(|shell| !self.minimized_shells.contains(&shell.id))
             })
             .map(|shell| shell.id.clone());
+        let from_sidebar = self.navigation_region == NavigationRegion::Sidebar;
         self.open_workspace(&workspace_id, preferred_shell_id.as_deref(), window, cx);
+        self.sidebar_item = Some(SidebarItem::Workspace(workspace_id));
+        if from_sidebar {
+            self.navigation_region = NavigationRegion::Sidebar;
+        }
+        self.reveal_sidebar_item(window, cx);
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn focus_terminal_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         if !self.terminals.contains_key(&pane_id) {
             return;
@@ -2258,6 +2447,7 @@ impl Workspace {
         {
             terminal.focus();
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -2301,6 +2491,10 @@ impl Workspace {
     }
 
     fn set_boomux_overview(&mut self, mut overview: BoomuxOverview) {
+        remote_visibility::filter(
+            &mut overview,
+            &self.layout_document.hidden_remote_workspaces,
+        );
         reconcile_workspace_order(&mut self.workspace_order, &mut overview);
         reconcile_completed_agents(
             &mut self.previous_agent_states,
@@ -2312,7 +2506,6 @@ impl Workspace {
             .iter()
             .flat_map(|workspace| workspace.shells.iter().cloned())
             .collect();
-        self.retain_known_minimized_shells(&overview);
         self.boomux_overview = overview;
     }
 
@@ -2396,6 +2589,7 @@ impl Workspace {
             } else {
                 self.workspace_order_animation = None;
             }
+            self.layout_changed(cx);
             cx.notify();
         }
     }
@@ -2621,6 +2815,7 @@ impl Workspace {
 
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.project_menu_open = false;
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         if self.settings_open {
@@ -2658,6 +2853,7 @@ impl Workspace {
         if self.pane_layout_mode == mode {
             return;
         }
+        self.capture_arrangement();
         self.pane_layout_mode = mode;
         if mode == PaneLayoutMode::Tabbed {
             self.workspace_pane_mode = WorkspacePaneMode::Workspace;
@@ -2672,6 +2868,7 @@ impl Workspace {
         }
         self.save_settings();
         self.reconcile_sidebar_item();
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -2826,18 +3023,31 @@ impl Workspace {
     }
 
     fn remove_resource_panes(&mut self, target: &SidebarResource, window: &mut Window) {
-        let pane_ids = self
-            .terminals
-            .iter()
-            .filter_map(|(id, pane)| {
-                let shell = pane.shell.as_ref()?;
-                let matches = match target {
-                    SidebarResource::Workspace { id, .. } => shell.workspace_id == *id,
-                    SidebarResource::Shell { id, .. } => shell.id == *id,
-                };
-                matches.then_some(*id)
-            })
-            .collect::<Vec<_>>();
+        let pane_ids =
+            self.terminals
+                .iter()
+                .filter_map(|(id, pane)| {
+                    let workspace_id = pane
+                        .shell
+                        .as_ref()
+                        .map(|shell| &shell.workspace_id)
+                        .or_else(|| {
+                            pane.restored
+                                .as_ref()
+                                .and_then(|pane| pane.workspace.as_ref())
+                        });
+                    let shell_id =
+                        pane.shell.as_ref().map(|shell| &shell.id).or_else(|| {
+                            pane.restored.as_ref().and_then(|pane| pane.shell.as_ref())
+                        });
+                    let matches = match target {
+                        SidebarResource::Workspace { id, .. } => workspace_id == Some(id),
+                        SidebarResource::Shell { id, .. } => shell_id == Some(id),
+                        SidebarResource::Connection { .. } => false,
+                    };
+                    matches.then_some(*id)
+                })
+                .collect::<Vec<_>>();
         for id in &pane_ids {
             if let Some(pane) = self.terminals.remove(id) {
                 for image in pane.render_images.into_values() {
@@ -2921,6 +3131,12 @@ impl Workspace {
             let result = cx
                 .background_spawn(async move {
                     match (&operation_target, kind) {
+                        (SidebarResource::Connection { id, name }, ResourceDialogKind::Rename) => {
+                            terminal::rename_connection(id, name, &operation_value)?;
+                        }
+                        (SidebarResource::Connection { .. }, ResourceDialogKind::Remove) => {
+                            return Err("Use Forget connection on the machine card".into());
+                        }
                         (SidebarResource::Workspace { id, .. }, ResourceDialogKind::Rename) => {
                             terminal::rename_workspace(id, &operation_value)?;
                         }
@@ -2957,6 +3173,20 @@ impl Workspace {
                                     session.shell_name = value.clone();
                                 }
                             }
+                        }
+                        if let SidebarResource::Connection { id, .. } = &target
+                            && let Some(node) =
+                                this.node_views.iter_mut().find(|node| node.id == *id)
+                        {
+                            node.label = value.clone();
+                        }
+                        if kind == ResourceDialogKind::Remove
+                            && let SidebarResource::Workspace { id, .. } = &target
+                        {
+                            this.layout_document
+                                .conversations
+                                .retain(|entry| &entry.workspace != id);
+                            this.save_presentation_preferences(cx);
                         }
                         this.set_boomux_overview(overview);
                         this.resource_dialog = None;
@@ -3004,6 +3234,7 @@ impl Workspace {
         {
             self.begin_layout_animation(previous_rects);
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3037,6 +3268,7 @@ impl Workspace {
                 layout.resize(self.focused, direction, tiled_amount);
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3054,6 +3286,7 @@ impl Workspace {
         let previous = layout.rects().into_iter().collect::<HashMap<_, _>>();
         if transform(layout, self.focused) {
             self.begin_layout_animation(previous);
+            self.layout_changed(cx);
             cx.notify();
         }
     }
@@ -3088,6 +3321,7 @@ impl Workspace {
                 generation: self.animation_generation,
             });
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3115,6 +3349,7 @@ impl Workspace {
             self.create_and_attach_terminal(id, anchor, window, cx);
         } else if let Some(pane) = self.terminals.get_mut(&id) {
             pane.error = Some("No Boomux workspace is available for a new terminal".into());
+            self.layout_changed(cx);
             cx.notify();
         }
     }
@@ -3152,6 +3387,14 @@ impl Workspace {
             .any(|animation| animation.pane_id == pane_id)
         {
             return;
+        }
+        if let Some(shell) = self.terminals.get(&pane_id).and_then(|p| {
+            p.shell
+                .as_ref()
+                .map(|s| s.id.clone())
+                .or_else(|| p.restored.as_ref().and_then(|r| r.shell.clone()))
+        }) {
+            self.minimized_shells.insert(shell);
         }
         let from = self.pane_bounds_in_panel(pane_id, window);
         let previous_rects = self
@@ -3213,6 +3456,7 @@ impl Workspace {
                 *pane = clamp_floating_to_panel(pane.clone(), panel_size);
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3236,6 +3480,7 @@ impl Workspace {
                 *pane = clamp_floating_to_panel(pane.clone(), panel_size);
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3343,6 +3588,7 @@ impl Workspace {
                 }
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3383,6 +3629,7 @@ impl Workspace {
                     self.floating_animation = None;
                 }
             }
+            self.layout_changed(cx);
             cx.notify();
             return;
         }
@@ -3407,11 +3654,14 @@ impl Workspace {
                 self.floating_animation = None;
             }
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
     fn focus_after_removal(&mut self) {
-        if let Some(pane) = self.floating.last() {
+        if let Some(id) = self.fullscreen.filter(|id| self.terminals.contains_key(id)) {
+            self.focused = id;
+        } else if let Some(pane) = self.floating.last() {
             self.focused = pane.id;
         } else if let Some(layout) = &self.layout {
             self.focused = layout.pane_ids()[0];
@@ -3662,6 +3912,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.capture_arrangement();
+        self.layout_changed(cx);
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         self.floating_animation = None;
         self.focused = id;
@@ -3724,6 +3977,20 @@ impl Workspace {
             return;
         }
         // Keep the dragged pane focused even while it crosses other panes.
+        if self.fullscreen.is_some_and(|expanded| expanded != id)
+            && !self
+                .terminals
+                .get(&id)
+                .is_some_and(|pane| pane.temporary_setup)
+        {
+            return;
+        }
+        if !self
+            .restore_pointer_guard
+            .allows_focus((f32::from(event.position.x), f32::from(event.position.y)))
+        {
+            return;
+        }
         if self.pointer_drag.is_some()
             || self.terminal_scrollbar_drag.is_some()
             || self.sidebar_resizing
@@ -3756,6 +4023,7 @@ impl Workspace {
         {
             terminal.focus();
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -3901,6 +4169,9 @@ impl Workspace {
         }
         if let Some(pane) = self.terminals.get_mut(&pane_id) {
             self.terminal_selection_release = None;
+            self.selection_autoscroll = None;
+            self.selection_autoscroll_task = None;
+            self.selection_copy_task = None;
             pane.selection_anchor_position = Some(event.position);
             pane.selection = None;
             cx.notify();
@@ -3936,16 +4207,144 @@ impl Workspace {
         ) else {
             return;
         };
+        // Keep the original cell anchored in scrollback, not in viewport pixels.
+        let selection = TerminalSelection {
+            anchor: pane
+                .selection
+                .map_or(selection.anchor, |previous| previous.anchor),
+            head: selection.head,
+        };
         pane.selection = Some(selection);
         self.terminal_selection_release = Some(drag.pane_id);
-        let selected = pane
-            .selection
-            .map(|selection| terminal_selected_text(screen, selection));
-        if let Some(text) = selected.filter(|text| !text.is_empty()) {
-            cx.write_to_primary(ClipboardItem::new_string(text));
+        #[cfg(target_os = "linux")]
+        {
+            let selected = pane
+                .selection
+                .map(|selection| terminal_selected_text(screen, selection));
+            if let Some(text) = selected.filter(|text| !text.is_empty()) {
+                cx.write_to_primary(ClipboardItem::new_string(text));
+            }
+        }
+        let scrolling = selection_scroll_delta(
+            f32::from(event.event.position.y),
+            f32::from(event.bounds.top()),
+            f32::from(event.bounds.bottom()),
+        ) != 0;
+        self.selection_autoscroll = scrolling.then_some(SelectionAutoscroll {
+            pane_id,
+            position: event.event.position,
+            bounds: event.bounds,
+        });
+        if scrolling && self.selection_autoscroll_task.is_none() {
+            self.selection_autoscroll_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    if !this
+                        .update(cx, |this, cx| this.tick_selection_autoscroll(cx))
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                }
+            }));
+        } else if !scrolling {
+            self.selection_autoscroll_task = None;
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn tick_selection_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let keep_scrolling = (|| {
+            let drag = self.selection_autoscroll?;
+            if self.terminal_selection_release != Some(drag.pane_id)
+                || self.layout_mode
+                || self.pointer_drag.is_some()
+            {
+                return None;
+            }
+            let pane = self.terminals.get_mut(&drag.pane_id)?;
+            let screen = pane.screen.as_ref()?;
+            let delta = selection_scroll_delta(
+                f32::from(drag.position.y),
+                f32::from(drag.bounds.top()),
+                f32::from(drag.bounds.bottom()),
+            );
+            let offset = screen.scroll_offset as usize;
+            let target = offset
+                .saturating_add_signed(delta)
+                .min(screen.scroll_total.saturating_sub(screen.scroll_len) as usize);
+            if target == offset {
+                return None;
+            }
+            pane.session.as_ref()?.scroll_to(target);
+            Some(())
+        })()
+        .is_some();
+        if !keep_scrolling {
+            self.selection_autoscroll_task = None;
+            self.selection_autoscroll = None;
+        }
+        cx.notify();
+        keep_scrolling
+    }
+
+    fn copy_scrollback_selection(
+        &mut self,
+        pane_id: usize,
+        clipboard: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pane) = self.terminals.get(&pane_id) else {
+            return false;
+        };
+        let (Some(selection), Some(screen), Some(session)) =
+            (pane.selection, pane.screen.as_ref(), pane.session.as_ref())
+        else {
+            return false;
+        };
+        let visible =
+            screen.scroll_offset as usize..screen.scroll_offset as usize + usize::from(screen.rows);
+        if visible.contains(&selection.anchor.0) && visible.contains(&selection.head.0) {
+            return false;
+        }
+        let receiver = match session.selected_text(selection.anchor, selection.head) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                self.terminals.get_mut(&pane_id).unwrap().error = Some(error);
+                cx.notify();
+                return true;
+            }
+        };
+        self.selection_copy_task = Some(cx.spawn(async move |this, cx| {
+            if let Ok(result) = receiver.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    // A later gesture or closed pane must not receive this copy.
+                    if this.terminals.get(&pane_id).and_then(|pane| pane.selection)
+                        != Some(selection)
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(text) if !text.is_empty() => {
+                            #[cfg(target_os = "linux")]
+                            cx.write_to_primary(ClipboardItem::new_string(text.clone()));
+                            if clipboard {
+                                this.copy_terminal_text(pane_id, text, cx);
+                            }
+                        }
+                        Err(error) => {
+                            this.terminals.get_mut(&pane_id).unwrap().error = Some(error);
+                            cx.notify();
+                        }
+                        _ => (),
+                    }
+                });
+            }
+        }));
+        true
     }
 
     fn copy_terminal_text(&mut self, pane_id: usize, text: String, cx: &mut Context<Self>) {
@@ -3968,6 +4367,10 @@ impl Workspace {
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.copy_scrollback_selection(self.focused, true, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let Some(text) = self.terminals.get(&self.focused).and_then(|pane| {
             Some(terminal_selected_text(
                 pane.screen.as_ref()?,
@@ -3984,30 +4387,39 @@ impl Workspace {
 
     fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if let Some(dialog) = self.resource_dialog.as_mut() {
+                if dialog.kind == ResourceDialogKind::Rename && !dialog.busy {
+                    append_resource_name(&mut dialog.value, &text);
+                    dialog.error = None;
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if self.project_menu_open {
+                if !self.remote_picker_open {
+                    project_search::append(&mut self.project_search, &text);
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if let Some((_, value)) = &mut self.boomux_setting_input {
                 append_boomux_setting_text(value, &text);
                 cx.stop_propagation();
                 cx.notify();
                 return;
             }
-            if let Some(ResourceDialog {
-                kind: ResourceDialogKind::Rename,
-                value,
-                busy: false,
-                ..
-            }) = self.resource_dialog.as_mut()
-            {
-                append_resource_name(value, &text);
-                cx.stop_propagation();
-                cx.notify();
-            } else {
-                self.paste_into_focused(&text, cx);
-            }
+            self.paste_into_focused(&text, cx);
         }
     }
 
     fn paste_primary(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
+        #[cfg(target_os = "linux")]
+        let item = cx.read_from_primary();
+        #[cfg(target_os = "macos")]
+        let item = cx.read_from_clipboard();
+        if let Some(text) = item.and_then(|item| item.text()) {
             self.paste_into_focused(&text, cx);
         }
     }
@@ -4045,7 +4457,8 @@ impl Workspace {
     ) {
         if self.sidebar_resizing {
             if event.pressed_button == Some(MouseButton::Left) {
-                self.sidebar_drag_width = Some(f32::from(event.position.x).clamp(0.0, 600.0));
+                self.sidebar_drag_width =
+                    Some(f32::from(event.position.x).clamp(0.0, SIDEBAR_MAX_WIDTH));
                 if let Some(width) = sidebar_drag_target(f32::from(event.position.x)) {
                     self.sidebar_visible = true;
                     self.sidebar_preferred_width = width;
@@ -4053,6 +4466,7 @@ impl Workspace {
                     self.sidebar_visible = false;
                     self.sidebar_menu = None;
                     self.sidebar_header_menu_open = false;
+                    self.conversations.search_focused = false;
                     self.git_panel.search_focused = false;
                     self.nodes_open = false;
                     if self.navigation_region == NavigationRegion::Sidebar {
@@ -4215,8 +4629,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if event.button == MouseButton::Left {
+            self.selection_autoscroll = None;
+            self.selection_autoscroll_task = None;
             let source_pane = self.terminal_selection_release;
             let enabled = self.copy_on_select && !self.layout_mode && self.pointer_drag.is_none();
+            if source_pane.is_some_and(|id| self.copy_scrollback_selection(id, enabled, cx)) {
+                self.terminal_selection_release = None;
+            }
             if let Some(text) = take_terminal_selection_copy(
                 &mut self.terminal_selection_release,
                 &self.terminals,
@@ -4252,6 +4671,7 @@ impl Workspace {
         let pointer =
             self.window_position_in_panel(f32::from(event.position.x), f32::from(event.position.y));
         self.finish_pointer_drag(pointer, window);
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -4594,12 +5014,34 @@ impl Workspace {
         }
     }
 
+    fn keyboard_input_target(&self) -> InputTarget {
+        InputOverlays {
+            resource_dialog: self.resource_dialog.is_some(),
+            remote_picker: self.project_menu_open && self.remote_picker_open,
+            project_search: self.project_menu_open,
+            git_search: self.git_panel.search_focused,
+            conversation_search: self.conversations.open
+                && !self.settings_open
+                && self.conversations.search_focused,
+            remotes: self.nodes_open && self.navigation_region == NavigationRegion::Sidebar,
+            settings_restart: self.settings_restart_confirm,
+            settings_input: self.boomux_setting_input.is_some(),
+            help: self.help_open,
+        }
+        .target()
+    }
+
     fn terminal_key_down(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let input_target = self.keyboard_input_target();
+        if input_target == InputTarget::ResourceDialog {
+            self.resource_dialog_key_down(event, window, cx);
+            return;
+        }
         if event.keystroke.key == "space" && self.layout_leader_pressed_at.is_some() {
             self.layout_leader_release_task = None;
             cx.stop_propagation();
@@ -4614,7 +5056,82 @@ impl Workspace {
         } else if !event.is_held {
             self.layout_suppressed_keys.remove(&event.keystroke.key);
         }
-        if self.git_panel.search_focused {
+        if input_target == InputTarget::RemotePicker {
+            let modifiers = event.keystroke.modifiers;
+            if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+                cx.stop_propagation();
+                return;
+            }
+            match event.keystroke.key.as_str() {
+                "escape" => self.project_menu_open = false,
+                "up" | "down" => {
+                    let nodes = self
+                        .node_views
+                        .iter()
+                        .filter(|n| !n.local)
+                        .collect::<Vec<_>>();
+                    // The final keyboard item is “Connect another machine”.
+                    let len = nodes.len() + 1;
+                    let current = nodes
+                        .iter()
+                        .position(|n| Some(&n.id) == self.selected_node.as_ref())
+                        .unwrap_or(nodes.len());
+                    let next = if event.keystroke.key == "up" {
+                        (current + len - 1) % len
+                    } else {
+                        (current + 1) % len
+                    };
+                    self.selected_node = nodes.get(next).map(|node| node.id.clone());
+                    if next < nodes.len() {
+                        let maximum = self.remote_picker_scroll_handle.max_offset();
+                        self.remote_picker_scroll_handle
+                            .set_offset(point(px(0.0), -px(next as f32 * 52.0).min(maximum.y)));
+                    }
+                }
+                "enter" if !event.is_held => {
+                    if let Some(id) = self.selected_node.clone() {
+                        self.activate_remote_machine(&id, window, cx);
+                    } else {
+                        self.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
+                    }
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if input_target == InputTarget::ProjectSearch {
+            match event.keystroke.key.as_str() {
+                "escape" => self.project_menu_open = false,
+                "backspace" => {
+                    self.project_search.pop();
+                }
+                "u" if event.keystroke.modifiers.control => self.project_search.clear(),
+                "v" if event.keystroke.modifiers.control && !cfg!(target_os = "macos") => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        project_search::append(&mut self.project_search, &text);
+                    }
+                }
+                _ if !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.alt =>
+                {
+                    if let Some(text) = &event.keystroke.key_char {
+                        project_search::append(&mut self.project_search, text);
+                    }
+                }
+                _ => (),
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if input_target == InputTarget::ConversationSearch {
+            self.conversation_search_key(event, cx);
+            return;
+        }
+        if input_target == InputTarget::GitSearch {
             match event.keystroke.key.as_str() {
                 "escape" | "enter" => self.git_panel.search_focused = false,
                 "backspace" => {
@@ -4637,7 +5154,7 @@ impl Workspace {
             return;
         }
 
-        if self.nodes_open && self.navigation_region == NavigationRegion::Sidebar {
+        if input_target == InputTarget::Remotes {
             let modifiers = event.keystroke.modifiers;
             if modifiers.control
                 || modifiers.alt
@@ -4691,7 +5208,7 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        if self.settings_restart_confirm {
+        if input_target == InputTarget::SettingsRestart {
             if event.keystroke.key == "escape" {
                 self.settings_restart_confirm = false;
                 cx.notify();
@@ -4699,16 +5216,12 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        if self.boomux_setting_input.is_some() {
+        if input_target == InputTarget::SettingsInput {
             self.boomux_setting_key_down(event, cx);
             return;
         }
-        if self.help_open {
+        if input_target == InputTarget::Help {
             self.help_key_down(event, cx);
-            return;
-        }
-        if self.resource_dialog.is_some() {
-            self.resource_dialog_key_down(event, window, cx);
             return;
         }
         if self.settings_open && event.keystroke.key == "escape" {
@@ -4875,10 +5388,11 @@ impl Workspace {
         pane.shell = Some(shell.clone());
         pane.attaching = true;
         pane.error = None;
+        self.layout_changed(cx);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let attached_shell = shell.clone();
+            let mut attached_shell = shell.clone();
             let result = cx
                 .background_spawn(async move {
                     TerminalSession::attach(shell, rows, cols, pixel_width, pixel_height)
@@ -4891,6 +5405,7 @@ impl Workspace {
                 pane.attaching = false;
                 match result {
                     Ok(terminal) => {
+                        attached_shell.run_id = terminal.run_id.clone();
                         let shell_id = terminal.shell_id.clone();
                         pane.screen = Some(terminal.screen());
                         pane.shell = Some(attached_shell);
@@ -4899,6 +5414,7 @@ impl Workspace {
                     }
                     Err(error) => pane.error = Some(error),
                 }
+                this.layout_changed(cx);
                 cx.notify();
             })
             .ok();
@@ -4918,6 +5434,7 @@ impl Workspace {
             pane.attaching = true;
             pane.error = None;
         }
+        self.layout_changed(cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -4956,6 +5473,7 @@ impl Workspace {
                     }
                     Err(error) => pane.error = Some(error),
                 }
+                this.layout_changed(cx);
                 cx.notify();
             })
             .ok();
@@ -5006,6 +5524,7 @@ impl Workspace {
         if let Some(pane) = self.terminals.get_mut(&pane_id) {
             pane.attaching = true;
         }
+        self.layout_changed(cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -5044,6 +5563,7 @@ impl Workspace {
                     }
                     Err(error) => pane.error = Some(error),
                 }
+                this.layout_changed(cx);
                 cx.notify();
             })
             .ok();
@@ -5064,23 +5584,58 @@ impl Workspace {
     ) {
         self.sidebar_menu = None;
         self.navigation_region = NavigationRegion::Terminal;
-        self.fullscreen = None;
-        self.layout_animation = None;
-        if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
-            self.detach_all_panes(window);
-        }
-        let pane_id = self.insert_pane();
+        let temporary_setup = launch.temporary_setup();
+        let pane_id = if temporary_setup {
+            // A setup terminal is an overlay, not navigation to another Workspace.
+            self.capture_arrangement();
+            let id = self.next_id;
+            self.next_id += 1;
+            self.terminals.insert(
+                id,
+                TerminalPane {
+                    temporary_setup: true,
+                    ..TerminalPane::default()
+                },
+            );
+            self.floating.push(centered_floating_pane(
+                id,
+                self.panel_size(window),
+                self.pane_gap,
+            ));
+            id
+        } else {
+            if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
+                self.detach_all_panes(window);
+            }
+            self.fullscreen = None;
+            self.layout_animation = None;
+            self.insert_pane()
+        };
         self.focused = pane_id;
         let size = self.terminal_grid_size(pane_id, window);
         if let Some(pane) = self.terminals.get_mut(&pane_id) {
             pane.attaching = true;
             pane.error = None;
         }
+        self.layout_changed(cx);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
+                    let connect_result = if matches!(launch, terminal::WorkspaceLaunch::AddNode) {
+                        Some(
+                            boomux::desktop_connect::ConnectResultReceiver::new()
+                                .map_err(|error| error.to_string())?,
+                        )
+                    } else {
+                        None
+                    };
+                    let launch = if let Some(receiver) = &connect_result {
+                        terminal::WorkspaceLaunch::AddNodeResult(receiver.path())
+                    } else {
+                        launch
+                    };
                     let (shell, setup_workspace_cleanup) =
                         terminal::create_workspace_with_shell(launch)?;
                     let mut session = match TerminalSession::attach(
@@ -5100,6 +5655,7 @@ impl Workspace {
                         }
                     };
                     session.setup_workspace_cleanup = setup_workspace_cleanup;
+                    session.connect_result = connect_result;
                     // The existing overview worker refreshes sidebar resources.
                     // Do not hold an attached terminal behind that extra request.
                     Ok::<_, String>((shell, session))
@@ -5117,11 +5673,13 @@ impl Workspace {
                         pane.screen = Some(session.screen());
                         pane.shell = Some(shell);
                         pane.session = Some(session);
-                        reveal_opened_workspace(
-                            this.workspace_pane_mode,
-                            &mut this.expanded_workspaces,
-                            &workspace_id,
-                        );
+                        if !temporary_setup {
+                            reveal_opened_workspace(
+                                this.workspace_pane_mode,
+                                &mut this.expanded_workspaces,
+                                &workspace_id,
+                            );
+                        }
                         if !this.workspace_order.contains(&workspace_id) {
                             this.workspace_order.push(workspace_id.clone());
                         }
@@ -5129,6 +5687,7 @@ impl Workspace {
                     }
                     Err(error) => pane.error = Some(error),
                 }
+                this.layout_changed(cx);
                 cx.notify();
             })
             .ok();
@@ -5142,10 +5701,11 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let result = cx
-                    .background_spawn(async { terminal::refresh_overview_and_nodes() })
+                    .background_spawn(async { terminal::discover_overview_and_nodes() })
                     .await;
                 let mut removed_setup_shells = Vec::new();
                 let mut setup_workspace_cleanups = Vec::new();
+                let mut connect_results = Vec::new();
                 let keep_watching = this
                     .update(cx, |this, cx| {
                         let (result, nodes) = result;
@@ -5161,6 +5721,7 @@ impl Workspace {
                         };
                         if this.node_views != node_views || this.nodes_error != nodes_error {
                             let visible_change = this.nodes_open
+                                || (this.project_menu_open && this.remote_picker_open)
                                 || this.nodes_error != nodes_error
                                 || this.node_views.len() != node_views.len()
                                 || this.node_views.iter().zip(&node_views).any(
@@ -5195,6 +5756,9 @@ impl Workspace {
                                         name: shell.name.clone(),
                                         workspace_id: shell.workspace_id.clone(),
                                     });
+                                    if let Some(receiver) = session.connect_result.take() {
+                                        connect_results.push(receiver);
+                                    }
                                     if let Some(cleanup) = session.setup_workspace_cleanup.take() {
                                         setup_workspace_cleanups.push(cleanup);
                                     }
@@ -5210,12 +5774,16 @@ impl Workspace {
                                 cx.notify();
                             }
                         }
+                        this.refresh_conversations(cx);
                         true
                     })
                     .unwrap_or(false);
                 if !keep_watching {
                     return;
                 }
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| this.reconnect_saved_panes(window, cx))
+                });
                 if !removed_setup_shells.is_empty() {
                     let _ = window_handle.update(cx, |_, window, cx| {
                         this.update(cx, |this, cx| {
@@ -5223,6 +5791,24 @@ impl Workspace {
                                 this.remove_resource_panes(&shell, window);
                             }
                             cx.notify();
+                        })
+                    });
+                }
+                for receiver in connect_results {
+                    let result = cx.background_spawn(async move {
+                        receiver.receive().map_err(|e| e.to_string())?
+                            .map(terminal::connected_shell).transpose()
+                    }).await;
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(Some(shell)) => this.open_shell_choice(shell, window, cx),
+                                Ok(None) => {}, // Cancelled or failed setup creates no navigation intent.
+                                Err(error) => {
+                                    this.boomux_error = Some(format!("Could not open the new remote workspace: {error}. Open it from the sidebar; do not repeat setup."));
+                                    cx.notify();
+                                }
+                            }
                         })
                     });
                 }
@@ -5256,17 +5842,8 @@ impl Workspace {
         if !self.expanded_workspaces.remove(workspace_id) {
             self.expanded_workspaces.insert(workspace_id.to_string());
         }
+        self.layout_changed(cx);
         cx.notify();
-    }
-
-    fn retain_known_minimized_shells(&mut self, overview: &BoomuxOverview) {
-        let known_shells = overview
-            .workspaces
-            .iter()
-            .flat_map(|workspace| workspace.shells.iter().map(|shell| shell.id.as_str()))
-            .collect::<HashSet<_>>();
-        self.minimized_shells
-            .retain(|shell_id| known_shells.contains(shell_id.as_str()));
     }
 
     fn minimized_tab_shells(&self) -> Vec<ShellChoice> {
@@ -5278,7 +5855,8 @@ impl Workspace {
             .get(&self.focused)
             .and_then(|pane| pane.shell.as_ref())
             .map(|shell| shell.workspace_id.as_str());
-        self.boomux_overview
+        let mut shells = self
+            .boomux_overview
             .workspaces
             .iter()
             .filter(|workspace| {
@@ -5289,7 +5867,15 @@ impl Workspace {
             .flat_map(|workspace| workspace.shells.iter())
             .filter(|shell| self.minimized_shells.contains(&shell.id))
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        shells.sort_by_key(|s| {
+            self.layout_document
+                .minimized
+                .iter()
+                .position(|id| id == &s.id)
+                .unwrap_or(usize::MAX)
+        });
+        shells
     }
 
     fn has_minimized_tabs(&self) -> bool {
@@ -5313,6 +5899,7 @@ impl Workspace {
     }
 
     fn detach_all_panes(&mut self, window: &mut Window) {
+        self.capture_arrangement();
         for (_, pane) in self.terminals.drain() {
             for image in pane.render_images.into_values() {
                 let _ = window.drop_image(image);
@@ -5369,6 +5956,84 @@ impl Workspace {
         cx.notify();
     }
 
+    // Retain outgoing terminals and their paint state until the slide completes.
+    // Both newly opened and persisted arrangements use this lifecycle.
+    fn begin_workspace_transition(
+        &mut self,
+        slide_direction: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_current_workspace_transition(window);
+        let mut outgoing = self
+            .layout
+            .as_ref()
+            .map(Node::pane_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .chain(self.floating.iter().map(|pane| pane.id))
+            .filter_map(|pane_id| self.pane_bounds_in_panel(pane_id, window))
+            .collect::<Vec<_>>();
+        for animation in &self.minimizing_panes {
+            if !outgoing.iter().any(|pane| pane.id == animation.pane_id) {
+                outgoing.push(animation.from.clone());
+            }
+        }
+        let outgoing_ids = outgoing.iter().map(|pane| pane.id).collect::<Vec<_>>();
+        let should_animate = !outgoing.is_empty();
+
+        self.layout = None;
+        self.floating.clear();
+        self.pointer_drag = None;
+        self.terminal_scrollbar_drag = None;
+        self.terminal_selection_release = None;
+        self.layout_animation = None;
+        self.floating_animation = None;
+        self.minimizing_panes.clear();
+        self.fullscreen = None;
+
+        if let Some(duration) = self.motion_speed.duration().filter(|_| should_animate) {
+            self.animation_generation = self.animation_generation.wrapping_add(1);
+            let generation = self.animation_generation;
+            self.workspace_transition = Some(WorkspaceTransition {
+                outgoing,
+                direction: slide_direction,
+                generation,
+                duration,
+            });
+            let window_handle = window.window_handle();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(duration).await;
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.finish_workspace_transition(generation, window, cx);
+                    })
+                });
+            })
+            .detach();
+        } else {
+            self.detach_terminal_ids(&outgoing_ids, window);
+        }
+    }
+
+    fn animate_workspace_arrival(&mut self) {
+        let Some(transition) = &self.workspace_transition else {
+            return;
+        };
+        let direction = transition.direction;
+        let incoming = self
+            .layout
+            .as_ref()
+            .map(|layout| {
+                workspace_layout_rects(layout, self.fullscreen)
+                    .into_iter()
+                    .map(|(id, rect)| (id, shifted_workspace_rect(rect, direction)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.begin_layout_animation(incoming);
+    }
+
     fn open_workspace(
         &mut self,
         workspace_id: &str,
@@ -5376,6 +6041,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.restore_workspace_layout(workspace_id, preferred_shell_id, window, cx) {
+            return;
+        }
         self.project_menu_open = false;
         let Some(shells) = self
             .boomux_overview
@@ -5423,56 +6091,7 @@ impl Workspace {
                 .filter_map(|pane| pane.shell.as_ref().map(|shell| shell.id.clone()))
                 .collect::<HashSet<_>>();
             if workspace_open_replaces_panes(self.workspace_pane_mode, &current, &desired) {
-                self.finish_current_workspace_transition(window);
-                let mut outgoing = self
-                    .layout
-                    .as_ref()
-                    .map(Node::pane_ids)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .chain(self.floating.iter().map(|pane| pane.id))
-                    .filter_map(|pane_id| self.pane_bounds_in_panel(pane_id, window))
-                    .collect::<Vec<_>>();
-                for animation in &self.minimizing_panes {
-                    if !outgoing.iter().any(|pane| pane.id == animation.pane_id) {
-                        outgoing.push(animation.from.clone());
-                    }
-                }
-                let outgoing_ids = outgoing.iter().map(|pane| pane.id).collect::<Vec<_>>();
-                let should_animate = !current.is_empty() && !outgoing.is_empty();
-
-                self.layout = None;
-                self.floating.clear();
-                self.pointer_drag = None;
-                self.terminal_scrollbar_drag = None;
-                self.terminal_selection_release = None;
-                self.layout_animation = None;
-                self.floating_animation = None;
-                self.minimizing_panes.clear();
-                self.fullscreen = None;
-
-                if let Some(duration) = self.motion_speed.duration().filter(|_| should_animate) {
-                    self.animation_generation = self.animation_generation.wrapping_add(1);
-                    let generation = self.animation_generation;
-                    self.workspace_transition = Some(WorkspaceTransition {
-                        outgoing,
-                        direction: slide_direction,
-                        generation,
-                        duration,
-                    });
-                    let window_handle = window.window_handle();
-                    cx.spawn(async move |this, cx| {
-                        cx.background_executor().timer(duration).await;
-                        let _ = window_handle.update(cx, |_, window, cx| {
-                            this.update(cx, |this, cx| {
-                                this.finish_workspace_transition(generation, window, cx);
-                            })
-                        });
-                    })
-                    .detach();
-                } else {
-                    self.detach_terminal_ids(&outgoing_ids, window);
-                }
+                self.begin_workspace_transition(slide_direction, window, cx);
             }
         }
 
@@ -5508,22 +6127,7 @@ impl Workspace {
             pending.push((pane_id, shell));
         }
 
-        if self.workspace_transition.is_some() {
-            let incoming = self
-                .layout
-                .as_ref()
-                .map(|layout| {
-                    layout
-                        .rects()
-                        .into_iter()
-                        .map(|(pane_id, rect)| {
-                            (pane_id, shifted_workspace_rect(rect, slide_direction))
-                        })
-                        .collect::<HashMap<_, _>>()
-                })
-                .unwrap_or_default();
-            self.begin_layout_animation(incoming);
-        }
+        self.animate_workspace_arrival();
 
         let preferred_pane = preferred_shell_id
             .and_then(|shell_id| pane_ids.get(shell_id).copied())
@@ -5546,6 +6150,7 @@ impl Workspace {
             let size = self.terminal_grid_size(pane_id, window);
             self.start_terminal_attachment(pane_id, shell, size, cx);
         }
+        self.layout_changed(cx);
         cx.notify();
     }
 
@@ -5557,11 +6162,32 @@ impl Workspace {
     ) {
         self.project_menu_open = false;
         if let Some(pane_id) = self.terminals.iter().find_map(|(pane_id, pane)| {
+            if self
+                .workspace_transition
+                .as_ref()
+                .is_some_and(|transition| {
+                    transition
+                        .outgoing
+                        .iter()
+                        .any(|outgoing| outgoing.id == *pane_id)
+                })
+            {
+                return None;
+            }
             pane.shell
                 .as_ref()
                 .filter(|shell| shell.id == shell_id)
                 .map(|_| *pane_id)
         }) {
+            let retry = self
+                .terminals
+                .get(&pane_id)
+                .filter(|pane| pane.session.is_none() && !pane.attaching)
+                .and_then(|pane| pane.shell.clone());
+            if let Some(shell) = retry {
+                let size = self.terminal_grid_size(pane_id, window);
+                self.start_terminal_attachment(pane_id, shell, size, cx);
+            }
             self.navigation_region = NavigationRegion::Terminal;
             self.focused = pane_id;
             self.raise_floating_pane(pane_id);
@@ -5573,6 +6199,7 @@ impl Workspace {
                 terminal.focus();
             }
             window.focus(&self.focus_handle, cx);
+            self.layout_changed(cx);
             cx.notify();
             return;
         }
@@ -5584,20 +6211,42 @@ impl Workspace {
             .cloned()
         else {
             self.boomux_error = Some("That Boomux shell is no longer available".into());
+            self.layout_changed(cx);
             cx.notify();
             return;
         };
+        self.open_shell_choice(shell, window, cx);
+    }
+
+    fn open_shell_choice(
+        &mut self,
+        shell: ShellChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_menu_open = false;
         self.minimized_shells.remove(&shell.id);
         let open_workspace_ids = self
             .terminals
-            .values()
-            .filter_map(|pane| pane.shell.as_ref().map(|shell| shell.workspace_id.clone()))
+            .iter()
+            .filter(|(id, _)| {
+                self.workspace_transition.as_ref().is_none_or(|transition| {
+                    !transition
+                        .outgoing
+                        .iter()
+                        .any(|outgoing| outgoing.id == **id)
+                })
+            })
+            .filter_map(|(_, pane)| pane.shell.as_ref().map(|shell| shell.workspace_id.clone()))
             .collect::<HashSet<_>>();
         if shell_open_replaces_panes(
             self.workspace_pane_mode,
             &open_workspace_ids,
             &shell.workspace_id,
         ) {
+            if self.restore_workspace_layout(&shell.workspace_id, Some(&shell.id), window, cx) {
+                return;
+            }
             self.detach_all_panes(window);
         }
         self.navigation_region = NavigationRegion::Terminal;
@@ -5660,6 +6309,19 @@ impl Workspace {
                         let next_revision = terminal.revision();
                         if next_revision != revision {
                             pane.screen = Some(terminal.screen());
+                            if let Some(drag) = this
+                                .selection_autoscroll
+                                .filter(|drag| drag.pane_id == pane_id)
+                                && let (Some(selection), Some(screen)) =
+                                    (pane.selection.as_mut(), pane.screen.as_ref())
+                            {
+                                let (row, col) = terminal_cell_from_offset(
+                                    f32::from(drag.position.x - drag.bounds.left()),
+                                    f32::from(drag.position.y - drag.bounds.top()),
+                                    screen,
+                                );
+                                selection.head = (row + screen.scroll_offset as usize, col);
+                            }
                             revision = next_revision;
                             cx.notify();
                         }
@@ -5797,6 +6459,7 @@ impl Workspace {
 
     fn open_nodes(&mut self, cx: &mut Context<Self>) {
         self.project_menu_open = false;
+        self.conversations.search_focused = false;
         self.git_panel.search_focused = false;
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
@@ -5822,6 +6485,123 @@ impl Workspace {
         cx.notify();
     }
 
+    fn activate_remote_machine(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.node_views.iter().find(|n| !n.local && n.id == id) else {
+            return;
+        };
+        let node_id = node.id.clone();
+        match node.primary_action() {
+            nodes::PrimaryAction::NewWorkspace => {
+                let name = terminal::project_workspace_name(
+                    &node.label,
+                    self.boomux_overview
+                        .workspaces
+                        .iter()
+                        .filter(|w| remote::identity(&w.id).is_some_and(|id| id.node_id == node_id))
+                        .map(|w| w.name.as_str()),
+                );
+                self.launch_node_action(
+                    terminal::WorkspaceLaunch::RemoteWorkspace { node_id, name },
+                    window,
+                    cx,
+                );
+            }
+            nodes::PrimaryAction::SignIn => self.launch_node_action(
+                terminal::WorkspaceLaunch::ReauthenticateNode(node_id),
+                window,
+                cx,
+            ),
+            nodes::PrimaryAction::Update => {
+                self.launch_node_action(terminal::WorkspaceLaunch::UpgradeNode(node_id), window, cx)
+            }
+            nodes::PrimaryAction::Review => {
+                self.open_nodes(cx);
+                self.selected_node = Some(node_id.clone());
+                self.expanded_node = Some(node_id);
+            }
+        }
+    }
+
+    fn remote_workspace_picker(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut list = div()
+            .id("remote-picker-list")
+            .track_scroll(&self.remote_picker_scroll_handle)
+            .max_h(px(320.0))
+            .overflow_y_scroll();
+        for node in self.node_views.iter().filter(|n| !n.local) {
+            let id = node.id.clone();
+            list = list.child(
+                sidebar_menu_row(SharedString::from(format!("remote-picker-{}", node.id)))
+                    .bg(rgb(if self.selected_node.as_ref() == Some(&node.id) {
+                        0x313244
+                    } else {
+                        0x1e1e2e
+                    }))
+                    .h(px(52.0))
+                    .flex_col()
+                    .justify_center()
+                    .items_start()
+                    .child(div().w_full().truncate().child(node.label.clone()))
+                    .child(div().text_xs().text_color(rgb(0xa6adc8)).child(format!(
+                        "{} · {}",
+                        node.status(),
+                        node.primary_action().label()
+                    )))
+                    .button_chrome()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.activate_remote_machine(&id, window, cx);
+                    })),
+            );
+        }
+        div()
+            .id("remote-workspace-picker")
+            .role(gpui::Role::Menu)
+            .aria_label("Choose remote machine")
+            .absolute()
+            .occlude()
+            .top(px(54.0))
+            .left(px(10.0))
+            .right(px(10.0))
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .bg(rgb(0x1e1e2e))
+            .shadow_lg()
+            .child(div().p_2().text_sm().child("Choose a machine"))
+            .child(
+                div()
+                    .px_2()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(rgb(0xa6adc8))
+                    .child("Your new workspace and terminal will run there."),
+            )
+            .when_some(self.nodes_error.clone(), |menu, error| {
+                menu.child(div().p_2().text_xs().text_color(rgb(0xf9e2af)).child(error))
+            })
+            .child(list)
+            .when(!self.node_views.iter().any(|n| !n.local), |menu| {
+                menu.child(div().p_2().text_xs().child("No machines connected yet."))
+            })
+            .child(
+                sidebar_menu_row("remote-picker-connect")
+                    .bg(rgb(if self.selected_node.is_none() {
+                        0x313244
+                    } else {
+                        0x1e1e2e
+                    }))
+                    .child("Connect another machine…")
+                    .button_chrome()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn launch_node_action(
         &mut self,
         launch: terminal::WorkspaceLaunch,
@@ -5829,6 +6609,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.nodes_open = false;
+        self.project_menu_open = false;
+        self.remote_picker_open = false;
         if self.layout_mode {
             self.leave_layout_mode(cx);
         }
@@ -5894,7 +6676,7 @@ impl Workspace {
                         0x1e1e2e
                     }))
                     .hover(|row| row.bg(rgb(0x313244)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .button_chrome().on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.selected_node = Some(id.clone());
                         this.expanded_node = if this.expanded_node.as_ref() == Some(&id) {
@@ -5914,6 +6696,14 @@ impl Workspace {
                             .text_color(rgb(if node.connected() { 0xa6e3a1 } else { 0xf9e2af }))
                             .child(node.status()),
                     )
+            .when(!node.connected(), |panel| {
+                let id = node.id.clone();
+                panel.child(Self::settings_option("remote-recovery", node.primary_action().label(), false)
+                    .button_chrome().on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.activate_remote_machine(&id, window, cx);
+                    })))
+            })
             .when(self.expanded_node.as_ref() == Some(&node.id), |panel| {
                 panel.child(div().mt_2().pt_2().border_t_1().border_color(rgb(0x45475a))
                     .id("remote-machine-details")
@@ -5926,13 +6716,25 @@ impl Workspace {
                         if node.connected() { "" } else { " · cached" }))
                     .when_some(node.version.clone(), |detail, version| detail.child(format!("Boomux {version}")))
                     .when(!node.connected(), |detail| detail.child(node.last_seen(now_ms)).child(node.guidance()))
+                    .child(Self::settings_option("rename-remote-connection", "Rename connection…", false)
+                        .flex_none()
+                        .button_chrome().on_click(cx.listener({
+                            let id = node.id.clone();
+                            let name = node.label.clone();
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_resource_dialog(ResourceDialogKind::Rename,
+                                    SidebarResource::Connection { id: id.clone(), name: name.clone() });
+                                cx.notify();
+                            }
+                        })))
                     .when(!node.local && node.connected(), |detail| {
                         let node_id = node.id.clone();
                         let name = node.label.clone();
                         let upgrade_id = node.id.clone();
                         detail.child(Self::settings_option("create-remote-workspace", "New workspace", false)
                             .flex_none()
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                            .button_chrome().on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 let name = terminal::project_workspace_name(&name, this.boomux_overview.workspaces.iter()
                                     .filter(|w| remote::identity(&w.id).is_some_and(|id| id.node_id == node_id))
@@ -5941,18 +6743,9 @@ impl Workspace {
                             })))
                             .child(Self::settings_option("update-remote", "Update Boomux", false)
                             .flex_none()
-                            .on_click(cx.listener(move |this, _, window, cx| {
+                            .button_chrome().on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.launch_node_action(terminal::WorkspaceLaunch::UpgradeNode(upgrade_id.clone()), window, cx);
-                            })))
-                    })
-                    .when(!node.local && node.health == boomux::protocol::NodeProjectionHealthCode::AuthenticationRequired, |detail| {
-                        let id = node.id.clone();
-                        detail.child(Self::settings_option("reauthenticate-node", "Sign in…", false)
-                            .flex_none()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.launch_node_action(terminal::WorkspaceLaunch::ReauthenticateNode(id.clone()), window, cx);
                             })))
                     })
                     .child(div().mt_2().pt_2().border_t_1().border_color(rgb(0x45475a))
@@ -5960,7 +6753,7 @@ impl Workspace {
                         .child(Self::settings_option("remove-remote-machine", "Remove machine & uninstall Boomux…", false)
                             .flex_none()
                             .text_color(rgb(0xf38ba8))
-                            .on_click(cx.listener({
+                            .button_chrome().on_click(cx.listener({
                                 let id = node.id.clone();
                                 move |this, _, window, cx| {
                                     cx.stop_propagation();
@@ -5970,7 +6763,7 @@ impl Workspace {
                         .child(format!("Stops all managed shells on {}. Opens a terminal for confirmation.", node.label))
                         .child(Self::settings_control("forget-remote-machine", "Forget connection only…", false, !self.node_forget_busy)
                             .flex_none()
-                            .on_click(cx.listener({
+                            .button_chrome().on_click(cx.listener({
                                 let id = node.id.clone();
                                 move |this, _, _, cx| {
                                     cx.stop_propagation();
@@ -5984,7 +6777,7 @@ impl Workspace {
                                 .child("Remove this connection and its cached workspaces from this computer? This does not contact the machine, uninstall Boomux, or stop remote work.")
                                 .child(Self::settings_control("confirm-forget-remote", if self.node_forget_busy { "Forgetting…" } else { "Forget connection" }, false, !self.node_forget_busy)
                                     .flex_none().text_color(rgb(0xf38ba8))
-                                    .on_click(cx.listener({
+                                    .button_chrome().on_click(cx.listener({
                                         let id = node.id.clone();
                                         move |this, _, _, cx| {
                                             cx.stop_propagation();
@@ -5992,7 +6785,7 @@ impl Workspace {
                                         }
                                     })))
                                 .child(Self::settings_option("cancel-forget-remote", "Cancel", false).flex_none()
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .button_chrome().on_click(cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
                                         if !this.node_forget_busy { this.node_forget_confirm = None; }
                                         cx.notify();
@@ -6024,6 +6817,7 @@ impl Workspace {
                 .child(
                     Self::settings_option("add-remote-node", "Connect another machine…", false)
                         .flex_none()
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.launch_node_action(terminal::WorkspaceLaunch::AddNode, window, cx);
                         })),
@@ -6047,14 +6841,43 @@ impl Workspace {
                         .child("REMOTE MACHINES"),
                 )
                 .children(rows)
+                .when(
+                    !self.layout_document.hidden_remote_workspaces.is_empty(),
+                    |panel| {
+                        panel
+                            .child(div().text_sm().child("HIDDEN WORKSPACES"))
+                            .children(self.layout_document.hidden_remote_workspaces.iter().map(
+                                |(id, name)| {
+                                    let id = id.clone();
+                                    Self::settings_option(
+                                        SharedString::from(format!("show-{id}")),
+                                        format!("Show {name}"),
+                                        false,
+                                    )
+                                    .flex_none()
+                                    .button_chrome()
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.show_remote_workspace(&id, cx);
+                                        },
+                                    ))
+                                },
+                            ))
+                    },
+                )
                 .into_any_element(),
         )
     }
 
     fn toggle_project_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.project_menu_open = !self.project_menu_open;
+        self.remote_picker_open = false;
         self.sidebar_header_menu_open = false;
         self.sidebar_menu = None;
+        self.project_search.clear();
+        self.conversations.search_focused = false;
+        self.git_panel.search_focused = false;
         window.focus(&self.focus_handle, cx);
         if self.project_menu_open && !self.projects_loading {
             self.projects_loading = true;
@@ -6138,10 +6961,14 @@ impl Workspace {
         if !self.project_menu_open {
             return None;
         }
+        if self.remote_picker_open {
+            return Some(self.remote_workspace_picker(cx));
+        }
         let mut entries = div()
             .id("project-menu-list")
             .max_h(px(320.0))
             .overflow_y_scroll();
+        let query = self.project_search.trim().to_lowercase();
         let mut configured = false;
         if self.projects_loading {
             entries = entries.child(
@@ -6165,7 +6992,24 @@ impl Workspace {
                                 },
                             ));
                     }
-                    for (index, project) in discovery.projects.iter().enumerate() {
+                    let mut matches = discovery
+                        .projects
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, project)| {
+                            project_search::matches(&project.name, &project.path, &query)
+                        })
+                        .peekable();
+                    if !discovery.projects.is_empty() && matches.peek().is_none() {
+                        entries = entries.child(
+                            div()
+                                .p_3()
+                                .text_sm()
+                                .text_color(rgb(0x9399b2))
+                                .child("No projects match your search."),
+                        );
+                    }
+                    for (index, project) in matches {
                         let project = project.clone();
                         entries = entries.child(
                             sidebar_menu_row(("project-choice", index))
@@ -6189,6 +7033,7 @@ impl Workspace {
                                         .text_color(rgb(0x9399b2))
                                         .child(project.path.display().to_string()),
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.project_menu_open = false;
@@ -6246,6 +7091,7 @@ impl Workspace {
                 .child(
                     sidebar_menu_row("project-new-workspace")
                         .child("New Workspace")
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             if this.settings_open {
@@ -6257,12 +7103,23 @@ impl Workspace {
                 .child(
                     sidebar_menu_row("project-new-remote-workspace")
                         .child("New remote workspace…")
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             if this.settings_open {
                                 this.close_settings(cx);
                             }
-                            this.open_nodes(cx);
+                            this.project_menu_open = true;
+                            this.remote_picker_open = true;
+                            this.remote_picker_scroll_handle
+                                .set_offset(point(px(0.0), px(0.0)));
+                            this.nodes_open = false;
+                            this.selected_node = this
+                                .node_views
+                                .iter()
+                                .find(|n| !n.local)
+                                .map(|n| n.id.clone());
+                            cx.notify();
                         })),
                 )
                 .child(div().mx_2().my_1().h(px(1.0)).bg(rgb(0x313244)))
@@ -6274,6 +7131,62 @@ impl Workspace {
                         .text_color(rgb(0x9399b2))
                         .child("LOCAL PROJECTS"),
                 )
+                .child(
+                    div()
+                        .id("project-search")
+                        .role(gpui::Role::SearchInput)
+                        .role(gpui::Role::SearchInput)
+                        .aria_label("Filter projects by name or path")
+                        .mx_2()
+                        .my_1()
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(0x89b4fa))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .button_chrome()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            window.focus(&this.focus_handle, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(rgb(if self.project_search.is_empty() {
+                                    0x9399b2
+                                } else {
+                                    0xcdd6f4
+                                }))
+                                .child(if self.project_search.is_empty() {
+                                    "Search projects…".to_string()
+                                } else {
+                                    self.project_search.clone()
+                                }),
+                        )
+                        .when(!self.project_search.is_empty(), |field| {
+                            field.child(
+                                div()
+                                    .id("project-search-clear")
+                                    .role(gpui::Role::Button)
+                                    .aria_label("Clear project search")
+                                    .cursor_pointer()
+                                    .px_1()
+                                    .child("×")
+                                    .button_chrome()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.project_search.clear();
+                                        window.focus(&this.focus_handle, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
+                )
                 .child(entries)
                 .child(div().mx_2().my_1().h(px(1.0)).bg(rgb(0x313244)))
                 .child(
@@ -6283,6 +7196,7 @@ impl Workspace {
                         } else {
                             "Add project folder…"
                         })
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.open_project_settings(window, cx);
@@ -6316,6 +7230,7 @@ impl Workspace {
                         } else {
                             "Check for updates"
                         })
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.sidebar_header_menu_open = false;
@@ -6330,6 +7245,7 @@ impl Workspace {
                     sidebar_menu_row("header-menu-help")
                         .justify_between()
                         .gap_3()
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.sidebar_header_menu_open = false;
@@ -6349,6 +7265,7 @@ impl Workspace {
                     sidebar_menu_row("header-menu-hide-sidebar")
                         .justify_between()
                         .gap_3()
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
                             this.sidebar_header_menu_open = false;
@@ -6397,6 +7314,7 @@ impl Workspace {
                 self.pane_layout_mode,
             )
         };
+        let compact_sidebar = self.sidebar_content_width() < 280.0;
         let workspace_order_animation = self.workspace_order_animation.clone();
         let workspace_order_animation_duration = self.motion_speed.duration();
         let workspace_rows = workspaces
@@ -6415,116 +7333,123 @@ impl Workspace {
                     .as_ref()
                     .and_then(|id| self.node_views.iter().find(|node| node.id == id.node_id));
                 let shell_count = workspace.shells.len();
-                let shell_rows =
-                    workspace
-                        .shells
-                        .iter()
-                        .filter(|_| expanded && self.pane_layout_mode != PaneLayoutMode::Tabbed)
-                        .cloned()
-                        .map(|shell| {
-                            let shell_id = shell.id.clone();
-                            let shell_target = SidebarResource::Shell {
-                                id: shell.id.clone(),
-                                workspace_id: workspace.id.clone(),
-                                name: shell.name.clone(),
-                            };
-                            let shell_item = SidebarItem::Shell {
-                                workspace_id: workspace.id.clone(),
-                                shell_id: shell.id.clone(),
-                            };
-                            let keyboard_selected = self.navigation_region
-                                == NavigationRegion::Sidebar
-                                && self.sidebar_item.as_ref() == Some(&shell_item);
-                            let selected = focused_shell_id == Some(shell.id.as_str());
-                            let pane_open = open_shell_ids.contains(shell.id.as_str());
-                            let pane_presence = shell_pane_presence(selected, pane_open);
-                            let status = shell.status_label();
-                            div()
-                                .id(SharedString::from(format!("sidebar-shell-{}", shell.id)))
-                                .ml_8()
-                                .h(px(39.0))
-                                .px_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .rounded_md()
-                                .anchor_scroll(
-                                    keyboard_selected.then(|| self.sidebar_scroll_anchor.clone()),
-                                )
-                                .bg(if keyboard_selected {
-                                    rgb(0x45475a)
-                                } else if selected {
-                                    rgb(0x252536)
-                                } else {
-                                    rgb(0x181825)
-                                })
-                                .hover(|element| element.bg(rgb(0x29293d)))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.activate_sidebar_shell(&shell_id, window, cx);
-                                }))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(
-                                            if pane_presence != ShellPanePresence::Minimized {
-                                                0x89b4fa
-                                            } else {
-                                                0x6c7086
-                                            },
-                                        ))
-                                        .child(if self.shell_has_agent(&shell) {
-                                            "✦"
+                let shell_rows = workspace
+                    .shells
+                    .iter()
+                    .filter(|_| expanded && self.pane_layout_mode != PaneLayoutMode::Tabbed)
+                    .cloned()
+                    .map(|shell| {
+                        let shell_id = shell.id.clone();
+                        let shell_target = SidebarResource::Shell {
+                            id: shell.id.clone(),
+                            workspace_id: workspace.id.clone(),
+                            name: shell.name.clone(),
+                        };
+                        let shell_item = SidebarItem::Shell {
+                            workspace_id: workspace.id.clone(),
+                            shell_id: shell.id.clone(),
+                        };
+                        let keyboard_selected = self.navigation_region == NavigationRegion::Sidebar
+                            && self.sidebar_item.as_ref() == Some(&shell_item);
+                        let selected = focused_shell_id == Some(shell.id.as_str());
+                        let pane_open = open_shell_ids.contains(shell.id.as_str());
+                        let pane_presence = shell_pane_presence(selected, pane_open);
+                        let status = shell.status_label();
+                        div()
+                            .id(SharedString::from(format!("sidebar-shell-{}", shell.id)))
+                            .ml(px(if compact_sidebar { 12.0 } else { 32.0 }))
+                            .h(px(SIDEBAR_SHELL_ROW_HEIGHT))
+                            .flex_none()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap(px(if compact_sidebar { 4.0 } else { 8.0 }))
+                            .rounded_md()
+                            .anchor_scroll(
+                                keyboard_selected.then(|| self.sidebar_scroll_anchor.clone()),
+                            )
+                            .bg(if keyboard_selected {
+                                rgb(0x45475a)
+                            } else if selected {
+                                rgb(0x252536)
+                            } else {
+                                rgb(0x181825)
+                            })
+                            .hover(|element| element.bg(rgb(0x29293d)))
+                            .cursor_pointer()
+                            .button_chrome()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.activate_sidebar_shell(&shell_id, window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgb(
+                                        if pane_presence != ShellPanePresence::Minimized {
+                                            0x89b4fa
                                         } else {
-                                            pane_presence.glyph()
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_weight(gpui::FontWeight::NORMAL)
-                                                .text_color(rgb(0xcdd6f4))
-                                                .child(shell.name),
-                                        )
-                                        .child(div().text_xs().text_color(rgb(0x6c7086)).child(
-                                            format!("{} · {status}", pane_presence.label()),
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "sidebar-shell-menu-{}",
-                                            shell.id
-                                        )))
-                                        .w(px(24.0))
-                                        .h(px(28.0))
-                                        .flex_none()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .text_color(rgb(0x7f849c))
-                                        .hover(|element| {
-                                            element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
-                                        })
-                                        .on_click(cx.listener(move |this, event, window, cx| {
-                                            this.open_sidebar_menu(
-                                                shell_target.clone(),
-                                                event,
-                                                window,
-                                                cx,
-                                            );
-                                        }))
-                                        .child("⋮"),
-                                )
-                        })
-                        .collect::<Vec<_>>();
+                                            0x6c7086
+                                        },
+                                    ))
+                                    .child(if self.shell_has_agent(&shell) {
+                                        "✦"
+                                    } else {
+                                        pane_presence.glyph()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::NORMAL)
+                                            .text_color(rgb(0xcdd6f4))
+                                            .child(shell.name),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_xs()
+                                            .text_color(rgb(0x6c7086))
+                                            .child(format!("{} · {status}", pane_presence.label())),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "sidebar-shell-menu-{}",
+                                        shell.id
+                                    )))
+                                    .w(px(24.0))
+                                    .h(px(28.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_color(rgb(0x7f849c))
+                                    .hover(|element| {
+                                        element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
+                                    })
+                                    .button_chrome()
+                                    .on_click(cx.listener(move |this, event, window, cx| {
+                                        this.open_sidebar_menu(
+                                            shell_target.clone(),
+                                            event,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .child("⋮"),
+                            )
+                    })
+                    .collect::<Vec<_>>();
 
                 let workspace_target = SidebarResource::Workspace {
                     id: workspace.id.clone(),
@@ -6552,7 +7477,7 @@ impl Workspace {
                             )
                             .h(px(52.0))
                             .rounded_md()
-                            .bg(if active { rgb(0x313244) } else { rgb(0x252536) })
+                            .bg(if active { rgb(0x313244) } else { rgb(0x181825) })
                             .px_2()
                             .flex()
                             .items_center()
@@ -6572,6 +7497,7 @@ impl Workspace {
                                 },
                                 |drag, _, _, cx| cx.new(|_| drag.clone()),
                             )
+                            .button_chrome()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.navigation_region = NavigationRegion::Sidebar;
                                 this.sidebar_item = Some(workspace_item.clone());
@@ -6656,6 +7582,7 @@ impl Workspace {
                                         div()
                                             .text_sm()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .truncate()
                                             .child(workspace.name.clone()),
                                     )
                                     .child(
@@ -6702,6 +7629,7 @@ impl Workspace {
                                     .hover(|element| {
                                         element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
                                     })
+                                    .button_chrome()
                                     .on_click(cx.listener(move |this, event, window, cx| {
                                         this.open_sidebar_menu(
                                             workspace_target.clone(),
@@ -6747,6 +7675,30 @@ impl Workspace {
             })
             .collect::<Vec<_>>();
 
+        let text_style = window.text_style();
+        let mut title_font = text_style.font();
+        title_font.weight = gpui::FontWeight::BOLD;
+        let title_width = window
+            .text_system()
+            .shape_line(
+                "BOOMUX".into(),
+                text_style.font_size.to_pixels(window.rem_size()),
+                &[TextRun {
+                    len: 6,
+                    font: title_font,
+                    color: text_style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                    ..Default::default()
+                }],
+                None,
+            )
+            .width;
+        let show_brand_text = sidebar_brand_text_fits(
+            self.sidebar_width().min(self.sidebar_content_width()),
+            f32::from(title_width),
+        );
         let agent_rows = agents
             .iter()
             .cloned()
@@ -6786,60 +7738,70 @@ impl Workspace {
                             .items_center()
                             .gap_3()
                             .child(sidebar_brand_mark())
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div().font_weight(gpui::FontWeight::BOLD).child("BOOMUX"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("sidebar-node-status")
-                                            .truncate()
-                                            .text_xs()
-                                            .text_color(rgb(0x89b4fa))
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.open_nodes(cx);
-                                            }))
-                                            .child(
-                                                if self.node_views.iter().any(|node| !node.local) {
-                                                    let unavailable = self
+                            .when(show_brand_text, |brand| {
+                                brand.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .whitespace_nowrap()
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .child("BOOMUX"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("sidebar-node-status")
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(rgb(0x89b4fa))
+                                                .cursor_pointer()
+                                                .button_chrome()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_nodes(cx);
+                                                }))
+                                                .child(
+                                                    if self
                                                         .node_views
                                                         .iter()
-                                                        .filter(|node| !node.connected())
-                                                        .count();
-                                                    if unavailable == 0 {
-                                                        format!(
-                                                            "{} remotes · connected",
-                                                            self.node_views
-                                                                .iter()
-                                                                .filter(|node| !node.local)
-                                                                .count()
-                                                        )
+                                                        .any(|node| !node.local)
+                                                    {
+                                                        let unavailable = self
+                                                            .node_views
+                                                            .iter()
+                                                            .filter(|node| !node.connected())
+                                                            .count();
+                                                        if unavailable == 0 {
+                                                            format!(
+                                                                "{} remotes · connected",
+                                                                self.node_views
+                                                                    .iter()
+                                                                    .filter(|node| !node.local)
+                                                                    .count()
+                                                            )
+                                                        } else {
+                                                            format!(
+                                                                "{} remotes · {} unavailable",
+                                                                self.node_views
+                                                                    .iter()
+                                                                    .filter(|node| !node.local)
+                                                                    .count(),
+                                                                unavailable
+                                                            )
+                                                        }
                                                     } else {
                                                         format!(
-                                                            "{} remotes · {} unavailable",
-                                                            self.node_views
-                                                                .iter()
-                                                                .filter(|node| !node.local)
-                                                                .count(),
-                                                            unavailable
+                                                            "active · {} workspaces",
+                                                            self.boomux_overview.workspaces.len()
                                                         )
-                                                    }
-                                                } else {
-                                                    format!(
-                                                        "active · {} workspaces",
-                                                        self.boomux_overview.workspaces.len()
-                                                    )
-                                                },
-                                            ),
-                                    ),
-                            ),
+                                                    },
+                                                ),
+                                        ),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -6854,6 +7816,7 @@ impl Workspace {
                                     "+",
                                     self.project_menu_open,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, window, cx| {
                                         cx.stop_propagation();
@@ -6864,11 +7827,27 @@ impl Workspace {
                             )
                             .child(
                                 sidebar_header_button(
+                                    "open-workspace-conversations",
+                                    "Workspace conversations",
+                                    "☷",
+                                    self.conversations.open,
+                                )
+                                .button_chrome()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_conversations(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                sidebar_header_button(
                                     "open-settings",
                                     "Settings",
                                     "⚙",
                                     self.settings_open,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -6883,6 +7862,7 @@ impl Workspace {
                                     "⋯",
                                     self.sidebar_header_menu_open,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -6987,9 +7967,15 @@ impl Workspace {
                                             1 => "sidebar-git-tab",
                                             _ => "sidebar-nodes-tab",
                                         })
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .py_2()
+                                        .bg(rgb(if selected { 0x313244 } else { 0x181825 }))
                                         .cursor_pointer()
                                         .text_sm()
-                                        .pb_1()
                                         .border_b_2()
                                         .border_color(rgb(if selected {
                                             0x89b4fa
@@ -7006,6 +7992,7 @@ impl Workspace {
                                         } else {
                                             "Agents".to_owned()
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             window.focus(&this.focus_handle, cx);
                                             if tab == 2 {
@@ -7014,12 +8001,18 @@ impl Workspace {
                                                 this.select_git_tab(tab == 1, cx);
                                             }
                                         }))
-                                }))
-                                .child(div().flex_1())
-                                .when(self.git_panel.open, |tabs| {
-                                    tabs.child(self.render_git_controls(cx))
-                                }),
+                                })),
                         )
+                        .when(self.git_panel.open, |section| {
+                            section.child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .px_3()
+                                    .py_1()
+                                    .child(self.render_git_controls(cx)),
+                            )
+                        })
                         .when_some(self.render_git_panel(cx), |section, git| section.child(git))
                         .when_some(self.nodes_panel(cx), |section, nodes| section.child(nodes))
                         .when(!self.git_panel.open && !self.nodes_open, |section| {
@@ -7056,11 +8049,17 @@ impl Workspace {
         let target = menu.target.clone();
         let open_workspace_id = match &target {
             SidebarResource::Workspace { id, .. } => Some(id.clone()),
-            SidebarResource::Shell { .. } => None,
+            SidebarResource::Shell { .. } | SidebarResource::Connection { .. } => None,
         };
         let create_workspace_id = match &target {
             SidebarResource::Workspace { id, .. } => Some(id.clone()),
-            SidebarResource::Shell { .. } => None,
+            SidebarResource::Shell { .. } | SidebarResource::Connection { .. } => None,
+        };
+        let hide_target = match &target {
+            SidebarResource::Workspace { id, .. } if remote::identity(id).is_some() => {
+                Some(target.clone())
+            }
+            _ => None,
         };
         let rename_target = target.clone();
         let remove_target = target.clone();
@@ -7090,6 +8089,7 @@ impl Workspace {
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|row| row.bg(rgb(0x313244)))
+                            .button_chrome()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.open_workspace(&workspace_id, None, window, cx);
@@ -7108,6 +8108,7 @@ impl Workspace {
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|row| row.bg(rgb(0x313244)))
+                            .button_chrome()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.create_and_attach_workspace_terminal(
@@ -7130,6 +8131,7 @@ impl Workspace {
                         .rounded_md()
                         .cursor_pointer()
                         .hover(|row| row.bg(rgb(0x313244)))
+                        .button_chrome()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.open_resource_dialog(
@@ -7141,6 +8143,17 @@ impl Workspace {
                         .child("Rename")
                         .child(div().text_xs().text_color(rgb(0x6c7086)).child("F2")),
                 )
+                .when_some(hide_target, |element, target| {
+                    element.child(
+                        sidebar_menu_row("sidebar-menu-hide-workspace")
+                            .child("Hide from sidebar")
+                            .button_chrome()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.hide_remote_workspace(target.clone(), window, cx);
+                            })),
+                    )
+                })
                 .child(
                     div()
                         .id("sidebar-menu-remove")
@@ -7152,6 +8165,7 @@ impl Workspace {
                         .text_color(rgb(0xf38ba8))
                         .cursor_pointer()
                         .hover(|row| row.bg(rgb(0x313244)))
+                        .button_chrome()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.request_remove_resource(remove_target.clone(), window, cx);
@@ -7185,7 +8199,7 @@ impl Workspace {
             .flex()
             .items_center()
             .justify_center()
-            .rounded_md()
+            .rounded(px(3.0))
             .border_1()
             .border_color(rgb(if selected { 0x89b4fa } else { 0x313244 }))
             .bg(rgb(if selected { 0x313244 } else { 0x181825 }))
@@ -7255,6 +8269,7 @@ impl Workspace {
                             .cursor_pointer()
                             .hover(|button| button.bg(rgb(0x313244)))
                             .child("×")
+                            .button_chrome()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.close_settings(cx);
                             })),
@@ -7372,6 +8387,7 @@ impl Workspace {
             .when(self.settings_restart_pending, |panel| {
                 panel.child(
                     Self::settings_option("settings-restart", "↻ Restart to apply changes", true)
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             if !this.boomux_settings_busy {
                                 this.settings_restart_confirm = true;
@@ -7386,14 +8402,18 @@ impl Workspace {
                         .flex()
                         .gap_2()
                         .child(
-                            Self::settings_option("retry-settings", "Retry save", false).on_click(
-                                cx.listener(|this, _, _, cx| this.save_boomux_settings(cx)),
-                            ),
+                            Self::settings_option("retry-settings", "Retry save", false)
+                                .button_chrome()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.save_boomux_settings(cx)),
+                                ),
                         )
                         .child(
-                            Self::settings_option("reload-settings", "Reload", false).on_click(
-                                cx.listener(|this, _, _, cx| this.load_boomux_settings(cx)),
-                            ),
+                            Self::settings_option("reload-settings", "Reload", false)
+                                .button_chrome()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.load_boomux_settings(cx)),
+                                ),
                         ),
                 )
             })
@@ -7438,9 +8458,9 @@ impl Workspace {
                     .child(div().text_sm().child("The terminal service will restart. Running shells and commands stay alive; terminal views reconnect briefly."))
                     .child(div().flex().gap_2()
                         .child(Self::settings_option("cancel-settings-restart", "Later", false)
-                            .on_click(cx.listener(|this, _, _, cx| { this.settings_restart_confirm = false; cx.notify(); })))
+                            .button_chrome().on_click(cx.listener(|this, _, _, cx| { this.settings_restart_confirm = false; cx.notify(); })))
                         .child(Self::settings_option("confirm-settings-restart", "Restart now", true)
-                            .on_click(cx.listener(|this, _, _, cx| this.restart_settings_service(cx))))))
+                            .button_chrome().on_click(cx.listener(|this, _, _, cx| this.restart_settings_service(cx))))))
                 .into_any_element()
         })
     }
@@ -7599,6 +8619,7 @@ impl Workspace {
                         snapshot.control_text(index) == "true",
                         enabled && !self.boomux_settings_busy,
                     )
+                    .button_chrome()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.boomux_settings_busy {
                             return;
@@ -7670,7 +8691,7 @@ impl Workspace {
                         ))
                         .child(
                             Self::settings_option(("accept-boomux-field", index), "Done", true)
-                                .on_click(
+                                .button_chrome().on_click(
                                     cx.listener(|this, _, _, cx| this.accept_boomux_setting(cx)),
                                 ),
                         );
@@ -7748,7 +8769,7 @@ impl Workspace {
                                 (SharedString::from(format!("boomux-field-{index}")), option_index),
                                 label, selected, enabled,
                             )
-                                .on_click(cx.listener(move |this, _, window, cx| {
+                                .button_chrome().on_click(cx.listener(move |this, _, window, cx| {
                                     if this.boomux_settings_busy || !enabled {
                                         return;
                                     }
@@ -7804,6 +8825,7 @@ impl Workspace {
                                         self.pane_layout_mode == PaneLayoutMode::Tiled,
                                         true,
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
                                             this.set_pane_layout_mode(
@@ -7821,6 +8843,7 @@ impl Workspace {
                                         self.pane_layout_mode == PaneLayoutMode::Tabbed,
                                         true,
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
                                             this.set_pane_layout_mode(
@@ -7846,8 +8869,10 @@ impl Workspace {
                                         self.workspace_pane_mode == WorkspacePaneMode::Workspace,
                                         true,
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
                                         |this, _, window, cx| {
+                                            this.capture_arrangement();
                                             this.workspace_pane_mode = WorkspacePaneMode::Workspace;
                                             let workspace_id = this
                                                 .terminals
@@ -7878,13 +8903,25 @@ impl Workspace {
                                             WorkspacePaneMode::Mixed,
                                         ),
                                     )
+                                    .button_chrome()
                                     .on_click(cx.listener(
-                                        |this, _, _, cx| {
+                                        |this, _, window, cx| {
                                             if pane_layout_supports_scope(
                                                 this.pane_layout_mode,
                                                 WorkspacePaneMode::Mixed,
                                             ) {
+                                                this.capture_arrangement();
                                                 this.workspace_pane_mode = WorkspacePaneMode::Mixed;
+                                                if let Some(saved) = this
+                                                    .layout_document
+                                                    .arrangements
+                                                    .get("mixed")
+                                                    .cloned()
+                                                {
+                                                    this.layout_document.active = "mixed".into();
+                                                    this.restore_arrangement(saved, window, cx);
+                                                }
+                                                this.layout_changed(cx);
                                                 this.save_settings();
                                                 cx.notify();
                                             }
@@ -7912,6 +8949,7 @@ impl Workspace {
                         self.pane_headings_visible,
                         true,
                     )
+                    .button_chrome()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.pane_headings_visible = !this.pane_headings_visible;
                         this.save_settings();
@@ -7930,6 +8968,7 @@ impl Workspace {
                                     self.pane_corner_style == PaneCornerStyle::Rounded,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.pane_corner_style = PaneCornerStyle::Rounded;
@@ -7945,6 +8984,7 @@ impl Workspace {
                                     self.pane_corner_style == PaneCornerStyle::Square,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.pane_corner_style = PaneCornerStyle::Square;
@@ -7960,6 +9000,7 @@ impl Workspace {
                                     self.pane_corner_style == PaneCornerStyle::Mixed,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.pane_corner_style = PaneCornerStyle::Mixed;
@@ -7977,6 +9018,7 @@ impl Workspace {
                             .gap_1()
                             .child(
                                 Self::settings_control("decrease-pane-gap", "−", false, true)
+                                    .button_chrome()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.pane_gap = (this.pane_gap - 2.0).max(0.0);
                                         this.save_settings();
@@ -7997,6 +9039,7 @@ impl Workspace {
                             )
                             .child(
                                 Self::settings_control("increase-pane-gap", "+", false, true)
+                                    .button_chrome()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.pane_gap = (this.pane_gap + 2.0).min(32.0);
                                         this.save_settings();
@@ -8016,8 +9059,24 @@ impl Workspace {
                         self.layout_overlay_visible,
                         true,
                     )
+                    .button_chrome()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.layout_overlay_visible = !this.layout_overlay_visible;
+                        this.save_settings();
+                        cx.notify();
+                    })),
+                ))
+                .child(Self::settings_toggle_row(
+                    "Button hover animations",
+                    "Animate button highlights on hover. Turn off for instant feedback.",
+                    Self::settings_switch(
+                        "button-hover-animations",
+                        "Button hover animations",
+                        self.button_hover_animations,
+                        true,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.button_hover_animations = !this.button_hover_animations;
                         this.save_settings();
                         cx.notify();
                     })),
@@ -8034,6 +9093,7 @@ impl Workspace {
                                     self.motion_speed == MotionSpeed::Instant,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.motion_speed = MotionSpeed::Instant;
@@ -8051,6 +9111,7 @@ impl Workspace {
                                     self.motion_speed == MotionSpeed::Fast,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.motion_speed = MotionSpeed::Fast;
@@ -8066,6 +9127,7 @@ impl Workspace {
                                     self.motion_speed == MotionSpeed::Smooth,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.motion_speed = MotionSpeed::Smooth;
@@ -8092,6 +9154,7 @@ impl Workspace {
                                     false,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.focus_highlight_strength =
                                         this.focus_highlight_strength.saturating_sub(10);
@@ -8118,6 +9181,7 @@ impl Workspace {
                                     false,
                                     true,
                                 )
+                                .button_chrome()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.focus_highlight_strength =
                                         this.focus_highlight_strength.saturating_add(10).min(100);
@@ -8143,7 +9207,7 @@ impl Workspace {
                     "Copy on select",
                     "Copy selected terminal text to the clipboard when you release the mouse.",
                     Self::settings_switch("copy-on-select", "Copy on select", self.copy_on_select, true)
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .button_chrome().on_click(cx.listener(|this, _, _, cx| {
                             this.copy_on_select = !this.copy_on_select;
                             this.save_settings();
                             cx.notify();
@@ -8154,12 +9218,12 @@ impl Workspace {
                 .child(Self::settings_category("Recovery & history"))
                 .child(Self::settings_group().children(self.shared_settings_rows(&[6, 7], cx)))
                 .child(Self::settings_category("Safety"))
-                .child(Self::settings_group().child(Self::settings_toggle_row("Confirm removals", "Ask before permanently removing a Shell or Workspace.", Self::settings_switch("removal-confirmation", "Confirm removals", self.confirm_destructive_actions, true).on_click(cx.listener(|this, _, _, cx| { this.confirm_destructive_actions = !this.confirm_destructive_actions; this.save_settings(); cx.notify(); })))))
+                .child(Self::settings_group().child(Self::settings_toggle_row("Confirm removals", "Ask before permanently removing a Shell or Workspace.", Self::settings_switch("removal-confirmation", "Confirm removals", self.confirm_destructive_actions, true).button_chrome().on_click(cx.listener(|this, _, _, cx| { this.confirm_destructive_actions = !this.confirm_destructive_actions; this.save_settings(); cx.notify(); })))))
                 .child(Self::settings_category("Projects"))
                 .child(div().text_xs().text_color(rgb(0x9399b2)).child("Scan these folders for projects to open from the + menu. Local Node only; no restart needed."))
                 .child(Self::settings_group()
                     .child(Self::settings_row().child(Self::settings_control("browse-project-folders", "Browse for folders…", false, !self.boomux_settings_busy && !self.project_folder_picker_open)
-                        .on_click(cx.listener(|this, _, _, cx| this.browse_project_folders(cx)))))
+                        .button_chrome().on_click(cx.listener(|this, _, _, cx| this.browse_project_folders(cx)))))
                     .children(self.shared_settings_rows(&[10, 11], cx)))
                 .child(Self::settings_category("Advanced"))
                 .child(Self::settings_group().child(
@@ -8169,14 +9233,14 @@ impl Workspace {
                                 .child(snapshot.path.display().to_string())
                         ))
                         .child(Self::settings_control("open-config-file", "Open config file", false, !self.boomux_settings_busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .button_chrome().on_click(cx.listener(|this, _, window, cx| {
                                 if this.boomux_settings_busy { return; }
                                 this.close_settings(cx);
                                 this.create_workspace_terminal(terminal::WorkspaceLaunch::ConfigEdit, window, cx);
                             })))
                 ))
                 .child(Self::settings_control("manual-setup", "Open advanced setup in terminal", false, true)
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .button_chrome().on_click(cx.listener(|this, _, window, cx| {
                         this.close_settings(cx);
                         this.create_workspace_terminal(terminal::WorkspaceLaunch::Setup, window, cx);
                     })));
@@ -8202,6 +9266,12 @@ impl Workspace {
             ResourceDialogKind::Remove => format!("Remove {kind_label}?"),
         };
         let detail = match (&dialog.target, dialog.kind) {
+            (SidebarResource::Connection { .. }, ResourceDialogKind::Rename) => {
+                "Change this connection’s display name on this computer. The SSH address and remote Workspace names stay the same.".into()
+            }
+            (SidebarResource::Connection { .. }, ResourceDialogKind::Remove) => {
+                "Use Forget connection on the machine card.".into()
+            }
             (_, ResourceDialogKind::Rename) => {
                 "Type a new name, then press Enter to save it.".to_string()
             }
@@ -8216,8 +9286,9 @@ impl Workspace {
                     .find(|workspace| workspace.id == *id)
                     .map_or(0, |workspace| workspace.shells.len());
                 format!(
-                    "This permanently removes “{name}” and its {shell_count} Boomux shell{}.",
-                    if shell_count == 1 { "" } else { "s" }
+                    "This permanently removes “{name}” and its {shell_count} Boomux shell{}.{}",
+                    if shell_count == 1 { "" } else { "s" },
+                    if remote::identity(id).is_some() { " The remote machine must be reachable. To remove only this sidebar entry, cancel and choose Hide from sidebar in its menu." } else { "" }
                 )
             }
         };
@@ -8302,6 +9373,7 @@ impl Workspace {
                                             button
                                                 .cursor_pointer()
                                                 .hover(|hovered| hovered.bg(rgb(0x313244)))
+                                                .button_chrome()
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
                                                     this.resource_dialog = None;
@@ -8327,6 +9399,7 @@ impl Workspace {
                                             button
                                                 .cursor_pointer()
                                                 .hover(|hovered| hovered.opacity(0.85))
+                                                .button_chrome()
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     cx.stop_propagation();
                                                     this.submit_resource_dialog(window, cx);
@@ -8473,6 +9546,7 @@ impl Workspace {
                                         .cursor_pointer()
                                         .text_color(rgb(0xa6adc8))
                                         .hover(|button| button.bg(rgb(0x313244)))
+                                        .button_chrome()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.help_open = false;
@@ -8569,6 +9643,7 @@ impl Workspace {
             })
             .hover(|element| element.bg(rgb(0x29293d)))
             .cursor_pointer()
+            .button_chrome()
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.activate_sidebar_shell(&shell_id, window, cx);
             }))
@@ -8647,6 +9722,7 @@ impl Workspace {
                         .cursor_pointer()
                         .hover(|element| element.bg(rgb(0x313244)))
                         .child(if dismissing { "…" } else { "Dismiss" })
+                        .button_chrome()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.dismiss_agent_notification(
@@ -8774,6 +9850,30 @@ impl Workspace {
                     "No Boomux terminal is available."
                 },
             ))
+            .when(
+                pane.is_some_and(|pane| {
+                    pane.restored
+                        .as_ref()
+                        .is_some_and(|saved| saved.shell.is_some())
+                        && !pane.attaching
+                        && pane.session.is_none()
+                }),
+                |element| {
+                    element.child(
+                        Self::settings_option(
+                            ("reconnect-saved-pane", pane_id),
+                            "Reconnect / start Shell",
+                            false,
+                        )
+                        .button_chrome()
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.reconnect_saved_pane(pane_id, window, cx)
+                            },
+                        )),
+                    )
+                },
+            )
             .when_some(
                 pane.and_then(|pane| pane.error.clone())
                     .or_else(|| self.boomux_error.clone()),
@@ -9056,6 +10156,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.request_pane_shell_dialog(
@@ -9138,6 +10239,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.focus_terminal_pane(id, window, cx);
@@ -9162,6 +10264,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.focus_terminal_pane(id, window, cx);
@@ -9186,6 +10289,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.minimize_pane(id, window, cx);
@@ -9211,6 +10315,7 @@ impl Workspace {
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
+                                        .button_chrome()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.request_pane_shell_dialog(
@@ -9311,6 +10416,7 @@ impl Workspace {
                     .text_color(rgb(0xcdd6f4))
                     .cursor_pointer()
                     .hover(|tab| tab.bg(rgb(0x29293d)).border_color(rgb(0x585b70)))
+                    .button_chrome()
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.activate_sidebar_shell(&shell_id, window, cx);
                     }))
@@ -9350,6 +10456,7 @@ impl Workspace {
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation();
                                     })
+                                    .button_chrome()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
                                         this.open_resource_dialog(
@@ -9389,6 +10496,7 @@ impl Workspace {
                         .text_color(rgb(0xa6adc8))
                         .cursor_pointer()
                         .hover(|button| button.bg(rgb(0x29293d)))
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.scroll_minimized_tabs(-1, cx);
                         }))
@@ -9422,6 +10530,7 @@ impl Workspace {
                         .text_color(rgb(0xa6adc8))
                         .cursor_pointer()
                         .hover(|button| button.bg(rgb(0x29293d)))
+                        .button_chrome()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.scroll_minimized_tabs(1, cx);
                         }))
@@ -9483,7 +10592,13 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        cx.set_global(buttons::Motion(
+            self.motion_speed
+                .duration()
+                .filter(|_| self.button_hover_animations),
+        ));
         self.sidebar_viewport_width = f32::from(window.viewport_size().width);
+        self.layout_canvas = self.panel_size(window);
         let workspace_name = self
             .terminals
             .get(&self.focused)
@@ -9522,6 +10637,33 @@ impl Render for Workspace {
         self.refresh_terminal_paint_caches(window);
         let tiled = if let Some(layout) = &self.layout {
             self.render_layout(layout, cx)
+        } else if self.boomux_overview.workspaces.is_empty() && self.terminals.is_empty() {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .p_6()
+                .text_center()
+                .text_sm()
+                .text_color(rgb(0xa6adc8))
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xcdd6f4))
+                        .child("Create your first Workspace"),
+                )
+                .child("Click + in the sidebar, then choose New Workspace to get started.")
+                .child(if cfg!(target_os = "macos") {
+                    "Once created, press Command + Enter to add a Shell."
+                } else {
+                    "Once created, press Ctrl + Enter to add a Shell."
+                })
+                .child("Press F1 for keyboard shortcuts.")
+                .into_any_element()
         } else {
             div().size_full().into_any_element()
         };
@@ -9542,10 +10684,21 @@ impl Render for Workspace {
                 .as_ref()
                 .is_some_and(|layout| layout.contains(id))
             {
-                // A maximized tiled pane covers the floating layer as well.
-                floating_panes.clear();
+                // Setup overlays remain usable without unmaximizing the current pane.
+                floating_panes.retain(|pane| {
+                    self.terminals
+                        .get(&pane.id)
+                        .is_some_and(|terminal| terminal.temporary_setup)
+                });
             } else {
-                floating_panes.sort_by_key(|pane| pane.id == id);
+                floating_panes.sort_by_key(|pane| {
+                    (
+                        self.terminals
+                            .get(&pane.id)
+                            .is_some_and(|terminal| terminal.temporary_setup),
+                        pane.id == id,
+                    )
+                });
             }
         }
         let floating = floating_panes
@@ -9578,7 +10731,30 @@ impl Render for Workspace {
                     )
                     .when(lifted_id == Some(pane.id), |element| element.opacity(0.92))
                     .child(self.pane(pane.id, cx));
-                if let (Some(animation), Some(duration)) = (
+                if let Some(transition) = &self.workspace_transition {
+                    let target = pane.clone();
+                    let from = FloatingPane {
+                        x: target.x + transition.direction * self.panel_size(window).0,
+                        ..target.clone()
+                    };
+                    let animation_id = SharedString::from(format!(
+                        "workspace-enter-{}-{}",
+                        transition.generation, pane.id
+                    ));
+                    base.with_animation(
+                        animation_id,
+                        Animation::new(transition.duration).with_easing(ease_out_quint()),
+                        move |element, progress| {
+                            let bounds = interpolate_floating_pane(&from, &target, progress);
+                            element
+                                .left(px(bounds.x))
+                                .top(px(bounds.y))
+                                .w(px(bounds.width))
+                                .h(px(bounds.height))
+                        },
+                    )
+                    .into_any_element()
+                } else if let (Some(animation), Some(duration)) = (
                     floating_animation
                         .as_ref()
                         .filter(|animation| animation.pane_id == pane.id),
@@ -9796,6 +10972,9 @@ impl Render for Workspace {
             .flex()
             .child(drawer)
             .child(terminal_area)
+            .when_some(self.conversations_panel(cx), |content, panel| {
+                content.child(panel)
+            })
             .when(!self.sidebar_visible, |content| {
                 content.child(
                     div()
@@ -9835,17 +11014,26 @@ impl Render for Workspace {
 
         div()
             .id("workspace")
+            .when_some(self.layout_error.clone(), |element, error| {
+                element.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .text_xs()
+                        .bg(rgb(0x313244))
+                        .text_color(rgb(0xf38ba8))
+                        .child(format!("Layout not saved: {error}")),
+                )
+            })
             .track_focus(&self.focus_handle)
             .key_context(
-                if (self.nodes_open && self.navigation_region == NavigationRegion::Sidebar)
-                    || self.git_panel.search_focused
-                    || self.boomux_setting_input.is_some()
-                    || self.settings_restart_confirm
-                {
-                    "BoomuxSettingsInput"
-                } else {
-                    workspace_key_context(self.help_open, self.navigation_region, self.layout_mode)
-                },
+                self.keyboard_input_target()
+                    .key_context(workspace_key_context(
+                        self.help_open,
+                        self.navigation_region,
+                        self.layout_mode,
+                    )),
             )
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
@@ -9926,9 +11114,9 @@ impl Render for Workspace {
             .text_color(rgb(0xcdd6f4))
             .child(content)
             .when_some(sidebar_menu, |element, menu| element.child(menu))
-            .when_some(resource_dialog, |element, dialog| element.child(dialog))
             .when_some(settings_restart, |element, dialog| element.child(dialog))
             .when_some(help, |element, help| element.child(help))
+            .when_some(resource_dialog, |element, dialog| element.child(dialog))
     }
 }
 
@@ -10088,7 +11276,11 @@ fn prepare_terminal_paint(
     let mut lines = Vec::with_capacity(usize::from(screen.rows));
     let mut backgrounds = Vec::new();
     let mut cursor_outline = None;
-    let mut base_font = font("JetBrainsMono Nerd Font");
+    let mut base_font = font(if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "JetBrainsMono Nerd Font"
+    });
     base_font.features = gpui::FontFeatures::disable_ligatures();
     let selection_range = selection.map(|selection| selection_indices(selection, cols));
 
@@ -10097,7 +11289,7 @@ fn prepare_terminal_paint(
         let mut runs = Vec::with_capacity(cells.len());
         for (col, cell) in cells.iter().enumerate() {
             let selected = selection_range.is_some_and(|(start, end)| {
-                let index = row * cols + col;
+                let index = (row + screen.scroll_offset as usize) * cols + col;
                 (start..=end).contains(&index)
             });
             let (foreground, background) = if selected {
@@ -10117,7 +11309,7 @@ fn prepare_terminal_paint(
                     color: terminal_theme.cursor,
                 });
             }
-            if background != terminal_theme.background {
+            if background != screen.background {
                 backgrounds.push(TerminalBackground {
                     row,
                     col,
@@ -10140,15 +11332,21 @@ fn prepare_terminal_paint(
             if cell.italic {
                 cell_font = cell_font.italic();
             }
+            let mut text_color = rgb_to_hsla(gpui::rgb(foreground));
+            // Match Ghostty's default faint opacity without changing the cell
+            // background or its palette/truecolor value.
+            if cell.faint {
+                text_color.alpha = 0.5;
+            }
             push_text_run(
                 &mut runs,
                 TextRun {
                     len: text.len() - start,
                     font: cell_font,
-                    color: rgb_to_hsla(gpui::rgb(foreground)),
+                    color: text_color,
                     underline: cell.underline.then_some(UnderlineStyle {
                         thickness: px(1.0),
-                        color: Some(rgb_to_hsla(gpui::rgb(foreground))),
+                        color: Some(text_color),
                         wavy: false,
                     }),
                     ..Default::default()
@@ -10175,7 +11373,8 @@ fn prepare_terminal_paint(
 
 fn terminal_view(paint_cache: Arc<TerminalPaintCache>, images: Vec<RenderedTerminalImage>) -> Div {
     let cached_paint = Arc::clone(&paint_cache);
-    div().size_full().overflow_hidden().bg(rgb(0x11111b)).child(
+    let background = gpui::rgb(paint_cache.screen.background);
+    div().size_full().overflow_hidden().bg(background).child(
         canvas(
             move |_, _, _| images,
             move |bounds, images, window, cx| {
@@ -10289,6 +11488,9 @@ fn paint_terminal_images(
 }
 
 fn main() {
+    if subprocess::dispatch() {
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("boomux-desktop {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -10329,7 +11531,31 @@ fn main() {
         Ok(saved) => (saved, None),
         Err(error) => (settings::Settings::default(), Some(error)),
     };
-    gpui_platform::application().run(move |cx: &mut App| {
+    let application = gpui_platform::application();
+    #[cfg(target_os = "macos")]
+    application.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            let loaded = settings::path()
+                .ok_or_else(|| "Cannot resolve Desktop settings".to_string())
+                .and_then(|path| settings::Settings::load(&path));
+            let (saved, error) = match loaded {
+                Ok(saved) => (saved, None),
+                Err(error) => (settings::Settings::default(), Some(error)),
+            };
+            open_desktop_window(cx, saved, error);
+        }
+        cx.activate(true);
+    });
+    application.run(move |cx: &mut App| {
+        #[cfg(target_os = "macos")]
+        cx.bind_keys([
+            KeyBinding::new("cmd-c", CopySelection, Some("Terminal")),
+            KeyBinding::new("cmd-v", PasteClipboard, Some("Terminal")),
+            KeyBinding::new("cmd-v", PasteClipboard, Some("BoomuxSettingsInput")),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
+        #[cfg(target_os = "macos")]
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.bind_keys([
             KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("BoomuxSettingsInput")),
             // Layout commands remain available while Control is held with the leader.
@@ -10371,6 +11597,10 @@ fn main() {
             KeyBinding::new("ctrl-c", CenterFloating, Some("Layout")),
             KeyBinding::new("ctrl-tab", CyclePaneNext, Some("Layout")),
             KeyBinding::new("ctrl-shift-tab", CyclePanePrevious, Some("Layout")),
+            KeyBinding::new("pagedown", CycleWorkspaceNext, Some("Sidebar")),
+            KeyBinding::new("pageup", CycleWorkspacePrevious, Some("Sidebar")),
+            KeyBinding::new("ctrl-pagedown", CycleWorkspaceNext, Some("Sidebar")),
+            KeyBinding::new("ctrl-pageup", CycleWorkspacePrevious, Some("Sidebar")),
             KeyBinding::new("ctrl-pagedown", CycleWorkspaceNext, Some("Layout")),
             KeyBinding::new("ctrl-pageup", CycleWorkspacePrevious, Some("Layout")),
             KeyBinding::new("ctrl-o", ToggleFloating, Some("Layout")),
@@ -10467,6 +11697,9 @@ fn main() {
             KeyBinding::new("secondary-shift-c", CopySelection, Some("Layout")),
             KeyBinding::new("secondary-shift-c", CopySelection, Some("Sidebar")),
             KeyBinding::new("secondary-shift-c", CopySelection, Some("SidebarLayout")),
+            KeyBinding::new("secondary-v", PasteClipboard, Some("ResourceDialog")),
+            KeyBinding::new("secondary-shift-v", PasteClipboard, Some("ResourceDialog")),
+            KeyBinding::new("shift-insert", PasteClipboard, Some("ResourceDialog")),
             KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Terminal")),
             KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Layout")),
             KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Sidebar")),
@@ -10483,18 +11716,7 @@ fn main() {
             KeyBinding::new("shift-insert", PasteClipboard, Some("SidebarLayout")),
         ]);
 
-        let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // Omarchy tags org.omarchy.* windows as terminals, which makes
-                // its universal clipboard binding choose Ctrl/Shift+Insert.
-                app_id: Some("org.omarchy.boomux-desktop".into()),
-                ..Default::default()
-            },
-            move |window, cx| cx.new(|cx| Workspace::new(window, cx, saved, settings_error)),
-        )
-        .unwrap();
+        open_desktop_window(cx, saved, settings_error);
         cx.activate(true);
         if let Some(path) = update_ready {
             bundle_update::signal_ready(path);
@@ -10502,9 +11724,75 @@ fn main() {
     });
 }
 
+#[cfg(target_os = "macos")]
+gpui::actions!(macos, [Quit]);
+
+fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: Option<String>) {
+    let mut layout_session = layout_state::Session::load();
+    match boomux::client::connect_if_running()
+        .ok()
+        .flatten()
+        .and_then(|client| client.node_identity().ok())
+    {
+        Some(owner)
+            if layout_session.document.owner.is_empty()
+                || layout_session.document.owner == owner =>
+        {
+            layout_session.document.owner = owner
+        }
+        _ => {
+            layout_session.error = Some(
+                "Saved layout belongs to an unavailable or different Node; it was retained.".into(),
+            );
+            layout_session.writer = None;
+            layout_session.document = layout_state::Document::default();
+        }
+    }
+    let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // Omarchy tags org.omarchy.* windows as terminals, which makes
+            // its universal clipboard binding choose Ctrl/Shift+Insert.
+            app_id: Some("org.omarchy.boomux-desktop".into()),
+            ..Default::default()
+        },
+        move |window, cx| {
+            cx.new(|cx| Workspace::new(window, cx, saved, settings_error, layout_session))
+        },
+    )
+    .unwrap();
+}
+
 #[cfg(test)]
 mod pointer_tests {
     use super::*;
+
+    #[test]
+    fn sidebar_brand_collapses_before_title_or_controls_wrap() {
+        assert!(!sidebar_brand_text_fits(280.0, 85.0));
+        assert!(sidebar_brand_text_fits(340.0, 85.0));
+        assert!(!sidebar_brand_text_fits(340.0, 140.0));
+        assert!(!sidebar_brand_text_fits(0.0, 85.0));
+    }
+
+    #[test]
+    fn workspace_navigation_uses_selection_and_empty_workspace_before_old_terminal() {
+        let order = vec!["first".into(), "empty".into(), "third".into()];
+        let sidebar = workspace_navigation_anchor(Some("empty"), Some("first"), Some("first"));
+        assert_eq!(cycled_workspace_id(&order, sidebar, false), Some("third"));
+        let empty = workspace_navigation_anchor(None, Some("empty"), None);
+        assert_eq!(cycled_workspace_id(&order, empty, true), Some("first"));
+        let transitioning = workspace_navigation_anchor(None, Some("empty"), Some("first"));
+        assert_eq!(
+            cycled_workspace_id(&order, transitioning, false),
+            Some("third")
+        );
+        assert_eq!(
+            workspace_navigation_anchor(None, None, Some("third")),
+            Some("third")
+        );
+    }
 
     #[test]
     fn layout_leader_release_distinguishes_taps_holds_and_toggle_off() {
@@ -10544,13 +11832,16 @@ mod pointer_tests {
         for x in [-20.0, 0.0, 48.0] {
             assert_eq!(sidebar_drag_target(x), None);
         }
-        assert_eq!(sidebar_drag_target(49.0), Some(280.0));
+        assert_eq!(sidebar_drag_target(49.0), Some(200.0));
+        assert_eq!(sidebar_drag_target(199.0), Some(200.0));
+        assert_eq!(sidebar_drag_target(200.0), Some(200.0));
+        assert_eq!(sidebar_drag_target(240.0), Some(240.0));
         assert_eq!(sidebar_drag_target(420.0), Some(420.0));
         assert_eq!(sidebar_drag_target(900.0), Some(600.0));
         // A single drag can cross the collapse boundary in either direction.
         assert_eq!(
             [320.0, 20.0, 100.0].map(sidebar_drag_target),
-            [Some(320.0), None, Some(280.0)]
+            [Some(320.0), None, Some(200.0)]
         );
     }
 
@@ -10895,7 +12186,8 @@ mod pointer_tests {
             key: "c".into(),
             key_char: Some("c".into()),
             modifiers: gpui::Modifiers {
-                control: true,
+                control: !cfg!(target_os = "macos"),
+                platform: cfg!(target_os = "macos"),
                 shift: true,
                 ..Default::default()
             },
@@ -10986,7 +12278,8 @@ mod pointer_tests {
                 key: "enter".into(),
                 key_char: None,
                 modifiers: gpui::Modifiers {
-                    control: true,
+                    control: !cfg!(target_os = "macos"),
+                    platform: cfg!(target_os = "macos"),
                     ..Default::default()
                 },
             },
@@ -11147,6 +12440,7 @@ mod pointer_tests {
     #[test]
     fn terminal_selection_drag_uses_only_source_pane_bounds_and_mouse_down_anchor() {
         let screen = TerminalScreen {
+            background: 0,
             rows: 24,
             cols: 80,
             cells: Vec::new(),
@@ -11219,6 +12513,7 @@ mod pointer_tests {
                 foreground: 0xffffff,
                 background: 0,
                 bold: false,
+                faint: false,
                 italic: false,
                 underline: false,
                 wide: false,
@@ -11227,6 +12522,7 @@ mod pointer_tests {
             })
             .collect();
         TerminalScreen {
+            background: 0,
             rows: 2,
             cols: 4,
             cells,
@@ -11236,6 +12532,48 @@ mod pointer_tests {
             images: Vec::new(),
             image_placements: Vec::new(),
         }
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_is_directional_bounded_and_stops_inside() {
+        assert_eq!(selection_scroll_delta(100.0, 100.0, 500.0), 0);
+        assert_eq!(selection_scroll_delta(499.0, 100.0, 500.0), 0);
+        assert_eq!(selection_scroll_delta(99.0, 100.0, 500.0), -1);
+        assert_eq!(selection_scroll_delta(500.0, 100.0, 500.0), 1);
+        assert_eq!(selection_scroll_delta(-1000.0, 100.0, 500.0), -6);
+        assert_eq!(selection_scroll_delta(2000.0, 100.0, 500.0), 6);
+    }
+
+    #[test]
+    fn terminal_selection_clips_visible_text_using_scrollback_coordinates() {
+        let mut screen = selection_test_screen();
+        screen.scroll_offset = 10;
+        screen.scroll_total = 20;
+        let selection = TerminalSelection {
+            anchor: (9, 2),
+            head: (11, 1),
+        };
+        assert_eq!(terminal_selected_text(&screen, selection), "abc\nef");
+        assert_eq!(
+            terminal_selected_text(
+                &screen,
+                TerminalSelection {
+                    anchor: selection.head,
+                    head: selection.anchor
+                }
+            ),
+            "abc\nef"
+        );
+        assert_eq!(
+            terminal_selected_text(
+                &screen,
+                TerminalSelection {
+                    anchor: (0, 0),
+                    head: (1, 2)
+                }
+            ),
+            ""
+        );
     }
 
     #[test]

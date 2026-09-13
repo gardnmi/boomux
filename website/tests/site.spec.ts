@@ -81,6 +81,10 @@ test("installation offers only the exact Desktop command", async ({
 }) => {
   await page.goto("./#install");
   await expect(page.locator("#install-desktop")).toBeVisible();
+  await expect(page.locator("#install")).toContainText("One command selects the right OS.");
+  await expect(page.locator("#install")).toContainText("Linux x86_64 requires glibc 2.39+");
+  await expect(page.locator("#install")).toContainText("Apple Silicon and macOS 15 or newer");
+  await expect(page.locator("#install")).toContainText("not notarized");
   await expect(page.locator("#install code")).toHaveCount(1);
   await expect(page.locator("#install [role=tab]")).toHaveCount(0);
   await expect(page.locator("#command-desktop")).toHaveText(

@@ -32,6 +32,8 @@ Detaching a pane never implies closing its Boomux Shell.
 When another client takes control, Desktop publishes the detached status before
 draining the terminal worker and shows **Take control** in the pane heading.
 That action attaches to the same ShellRun; workspace switching is not required.
+Layout capture and restore discard unbound placeholders that have no Shell identity,
+collapsing their splits. Saved references to unavailable Shells remain reconnectable.
 
 New terminal creation publishes the attachment before any sidebar overview refresh;
 the existing overview worker refreshes resource rows independently. New local
@@ -45,7 +47,17 @@ second owner lookup. Newly started/restarted Shells still resolve their new run.
 ### Terminal Selection And Clipboard
 
 Selection drag updates use only the source pane's bounds and retain the original
-mouse-down anchor. The primary selection updates during the drag. On left-button
+mouse-down anchor in scrollback coordinates. Dragging above or below the source
+pane runs one gesture-scoped 50 ms timer, scrolling one to six rows per tick.
+Viewport requests coalesce through the existing emulator worker queue. Returning
+inside, releasing the button, losing window activation, removing the pane, or
+reaching a history boundary ends the timer; there is no idle per-pane polling.
+
+Visible highlighting projects the anchored selection into each new viewport.
+Copies spanning off-screen history are formatted by Ghostty on its existing
+worker, with a 4 MiB output limit and an explicit error on overflow. Only one
+pending asynchronous copy is retained per Desktop; a new gesture cancels it.
+No second scrollback buffer is created. The primary selection updates during the drag. On left-button
 release, Desktop copies nonempty selected text from that pane to the system
 clipboard once per gesture when `copy_on_select` is enabled (the default).
 The preference applies immediately and is saved in Desktop settings. Disabling
@@ -60,6 +72,13 @@ so a Desktop selection cannot simultaneously invoke a harness copy-on-select
 handler. Future button forwarding must preserve exclusive gesture ownership.
 
 ### Input And Layout Mode
+
+Rename and removal dialogs own keyboard input while open, even when the Remotes,
+project, or Git panel remains open behind them. The shared input router gives
+these modals a dedicated `ResourceDialog` key context before panel navigation or
+layout-leader handling. Clipboard paste goes to an editable rename field and is
+consumed by busy or confirmation-only dialogs. Closing the modal restores the
+underlying panel's routing without changing its expanded state.
 
 GPUI key contexts separate ordinary terminal input from desktop layout actions.
 The default `Terminal` context reserves only explicit lifecycle, clipboard, and
@@ -99,6 +118,7 @@ and history but does not remove project shortcuts or filesystem contents.
 
 ## Module Map
 
+- `src/input_routing.rs`: keyboard recipient priority and modal key contexts.
 - `src/main.rs`: application model, Boomux sidebar projection, input routing,
   pane lifecycle, GPUI elements, terminal cell drawing, and GPU image caching.
 - `src/layout.rs`: binary split tree, normalized rectangles, spatial focus,
@@ -112,6 +132,12 @@ and history but does not remove project shortcuts or filesystem contents.
   from the daemon's combined snapshot.
 - `src/boomux_settings.rs`: active-layer settings editor and bounded CLI bridge;
   Boomux retains configuration validation and commit authority.
+- `src/layout_state.rs`: versioned, bounded Desktop arrangement storage with atomic
+  background writes and revision checks preventing stale-instance overwrites.
+- `src/layout_persistence.rs`: pane-ID remapping, per-Workspace/Mixed arrangement
+  capture/restore, debounced saves, and deferred exact-run attachments. Local
+  references are scoped to the verified coordinator Node; remote keys retain
+  owner and resource identity. No terminal data or attachment environment is saved.
 - `src/settings.rs`: bounded preference loading, validation, and atomic background
   saves of Desktop-owned settings; shared Boomux configuration remains separate.
 - `src/layout_badge.rs`: shared animated Layout-mode icons and pane overlays.
@@ -125,7 +151,25 @@ terminal parser. Each attached pane has a socket reader and one terminal worker.
 The reader sends byte chunks through a bounded queue. When decoding falls behind,
 pressure propagates back through the Boomux socket to the PTY producer; arbitrary
 terminal bytes are never discarded because doing so could corrupt escape or
-Kitty graphics sequences.
+Kitty graphics sequences. A producer clones the queue sender under its mutex,
+then releases the mutex before waiting for capacity. Queue saturation must not
+prevent GPUI from accessing the sender or cancelling a discarded pane.
+Pane focus notifications use a single pending flag and a nonblocking wake marker.
+The terminal worker sends the notification, including between replay chunks;
+click and hover handlers never acquire the attachment writer or write a focus
+frame themselves. Repeated focus requests coalesce while the queue is full.
+
+Pane resize requests likewise retain only one latest set of dimensions per pane
+and use a nonblocking wake marker. The worker updates the terminal profile,
+resizes the emulator, and sends the daemon resize frame between replay chunks.
+Fullscreen and window resize handlers do not wait for queue capacity or socket
+writes.
+
+Discarding a pane cancels its local replay and disconnects the queue sender;
+it does not enqueue a blocking stop command. The worker checks cancellation
+between 16 KiB decode chunks and releases pending replay data when it exits.
+This discards only presentation work for a closed pane, not daemon-owned Shell
+output or processes.
 
 After initial attachment and daemon reconnect, the reader requests one redraw
 by briefly changing the PTY width and restoring the latest pane dimensions after
@@ -139,7 +183,7 @@ new snapshot or terminal status exists; bursts collapse into one wakeup because
 the consumer always reads the newest snapshot. Synchronized-output mode delays
 publication until the terminal frame is complete.
 When an attachment ends, the worker publishes its final decoded screen before
-stopping, including output batched with the stop command. Detachment itself does
+stopping, including output queued before transport closure. Detachment itself does
 not establish command success. The UI watches until the worker closes its update
 stream after final publication, rather than stopping at transport closure.
 
@@ -154,6 +198,10 @@ command path and republishes a screen without reconnecting the Boomux Shell.
 ## Rendering
 
 Text cells and Kitty image placements come from the same Ghostty terminal state.
+Each screen carries its resolved terminal background, including application OSC
+changes; the terminal canvas and padding use that color rather than the app
+canvas color. SGR faint text retains its palette/truecolor value and renders at
+50% foreground opacity, including underlines.
 The GPUI layer draws background images, cells, and foreground images in z-order,
 clips every placement to its pane, and caches GPU images by terminal generation.
 Images are explicitly dropped when their generation disappears or their pane
@@ -221,7 +269,12 @@ Workspace authority.
 
 ## Remote Node Entry Points
 
-The lower sidebar has Agents, Git, and Remotes tabs. Remotes contains the scrollable
+Connection, sign-in, update, uninstall, and agent setup terminals open as temporary
+floating panes over the current arrangement. They do not detach existing panes,
+change the expanded Workspace, or enter the saved arrangement. Closing a failed
+or cancelled setup leaves the underlying panes available.
+
+The lower sidebar has Agents, Conversations, Git, and Remotes tabs. Remotes contains the scrollable
 machine cards with selected-machine details and create/update/sign-in controls.
 The general connect action sits above the cards, outside any machine's controls;
 it is no longer an overflow-menu popover. Node shortcuts apply only while the
@@ -235,12 +288,23 @@ use the registered owner's existing guarded APIs. Cached directories are not
 invented from local paths. Remote creation resolves the owner's starting directory
 and creates the owner-local Workspace and first pending Shell with fresh exact IDs;
 ambiguous mutation failures are surfaced without automatic replay.
-The initial connect flow creates this Workspace after successful registration.
-Open its Shell from the sidebar; creating another Workspace from Remotes also
-attaches its first Shell. Multi-placement coordinator metadata is left unchanged.
+The initial connect flow reads the verified owner's live Workspace snapshot after
+registration and offers a starter only when the owner has no Workspaces. Reconnecting
+with a different connection alias does not create an additional Workspace. An owner-confirmed `already_exists` result leaves the connection
+successful and directs the user to existing Workspaces in the sidebar, without
+selecting or modifying one by name. Other failures remain errors and are not
+replayed. When creation succeeds, Desktop opens its exact Shell after the user
+acknowledges the setup result.
+The Workspace menu's remote picker uses the existing Node summaries and creates
+and attaches the first Shell on the selected connected machine. Unavailable
+machines offer recovery instead of attempting creation. Multi-placement
+coordinator metadata is left unchanged.
 
 The Remotes tab retains sign-in actions and adds an explicitly confirmed
-remote update action. No background installation or upgrade is performed.
+remote update action. Expanded machine cards also expose connection renaming,
+including while disconnected. Rename uses the exact registered Node ID and a
+revision guard; it changes only the local alias, preserving the SSH route and
+remote Workspace names. No background installation or upgrade is performed.
 Once remote
 Nodes are registered, the existing sidebar subtitle shows a compact Node count
 and connection summary. Selection uses stable Node IDs, including when aliases
@@ -266,6 +330,24 @@ and protocol compatibility remain owned by that interactive flow. After the
 result acknowledgment, the exact dedicated command Shell/run is removed with a
 revision guard. Desktop removes its temporary Workspace only with ephemeral
 creation proof, the expected post-removal revision, and no remaining resources.
+
+For a Desktop-owned connect launch, a private one-shot Unix datagram socket
+returns only the exact qualified identity of the created Shell. Its random
+short `/tmp` directory is mode 0700; the receiver is owned by that terminal
+session, accepts at most 1 KiB, and removes its socket and directory on drop.
+No terminal output, names, new-row detection, or persisted connection intent is
+used to infer the result. There is no extra worker or polling loop: after the
+existing overview worker confirms setup-Shell removal and output completion,
+it consumes the receipt and resolves the Shell from its registered owner off
+the UI thread before attaching. Failed or cancelled setup without a receipt
+causes no navigation. Closing/detaching the setup pane drops the receiver.
+A failed result delivery or attachment directs the user to the sidebar and never
+replays Workspace creation. This is an ephemeral matching-CLI/Desktop channel,
+not a daemon wire or persistence change.
+
+Collapsed unavailable machine cards expose sign-in, update review, or connection
+details according to the existing typed health. Update review uses the guarded
+CLI flow; it does not bypass incompatible-helper or identity checks.
 
 Ordinary Shells invoking the CLI are not cleanup targets. Remotes does not launch
 the separate terminal dashboard. Healthy cards omit generic lifecycle guidance;
@@ -433,8 +515,10 @@ executable gets a finish-installation reminder after launching a new bundle.
 ## Edge Resizing
 
 The sidebar exposes a five-pixel right-edge handle. Its preferred width is bounded
-to 280–600 logical pixels and stored in Desktop preferences when dragging ends;
-older preference files retain the 300-pixel default. The displayed width also
+to 200–600 logical pixels and stored in Desktop preferences when dragging ends;
+older preference files retain the 300-pixel default. The compact minimum fits
+the logo and header controls after the brand text hides; dragging below that
+minimum retains the existing rebound and far-edge collapse behavior. The displayed width also
 reserves terminal canvas space on narrow windows. Sidebar content, Settings,
 menus, and terminal pointer coordinates use the same effective width.
 
@@ -447,3 +531,81 @@ Twelve-pixel corner targets paint above side handles and resize both axes with
 diagonal cursors. Tiled corner targets require adjoining dividers on both axes.
 Maximized and transitioning panes omit edge handles. Terminal body selection
 and Ctrl-drag behavior retain their existing input paths.
+
+## Internal layout restoration
+
+Layout mutations retain one 250 ms debounce task and one pending writer request;
+terminal output and rendering do not generate persistence snapshots. Active drag
+state is excluded. Workspace switching captures the outgoing committed tree;
+inactive arrangements retain metadata only, not sessions or emulator state.
+Files cap at 2 MiB, 256 arrangements, 4096 total panes and depth 64. Invalid or
+unsupported files remain untouched and disable writes with a visible notice.
+
+Desktop startup restores the tree and floating geometry before exact-running
+attachments. Stopped Shells require explicit user action. Deferred attachments reuse the
+existing overview refresh, attempt at most four panes per refresh, and back off
+failed attempts up to 30 seconds without per-pane timers. This also allows an
+update replacement to attach after the old window releases its terminals. Restoration never authorizes
+Shell creation, restart, or attachment takeover. Updates freeze saving and await
+the durable snapshot before launching the replacement; failure permits retry.
+A per-file lock plus revision comparison prevents stale windows from replacing
+newer state. Outer OS window placement remains outside this feature.
+
+## Remote Workspace visibility
+
+`src/remote_visibility.rs` filters owner-qualified remote Workspace keys from
+Desktop's overview before sidebar ordering and navigation. Hiding detaches open
+and restored panes and removes their saved arrangements; it does not mutate the
+owner or its projection cache. The normal local snapshot refresh restores shown
+entries. The hidden map is bounded to 256 entries with 1,024-byte identities and
+labels, and shares the existing bounded atomic layout writer and stale-writer
+revision checks.
+
+Desktop layout document version 2 adds `hidden_remote_workspaces`. Version 1 is
+explicitly migrated with an empty hidden map while preserving its revision and
+arrangements. Unknown versions remain rejected. This is separate from daemon
+persistence and wire versions, which are unchanged.
+
+## Workspace Conversations
+
+`src/conversations.rs` owns the selected Workspace's conversation panel, loading,
+error, and open-request state. It fetches owner-scoped conversation lists with cached harness titles in
+background work driven by the existing overview loop, at most every three seconds
+while visible. Selection changes discard the previous Workspace's entries; late
+responses are ignored. Rendering pages 50 entries at a time bounds UI work.
+
+The shared core projection groups recorded Agent runs by harness and exact
+conversation ID within one immutable Workspace. It does not inspect external
+history. Opening uses protocol 55 owner validation, focuses an existing exact-run
+pane, or attaches a tiled pane without detaching the current layout. A failed
+or ambiguous open surfaces an error; retry retains its requested Shell ID.
+Missing/old remote owners never cause local execution. Overview refresh is read-only: all user Workspaces remain until explicitly
+removed, including those without Shells or recorded conversations. The exact
+creation-receipt cleanup of temporary setup Workspaces remains separate.
+
+Conversation organization is Desktop presentation state. Layout document version 3
+adds up to 4096 pin/archive preferences keyed by owner-scoped Workspace, integration,
+and external conversation ID. Versions 1 and 2 migrate explicitly with no
+conversation preferences, preserving existing layout and visibility data. Preferences
+use the existing bounded atomic layout writer and are saved even when no terminal
+arrangement is active. Explicit Workspace removal clears its preferences. They do
+not sync across Desktop installations or affect Agent lifecycle or harness history.
+
+The panel caches filtered row indices outside rendering. Recent excludes archived
+entries and sorts pinned entries first, then by latest observed activity; Archived
+is separately searchable. Search matches title and harness. A dedicated keyboard
+recipient prevents search typing from reaching terminals and yields to resource
+dialogs. Open and Resume are explicit row actions; unavailable resume is not invoked.
+
+## Button feedback
+
+`src/buttons.rs` supplies shared 3-pixel button corners and a diagonal hover fill
+using existing theme accents. Buttons retain their semantic colors and handlers.
+Hover transitions reverse from their current position, respect Desktop Instant
+motion and system reduced motion, and request frames only while transitioning.
+The persisted `button_hover_animations` preference defaults to enabled; disabling
+it makes hover feedback immediate without changing pane transition speed.
+State is owned by the visible element and reclaimed when it disappears. Switches
+and text fields keep their distinct input shapes; disabled controls do not animate.
+The Agents/Git/Remotes tabs divide their row equally, with selected backgrounds and
+underlines. Git toolbar actions occupy a separate row to preserve tab widths.

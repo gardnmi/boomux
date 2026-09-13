@@ -160,8 +160,7 @@ mod tests {
             self, Envelope, HostServiceOperation, HostServiceResult, Request, Response,
         };
         use std::os::unix::net::UnixListener;
-        let directory =
-            std::env::temp_dir().join(format!("remote-workspace-{}", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("rw-{:016x}", fastrand::u64(..)));
         std::fs::create_dir(&directory).unwrap();
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();

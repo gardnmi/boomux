@@ -108,8 +108,16 @@ pub(crate) fn validate_desktop_entry(entry: &str) -> Result<(), Box<dyn Error>> 
 }
 
 pub(crate) fn selected(desktop_entry: Option<&str>) -> Result<String, Box<dyn Error>> {
-    let preference = desktop_entry.map(TemporaryPreference::new).transpose()?;
-    selected_with_preference(desktop_entry, preference.as_ref())
+    #[cfg(target_os = "macos")]
+    {
+        let _ = desktop_entry;
+        Ok("Terminal.app".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let preference = desktop_entry.map(TemporaryPreference::new).transpose()?;
+        selected_with_preference(desktop_entry, preference.as_ref())
+    }
 }
 
 pub(crate) fn open(
@@ -484,6 +492,7 @@ pub(crate) fn open_plain(desktop_entry: Option<&str>) -> Result<(), Box<dyn Erro
     spawn_terminal(parse_nul_arguments(&output.stdout)?, None, &selected, None)
 }
 
+#[cfg(target_os = "linux")]
 fn launch(
     desktop_entry: Option<&str>,
     title: &str,
@@ -763,6 +772,24 @@ impl Drop for TemporaryPreference {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.directory);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn launch(
+    desktop_entry: Option<&str>,
+    _title: &str,
+    cwd: Option<&Path>,
+    program: &OsStr,
+    arguments: &[OsString],
+    _placement: Option<HyprlandPlacement<'_>>,
+    _reuse_existing: bool,
+) -> Result<(), Box<dyn Error>> {
+    if desktop_entry.is_some() {
+        return Err(
+            "macOS terminal selection currently supports Terminal.app; omit --terminal".into(),
+        );
+    }
+    crate::macos_terminal::launch(program, arguments, cwd).map_err(Into::into)
 }
 
 #[cfg(test)]

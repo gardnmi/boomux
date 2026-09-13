@@ -1,13 +1,15 @@
 //! Read-only release discovery. No installs or daemon lifecycle operations.
 use semver::Version;
 use serde_json::Value;
-use std::{
-    io::Read,
-    process::{Command, Stdio},
-};
+use std::{io::Read, process::Stdio};
 
 const LIMIT: u64 = 128 * 1024;
+#[cfg(target_os = "linux")]
 const DESKTOP_ASSET: &str = "boomux-desktop-x86_64-unknown-linux-gnu.tar.gz";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const DESKTOP_ASSET: &str = "boomux-desktop-aarch64-apple-darwin.zip";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const DESKTOP_ASSET: &str = "boomux-desktop-x86_64-apple-darwin.zip";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notice {
@@ -113,8 +115,7 @@ fn boomux_status(raw: &[u8]) -> Option<Notice> {
 
 // Both process lifetime and retained output are bounded. Call only on a worker.
 fn output(program: &str, args: &[&str]) -> Option<Vec<u8>> {
-    let mut child = Command::new("timeout")
-        .args(["--kill-after=1s", "20s", program])
+    let mut child = crate::subprocess::command(20, program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

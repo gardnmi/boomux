@@ -7,6 +7,10 @@ install_desktop() {
 @DESKTOP_INSTALLER@
 }
 
+install_macos_desktop() {
+@MACOS_INSTALLER@
+}
+
 install_cli() {
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
@@ -191,7 +195,10 @@ choose_install() {
     if [ "$choice" = desktop ]; then
         BOOMUX_DESKTOP_VERSION=$tag
         export BOOMUX_DESKTOP_VERSION
-        install_desktop
+        case "$(uname -s)" in
+            Darwin) install_macos_desktop ;;
+            *) install_desktop ;;
+        esac
     else
         install_cli
     fi

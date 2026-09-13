@@ -1,0 +1,98 @@
+name: macOS validation
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native macOS
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-preview-v1
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Run native Clippy
+        run: cargo +stable clippy --locked -p boomux -p boomux-desktop --all-targets --all-features -- -D warnings
+      - name: Compile native lifecycle tests
+        run: cargo +stable test --locked --test native_backend --no-run
+      - name: Test descriptor transfer
+        run: cargo +stable test --locked --lib fd_transfer -- --test-threads=1
+      - name: Test native process identity
+        run: cargo +stable test --locked --lib platform::macos::tests -- --test-threads=1 --nocapture
+      - name: Test native lifecycle and recovery
+        env:
+          BOOMUX_TEST_DIAGNOSTICS: "1"
+        run: python3 .github/scripts/test-macos-native.py
+      - name: Test native Desktop
+        run: cargo +stable test -p boomux-desktop --locked -- --test-threads=1
+      - name: Upload native diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boomux-macos-native
+          path: dist/macos/native/
+          if-no-files-found: ignore
+          retention-days: 14
+  package:
+    name: Package macOS preview
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-preview-release-v1
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Build preview executables
+        run: cargo +stable build --release --locked -p boomux -p boomux-desktop
+      - name: Package preview
+        run: python3 desktop/scripts/package-macos.py
+      - name: Exercise packaged application
+        run: python3 desktop/scripts/smoke-macos.py
+      - name: Test universal macOS installer
+        run: sh desktop/scripts/test-macos-install.sh
+      - name: Upload application diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boomux-macos-smoke
+          path: dist/macos/smoke/
+          if-no-files-found: ignore
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boomux-macos-preview
+          path: |
+            dist/macos/*.zip
+            dist/macos/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload macOS release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boomux-desktop-macos-aarch64
+          path: dist/macos/release/
+          if-no-files-found: error
+          retention-days: 30

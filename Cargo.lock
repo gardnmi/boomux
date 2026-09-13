@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "boomux"
-version = "1.14.1"
+version = "1.20.1"
 dependencies = [
  "axum",
  "clap",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "boomux-desktop"
-version = "1.14.1"
+version = "1.20.1"
 dependencies = [
  "async-channel",
  "boomux",
@@ -839,6 +839,7 @@ dependencies = [
  "libghostty-vt",
  "notify",
  "semver",
+ "serde",
  "serde_json",
  "smallvec",
  "toml 0.9.12+spec-1.1.0",
@@ -2143,6 +2144,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsevent-sys"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2608,6 +2618,7 @@ dependencies = [
  "smallvec",
  "strum 0.27.2",
  "uuid",
+ "zed-font-kit",
 ]
 
 [[package]]
@@ -3992,6 +4003,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
 dependencies = [
  "bitflags 2.13.1",
+ "fsevent-sys",
  "inotify",
  "kqueue",
  "libc",

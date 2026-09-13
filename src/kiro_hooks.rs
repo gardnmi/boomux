@@ -10,15 +10,10 @@ use crate::hook_input::read_bounded_hook_input;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 enum HookEvent {
-    #[serde(alias = "agentSpawn")]
     SessionStart,
-    #[serde(alias = "userPromptSubmit")]
     UserPromptSubmit,
-    #[serde(alias = "preToolUse")]
     PreToolUse,
-    #[serde(alias = "postToolUse")]
     PostToolUse,
-    #[serde(alias = "stop")]
     Stop,
 }
 
@@ -117,15 +112,16 @@ mod tests {
     }
 
     #[test]
-    fn documented_legacy_payload_names_remain_decodable() {
-        for (event, state) in [
-            ("agentSpawn", AgentState::Unknown),
-            ("userPromptSubmit", AgentState::Working),
-            ("preToolUse", AgentState::Working),
-            ("postToolUse", AgentState::Working),
-            ("stop", AgentState::Idle),
+    fn legacy_v2_events_cannot_establish_v3_lifecycle() {
+        for event in [
+            "agentSpawn",
+            "userPromptSubmit",
+            "preToolUse",
+            "postToolUse",
+            "stop",
         ] {
-            assert_eq!(update(event).observation.state, state, "{event}");
+            let payload = format!(r#"{{"session_id":"session-1","hook_event_name":"{event}"}}"#);
+            assert!(read_update(payload.as_bytes()).is_err());
         }
     }
 

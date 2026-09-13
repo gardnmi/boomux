@@ -1,5 +1,6 @@
 """Checks that smoke-test readiness cannot pass on an idle or failed client."""
 
+import copy
 from pathlib import Path
 import runpy
 import unittest
@@ -16,6 +17,18 @@ wl_callback#23.done(12345)
 
 
 class SmokeEvidenceTests(unittest.TestCase):
+    def test_layout_evidence_requires_restored_geometry_identity_and_state(self):
+        document = {"active": "workspace:w", "minimized": ["minimized-missing"], "arrangements": {
+            "workspace:w": {"tree": {"Split": {"ratio": 0.31, "horizontal": True, "first": {"Pane": 101}, "second": {"Pane": 202}}},
+                "panes": {"101": {"shell": "running"}, "202": {"shell": "pending"}, "303": {"shell": "remote:offline:missing"}},
+                "focused": 101, "expanded": 101, "floating": [{"pane": 303, "rect": [80.0, 60.0, 300.0, 200.0]}]}}}
+        self.assertTrue(SMOKE["restored_layout_matches"](document, "running", "pending"))
+        for field, value in [("focused", 202), ("expanded", None), ("floating", [])]:
+            broken = copy.deepcopy(document)
+            broken["arrangements"]["workspace:w"][field] = value
+            self.assertFalse(SMOKE["restored_layout_matches"](broken, "running", "pending"))
+        self.assertFalse(SMOKE["restored_layout_matches"](document, "wrong-runner", "pending"))
+
     def test_accepts_committed_window_frame(self):
         self.assertTrue(SMOKE["wayland_frame_presented"](FRAME))
         self.assertTrue(SMOKE["wayland_frame_presented"](FRAME.replace("#", "@")))

@@ -6,8 +6,8 @@ release stage.
 
 | Stage | Validation |
 | --- | --- |
-| Backend/shared-code PR | Formatting, backend and Desktop Clippy/tests, integration fixtures, dependency policy, release packaging on both architectures, Arch compatibility; benchmark smoke when relevant |
-| Desktop-only Rust PR | Formatting, Desktop Clippy/tests, and optimized Desktop build; omit unchanged backend tests, integrations, dependency audit, CLI packaging, and backend benchmarks |
+| Backend/shared-code PR | Formatting, Linux backend and Desktop Clippy/tests, native macOS checks and app smoke, integration fixtures, dependency policy, release packaging on both architectures, Arch compatibility; benchmark smoke when relevant |
+| Desktop-only Rust PR | Formatting, Linux Desktop Clippy/tests/build, native macOS checks and app smoke; omit unchanged backend tests, integrations, dependency audit, CLI packaging, and backend benchmarks |
 | Code merge to main | Same component selection on the actual merged commit; main also saves dependency caches |
 | Release Please proposal generation | No builds or test suites; runs after successful main push CI |
 | Version-only release PR / merge group | Verify strict metadata-only changes and reusable component evidence; defer release builds until merge. Missing evidence selects full validation. |
@@ -39,7 +39,8 @@ The workflow also defaults to full work if classification fails. Manual CI runs
 have no diff base and run all checks. Merge-group events are supported.
 
 Documentation-only skips apply to Markdown under `docs/`, `desktop/AGENTS.md`,
-and the explicitly listed root guidance/changelog files. The packaged `README.md`, embedded
+and the explicitly listed root guidance/changelog files. `docs/platforms/macos-testing.md`
+is packaged in the Mac archive and cannot use the documentation-only skip. The packaged `README.md`, embedded
 `THIRD_PARTY_NOTICES.md`, and `.agents/skills/boomux/SKILL.md` are executable or
 packaging inputs and cannot use the documentation skip.
 
@@ -52,7 +53,7 @@ A version-only release must satisfy all of these conditions:
   dependencies and checksums remain identical.
 - The Release Please manifest matches the new version and has no other changes.
 - Successful default-branch `CI` push runs provide actual executed steps for
-  backend, Desktop, integrations, and dependency policy. Evidence may come from
+  backend, Linux Desktop, native macOS, integrations, and dependency policy. Evidence may come from
   different ancestor commits only when their relevant inputs remain unchanged.
   A green documentation-only run contributes no new component evidence.
   PR names, labels, authors, and dependency caches are not proof.
@@ -65,7 +66,7 @@ validation. Source or dependency changes mixed into a release PR still receive
 full checks. The selection summary records each reused component's run and SHA.
 
 After excluding guidance, a change consisting entirely of `.rs` files under
-`desktop/src/` selects Desktop validation only. Deletions still select Desktop;
+`desktop/src/` selects Linux Desktop and native macOS validation. Deletions still select Desktop;
 renames use both old and new paths, so moving backend code cannot skip backend
 validation. Desktop formatting and a release build remain checked even when the
 backend and bundle jobs are omitted. Full runs build the optimized Desktop in
@@ -78,7 +79,7 @@ installer/assets still require packaging coverage. A source-only change does not
 rebuild the unchanged packaging machinery or CLI architectures; release version
 changes always build both CLI architectures and the complete bundle.
 
-A Desktop-only main success supplies Desktop evidence. Backend, integration,
+A Desktop-only main success supplies Linux Desktop and native macOS evidence. Backend, integration,
 and dependency-policy evidence may be inherited from an earlier successful main
 run when the intervening diff contains only Desktop Rust, guidance, website, and
 strictly validated project-version changes. Guidance-only runs can inherit all
@@ -150,40 +151,79 @@ estimated or measured improvement. Hosted cache behavior, release metadata
 selection, artifact download permissions, and elapsed savings need verification
 after deployment.
 
+## Native macOS validation
+
+The reusable `macos.yml` workflow is called by `CI` for PRs, merge groups,
+main pushes, and manual CI runs whenever backend, Desktop, or packaging work is
+selected. Guidance/website-only changes and proven metadata-only release PRs
+skip it; release pushes build and smoke-test the versioned app. The existing
+required **CI result** gate includes the complete macOS call, so native failures,
+cancellations, or unexpected skips block merging and automatic release work.
+No separate branch-protection entry or feature-branch trigger is needed.
+
+Both native jobs check out the same revision as the Linux jobs (the proposed
+integration commit on PRs). Apple Silicon `macos-15` runs backend/Desktop Clippy,
+descriptor and process-identity tests, the selected serial native lifecycle
+scenarios, and platform-applicable Desktop tests. The four stable Linux bundle
+restart/process fixtures remain in Linux CI because Mac app-bundle updates are
+not supported; portable bundle validation still runs on both platforms. Keyboard
+fixtures verify Command shortcuts and native Option text on Mac. Lifecycle tests
+are compiled before their bounded
+scenario deadlines. The package job builds both optimized executables, packages
+and ad-hoc signs the app, checks native glyphs and dependencies, and exercises
+window creation, Shell survival, and daemon restart. The public installer is also exercised with the actual native bundle. Native
+and app diagnostics are retained separately from the ZIP and checksum.
+
+The package job uploads `boomux-desktop-macos-aarch64` containing the canonical
+`boomux-desktop-aarch64-apple-darwin.zip`, its checksum, and source provenance.
+Normal Release Please publication downloads it from the exact successful main
+CI run and verifies source SHA, version, target, and checksum before uploading.
+Missing or expired artifacts fail publication; only explicit tag recovery
+rebuilds and smoke-tests on macOS. The published ZIP contains the same bytes as
+the tested preview ZIP. The release stays draft until Mac and Linux assets are
+ready. macOS support remains experimental and ad-hoc signed.
+
+Release evidence reuse now requires the native job's actual successful test
+steps. Pre-port Linux-only runs cannot satisfy it, and Desktop source changes
+invalidate prior native evidence. Mac compilation and lifecycle coverage remain
+required even while distribution is a testing preview. Human keyboard/IME,
+Retina, notification, and sleep/wake coverage remains in the testing guide.
+
+The former `macos-preview.yml` branch-push workflow and its exploratory process
+API probe have been retired. The backend and Desktop scheduled performance
+workflows remain useful independent measurements and use distinct concurrency
+groups so they cannot cancel one another.
+
 ## Development previews
 
-Development previews are published GitHub prereleases, not scheduled nightlies.
-The stable release path remains Linux-only; the initial development publisher
-promotes the Apple Silicon macOS preview artifact.
+Development previews are manually published GitHub prereleases, not scheduled
+nightlies. They remain available alongside the experimental Mac bundle included
+with regular releases. Neither distribution advertises notarization, Intel
+support, or app-bundle automatic updates.
 
-1. Push the development branch and open/update its PR. General CI runs its
-   selected checks; the `macOS preview` workflow separately runs native backend
-   checks and builds, ad-hoc signs, checks glyph rasterization, and smoke-tests
-   the app. Both native and package jobs must pass.
-2. Manually run `Publish development preview` with that Mac workflow run ID.
-   The workflow becomes available for manual dispatch once its definition lands
-   on the default branch. Before then, use the local commands below from the
-   experimental worktree; no merge into `main` is required. No schedule or
-   automatic publication is enabled.
-3. The read-only prepare job requires a completed successful Mac run and
-   successful general CI for the same source revision, including `CI result`.
-   It rejects fork/PR-triggered Mac builds, expired/missing artifacts, wrong
-   architecture/source metadata, and mismatched checksums. It prepares reviewable
-   release metadata without executing the downloaded app or rebuilding it.
+1. Let a **CI** main push complete, or manually dispatch **CI** for the intended
+   development branch. Native and package macOS jobs must run and pass. PR and
+   merge-group builds validate integration but are not publication candidates.
+2. Run **Publish development preview** with that successful CI run ID. It promotes
+   the exact ZIP and checksum from the run without rebuilding or executing the
+   downloaded app. No automatic publication is enabled.
+3. The read-only prepare job verifies same-repository source, successful native
+   test steps, packaging smoke, and **CI result**. Missing/expired artifacts,
+   source or architecture mismatches, and incorrect checksums reject publication.
 4. The publication job revalidates the candidate, creates a fixed-source tag
    `preview-macos-YYYYMMDD.<build-run-id>`, uploads the exact ZIP and checksum,
    verifies uploaded digests, then publishes with `prerelease=true` and
-   `make_latest=false`. GitHub's stable latest release and Desktop stable update
-   checks continue to exclude previews.
+   `make_latest=false`. Stable latest-release and Desktop update checks exclude
+   previews.
 5. Testers report the tag, chip, macOS version, and reproduction steps. A new
    build gets a new preview tag; published bytes and source tags are never
-   silently replaced. An interrupted draft can be resumed if its existing assets
-   match. Missing/expired artifacts require a new build, not a silent fallback.
+   replaced. An interrupted draft can resume only when existing assets match.
 
-General PR CI validates the proposed integration commit; the native Mac workflow
-builds the branch revision itself. Promotion requires both corresponding checks,
-not just a successful packaging job. If general CI is pending or failed,
-publication stops before creating a tag or release.
+Previously successful standalone `macos-preview.yml` push/manual runs remain
+valid candidates while their artifacts exist, with their original native-step
+requirements and matching successful general CI. New candidates come from CI.
+The immutable installer for the already-published preview remains pinned to its
+original release; it is not a latest-preview updater.
 
 The stable draft-release blocker ignores only prerelease drafts in the
 `preview-macos-` namespace, so interrupted preview uploads do not stall stable

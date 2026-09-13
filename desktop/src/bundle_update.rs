@@ -342,6 +342,9 @@ pub fn signal_ready(path: PathBuf) {
 mod tests {
     use super::*;
 
+    // Stable bundle installation/restart is Linux-only and invokes GNU timeout.
+    // Keep its process fixtures in Linux CI; structural validation is portable.
+
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
@@ -416,6 +419,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn restart_hands_off_before_switching_and_waits_for_the_window() {
         let fixture = Fixture::new();
@@ -436,6 +440,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn failed_window_restores_previous_bundle_and_daemon_and_keeps_retry() {
         let fixture = Fixture::new();
@@ -492,6 +497,7 @@ mod tests {
         assert!(!fixture.0.join("handoffs").exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn failed_daemon_handoff_keeps_the_current_bundle_and_pending_update() {
         let fixture = Fixture::new();
@@ -508,6 +514,7 @@ mod tests {
         assert!(!fixture.0.join(".install-lock").exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn manual_installation_only_requests_restart_for_a_different_daemon_executable() {
         let fixture = Fixture::new();

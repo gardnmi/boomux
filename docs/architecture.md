@@ -18,6 +18,7 @@ This is the implementation reference. For product usage, see the
 | `src/dashboard_projection.rs` | Typed snapshot/session-to-dashboard classification, view construction, and title enrichment |
 | `src/protocol.rs` | Versioned control and attachment wire models, framing, and request version requirements |
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
+| `src/platform/` | Linux and Darwin process identity, monitoring, runtime paths, descriptor and filesystem operations |
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
 | `src/global_workspace_store.rs` | Independently versioned coordinator Workspace metadata, placement membership, initialization and schema migration, prepared resource and placement-default recovery, and resumable close progress |
@@ -27,6 +28,7 @@ This is the implementation reference. For product usage, see the
 | `src/node_projection.rs` | Disposable owner-only remote projection cache, deterministic bounds, health, generation CAS, quarantine, and atomic storage |
 | `src/federation.rs` | Independently versioned federation handshake and verified stdio daemon bridging |
 | `src/ssh_bootstrap.rs` | Validated SSH targets, private invocation configuration, bounded interactive authentication presentation, deadline-bound remote discovery, and helper compatibility selection |
+| `src/remote_maintenance.rs` | Temporary owner-side repair/removal, existing-identity verification, user installation records, and retryable recovery serialization |
 | `src/handoff.rs`, `src/fd_transfer.rs` | Graceful daemon replacement records and Unix descriptor transfer |
 | `src/attach.rs` | Terminal-side raw mode, control frames, live input/output, resize, focus, takeover waiting, and reconnect handling |
 | `src/terminal.rs` | Selection and launch of native terminal windows through `xdg-terminal-exec` |
@@ -39,6 +41,7 @@ This is the implementation reference. For product usage, see the
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
 | `src/host_services.rs` | Owner-local project, launcher, integration, Session-catalog, and bounded Git working-context services |
 | `src/hook_input.rs` | Shared allowlist for structured absolute cwd and tool-path observations from lifecycle integrations |
+| `src/conversations.rs` | Workspace-owned conversation projection and owner-side open/resume planning |
 | `src/integrations.rs` | Integration identity, display metadata, and optional installation, title/catalog, resume, and foreground capabilities |
 | `src/host_session_titles.rs` and children | Shared title/catalog policy and host-specific discovery adapters |
 | `src/host_session_source.rs` and children | Canonical host source paths, normalization, and secure source lookup |
@@ -54,6 +57,16 @@ This is the implementation reference. For product usage, see the
 | `src/projects.rs`, `src/git.rs` | Bounded project discovery and asynchronous Git metadata |
 | `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
 | `src/desktop_notifications.rs` | Bounded fail-open desktop and sound delivery |
+
+## macOS preview boundary
+
+The `feature/macos` preview retains the existing resource, event, and persistence
+model. Host operations live in `src/platform/`; [ADR 0017](adr/0017-macos-platform-boundary.md)
+and the [macOS validation record](platforms/macos.md) describe the Darwin
+implementation. References below to pidfds, eventfd, `/proc`, and H8 describe
+the Linux implementation. Darwin uses kqueue process monitors, kernel-validated
+process identity descriptors, socketpair control wakeups, and a separate private
+`BOOMUXM1` handoff format. Public protocol and state versions remain unchanged.
 
 ## Managed Integration Assets
 
@@ -313,6 +326,18 @@ event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
 default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
 unchanged because owner Workspaces already persist `default_cwd`.
+Protocol 55 adds `workspace_conversations`: `OpenWorkspaceConversation` and its
+routed equivalent take an exact Workspace, recorded Agent, and caller-generated
+Shell ID. The owner validates membership and prepares or reuses a native resume
+Shell inside the durable mutation gate, publishing only after persistence.
+It never creates a Workspace. Local clients, coordinators, and remote owners
+require protocol 55 for this operation; old versions receive `unsupported_version`.
+Ordinary Workspace snapshots supply the recorded conversation inputs, with no
+new persistence fields or remote projection fields. The protocol-55
+`ListWorkspaceConversations` host service adds owner-local title enrichment using
+bounded cached harness readers; it never imports catalog-only conversations.
+ADR 0018 defines this narrower feature separately from the retired Session APIs.
+
 Protocol 54 adds `create_started_shell`: local `CreateStartedShell` creates a
 Shell and its first ShellRun in one durable state replacement. The PTY reader
 stays paused until persistence succeeds; `shell_created` then `run_started` are
@@ -1071,8 +1096,8 @@ Protocol 51 and state schema 17 remain decodable during this compatibility stage
 Legacy Session wire variants, projection helpers, and persisted presentation
 metadata are inert implementation detail, not supported APIs. Exact external
 session IDs remain on Agent instances because integrations use them as opaque
-run-scoped lifecycle authority and exact cold-recovery input. They do not define
-a browseable, resumable, nameable, or hideable Boomux resource.
+run-scoped lifecycle authority and exact cold-recovery input. They do not define a machine-wide history resource. ADR 0018 now permits a
+Workspace-owned Conversations view over those existing records.
 
 Session list/inspect requires a negotiated protocol-12 snapshot because the
 projection depends on that complete Agent state model. Protocol 13 adds an
@@ -1267,17 +1292,31 @@ phone-accessible Remote destination.
 
 ### Kiro CLI Lifecycle Integration
 
-The Kiro descriptor targets `kiro-cli` `2.18.0` with its opt-in v3 harness as a
-compatibility point. Installation owns the dedicated
+The `kiro-v2` descriptor explicitly has no automatic lifecycle installation.
+It remains discoverable with a limitation in inventory/capabilities. V2 embeds
+hooks in agent configurations but does not provide global hooks for the normal
+built-in agent. Boomux does not replace or select an agent profile to work around
+that host limitation. V2 terminal behavior and the generic foreground hint remain
+available; no automatic Session lifecycle, notification, resume, or title
+capability is claimed. See [Kiro usage](kiro.md).
+
+The `kiro-v3` descriptor (legacy install alias `kiro`) targets `kiro-cli`
+`2.21.1` with its opt-in v3 harness as a compatibility point. Installation owns
+the dedicated
 `${KIRO_HOME:-$HOME/.kiro}/hooks/boomux.json` file and registers non-deciding
 SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop command hooks.
 The ordinary bounded, symlink-safe, atomic integration installer applies because
 Boomux does not share that file with unrelated Kiro configuration.
 
 Eligible managed Kiro invocations pass through the common Shell-scoped shim and
-hidden launcher. A bare `kiro-cli` becomes `kiro-cli --v3`, while an explicit
-leading `--v3` is preserved. The launcher supervises the exact argument vector
-with the matching Boomux executable directory first on the sanitized child PATH,
+hidden launcher. A bare `kiro-cli` retains its exact empty argument vector and
+Kiro-selected default engine and agent. Package version and missing flags never
+establish the running engine. The wrapper accepts exact configured Kiro
+commands; eligible local chat launches, including bare and explicit custom-agent
+launches, may acquire a holder. Service and cloud launches remain untracked.
+When the v3 hook
+asset is current in a managed ShellRun, the launcher places the matching Boomux
+executable directory first on the sanitized child PATH,
 so bare lifecycle hook commands cannot select an older user installation instead
 of the launcher's CLI. Managed Codex launches use the same path priority; the
 selected harness executable and argument vector remain unchanged. Unmanaged
@@ -1285,18 +1324,25 @@ invocations retain their ordinary PATH. The launcher inherits terminal streams
 and foreground process-group behavior, and
 acquires a private daemon-owned Launch Holder
 only while the installed asset is current. Only that Kiro process tree receives
-the holder capability. Eligible login ShellRuns stage the delegating shim even
+the holder capability. A holder authorizes reporting from that launch without
+identifying the engine or creating an Agent. Only recognized PascalCase v3 hook events establish v3 Sessions; v2
+events are rejected. A silent v2 process holds no Session associations. Empty
+holders use the same bounded capacity and exact-process cleanup as v3 holders.
+Eligible login ShellRuns stage the delegating shim even
 when Kiro is not yet installed, so a later installation into their existing
-executable search path does not bypass lifecycle integration. Kiro v2 and
-service invocations, absolute paths typed in a login Shell,
+executable search path does not bypass v3 lifecycle integration. Service
+invocations, absolute paths typed in a login Shell,
 modified PATHs, absent or modified assets, and use outside Boomux execute stock
-Kiro unchanged and untracked. Exact configured executable paths are retained
+Kiro unchanged without holder tracking. Exact configured executable paths are
+retained
 through `BOOMUX_REAL_KIRO`; private launcher provenance is removed from unrelated
 children.
 
 Kiro hook `session_id` is the canonical Session identity and ensures the exact
-`(kiro, session, shell, run)` Agent key through its live Launch Holder. Prompt and
-tool events report Working. Kiro v3 documents Stop as the boundary where the
+`(kiro, session, shell, run)` Agent key through its live Launch Holder. This
+legacy v3 key and its existing asset path/receipt remain unchanged by the
+installation-name split; v2 declares its lifecycle limitation separately. Prompt
+and tool events report Working. Kiro v3 documents Stop as the boundary where the
 agent completed its turn and finished responding, so Stop reports Idle for that
 exact Session. Idle is resumable turn completion, not permanent Session
 completion. The documented hooks expose no authoritative permission-wait,

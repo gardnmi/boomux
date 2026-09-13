@@ -699,28 +699,9 @@ impl Drop for TemporaryPath {
 }
 
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    renameat2(from, to, libc::RENAME_NOREPLACE)
-}
-
-fn renameat2(from: &Path, to: &Path, flags: u32) -> io::Result<()> {
-    let from = CString::new(from.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    let to = CString::new(to.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            flags,
-        )
-    };
-    if result == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    let from = CString::new(from.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let to = CString::new(to.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    boomux::platform::rename_noreplace(libc::AT_FDCWD, &from, libc::AT_FDCWD, &to)
 }
 
 fn merge(base: &mut RawConfig, next: RawConfig) {

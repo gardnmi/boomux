@@ -1,5 +1,105 @@
 # Changelog
 
+## [1.20.1](https://github.com/gardnmi/boomux/compare/v1.20.0...v1.20.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* **conversations:** resolve kiro aliases when loading titles ([#427](https://github.com/gardnmi/boomux/issues/427)) ([1320d1c](https://github.com/gardnmi/boomux/commit/1320d1c7e2dbabd0cc2741b9e0a9119a031a822b))
+
+## [1.20.0](https://github.com/gardnmi/boomux/compare/v1.19.2...v1.20.0) (2026-09-12)
+
+
+### Features
+
+* **desktop:** add workspace conversations panel and native resume ([#425](https://github.com/gardnmi/boomux/issues/425)) ([49d3fa9](https://github.com/gardnmi/boomux/commit/49d3fa9f3f19a21dad4b5e006c14589a6f9e9e19))
+
+## [1.19.2](https://github.com/gardnmi/boomux/compare/v1.19.1...v1.19.2) (2026-09-12)
+
+
+### Bug Fixes
+
+* **remote:** preserve workspace state across connection setup ([#423](https://github.com/gardnmi/boomux/issues/423)) ([6468da8](https://github.com/gardnmi/boomux/commit/6468da819dd51e9d2d776b03325c7b65db47c4dc))
+
+## [1.19.1](https://github.com/gardnmi/boomux/compare/v1.19.0...v1.19.1) (2026-09-12)
+
+
+### Bug Fixes
+
+* **desktop:** prioritize modal input over open panels ([#421](https://github.com/gardnmi/boomux/issues/421)) ([548aa82](https://github.com/gardnmi/boomux/commit/548aa82674842b55c6c06023af80cec6605063b3))
+
+## [1.19.0](https://github.com/gardnmi/boomux/compare/v1.18.0...v1.19.0) (2026-09-12)
+
+
+### Features
+
+* **remote:** make update and removal recoverable ([#419](https://github.com/gardnmi/boomux/issues/419)) ([8d0e730](https://github.com/gardnmi/boomux/commit/8d0e730b02bfda120836ea31d451dc91f7593327))
+
+## [1.18.0](https://github.com/gardnmi/boomux/compare/v1.17.0...v1.18.0) (2026-09-12)
+
+
+### Features
+
+* **desktop:** streamline remote workspace setup and connection management ([#415](https://github.com/gardnmi/boomux/issues/415)) ([2acf3ac](https://github.com/gardnmi/boomux/commit/2acf3acfafdc3c55366976bc1b354cea8fe41108))
+
+
+### Bug Fixes
+
+* **desktop:** preserve terminal background and faint colors ([#418](https://github.com/gardnmi/boomux/issues/418)) ([d0ff62f](https://github.com/gardnmi/boomux/commit/d0ff62fab0803d9a4439864afaf93c3f709d2b4a))
+
+## [1.17.0](https://github.com/gardnmi/boomux/compare/v1.16.1...v1.17.0) (2026-09-11)
+
+
+### Features
+
+* **desktop:** filter projects in the workspace menu ([#411](https://github.com/gardnmi/boomux/issues/411)) ([5b064bf](https://github.com/gardnmi/boomux/commit/5b064bfec733ccacda5776c6fab935a18215f749))
+
+
+### Bug Fixes
+
+* **desktop:** scroll while extending terminal selections ([#412](https://github.com/gardnmi/boomux/issues/412)) ([0f5bc0f](https://github.com/gardnmi/boomux/commit/0f5bc0fd2ceb6fb4edc1c75907d1c2c60abf73a2))
+
+## [1.16.1](https://github.com/gardnmi/boomux/compare/v1.16.0...v1.16.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* preserve managed harness launches after prompt path changes ([#409](https://github.com/gardnmi/boomux/issues/409)) ([31bec82](https://github.com/gardnmi/boomux/commit/31bec82fe3494b7590af0905646ac465820d98b5))
+
+## [1.16.0](https://github.com/gardnmi/boomux/compare/v1.15.2...v1.16.0) (2026-09-11)
+
+
+### Features
+
+* **macos:** add native desktop and unified release installation ([c90fe11](https://github.com/gardnmi/boomux/commit/c90fe11e887d103b2dbc8a1742af123d800687a6))
+
+
+### Bug Fixes
+
+* **desktop:** guide new users to create a workspace ([#405](https://github.com/gardnmi/boomux/issues/405)) ([5911f95](https://github.com/gardnmi/boomux/commit/5911f9584bd55e5ae220f54e0898f3449b1f61d3))
+* **kiro:** preserve host-selected engines and agents ([#407](https://github.com/gardnmi/boomux/issues/407)) ([37dfda4](https://github.com/gardnmi/boomux/commit/37dfda40420e6967b90eff1327d51c8e0af5739e))
+
+## [1.15.2](https://github.com/gardnmi/boomux/compare/v1.15.1...v1.15.2) (2026-09-10)
+
+
+### Bug Fixes
+
+* **desktop:** discard unbound saved pane placeholders ([#403](https://github.com/gardnmi/boomux/issues/403)) ([fb4fce5](https://github.com/gardnmi/boomux/commit/fb4fce5f99ec85c0897f674195d3fe0704322509))
+
+## [1.15.1](https://github.com/gardnmi/boomux/compare/v1.15.0...v1.15.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* **desktop:** restore workspace animations and prevent UI stalls ([#401](https://github.com/gardnmi/boomux/issues/401)) ([f3d6870](https://github.com/gardnmi/boomux/commit/f3d687080e90f185d4734ca1084fd4ad9f6d3902))
+
+## [1.15.0](https://github.com/gardnmi/boomux/compare/v1.14.1...v1.15.0) (2026-09-10)
+
+
+### Features
+
+* **desktop:** persist internal pane arrangements across restarts ([#399](https://github.com/gardnmi/boomux/issues/399)) ([efa3de7](https://github.com/gardnmi/boomux/commit/efa3de79eb11961a331e08d20e42decee9f8ef2d))
+
 ## [1.14.1](https://github.com/gardnmi/boomux/compare/v1.14.0...v1.14.1) (2026-09-09)
 
 

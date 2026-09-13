@@ -427,24 +427,21 @@ jobs:
     with:
       source-ref: ${{ github.sha }}
 
+  macos:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run_code != 'false' || needs.changes.outputs.run_desktop != 'false' || needs.changes.outputs.run_package != 'false') }}
+    uses: ./.github/workflows/macos.yml
+
   result:
     name: CI result
     if: always()
-    needs: [changes, rust, dependency-policy, benchmarks, integrations, release-packaging, aur-package, arch-compatibility, desktop-rust, desktop-bundle, desktop-smoke]
+    needs: [changes, rust, dependency-policy, benchmarks, integrations, release-packaging, aur-package, arch-compatibility, desktop-rust, desktop-bundle, desktop-smoke, macos]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Require every selected check
         env:
           RESULTS: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          jobs = json.loads(os.environ['RESULTS'])
-          package = jobs['changes']['outputs'].get('run_package') != 'false'
-          for name, job in jobs.items():
-              expected = {'success'}
-              if not package and name in {'desktop-bundle', 'desktop-smoke'}:
-                  expected = {'skipped'}
-              if job['result'] not in expected:
-                  raise SystemExit(f"{name}: {job['result']}; expected {expected}")
-          PY
+        run: python3 .github/scripts/ci-result.py

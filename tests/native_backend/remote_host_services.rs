@@ -285,6 +285,32 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
         36
     );
 
+    // Workspace conversations use a new owner-validated operation; legacy
+    // unscoped Session APIs above remain retired.
+    let resumed = local
+        .client
+        .open_workspace_conversation(
+            Some(&owner_id),
+            &session_workspace.id,
+            &agent.id,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+    assert_eq!(resumed.workspace_id, session_workspace.id);
+    assert_eq!(resumed.command, ["pi", "--session", hostile_session_id]);
+    assert!(local.client.snapshot().unwrap().workspaces.is_empty());
+    owner.client.close_workspace(&session_workspace.id).unwrap();
+    assert!(
+        local
+            .client
+            .open_workspace_conversation(
+                Some(&owner_id),
+                &session_workspace.id,
+                &agent.id,
+                &uuid::Uuid::new_v4().to_string()
+            )
+            .is_err()
+    );
     local.stop_with_cli();
     owner.stop_with_cli();
     std::thread::sleep(Duration::from_millis(10));

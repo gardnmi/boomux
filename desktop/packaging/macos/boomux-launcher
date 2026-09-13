@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+# Resolve the bundle once; never mix the CLI and GUI from different previews.
+bundle=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+PATH="$bundle/MacOS:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+export PATH
+# Finder may omit SHELL and start in /. Keep the user's normal home and shell.
+if [ -z "${SHELL:-}" ]; then SHELL=/bin/zsh; export SHELL; fi
+cd -- "$HOME"
+"$bundle/MacOS/boomux" daemon start
+exec "$bundle/MacOS/boomux-desktop" "$@"

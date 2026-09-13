@@ -1,7 +1,11 @@
 use std::env;
 use std::error::Error;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+#[cfg(target_os = "linux")]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -12,7 +16,9 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use crate::protocol::{
     self, AgentInstanceSnapshot, AgentRegistrationSpec, AgentReport, AgentState,
@@ -337,10 +343,7 @@ impl std::fmt::Display for RemoteError {
 impl Error for RemoteError {}
 
 pub fn socket_path() -> io::Result<PathBuf> {
-    let runtime = env::var_os("BOOMUX_RUNTIME_DIR")
-        .or_else(|| env::var_os("XDG_RUNTIME_DIR"))
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    let runtime = crate::platform::runtime_root()?;
     if !runtime.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -585,6 +588,35 @@ impl Client {
 
     pub fn ping(&self) -> Result<()> {
         expect_ok(self.request(Request::Ping)?, Response::Pong)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn daemon_peer_credentials(&self) -> Result<DaemonPeerCredentials> {
+        let (stream, protocol_version, response) = self.send(Request::Ping)?;
+        expect_ok(response, Response::Pong)?;
+        // getpeereid is cached after disconnect; LOCAL_PEERPID is not. The
+        // one-response handler may already have closed its endpoint here.
+        let uid = crate::platform::peer_uid(&stream).map_err(ClientError::Transport)?;
+        let pid = crate::platform::daemon_listener_holder(&self.socket_path, uid)
+            .map_err(ClientError::Transport)?;
+        Ok(DaemonPeerCredentials {
+            pid,
+            uid,
+            protocol_version,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn daemon_process_credentials(&self) -> Result<DaemonPeerCredentials> {
+        let before = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
+        let peer = self.daemon_peer_credentials()?;
+        let after = fs::metadata(&self.socket_path).map_err(ClientError::Transport)?;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(ClientError::Transport(io::Error::other(
+                "daemon socket changed during inspection",
+            )));
+        }
+        Ok(peer)
     }
 
     #[cfg(target_os = "linux")]
@@ -985,6 +1017,24 @@ impl Client {
         })? {
             Response::RoutedNodeOperation { result } => Ok(result),
             response => unexpected(response),
+        }
+    }
+
+    /// Offer a starter Workspace after registering a machine. An owner-confirmed
+    /// collision leaves the connection usable without selecting or changing any
+    /// existing Workspace. Never retry an ambiguous creation.
+    pub fn create_initial_remote_workspace(
+        &self,
+        node_id: &str,
+        name: &str,
+    ) -> Result<Option<ShellSnapshot>> {
+        match self.create_remote_workspace(node_id, name) {
+            Ok(shell) => Ok(Some(shell)),
+            Err(ClientError::Remote(RemoteError {
+                code: Some(ErrorCode::AlreadyExists),
+                ..
+            })) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -2109,6 +2159,38 @@ impl Client {
         attachment_from_response(stream, protocol_version, response)
     }
 
+    pub fn open_workspace_conversation(
+        &self,
+        node_id: Option<&str>,
+        workspace_id: &str,
+        agent_id: &str,
+        shell_id: &str,
+    ) -> Result<ShellSnapshot> {
+        if !self.supports(protocol::ProtocolFeature::WorkspaceConversations)? {
+            return Err(unsupported_version(
+                "Update Boomux to use Workspace conversations",
+            ));
+        }
+        let operation = RoutedOperation::OpenWorkspaceConversation {
+            workspace_id: workspace_id.into(),
+            agent_id: agent_id.into(),
+            shell_id: shell_id.into(),
+        };
+        if let Some(node_id) = node_id {
+            return match self.route_node_operation(node_id, operation)? {
+                RoutedOperationResult::Shell { shell } => Ok(shell),
+                response => Err(io::Error::other(format!(
+                    "unexpected conversation response: {response:?}"
+                ))
+                .into()),
+            };
+        }
+        match self.request(operation.owner_request())? {
+            Response::Shell { shell } => Ok(shell),
+            response => unexpected(response),
+        }
+    }
+
     pub fn resume_agent_session(
         &self,
         node_id: Option<&str>,
@@ -2612,6 +2694,115 @@ mod tests {
         ));
 
         server.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn initial_remote_workspace_handles_collision_without_replaying_or_hiding_failures() {
+        for outcome in [
+            Some(ErrorCode::AlreadyExists),
+            Some(ErrorCode::OutcomeUnknown),
+            Some(ErrorCode::Timeout),
+            None,
+        ] {
+            let directory =
+                env::temp_dir().join(format!("boomux-client-remote-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert!(matches!(request.message, Request::RouteNodeHostService {
+                    node_id, operation: protocol::HostServiceOperation::ResolveDirectory { .. }
+                } if node_id == "remote-owner"));
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::new(Response::HostService {
+                        result: protocol::HostServiceResult::Directory {
+                            path: "/remote/home".into(),
+                        },
+                    }),
+                )
+                .unwrap();
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert!(matches!(request.message, Request::RouteNodeOperation {
+                    node_id, operation: RoutedOperation::CreateWorkspaceShell {
+                        workspace_name, default_cwd: Some(cwd), ..
+                    }
+                } if node_id == "remote-owner" && workspace_name == "omarchy"
+                    && cwd == Path::new("/remote/home")));
+                // The same text with no typed code must remain an error.
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::new(Response::Error {
+                        code: outcome,
+                        message: "workspace name already exists: omarchy".into(),
+                    }),
+                )
+                .unwrap();
+                listener.set_nonblocking(true).unwrap();
+                listener
+            });
+            let client = Client::from_socket_path(socket);
+            let result = client.create_initial_remote_workspace("remote-owner", "omarchy");
+            if outcome == Some(ErrorCode::AlreadyExists) {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(
+                    matches!(result, Err(ClientError::Remote(RemoteError { code, .. }))
+                    if code == outcome)
+                );
+            }
+            let listener = server.join().unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn conversation_open_negotiates_without_sending_mutation_to_old_peer() {
+        let directory =
+            env::temp_dir().join(format!("boomux-conversation-client-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            for version in (54..=protocol::PROTOCOL_VERSION).rev() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert_eq!(request.message, Request::Ping);
+                let response = if version == 54 {
+                    Response::Pong
+                } else {
+                    Response::Error {
+                        code: Some(ErrorCode::UnsupportedVersion),
+                        message: "older daemon".into(),
+                    }
+                };
+                protocol::write_message(&mut stream, &Envelope::with_version(54, response))
+                    .unwrap();
+            }
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let client = Client::from_socket_path(socket);
+        let error = client
+            .open_workspace_conversation(None, "workspace", "agent", "shell")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Protocol(ProtocolError::UnsupportedVersion(_))
+        ));
+        let listener = server.join().unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

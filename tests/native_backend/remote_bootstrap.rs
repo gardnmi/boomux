@@ -1,12 +1,15 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use boomux::client::Client;
 use boomux::federation::{
     FEDERATION_VERSION, FederationConnectionMode, FederationHandshake, write_handshake,
@@ -15,6 +18,7 @@ use boomux::protocol::{self, Envelope, Request, Response};
 use boomux::ssh_bootstrap::{
     REMOTE_INSTALL_ACTIVATE_COMMAND, REMOTE_INSTALL_COMMAND, REMOTE_INSTALL_ROLLBACK_COMMAND,
 };
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -243,8 +247,8 @@ fn run_interactive_with_timeout(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0
@@ -263,7 +267,7 @@ fn run_interactive_with_timeout(
         .stderr(Stdio::from(slave));
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                 Err(std::io::Error::last_os_error())
             } else {
                 Ok(())
@@ -653,7 +657,12 @@ fn public_remote_uses_verified_stdio_protocol_channel() {
     fs::create_dir_all(directory.join("runtime")).unwrap();
     fake_ssh(&directory, "/remote/boomux\\0", false);
 
-    let output = command(&directory).output().unwrap();
+    // Own and join the local daemon before removing files it may still write.
+    let mut daemon = crate::support::TestDaemon::start();
+    let output = command(&directory)
+        .env("XDG_RUNTIME_DIR", &daemon.runtime_dir)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "remote command failed: {}",
@@ -669,11 +678,12 @@ fn public_remote_uses_verified_stdio_protocol_channel() {
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(control_paths.len(), 1);
     assert!(
-        fs::read_dir(directory.join("runtime/boomux"))
+        fs::read_dir(daemon.runtime_dir.join("boomux"))
             .unwrap()
             .filter_map(Result::ok)
             .all(|entry| !entry.file_name().to_string_lossy().starts_with("ssh-"))
     );
+    daemon.stop_with_cli();
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -919,6 +929,14 @@ fn registered_node_reauthentication_is_interactive_read_only_and_requests_projec
         String::from_utf8_lossy(&output)
             .contains("Authenticated work and requested a fresh background observation")
     );
+    let output = String::from_utf8_lossy(&output);
+    for stage in [
+        "15-second SSH connection timeout",
+        "SSH sign-in succeeded",
+        "Remote identity verified",
+    ] {
+        assert!(output.contains(stage), "missing progress stage: {stage}");
+    }
     assert_eq!(fs::read(&registration_path).unwrap(), registration_before);
     let ssh_log = fs::read_to_string(directory.join("ssh.log")).unwrap();
     for forbidden in [
@@ -958,8 +976,8 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         },
         0
@@ -978,7 +996,7 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
         .stderr(Stdio::from(slave));
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                 Err(std::io::Error::last_os_error())
             } else {
                 Ok(())
@@ -987,7 +1005,7 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
     }
     let mut child = command.spawn().unwrap();
     let mut master = fs::File::from(master);
-    master.write_all(b"work\nworkbox\n").unwrap();
+    master.write_all(b"workbox\nwork\n").unwrap();
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert_ne!(flags, -1);
     assert_ne!(
@@ -1021,7 +1039,10 @@ fn guided_node_add_mirrors_master_challenge_and_waits_after_failure() {
         output.contains("https://login.tailscale.test/challenge"),
         "{output}"
     );
-    assert!(output.contains("Node setup failed (exit 1)."), "{output}");
+    assert!(
+        output.contains("Remote connection failed (exit 1)."),
+        "{output}"
+    );
     assert!(child.try_wait().unwrap().is_none());
     master.write_all(b"\n").unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(1));
@@ -1051,7 +1072,10 @@ fn guided_node_add_allows_ssh_to_read_authentication_from_the_terminal() {
         fs::read(directory.join("authentication")).unwrap(),
         b"secret"
     );
-    assert!(output.contains("Node setup failed (exit 1)."), "{output}");
+    assert!(
+        output.contains("Remote connection failed (exit 1)."),
+        "{output}"
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 

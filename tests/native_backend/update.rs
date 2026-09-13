@@ -1,15 +1,24 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
+#[cfg(target_os = "linux")]
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+    os::unix::{fs::MetadataExt, net::UnixStream},
+    process::Stdio,
+    time::{Duration, Instant},
+};
+
+#[cfg(target_os = "linux")]
 use boomux::client::Client;
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
 use crate::support::wait_until;
 
 fn fixture() -> PathBuf {
@@ -40,6 +49,7 @@ fn command_with_executable(root: &Path, executable: &Path) -> Command {
     command
 }
 
+#[cfg(target_os = "linux")]
 fn executable_digest(path: &Path) -> [u8; 32] {
     let mut file = File::open(path).unwrap();
     let mut digest = Sha256::new();

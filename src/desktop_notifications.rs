@@ -204,6 +204,18 @@ pub(crate) fn category_enabled(
         }
 }
 
+#[cfg(target_os = "macos")]
+fn sound_argv(_settings: &NotificationDeliverySettings, reason: NotificationReason) -> Vec<String> {
+    vec![
+        "/usr/bin/afplay".into(),
+        match reason {
+            NotificationReason::Blocked => "/System/Library/Sounds/Glass.aiff",
+            NotificationReason::Completed => "/System/Library/Sounds/Pop.aiff",
+        }
+        .into(),
+    ]
+}
+#[cfg(target_os = "linux")]
 fn sound_argv(settings: &NotificationDeliverySettings, reason: NotificationReason) -> Vec<String> {
     let event = match reason {
         NotificationReason::Blocked => &settings.sound.blocked,
@@ -265,13 +277,20 @@ fn notify_send_argv(request: &NotificationRequest) -> Vec<String> {
             sanitize(&node.node_id)
         ));
     }
-    vec![
-        "notify-send".into(),
-        "--app-name".into(),
-        "Boomux".into(),
-        title,
-        body,
-    ]
+    #[cfg(target_os = "macos")]
+    {
+        vec!["/usr/bin/osascript".into(), "-e".into(), "on run argv\n display notification (item 2 of argv) with title (item 1 of argv)\nend run".into(), title, body]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            "notify-send".into(),
+            "--app-name".into(),
+            "Boomux".into(),
+            title,
+            body,
+        ]
+    }
 }
 
 fn sanitize(value: &str) -> String {

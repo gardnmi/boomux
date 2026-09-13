@@ -154,6 +154,24 @@ pub fn run_stdio_helper() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Inspect existing identity for recovery without creating a Node or daemon.
+#[doc(hidden)]
+pub fn existing_node_identity() -> std::io::Result<String> {
+    Ok(
+        crate::node_identity::NodeIdentity::load_existing_from_environment()?
+            .id()
+            .to_owned(),
+    )
+}
+
+/// Validate saved state without migrating or starting the owner.
+#[doc(hidden)]
+pub fn validate_recovery_state() -> std::io::Result<()> {
+    crate::state_store::StateStore::from_environment()?
+        .load_deferred()
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

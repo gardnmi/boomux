@@ -5,7 +5,10 @@ pub mod attach;
 #[doc(hidden)]
 pub mod benchmark_support;
 pub mod client;
+pub mod conversations;
 pub mod daemon;
+#[doc(hidden)]
+pub mod desktop_connect;
 mod desktop_notifications;
 mod fd_transfer;
 pub mod federation;
@@ -29,6 +32,8 @@ mod local_shell_journal;
 mod node_identity;
 mod node_projection;
 mod node_registration;
+#[doc(hidden)]
+pub mod platform;
 pub mod protocol;
 mod session_projection;
 pub mod ssh_bootstrap;

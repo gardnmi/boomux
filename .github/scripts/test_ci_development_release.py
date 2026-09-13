@@ -26,7 +26,7 @@ class PreviewTests(unittest.TestCase):
         self.directory = Path(self.temporary.name)
         self.run = {"id": 123, "run_attempt": 1, "general_ci_run": 789, "head_sha": SHA, "status": "completed",
                     "conclusion": "success", "event": "push", "head_repository": {"full_name": REPO},
-                    "repository": {"full_name": REPO}, "path": ".github/workflows/macos-preview.yml",
+                    "repository": {"full_name": REPO}, "path": ".github/workflows/ci.yml",
                     "created_at": "2026-09-10T00:00:00Z"}
         self.jobs = [{"name": name, "conclusion": "success", "steps": [
             {"name": step, "conclusion": "success"} for step in steps]}
@@ -107,7 +107,7 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(development.validate_run(self.run, self.jobs, REPO, "123"), SHA)
         for field, value in [("status", "in_progress"), ("conclusion", "failure"), ("event", "pull_request"),
                              ("head_sha", "bad"), ("head_repository", {"full_name": "fork/boomux"}),
-                             ("path", ".github/workflows/ci.yml"), ("id", 124)]:
+                             ("path", ".github/workflows/website.yml"), ("id", 124)]:
             with self.subTest(field=field):
                 run = {**self.run, field: value}
                 with self.assertRaises(ValueError):
@@ -115,6 +115,22 @@ class PreviewTests(unittest.TestCase):
         self.jobs[0]["steps"][0]["conclusion"] = "skipped"
         with self.assertRaises(ValueError):
             development.validate_run(self.run, self.jobs, REPO, "123")
+
+    def test_legacy_preview_runs_remain_publishable(self):
+        run = {**self.run, "path": ".github/workflows/macos-preview.yml"}
+        jobs = [{"name": name, "conclusion": "success", "steps": [
+            {"name": step, "conclusion": "success"} for step in steps]}
+            for name, steps in development.LEGACY_REQUIRED_JOBS.items()]
+        self.assertEqual(development.validate_run(run, jobs, REPO, "123"), SHA)
+
+    def test_ci_requires_native_package_and_aggregate_evidence(self):
+        for event in ["push", "workflow_dispatch"]:
+            self.assertEqual(development.validate_run({**self.run, "event": event}, self.jobs, REPO, "123"), SHA)
+        for missing in development.REQUIRED_JOBS:
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "Missing successful"):
+                development.validate_run(self.run, [job for job in self.jobs if job["name"] != missing], REPO, "123")
+        with self.assertRaises(ValueError):
+            development.validate_run({**self.run, "event": "merge_group"}, self.jobs, REPO, "123")
 
     def test_general_ci_requires_matching_success_and_aggregate_gate(self):
         run = {**self.run, "id": 789, "event": "pull_request"}

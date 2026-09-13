@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::platform::{self, ProcessHandle};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -149,19 +150,26 @@ exec "$BOOMUX_SHIM_EXECUTABLE" kiro launch -- "$@"
 const OPENCODE_BASH_RC: &[u8] = br#"if [ -r "${HOME}/.bashrc" ]; then
   . "${HOME}/.bashrc"
 fi
-_boomux_path=()
-IFS=: read -r -a _boomux_path <<< "${PATH-}"
-_boomux_filtered=()
-for _boomux_entry in "${_boomux_path[@]}"; do
-  if [ "$_boomux_entry" != "$BOOMUX_OPENCODE_SHIM_DIR" ]; then
-    _boomux_filtered+=("$_boomux_entry")
-  fi
-done
-BOOMUX_ORIGINAL_PATH="$(IFS=:; printf '%s' "${_boomux_filtered[*]}")"
-PATH="$BOOMUX_OPENCODE_SHIM_DIR${BOOMUX_ORIGINAL_PATH:+:$BOOMUX_ORIGINAL_PATH}"
-export BOOMUX_ORIGINAL_PATH PATH
-builtin hash -r 2>/dev/null || :
-unset _boomux_entry _boomux_filtered _boomux_path
+_boomux_refresh_path() {
+  local _boomux_status=$? _boomux_entry
+  local -a _boomux_path=() _boomux_filtered=()
+  IFS=: read -r -a _boomux_path <<< "${PATH-}"
+  for _boomux_entry in "${_boomux_path[@]}"; do
+    if [ "$_boomux_entry" != "$BOOMUX_OPENCODE_SHIM_DIR" ]; then
+      _boomux_filtered+=("$_boomux_entry")
+    fi
+  done
+  local IFS=:
+  BOOMUX_ORIGINAL_PATH="${_boomux_filtered[*]}"
+  PATH="$BOOMUX_OPENCODE_SHIM_DIR${BOOMUX_ORIGINAL_PATH:+:$BOOMUX_ORIGINAL_PATH}"
+  export BOOMUX_ORIGINAL_PATH PATH
+  builtin hash -r 2>/dev/null || :
+  return "$_boomux_status"
+}
+# Tool managers can change PATH in their prompt callbacks after startup.
+# Run last, retaining both scalar and array prompt callbacks and their status.
+PROMPT_COMMAND=("${PROMPT_COMMAND[@]}" _boomux_refresh_path)
+_boomux_refresh_path
 "#;
 const OPENCODE_ZSH_ENV: &[u8] = br#"if [[ -r "$BOOMUX_USER_ZDOTDIR/.zshenv" ]]; then
   source "$BOOMUX_USER_ZDOTDIR/.zshenv"
@@ -376,6 +384,8 @@ pub fn run_with_notification_delivery(
         .ok_or_else(|| io::Error::other("socket path has no parent"))?;
     secure_runtime_dir(runtime_dir)?;
     let daemon_lock = acquire_daemon_lock(runtime_dir)?;
+    #[cfg(target_os = "macos")]
+    platform::remove_stale_executable_pins(runtime_dir)?;
 
     if socket_path.exists() {
         fs::remove_file(&socket_path)?;
@@ -417,6 +427,8 @@ fn run_daemon(
     committed: Option<&mut UnixStream>,
     notification_settings: NotificationDeliverySettings,
 ) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let _executable_pin = platform::running_executable_pin()?;
     validate_notification_delivery_settings(&notification_settings)?;
     let live_handoff = committed.is_some();
     let mut registry = DaemonService::restore(store, live_handoff, transferred.events)?;
@@ -829,6 +841,10 @@ impl Drop for SocketCleanup {
 }
 
 fn secure_runtime_dir(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if env::var_os("BOOMUX_RUNTIME_DIR").is_none() && env::var_os("XDG_RUNTIME_DIR").is_none() {
+        platform::prepare_default_runtime_root()?;
+    }
     fs::create_dir_all(path)?;
     let metadata = fs::symlink_metadata(path)?;
     // `geteuid` has no arguments, pointers, or caller safety requirements.
@@ -858,12 +874,7 @@ fn process_start_time(stat: &str) -> Option<u64> {
 }
 
 fn process_argv(pid: u32) -> io::Result<Vec<Vec<u8>>> {
-    let bytes = fs::read(format!("/proc/{pid}/cmdline"))?;
-    Ok(bytes
-        .split(|byte| *byte == 0)
-        .filter(|argument| !argument.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect())
+    platform::process_argv(pid)
 }
 
 fn process_has_environment(pid: u32, name: &[u8], value: &[u8]) -> io::Result<bool> {
@@ -871,11 +882,7 @@ fn process_has_environment(pid: u32, name: &[u8], value: &[u8]) -> io::Result<bo
 }
 
 fn process_environment_value(pid: u32, name: &[u8]) -> io::Result<Option<Vec<u8>>> {
-    let bytes = fs::read(format!("/proc/{pid}/environ"))?;
-    Ok(bytes.split(|byte| *byte == 0).find_map(|variable| {
-        let separator = variable.iter().position(|byte| *byte == b'=')?;
-        (variable[..separator] == *name).then(|| variable[separator + 1..].to_vec())
-    }))
+    platform::process_environment_value(pid, name)
 }
 
 fn kiro_holder_process_evidence(
@@ -888,15 +895,13 @@ fn kiro_holder_process_evidence(
             "Kiro launch holder PID must be nonzero",
         ));
     }
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| {
+    let stat = platform::process_snapshot(pid).map_err(|_| {
         DaemonError::lifecycle(
             ErrorCode::NotFound,
             "Kiro launch holder process was not found",
         )
     })?;
-    let start_time = process_start_time(&stat).ok_or_else(|| {
-        DaemonError::validation("Kiro launch holder process has invalid start identity")
-    })?;
+    let start_time = stat.start_time;
     let argv = process_argv(pid).map_err(|_| {
         DaemonError::lifecycle(
             ErrorCode::NotFound,
@@ -914,16 +919,13 @@ fn kiro_holder_process_evidence(
             "Kiro launch holder does not match the managed launcher ShellRun",
         ));
     }
-    Ok((
-        start_time,
-        proc_process_group(&stat) == Some(pid as libc::pid_t),
-    ))
+    Ok((start_time, Some(stat.group) == Some(pid as libc::pid_t)))
 }
 
 fn kiro_holder_is_live(holder: &KiroLaunchHolder) -> bool {
-    fs::read_to_string(format!("/proc/{}/stat", holder.pid))
+    platform::process_snapshot(holder.pid)
         .ok()
-        .and_then(|stat| process_start_time(&stat))
+        .map(|stat| stat.start_time)
         == Some(holder.start_time)
 }
 
@@ -941,19 +943,9 @@ fn terminate_dead_kiro_holder_group(holder_id: &str, holder: &KiroLaunchHolder) 
         return;
     }
     let group = holder.pid as libc::pid_t;
-    let authorized = fs::read_dir("/proc").is_ok_and(|entries| {
-        entries.filter_map(Result::ok).any(|entry| {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                return false;
-            };
-            fs::read_to_string(format!("/proc/{pid}/stat"))
-                .ok()
-                .and_then(|stat| proc_process_group(&stat))
-                == Some(group)
+    let authorized = platform::process_ids().is_ok_and(|entries| {
+        entries.into_iter().any(|pid| {
+            platform::process_snapshot(pid).ok().map(|stat| stat.group) == Some(group)
                 && process_has_environment(pid, b"BOOMUX_KIRO_LAUNCH_HOLDER", holder_id.as_bytes())
                     .unwrap_or(false)
         })
@@ -998,10 +990,9 @@ fn prune_dead_kiro_holders(
 }
 
 fn opencode_process_evidence(pid: u32) -> io::Result<(u64, Vec<u8>, Vec<Vec<u8>>)> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    let start_time = process_start_time(&stat)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid process start time"))?;
-    let executable = fs::read_link(format!("/proc/{pid}/exe"))?
+    let stat = platform::process_snapshot(pid)?;
+    let start_time = stat.start_time;
+    let executable = platform::process_executable(pid)?
         .as_os_str()
         .as_bytes()
         .to_vec();
@@ -1078,11 +1069,11 @@ fn adopt_registered_opencode_runtime() -> io::Result<Option<OpenCodeRuntime>> {
             && argv == registration.argv
             && is_opencode_serve_argv(&argv, registration.port)
     });
-    let stat = fs::read_to_string(format!("/proc/{}/stat", registration.pid));
+    let stat = platform::process_snapshot(registration.pid);
     let valid_session = stat
-        .as_deref()
+        .as_ref()
         .ok()
-        .is_some_and(|stat| proc_session_id(stat) == Some(registration.pid as libc::pid_t));
+        .is_some_and(|stat| stat.session == registration.pid as libc::pid_t);
     let valid_generation = process_has_environment(
         registration.pid,
         b"BOOMUX_OPENCODE_SHARED_GENERATION",
@@ -1132,22 +1123,15 @@ fn is_opencode_serve_argv(argv: &[Vec<u8>], port: u16) -> bool {
 }
 
 fn discover_unregistered_opencode_runtime(port: u16) -> io::Result<Option<OpenCodeRuntime>> {
-    let Ok(entries) = fs::read_dir("/proc") else {
+    let Ok(entries) = platform::process_ids() else {
         return Ok(None);
     };
     let mut discovered = None;
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
+    for pid in entries {
+        let Ok(stat) = platform::process_snapshot(pid) else {
             continue;
         };
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        if proc_session_id(&stat) != Some(pid as libc::pid_t)
+        if Some(stat.session) != Some(pid as libc::pid_t)
             || !process_argv(pid).is_ok_and(|argv| is_opencode_serve_argv(&argv, port))
             || !opencode_listener_belongs_to_session(port, pid)
         {
@@ -1298,7 +1282,7 @@ fn resolve_executable(
     executable: &str,
 ) -> Option<PathBuf> {
     let path = environment_value(environment, b"PATH")?;
-    let current_executable = env::current_exe()
+    let current_executable = platform::current_executable()
         .ok()
         .and_then(|path| path.canonicalize().ok());
     env::split_paths(&path).find_map(|directory| {
@@ -1373,10 +1357,7 @@ fn kiro_launch_eligible(_shell: &Shell, effective_command: &[String]) -> bool {
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             == Some("kiro-cli")
-    }) && (effective_command.len() == 1
-        || effective_command
-            .get(1)
-            .is_some_and(|argument| argument == "--v3"))
+    })
 }
 
 fn claude_remote_control_command(
@@ -1419,7 +1400,7 @@ fn inject_opencode_shim_environment(
     let real_claude = resolve_executable(environment, Some(&shim_dir), "claude");
     let real_codex = resolve_codex_executable(environment, Some(&shim_dir));
     let real_kiro = resolve_kiro_executable(environment, Some(&shim_dir));
-    let boomux = env::current_exe()?.canonicalize()?;
+    let boomux = platform::current_executable()?.canonicalize()?;
     let boomux_metadata = fs::metadata(&boomux)?;
     if !boomux.is_absolute()
         || !boomux_metadata.is_file()
@@ -1713,7 +1694,8 @@ fn validate_restart_environment_roots(environment: &UnixEnvironment) -> io::Resu
     let runtime = environment_value(environment, b"BOOMUX_RUNTIME_DIR")
         .or_else(|| environment_value(environment, b"XDG_RUNTIME_DIR"))
         .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("restart environment has no runtime root"))?;
+        .map(Ok)
+        .unwrap_or_else(platform::default_runtime_root)?;
     let state = environment_value(environment, b"BOOMUX_STATE_HOME")
         .or_else(|| environment_value(environment, b"XDG_STATE_HOME").filter(|p| !p.is_empty()))
         .map(PathBuf::from)
@@ -1754,15 +1736,29 @@ fn launch_replacement_process(
         claude_remote_control_bindings,
         kiro_launch_holders,
     } = options;
+    #[cfg(target_os = "macos")]
+    let executable = Some(match executable {
+        Some(file) => file,
+        None => pin_replacement_executable(&replacement_executable()?)?,
+    });
+    #[cfg(target_os = "macos")]
+    let mut executable_pin = platform::ExecutablePin::prepare(
+        executable.as_ref().expect("Darwin replacement is pinned"),
+    )?;
     let (mut channel, child_channel) = UnixStream::pair()?;
     let child_channel_fd = child_channel.as_raw_fd();
     // Keep the inspected executable open through exec. The descriptor is above
     // CHANNEL_FD so the handoff channel duplication cannot overwrite it.
+    #[cfg(target_os = "linux")]
     let replacement_path = match executable.as_ref() {
-        Some(file) => PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+        Some(file) => platform::executable_path(file)?,
         None => replacement_executable()?,
     };
+    #[cfg(target_os = "macos")]
+    let replacement_path = &executable_pin.path;
     let mut command = Command::new(replacement_path);
+    #[cfg(target_os = "macos")]
+    command.arg0(&executable_pin.original);
     if let Some(environment) = startup_environment {
         command.env_clear();
         for variable in environment.variables {
@@ -1782,6 +1778,11 @@ fn launch_replacement_process(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if env::var_os("BOOMUX_NATIVE_TEST_HOOKS").is_some()
+        && env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some()
+    {
+        command.stderr(Stdio::inherit());
+    }
     // Only async-signal-safe descriptor operations run between fork and exec.
     unsafe {
         command.pre_exec(move || {
@@ -1860,9 +1861,23 @@ fn launch_replacement_process(
         Ok(())
     })();
     if result.is_err() {
+        if env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "boomux: replacement {} exited: {:?}",
+                replacement.id(),
+                replacement.try_wait()
+            );
+        }
         let _ = channel.write_all(&[handoff::ABORT]);
         let _ = replacement.kill();
-        let _ = replacement.wait();
+        let status = replacement.wait();
+        if env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+            eprintln!("boomux: replacement cleanup: {status:?}");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if result.is_ok() {
+        executable_pin.commit();
     }
     result
 }
@@ -1891,10 +1906,10 @@ fn pin_replacement_executable(path: &Path) -> io::Result<File> {
     }
     let mut magic = [0; 4];
     file.read_exact(&mut magic)?;
-    if magic != *b"\x7fELF" {
+    if !platform::native_executable_magic(magic) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "replacement must be a native ELF executable",
+            "replacement must be a native executable",
         ));
     }
     let descriptor = unsafe {
@@ -1911,7 +1926,7 @@ fn pin_replacement_executable(path: &Path) -> io::Result<File> {
 }
 
 fn replacement_executable() -> io::Result<PathBuf> {
-    let current = env::current_exe()?;
+    let current = platform::current_executable()?;
     Ok(select_replacement_executable(
         current,
         env::args_os().next().map(PathBuf::from),
@@ -2024,6 +2039,9 @@ fn handle_connection_inner(
     mut permit: ConnectionPermit,
     federation_lease: Option<NodeIdentityLease>,
 ) -> io::Result<()> {
+    // Darwin accept inherits O_NONBLOCK from the listening socket. Connection
+    // handlers use blocking I/O with a bounded handshake on every platform.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let request: Envelope<Request> = protocol::read_message(&mut stream)?;
     stream.set_read_timeout(None)?;
@@ -3276,6 +3294,10 @@ fn routed_response_timeout(operation: &RoutedOperation) -> Duration {
 }
 
 fn routed_owner_feature(operation: &RoutedOperation) -> Option<protocol::ProtocolFeature> {
+    if matches!(operation, RoutedOperation::OpenWorkspaceConversation { .. }) {
+        return Some(protocol::ProtocolFeature::WorkspaceConversations);
+    }
+
     if matches!(
         operation,
         RoutedOperation::SetAgentSessionDisplayName { .. }
@@ -3441,6 +3463,27 @@ struct CachedHostSessionCatalog {
     last_used: u64,
 }
 
+// Generated OpenCode titles often arrive just after the first catalog read.
+// Retry provisional titles briefly, then return to the normal idle cadence.
+fn host_session_catalog_ttl(
+    sessions: Option<&[crate::host_session_titles::HostSession]>,
+    now_ms: u64,
+) -> Duration {
+    match sessions {
+        None => HOST_SESSION_CATALOG_FAILURE_TTL,
+        Some(sessions)
+            if sessions.iter().any(|session| {
+                session.integration == "opencode"
+                    && session.title.starts_with("New session - ")
+                    && now_ms.saturating_sub(session.created_at_ms) < 30_000
+            }) =>
+        {
+            Duration::from_secs(3)
+        }
+        Some(_) => HOST_SESSION_CATALOG_TTL,
+    }
+}
+
 impl HostSessionCatalogCache {
     fn records(
         &self,
@@ -3462,15 +3505,12 @@ impl HostSessionCatalogCache {
         loop {
             let mut state = lock(&self.state)?;
             let now = Instant::now();
+            let wall_time_ms = unix_time_ms();
             let stale = requests
                 .iter()
                 .filter(|request| {
                     state.entries.get(*request).is_none_or(|entry| {
-                        let ttl = if entry.sessions.is_some() {
-                            HOST_SESSION_CATALOG_TTL
-                        } else {
-                            HOST_SESSION_CATALOG_FAILURE_TTL
-                        };
+                        let ttl = host_session_catalog_ttl(entry.sessions.as_deref(), wall_time_ms);
                         now.duration_since(entry.inspected_at) >= ttl
                     })
                 })
@@ -3676,7 +3716,7 @@ impl Drop for OpenCodeClaimsMutation<'_> {
 
 struct OutgoingOpenCodeRuntime {
     manifest: handoff::OpenCodeRuntimeManifest,
-    pidfd: OwnedFd,
+    pidfd: ProcessHandle,
 }
 
 impl OpenCodeRuntimeProcess {
@@ -3687,7 +3727,7 @@ impl OpenCodeRuntimeProcess {
         }
     }
 
-    fn pidfd(&mut self, pid: u32) -> io::Result<OwnedFd> {
+    fn pidfd(&mut self, pid: u32) -> io::Result<ProcessHandle> {
         match self {
             Self::Owned(child) => {
                 if child.try_wait()?.is_some() {
@@ -3977,8 +4017,8 @@ impl OpenCodeCoordinator {
         state.runtime = transferred
             .map(|transferred| {
                 let manifest = transferred.manifest;
-                let stat = fs::read_to_string(format!("/proc/{}/stat", manifest.pid))?;
-                if proc_session_id(&stat) != Some(manifest.pid as libc::pid_t) {
+                let stat = platform::process_snapshot(manifest.pid)?;
+                if Some(stat.session) != Some(manifest.pid as libc::pid_t) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "transferred OpenCode process is not its session leader",
@@ -6934,6 +6974,23 @@ impl ShellRuntimeManager {
             if let Some(session_id) = child_pid {
                 signal_session(session_id, libc::SIGKILL);
             }
+            // Darwin session leaders can block in ttywait during kernel exit,
+            // even after SIGKILL, while the paused reader leaves output queued.
+            // This is destructive shutdown: discard only the unread tail after
+            // killing the session. Handoff and rollback never flush the PTY.
+            #[cfg(target_os = "macos")]
+            {
+                let master = lock(&runtime.master)?;
+                if unsafe { libc::tcflush(master.descriptor.as_raw_fd(), libc::TCOFLUSH) } < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if env::var_os("BOOMUX_TEST_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "BOOMUX_TEST_CHILD_WAIT pid={child_pid:?} kill={kill_result:?} status={:?}",
+                    process.try_wait_code()
+                );
+            }
             let wait_result = if exited { Ok(()) } else { process.wait() };
             match (kill_result, wait_result) {
                 (_, Ok(())) => Ok(()),
@@ -7633,13 +7690,13 @@ enum ManagedProcess {
 
 struct ImportedProcess {
     pid: u32,
-    pidfd: OwnedFd,
+    pidfd: ProcessHandle,
 }
 
 struct OutgoingRuntime {
     manifest: handoff::RuntimeManifest,
     pty: OwnedFd,
-    pidfd: OwnedFd,
+    pidfd: ProcessHandle,
     reconstruction: Vec<u8>,
 }
 
@@ -7687,15 +7744,27 @@ struct ReaderTask {
 
 // One coalescing eventfd wakes the reader for control messages and pause
 // cancellation. Closing the sender also wakes it to observe disconnection.
+#[cfg(target_os = "linux")]
 struct ReaderWake(OwnedFd);
+#[cfg(target_os = "macos")]
+struct ReaderWake(OwnedFd, OwnedFd);
 
 impl ReaderWake {
+    fn write_fd(&self) -> RawFd {
+        #[cfg(target_os = "linux")]
+        {
+            self.0.as_raw_fd()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.1.as_raw_fd()
+        }
+    }
     fn notify(&self) {
         let value = 1u64;
         loop {
             // The eventfd is nonblocking; saturation already means it is readable.
-            let result =
-                unsafe { libc::write(self.0.as_raw_fd(), (&value as *const u64).cast(), 8) };
+            let result = unsafe { libc::write(self.write_fd(), (&value as *const u64).cast(), 8) };
             if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 break;
             }
@@ -7708,6 +7777,10 @@ impl ReaderWake {
             // One read drains every coalesced wakeup without allocating a queue.
             let result =
                 unsafe { libc::read(self.0.as_raw_fd(), (&mut value as *mut u64).cast(), 8) };
+            #[cfg(target_os = "macos")]
+            if result > 0 {
+                continue;
+            }
             if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 break;
             }
@@ -7717,7 +7790,7 @@ impl ReaderWake {
     fn wait(
         &self,
         reader: Option<&PtyReader>,
-        process: Option<&OwnedFd>,
+        process: Option<&ProcessHandle>,
         deadline: Option<Instant>,
     ) -> io::Result<()> {
         let mut descriptors = [
@@ -7732,7 +7805,7 @@ impl ReaderWake {
                 revents: 0,
             },
             libc::pollfd {
-                fd: process.map_or(-1, AsRawFd::as_raw_fd),
+                fd: process.map_or(-1, platform::process_wait_fd),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -7772,11 +7845,21 @@ struct ReaderCommands {
 impl ReaderCommands {
     fn channel() -> io::Result<(Self, mpsc::Receiver<ReaderCommand>, Arc<ReaderWake>)> {
         // eventfd returns a new, exclusively owned, close-on-exec descriptor.
-        let descriptor = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if descriptor == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        let wake = Arc::new(ReaderWake(unsafe { OwnedFd::from_raw_fd(descriptor) }));
+        #[cfg(target_os = "linux")]
+        let wake = {
+            let descriptor = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if descriptor == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Arc::new(ReaderWake(unsafe { OwnedFd::from_raw_fd(descriptor) }))
+        };
+        #[cfg(target_os = "macos")]
+        let wake = {
+            let (reader, writer) = UnixStream::pair()?;
+            reader.set_nonblocking(true)?;
+            writer.set_nonblocking(true)?;
+            Arc::new(ReaderWake(reader.into(), writer.into()))
+        };
         let (sender, receiver) = mpsc::channel();
         Ok((
             Self {
@@ -7844,7 +7927,7 @@ impl ManagedProcess {
         }
     }
 
-    fn transfer_identity(&mut self) -> io::Result<(u32, OwnedFd)> {
+    fn transfer_identity(&mut self) -> io::Result<(u32, ProcessHandle)> {
         if self.try_wait_code()?.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -7863,20 +7946,14 @@ impl ManagedProcess {
     }
 }
 
-fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
-    // pidfd_open creates a stable kernel reference to the live process.
-    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if descriptor == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // pidfd_open returned a new descriptor with ownership transferred here.
-    Ok(unsafe { OwnedFd::from_raw_fd(descriptor as RawFd) })
+fn open_pidfd(pid: u32) -> io::Result<ProcessHandle> {
+    platform::open_process(pid)
 }
 
 impl ImportedProcess {
     fn has_exited(&self) -> io::Result<bool> {
         let mut descriptor = libc::pollfd {
-            fd: self.pidfd.as_raw_fd(),
+            fd: platform::process_wait_fd(&self.pidfd),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -7909,26 +7986,7 @@ impl ImportedProcess {
 }
 
 fn send_pidfd_signal(pidfd: BorrowedFd<'_>, signal: libc::c_int) -> io::Result<()> {
-    // pidfd_send_signal uses the stable process reference held by pidfd.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            signal,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if result == -1 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    } else {
-        Ok(())
-    }
+    platform::signal_process(pidfd, signal)
 }
 
 impl PtyMaster {
@@ -9748,7 +9806,7 @@ impl DaemonService {
                         let mut process = lock(&runtime.process)?;
                         if process.try_wait_code()?.is_none()
                             && let Some(pid) = process.process_id()
-                            && let Ok(path) = fs::read_link(format!("/proc/{pid}/cwd"))
+                            && let Ok(path) = platform::process_cwd(pid)
                             && path.is_absolute()
                             && process.try_wait_code()?.is_none()
                         {
@@ -9862,6 +9920,33 @@ impl DaemonService {
                 shell_id,
                 run_id,
             }),
+            HostServiceOperation::ListWorkspaceConversations { workspace_id } => {
+                let workspace = self.workspace(&workspace_id)?.snapshot(&self.durable)?;
+                let mut conversations = crate::conversations::list(&workspace);
+                if !conversations.is_empty() {
+                    let snapshot = Snapshot {
+                        workspaces: vec![workspace],
+                        focused_terminal: None,
+                    };
+                    let integrations = conversations
+                        .iter()
+                        .map(|entry| {
+                            crate::conversations::canonical_integration(&entry.integration)
+                        })
+                        .collect::<HashSet<_>>();
+                    let requests = host_services::session_catalog_requests(&snapshot)
+                        .into_iter()
+                        .filter(|request| {
+                            integrations.contains(crate::conversations::canonical_integration(
+                                &request.integration,
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    let catalog = self.host_session_catalog.records(&requests)?;
+                    crate::conversations::enrich_titles(&mut conversations, &catalog);
+                }
+                Ok(HostServiceResult::WorkspaceConversations { conversations })
+            }
             HostServiceOperation::ListAgentSessions { .. }
             | HostServiceOperation::InspectAgentSession { .. }
             | HostServiceOperation::ResolveAgentSession { .. } => Err(DaemonError::lifecycle(
@@ -10240,7 +10325,8 @@ impl DaemonService {
         );
         let response_timeout = match &operation {
             HostServiceOperation::ListAgentSessions { .. }
-            | HostServiceOperation::InspectAgentSession { .. } => {
+            | HostServiceOperation::InspectAgentSession { .. }
+            | HostServiceOperation::ListWorkspaceConversations { .. } => {
                 REGISTERED_NODE_SESSION_RESPONSE_TIMEOUT
             }
             _ => REGISTERED_NODE_RESPONSE_TIMEOUT,
@@ -13365,6 +13451,44 @@ impl DaemonService {
                 let events = workspace_created_events(&workspace);
                 Ok((Response::Workspace { workspace }, events))
             }),
+            Request::OpenWorkspaceConversation {
+                workspace_id,
+                agent_id,
+                shell_id,
+            } => self.durable_mutation_outcome(|undo| {
+                validate_uuid(&shell_id, "conversation Shell key")?;
+                let workspace = self
+                    .durable
+                    .workspace(&workspace_id)?
+                    .snapshot(&self.durable)?;
+                let plan = crate::conversations::plan(&workspace, &agent_id, &shell_id)
+                    .map_err(|message| DaemonError::lifecycle(ErrorCode::NotFound, message))?;
+                match plan {
+                    crate::conversations::OpenPlan::Existing(shell) => {
+                        Ok(DurableMutation::Unchanged(Response::Shell {
+                            shell: *shell,
+                        }))
+                    }
+                    crate::conversations::OpenPlan::Resume(spec) => {
+                        let (shell, record) =
+                            self.durable
+                                .create_shell_exact(&workspace_id, &shell_id, spec)?;
+                        let Some(record) = record else {
+                            return Ok(DurableMutation::Unchanged(Response::Shell { shell }));
+                        };
+                        undo.record(record);
+                        let event = DaemonEventKind::ShellCreated {
+                            workspace_id,
+                            shell_id: shell.id.clone(),
+                            name: shell.name.clone(),
+                        };
+                        Ok(DurableMutation::Changed(
+                            Response::Shell { shell },
+                            vec![event],
+                        ))
+                    }
+                }
+            }),
             Request::CreateWorkspaceShell {
                 workspace_id,
                 workspace_name,
@@ -14147,8 +14271,8 @@ impl ShellRuntimeManager {
                 saved_run.output_revision = output_revision;
             }
             let run = Arc::new(ShellRun::from_persisted(&saved_run));
-            let stat = fs::read_to_string(format!("/proc/{}/stat", manifest.pid))?;
-            if proc_session_id(&stat) != Some(manifest.pid as libc::pid_t) {
+            let stat = platform::process_snapshot(manifest.pid)?;
+            if Some(stat.session) != Some(manifest.pid as libc::pid_t) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "transferred process is not its session leader",
@@ -17595,38 +17719,32 @@ fn signal_session(session_id: libc::pid_t, signal: libc::c_int) {
         let Ok(pidfd) = open_pidfd(pid as u32) else {
             continue;
         };
-        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        let Ok(stat) = platform::process_snapshot(pid as u32) else {
             continue;
         };
-        if proc_session_id(&stat) == Some(session_id) {
+        if Some(stat.session) == Some(session_id) {
             let _ = send_pidfd_signal(pidfd.as_fd(), signal);
         }
     }
 }
 
 fn session_processes(session_id: libc::pid_t) -> Vec<libc::pid_t> {
-    let Ok(entries) = fs::read_dir("/proc") else {
+    let Ok(entries) = platform::process_ids() else {
         return Vec::new();
     };
     let mut processes = Vec::new();
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<libc::pid_t>().ok())
-        else {
+    for pid in entries {
+        let Ok(stat) = platform::process_snapshot(pid) else {
             continue;
         };
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        if proc_session_id(&stat) == Some(session_id) {
-            processes.push(pid);
+        if Some(stat.session) == Some(session_id) {
+            processes.push(pid as libc::pid_t);
         }
     }
     processes
 }
 
+#[cfg(target_os = "linux")]
 fn opencode_listener_belongs_to_session(port: u16, session_id: u32) -> bool {
     let Ok(table) = fs::read_to_string("/proc/net/tcp") else {
         return false;
@@ -17706,20 +17824,15 @@ fn proc_foreground_process_group(stat: &str) -> Option<libc::pid_t> {
 }
 
 fn foreground_process_for_session_leader(pid: u32) -> Option<String> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let process_group = proc_foreground_process_group(&stat)?;
+    let stat = platform::process_snapshot(pid).ok()?;
+    let process_group = stat.foreground_group;
     (process_group > 0)
         .then(|| read_process_name(process_group as u32))
         .flatten()
 }
 
 fn read_process_name(pid: u32) -> Option<String> {
-    let file = File::open(format!("/proc/{pid}/comm")).ok()?;
-    let mut bytes = Vec::with_capacity(MAX_FOREGROUND_PROCESS_BYTES + 1);
-    file.take((MAX_FOREGROUND_PROCESS_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    parse_process_name(&bytes)
+    parse_process_name(&platform::process_name(pid).ok()?)
 }
 
 fn validate_shell_specs(specs: &[ShellSpec]) -> io::Result<()> {
@@ -18134,6 +18247,11 @@ fn lock<T>(mutex: &Mutex<T>) -> io::Result<MutexGuard<'_, T>> {
         .map_err(|_| io::Error::other("daemon state lock poisoned"))
 }
 
+#[cfg(target_os = "macos")]
+fn opencode_listener_belongs_to_session(port: u16, session_id: u32) -> bool {
+    platform::listener_belongs_to_session(port, session_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18501,7 +18619,7 @@ mod tests {
     }
 
     #[test]
-    fn kiro_launcher_accepts_only_bare_or_explicit_v3_shapes() {
+    fn kiro_launcher_accepts_chat_without_selecting_an_engine() {
         let shell = create_pending_shell(
             "workspace",
             ShellSpec {
@@ -18513,6 +18631,9 @@ mod tests {
         .unwrap();
         for argv in [
             vec!["/opt/kiro/bin/kiro-cli".into()],
+            vec!["kiro-cli".into(), "chat".into()],
+            vec!["kiro-cli".into(), "--agent".into(), "reviewer".into()],
+            vec!["kiro-cli".into(), "--version".into()],
             vec![
                 "/opt/kiro/bin/kiro-cli".into(),
                 "--v3".into(),
@@ -18521,13 +18642,7 @@ mod tests {
         ] {
             assert!(kiro_launch_eligible(&shell, &argv));
         }
-        for argv in [
-            vec!["kiro-cli".into(), "chat".into()],
-            vec!["kiro-cli".into(), "--version".into()],
-            vec!["kiro".into()],
-        ] {
-            assert!(!kiro_launch_eligible(&shell, &argv));
-        }
+        assert!(!kiro_launch_eligible(&shell, &["kiro".into()]));
     }
 
     #[test]
@@ -18694,6 +18809,41 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bash_prompt_refresh_preserves_callbacks_status_and_current_tool_path() {
+        let directory = env::temp_dir().join(format!("boomux-prompt-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let startup = directory.join("boomux.bashrc");
+        fs::write(&startup, OPENCODE_BASH_RC).unwrap();
+        for callbacks in [
+            "PROMPT_COMMAND='PATH=/selected/bin:$PATH; false'",
+            "PROMPT_COMMAND=('PATH=/selected/bin:$PATH' 'false')",
+        ] {
+            fs::write(directory.join(".bashrc"), callbacks).unwrap();
+            let output = Command::new("/bin/bash")
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    r#". "$BOOMUX_TEST_RC"
+for callback in "${PROMPT_COMMAND[@]}"; do eval "$callback"; done
+status=$?
+[ "$status" = 1 ] || exit 10
+[ "$PATH" = /boomux/shims:/selected/bin:/usr/bin:/bin ] || exit 11
+[ "$BOOMUX_ORIGINAL_PATH" = /selected/bin:/usr/bin:/bin ] || exit 12
+"#,
+                ])
+                .env("HOME", &directory)
+                .env("PATH", "/usr/bin:/bin")
+                .env("BOOMUX_OPENCODE_SHIM_DIR", "/boomux/shims")
+                .env("BOOMUX_TEST_RC", &startup)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{callbacks}: {output:?}");
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -19432,6 +19582,51 @@ mod tests {
     }
 
     #[test]
+    fn provisional_opencode_titles_refresh_quickly_without_permanent_fast_polling() {
+        let cache = HostSessionCatalogCache::default();
+        let request = crate::host_session_titles::ProjectionRequest {
+            integration: "opencode".into(),
+            directory: "/repo".into(),
+        };
+        let mut session = crate::host_session_titles::HostSession {
+            integration: "opencode".into(),
+            root_id: "session-1".into(),
+            title: "New session - 2026-09-12T05:08:10.407Z".into(),
+            directory: "/repo".into(),
+            created_at_ms: unix_time_ms(),
+            updated_at_ms: unix_time_ms(),
+        };
+        let requests = [request.clone()];
+        cache
+            .records_with(&requests, &|_| vec![Some(vec![session.clone()])])
+            .unwrap();
+        lock(&cache.state)
+            .unwrap()
+            .entries
+            .get_mut(&request)
+            .unwrap()
+            .inspected_at = Instant::now() - Duration::from_secs(4);
+        session.title = "Casual greeting".into();
+        let refreshed = cache
+            .records_with(&requests, &|_| vec![Some(vec![session.clone()])])
+            .unwrap();
+        assert_eq!(refreshed[0].title, "Casual greeting");
+        assert_eq!(
+            host_session_catalog_ttl(Some(&refreshed), unix_time_ms()),
+            HOST_SESSION_CATALOG_TTL
+        );
+        session.title = "New session - old untitled conversation".into();
+        assert_eq!(
+            host_session_catalog_ttl(Some(&[session.clone()]), session.created_at_ms + 30_000),
+            HOST_SESSION_CATALOG_TTL
+        );
+        assert_eq!(
+            host_session_catalog_ttl(None, unix_time_ms()),
+            HOST_SESSION_CATALOG_FAILURE_TTL
+        );
+    }
+
+    #[test]
     fn session_catalog_cache_is_single_flight_without_holding_its_state_lock() {
         use std::sync::Barrier;
 
@@ -19663,14 +19858,14 @@ mod tests {
         {
             thread::sleep(Duration::from_millis(1));
         }
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let stat = platform::process_snapshot(pid).unwrap();
         let holder_id = Uuid::new_v4().to_string();
         lock(&registry.kiro.state).unwrap().insert(
             holder_id.clone(),
             KiroLaunchHolder {
                 pid,
-                start_time: process_start_time(&stat).unwrap(),
-                process_group_leader: proc_process_group(&stat) == Some(pid as libc::pid_t),
+                start_time: stat.start_time,
+                process_group_leader: Some(stat.group) == Some(pid as libc::pid_t),
                 shell_id: shell_id.into(),
                 run_id: run_id.into(),
                 sessions: HashMap::new(),

@@ -46,9 +46,14 @@ mod host_session_titles;
 mod hyprland;
 mod integration_management;
 mod kiro_hooks;
+#[cfg(target_os = "macos")]
+mod macos_parent_guard;
+#[cfg(target_os = "macos")]
+mod macos_terminal;
 mod mobile_web;
 mod process_adapter;
 mod projects;
+mod remote_maintenance;
 mod session_projection;
 mod setup;
 mod tailscale_serve;
@@ -147,12 +152,17 @@ const NON_PROTOCOL_FEATURES: &[&str] = &[
     "persistent_workspace_selection",
     "create_and_open_shell",
     "atomic_workspace_shell_creation",
+    #[cfg(target_os = "linux")]
     "hyprland_special_workspaces",
+    #[cfg(target_os = "linux")]
     "contextual_desktop_terminal",
+    #[cfg(target_os = "linux")]
     "coordinated_shell_desktop_placement",
+    #[cfg(target_os = "linux")]
     "desktop_workspace_show",
     "node_reauthentication",
     "local_update_status",
+    #[cfg(target_os = "linux")]
     "guided_local_update",
     "guided_local_uninstall",
     "guided_setup",
@@ -464,7 +474,10 @@ enum Commands {
     #[command(name = "__federation-stdio", hide = true)]
     FederationStdio,
     #[command(name = "__guided-node-add", hide = true)]
-    GuidedNodeAdd,
+    GuidedNodeAdd {
+        #[arg(long)]
+        result_socket: Option<PathBuf>,
+    },
     #[command(name = "__guided-node-upgrade", hide = true)]
     GuidedNodeUpgrade { selector: String },
     #[command(name = "__guided-node-uninstall", hide = true)]
@@ -487,6 +500,12 @@ enum Commands {
     },
     #[command(name = "__uninstall-fingerprint", hide = true)]
     UninstallFingerprint,
+    #[command(name = "__remote-maintenance", hide = true)]
+    RemoteMaintenance {
+        action: String,
+        expected_node_id: String,
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -557,6 +576,8 @@ enum NodeCommands {
         target: Option<String>,
         #[arg(long, hide = true)]
         desktop_workspace: bool,
+        #[arg(long, hide = true, requires = "desktop_workspace")]
+        desktop_result_socket: Option<PathBuf>,
     },
     /// List registered remote Nodes
     List,
@@ -1364,6 +1385,7 @@ command_keys! {
     ResumeSessionInternal => ("resume-session-internal", HumanOnly),
     UninstallRemote => ("uninstall-remote", HumanOnly),
     UninstallFingerprint => ("uninstall-fingerprint", HumanOnly),
+    RemoteMaintenance => ("remote-maintenance", HumanOnly),
 }
 
 impl Cli {
@@ -1627,12 +1649,13 @@ impl Cli {
             Some(Commands::Attach { .. } | Commands::AwaitAttach { .. }) => CommandKey::Attach,
             Some(Commands::ResumeSession { .. }) => CommandKey::ResumeSessionInternal,
             Some(Commands::FederationStdio) => CommandKey::Attach,
-            Some(Commands::GuidedNodeAdd) => CommandKey::NodeAdd,
+            Some(Commands::GuidedNodeAdd { .. }) => CommandKey::NodeAdd,
             Some(Commands::GuidedNodeUpgrade { .. }) => CommandKey::NodeUpgrade,
             Some(Commands::GuidedNodeUninstall { .. }) => CommandKey::NodeUninstall,
             Some(Commands::GuidedNodeReauthenticate { .. }) => CommandKey::NodeReauthenticate,
             Some(Commands::UninstallRemote { .. }) => CommandKey::UninstallRemote,
             Some(Commands::UninstallFingerprint) => CommandKey::UninstallFingerprint,
+            Some(Commands::RemoteMaintenance { .. }) => CommandKey::RemoteMaintenance,
             Some(Commands::BootstrapActivate { .. }) => CommandKey::Daemon,
         }
     }
@@ -1671,6 +1694,14 @@ impl CliExit {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(code) = macos_parent_guard::dispatch() {
+        return code;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(code) = macos_terminal::dispatch() {
+        return code;
+    }
     if env::var_os("BOOMUX_INTERNAL_GUIDED_STOP").as_deref() == Some(std::ffi::OsStr::new("1")) {
         unsafe {
             env::remove_var("BOOMUX_INTERNAL_GUIDED_STOP");
@@ -1868,8 +1899,9 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             federation::run_stdio_helper()?;
             return Ok(CliExit::Success);
         }
-        Some(Commands::GuidedNodeAdd) => {
-            return finish_guided_shell(guided_node_add()?).map(CliExit::Child);
+        Some(Commands::GuidedNodeAdd { result_socket }) => {
+            return finish_guided_shell(guided_node_add(result_socket.as_deref())?)
+                .map(CliExit::Child);
         }
         Some(Commands::GuidedNodeUpgrade { selector }) => {
             return finish_guided_shell(guided_node_upgrade(selector)?).map(CliExit::Child);
@@ -2078,7 +2110,7 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
         Some(Commands::Attach { .. } | Commands::AwaitAttach { .. }) => unreachable!(),
         Some(Commands::ResumeSession { .. }) => unreachable!(),
         Some(Commands::FederationStdio) => unreachable!(),
-        Some(Commands::GuidedNodeAdd) => unreachable!(),
+        Some(Commands::GuidedNodeAdd { .. }) => unreachable!(),
         Some(Commands::GuidedNodeUpgrade { .. }) => unreachable!(),
         Some(Commands::GuidedNodeUninstall { .. }) => unreachable!(),
         Some(Commands::GuidedNodeReauthenticate { .. }) => unreachable!(),
@@ -2086,6 +2118,11 @@ fn run(cli: Cli) -> Result<CliExit, Box<dyn Error>> {
             expected_node_id,
             expected_executable,
         }) => uninstall::remote_uninstall(&expected_node_id, &expected_executable),
+        Some(Commands::RemoteMaintenance {
+            action,
+            expected_node_id,
+            token,
+        }) => remote_maintenance::run(&action, &expected_node_id, token.as_deref()),
         Some(Commands::UninstallFingerprint) => {
             let target = update::remote_uninstall_target()?;
             println!(
@@ -2240,9 +2277,15 @@ fn upgrade_node(selector: &str) -> Result<(), Box<dyn Error>> {
     println!("Remote target: {}", registration.target);
     println!("Install source: {}", plan.source.description());
     println!("Install destination: {}", plan.destination.as_str());
-    println!(
-        "Process impact: this workflow requires an already protocol-compatible helper; the pinned binary is uploaded privately first, activation requires proof that the running daemon uses this destination, the previous executable is retained for rollback, and any present compatible daemon is restarted"
-    );
+    if plan.uses_recovery_helper() {
+        println!(
+            "Process impact: a temporary recovery helper repairs the verified user installation and hands any compatible running daemon over to it. Saved Workspace data and Node identity are preserved."
+        );
+    } else {
+        println!(
+            "Process impact: the pinned binary is uploaded privately, the previous executable is retained for rollback, and any compatible running daemon is restarted after its installation is verified."
+        );
+    }
     if !confirm_setup("Upgrade Boomux on this registered Node?")? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -2400,6 +2443,7 @@ fn uninstall_node(selector: &str) -> Result<(), Box<dyn Error>> {
 
 fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
     const TIMEOUT: Duration = Duration::from_secs(120);
+    const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::new(
@@ -2419,7 +2463,7 @@ fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
     println!("Node: {} ({})", registration.alias, registration.node_id);
     println!("Stored SSH route: {}", registration.target);
     println!(
-        "Complete any SSH authentication prompt or login URL shown in this terminal. Boomux will not install, upgrade, retarget, or modify the registration."
+        "Connecting to the remote machine (15-second SSH connection timeout). Sign-in prompts or a login URL will appear here if required; allow up to 2 minutes to complete sign-in. Press Ctrl+C to cancel."
     );
     io::Write::flush(&mut io::stdout())?;
 
@@ -2430,21 +2474,25 @@ fn reauthenticate_node(selector: &str) -> Result<(), Box<dyn Error>> {
         TIMEOUT,
     )
     .map_err(bootstrap_cli_failure)?;
+    println!("SSH sign-in succeeded. Checking the remote Boomux identity (up to 30 seconds)...");
+    io::Write::flush(&mut io::stdout())?;
     let connection = session
-        .connect_existing_verified(&registration.node_id, TIMEOUT)
+        .connect_existing_verified(&registration.node_id, VERIFY_TIMEOUT)
         .map_err(bootstrap_cli_failure)?;
     drop(connection);
 
-    println!("Verifying that background observation can reconnect without prompts...");
+    println!(
+        "Remote identity verified. Checking background access without prompts (up to 30 seconds per check)..."
+    );
     io::Write::flush(&mut io::stdout())?;
     let session = ssh_bootstrap::BootstrapSession::open(
         target,
         ssh_bootstrap::SshAuthenticationMode::Batch,
-        TIMEOUT,
+        VERIFY_TIMEOUT,
     )
     .map_err(bootstrap_cli_failure)?;
     let connection = session
-        .connect_existing_verified(&registration.node_id, TIMEOUT)
+        .connect_existing_verified(&registration.node_id, VERIFY_TIMEOUT)
         .map_err(bootstrap_cli_failure)?;
 
     let current = local.node_registration(&registration.node_id)?;
@@ -2475,6 +2523,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             alias,
             target,
             desktop_workspace,
+            desktop_result_socket,
         } => {
             if desktop_workspace && json {
                 return Err(
@@ -2482,7 +2531,7 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
                 );
             }
             let (alias, target) = resolve_node_add_inputs(alias, target, json)?;
-            let remote = verified_remote_connection(&target, !json)?;
+            let mut remote = verified_remote_connection(&target, !json)?;
             let registration = client::connect_or_start()?.add_node_registration(
                 alias,
                 target,
@@ -2490,12 +2539,43 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
             )?;
             print_node_registration(CommandKey::NodeAdd, &registration, json)?;
             if desktop_workspace {
-                let shell = client::connect_or_start()?
-                    .create_remote_workspace(&registration.node_id, &registration.alias)?;
-                println!(
-                    "Remote workspace created with Shell {}. Open it from the Desktop sidebar.",
-                    shell.name
-                );
+                if remote.has_workspaces(Duration::from_secs(15))? {
+                    println!(
+                        "Connected to {}. Existing remote Workspaces are available in the Desktop sidebar; no starter Workspace was created.",
+                        registration.alias
+                    );
+                    return Ok(());
+                }
+                let Some(shell) = client::connect_or_start()?
+                    .create_initial_remote_workspace(&registration.node_id, &registration.alias)?
+                else {
+                    println!(
+                        "Connected to {}. The starter Workspace name is already in use. Press Enter at the next prompt, then open an existing Workspace from the Desktop sidebar or create a new one from the + menu.",
+                        registration.alias
+                    );
+                    return Ok(());
+                };
+                if let Some(path) = desktop_result_socket {
+                    let identity = protocol::QualifiedIdentity {
+                        node_id: registration.node_id.clone(),
+                        inner_id: shell.id.clone(),
+                    };
+                    match boomux::desktop_connect::send_result(&path, &identity) {
+                        Ok(()) => println!(
+                            "Connected to {}. Press Enter at the next prompt to open your remote workspace.",
+                            registration.alias
+                        ),
+                        Err(error) => eprintln!(
+                            "Connected, but Desktop could not receive the new Shell: {error}. Open {} from the sidebar; do not repeat setup.",
+                            shell.name
+                        ),
+                    }
+                } else {
+                    println!(
+                        "Remote workspace created with Shell {}. Open it from the Desktop sidebar.",
+                        shell.name
+                    );
+                }
             }
             Ok(())
         }
@@ -2712,7 +2792,9 @@ fn node_command(command: NodeCommands, json: bool) -> Result<(), Box<dyn Error>>
     }
 }
 
-fn guided_node_add() -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+fn guided_node_add(
+    result_socket: Option<&Path>,
+) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     let executable = env::current_exe()?;
     let stdin = io::stdin();
     let interactive = stdin.is_terminal() && io::stdout().is_terminal();
@@ -2724,6 +2806,7 @@ fn guided_node_add() -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
         &mut output,
         interactive,
         interactive.then(|| stdin.as_raw_fd()),
+        result_socket,
     )
 }
 
@@ -2751,7 +2834,10 @@ fn guided_shell_close_request(
     executable: &Path,
 ) -> Option<protocol::Request> {
     let command_matches = match shell.command.get(1).map(String::as_str) {
-        Some("__guided-node-add") => shell.command.len() == 2,
+        Some("__guided-node-add") => {
+            shell.command.len() == 2
+                || (shell.command.len() == 4 && shell.command[2] == "--result-socket")
+        }
         Some(
             "__guided-node-upgrade" | "__guided-node-reauthenticate" | "__guided-node-uninstall",
         ) => shell.command.len() == 3,
@@ -2842,11 +2928,19 @@ fn guided_node_add_with(
     output: &mut impl io::Write,
     wait_for_newline: bool,
     terminal_fd: Option<i32>,
+    result_socket: Option<&Path>,
 ) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
+    let mut arguments = vec!["node", "add", "--desktop-workspace"];
+    if let Some(path) = result_socket {
+        arguments.extend([
+            "--desktop-result-socket",
+            path.to_str().ok_or("Invalid Desktop result path")?,
+        ]);
+    }
     guided_node_command_with(
         executable,
-        &["node", "add", "--desktop-workspace"],
-        "Node setup",
+        &arguments,
+        "Remote connection",
         input,
         output,
         wait_for_newline,
@@ -3012,11 +3106,13 @@ fn resolve_node_add_inputs(
         .into());
     }
 
-    println!("Add a remote Boomux Node");
-    println!("Boomux uses your normal OpenSSH configuration and keeps remote work on its owner.");
+    println!("Connect a remote machine");
+    println!(
+        "Use an SSH host name or user@hostname. Your terminals and processes will run on that machine."
+    );
     let target = prompt_node_value("SSH target (for example user@workbox): ", None)?;
     let suggested_alias = target.rsplit('@').next().filter(|value| !value.is_empty());
-    let alias = prompt_node_value("Local alias", suggested_alias)?;
+    let alias = prompt_node_value("Display name", suggested_alias)?;
     Ok((alias, target))
 }
 
@@ -3493,9 +3589,38 @@ fn normalize_daemon_executable(path: &[u8]) -> Option<String> {
     Some(executable)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn daemon_process_identity(_client: &client::Client) -> Option<DaemonProcessIdentity> {
-    None
+#[cfg(target_os = "macos")]
+fn daemon_process_identity(client: &client::Client) -> Option<DaemonProcessIdentity> {
+    let before = fs::metadata(client.socket_path()).ok()?;
+    let credentials = client.daemon_process_credentials().ok()?;
+    if credentials.uid != unsafe { libc::geteuid() } {
+        return None;
+    }
+    let process = boomux::platform::process_snapshot(credentials.pid).ok()?;
+    let executable = boomux::platform::daemon_executable_path(credentials.pid)
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()?;
+    let confirmed = client.daemon_process_credentials().ok()?;
+    let after = fs::metadata(client.socket_path()).ok()?;
+    if confirmed != credentials
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || boomux::platform::process_snapshot(credentials.pid)
+            .ok()?
+            .start_time
+            != process.start_time
+    {
+        return None;
+    }
+    Some(DaemonProcessIdentity {
+        pid: credentials.pid,
+        protocol_version: credentials.protocol_version,
+        executable: Some(executable),
+        socket_device: after.dev(),
+        socket_inode: after.ino(),
+    })
 }
 
 fn bootstrap_activate(
@@ -3506,22 +3631,6 @@ fn bootstrap_activate(
     expected_socket_device: u64,
     expected_socket_inode: u64,
 ) -> io::Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (
-            transaction,
-            expected_pid,
-            expected_protocol,
-            expected_executable,
-            expected_socket_device,
-            expected_socket_inode,
-        );
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "proof-bound bootstrap activation is unsupported on this platform",
-        ));
-    }
-    #[cfg(target_os = "linux")]
     {
         let suffix = transaction
             .strip_prefix(".boomux.bootstrap.")
@@ -6709,7 +6818,8 @@ fn format_ambiguous_verification_targets(
 }
 
 fn list_integrations(json: bool) -> Result<(), Box<dyn Error>> {
-    let integrations = integration_management::IntegrationId::all()
+    let integrations = boomux::integrations::ALL
+        .iter()
         .map(integration_management::IntegrationSummary::from)
         .collect::<Vec<_>>();
     if json {
@@ -6749,6 +6859,12 @@ fn format_integration_list(integrations: &[integration_management::IntegrationSu
             integration.name, integration.package, integration.validated_version
         )
         .expect("writing to a string cannot fail");
+    }
+    for integration in integrations {
+        if let Some(reason) = integration.lifecycle_limitation {
+            writeln!(output, "\n{}: {reason}", integration.name)
+                .expect("writing to a string cannot fail");
+        }
     }
     output
 }
@@ -6865,8 +6981,10 @@ fn format_recommended_action(
         integration_management::RecommendedAction::None => "none",
         integration_management::RecommendedAction::Install => "install integration",
         integration_management::RecommendedAction::Replace => "replace with --force",
-        integration_management::RecommendedAction::RestartHost if integration == "kiro" => {
-            "reopen managed ShellRun, then launch bare kiro-cli"
+        integration_management::RecommendedAction::RestartHost
+            if matches!(integration, "kiro" | "kiro-v3") =>
+        {
+            "reopen managed ShellRun, then launch kiro-cli normally"
         }
         integration_management::RecommendedAction::RestartHost => "restart host",
         integration_management::RecommendedAction::InspectError => "inspect reported error",
@@ -7135,15 +7253,12 @@ fn capabilities(json: bool) -> Result<(), Box<dyn Error>> {
     ];
     let integration_hosts = boomux::integrations::ALL
         .iter()
-        .filter_map(|descriptor| {
-            let installation = descriptor.installation?;
-            Some((
-                descriptor.key.to_owned(),
-                serde_json::json!({
-                    "package": installation.package,
-                    "validated_version": installation.validated_version,
-                }),
-            ))
+        .map(|descriptor| {
+            (descriptor.key.to_owned(), serde_json::json!({
+                "package": descriptor.installation.map(|installation| installation.package),
+                "validated_version": descriptor.installation.map(|installation| installation.validated_version),
+                "lifecycle_limitation": descriptor.lifecycle_limitation,
+            }))
         })
         .collect::<serde_json::Map<_, _>>();
     if json {
@@ -10231,25 +10346,25 @@ fn kiro_hook_command() -> Result<(), Box<dyn Error>> {
 
 fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit, Box<dyn Error>> {
     let executable = resolve_real_kiro()?;
-    let explicit_v3 = arguments.first().is_some_and(|argument| argument == "--v3")
-        && !arguments.iter().any(|argument| argument == "--cloud");
-    let managed_v3 = arguments.is_empty() || explicit_v3;
+    // Acquire only launch authority here. Hook payloads, not flags or the
+    // installed package version, establish that the running engine is v3.
+    let tracking_eligible = kiro_tracking_eligible(&arguments);
+    let integration = integration_management::IntegrationId::KIRO;
+    let managed_run = env::var("BOOMUX_SHELL_ID").is_ok_and(|value| !value.is_empty())
+        && env::var("BOOMUX_RUN_ID").is_ok_and(|value| !value.is_empty());
     let environment = integration_management::Environment::from_process();
-    let hooks_current = integration_management::inspect_without_host_probe(
-        integration_management::IntegrationId::KIRO,
-        &environment,
-        None,
-    )
-    .asset
-    .state
-        == integration_management::AssetState::Current;
-    let argv = kiro_argv(executable, arguments, managed_v3 && hooks_current);
+    let hooks_current =
+        integration_management::inspect_without_host_probe(integration, &environment, None)
+            .asset
+            .state
+            == integration_management::AssetState::Current;
+    let argv = kiro_argv(executable, arguments);
     let mut command = Command::new(&argv[0]);
     sanitize_inherited_opencode_shim(&mut command);
-    if managed_v3 && hooks_current {
+    if managed_run && hooks_current {
         prioritize_boomux_hook_executable(&mut command)?;
     }
-    let holder = if managed_v3 && hooks_current {
+    let holder = if managed_run && tracking_eligible && hooks_current {
         match (
             env::var("BOOMUX_SHELL_ID").ok(),
             env::var("BOOMUX_RUN_ID").ok(),
@@ -10275,11 +10390,14 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit,
         command.env_remove("BOOMUX_KIRO_LAUNCH_HOLDER");
     }
     command.args(&argv[1..]);
+    #[cfg(target_os = "macos")]
+    let mut command = macos_parent_guard::wrap(command)?;
     let holder_pid = std::process::id() as libc::pid_t;
     // The child stays in the foreground process group for ordinary terminal
     // signals. A direct holder death also terminates the exact managed child.
     unsafe {
         command.pre_exec(move || {
+            #[cfg(target_os = "linux")]
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -10303,11 +10421,31 @@ fn launch_kiro(arguments: Vec<OsString>) -> Result<process_adapter::ProcessExit,
     Ok(process_exit_from_status(status))
 }
 
-fn kiro_argv(executable: PathBuf, arguments: Vec<OsString>, managed_v3: bool) -> Vec<OsString> {
-    let mut argv = vec![executable.into_os_string()];
-    if managed_v3 && arguments.is_empty() {
-        argv.push("--v3".into());
+fn kiro_tracking_eligible(arguments: &[OsString]) -> bool {
+    if arguments.iter().any(|argument| argument == "--cloud") {
+        return false;
     }
+    arguments.first().is_none_or(|argument| {
+        matches!(
+            argument.to_str(),
+            Some(
+                "chat"
+                    | "--v3"
+                    | "--tui"
+                    | "--classic"
+                    | "--agent"
+                    | "--resume"
+                    | "-r"
+                    | "--resume-id"
+                    | "--resume-picker"
+                    | "--list"
+            )
+        )
+    })
+}
+
+fn kiro_argv(executable: PathBuf, arguments: Vec<OsString>) -> Vec<OsString> {
+    let mut argv = vec![executable.into_os_string()];
     argv.extend(arguments);
     argv
 }
@@ -11949,7 +12087,7 @@ fn print_integration_diagnostic(
     } else {
         if integration == integration_management::IntegrationId::KIRO {
             eprintln!(
-                "err {} integration: {} foreground process(es) are untracked; reopen the owning managed ShellRun, then launch bare kiro-cli and verify it loads {path}",
+                "err {} integration: {} foreground process(es) are untracked; reopen the owning managed ShellRun, then launch kiro-cli --v3 and verify it loads {path}",
                 spec.key, status.runtime.untracked_processes
             );
         } else {
@@ -12746,6 +12884,7 @@ mod tests {
                     alias: Some(alias),
                     target: Some(target),
                     desktop_workspace: false,
+                    desktop_result_socket: None,
                 }
             }) if alias == "work" && target == "user@host"
         ));
@@ -12757,6 +12896,7 @@ mod tests {
                     alias: None,
                     target: None,
                     desktop_workspace: false,
+                    desktop_result_socket: None,
                 }
             })
         ));
@@ -12768,7 +12908,7 @@ mod tests {
         assert!(resolve_node_add_inputs(None, None, true).is_err());
 
         let held = Cli::try_parse_from(["boomux", "__guided-node-add"]).unwrap();
-        assert!(matches!(held.command, Some(Commands::GuidedNodeAdd)));
+        assert!(matches!(held.command, Some(Commands::GuidedNodeAdd { .. })));
         assert_eq!(held.command_descriptor().key, "node.add");
     }
 
@@ -12803,6 +12943,13 @@ mod tests {
         shell.command[0] = "/other/boomux".into();
         assert!(request(&shell).is_none());
         shell.command[0] = "/bin/boomux".into();
+        shell
+            .command
+            .extend(["--result-socket".into(), "/tmp/setup result".into()]);
+        assert!(request(&shell).is_some());
+        shell.command[2] = "--unexpected".into();
+        assert!(request(&shell).is_none());
+        shell.command.truncate(2);
         shell.command[1] = "__guided-node-uninstall".into();
         assert!(request(&shell).is_none());
         shell.command.push("exact-owner".into());
@@ -12824,11 +12971,12 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let child = directory.join("child");
         let child_output = directory.join("child-output");
+        let child_arguments = directory.join("child-arguments");
         fs::write(
             &child,
             format!(
-                "#!/bin/sh\nprintf 'child failed\\n'\nprintf 'child failed\\n' > '{}'\nexit 7\n",
-                child_output.display()
+                "#!/bin/sh\nprintf 'child failed\\n'\nprintf 'child failed\\n' > '{}'\nprintf '%s\\n' \"$@\" > '{}'\nexit 7\n",
+                child_output.display(), child_arguments.display()
             ),
         )
         .unwrap();
@@ -12837,19 +12985,31 @@ mod tests {
         let mut newline = io::Cursor::new(b"\n");
         let mut output = Vec::new();
         assert_eq!(
-            guided_node_add_with(&child, &mut newline, &mut output, true, None).unwrap(),
+            guided_node_add_with(
+                &child,
+                &mut newline,
+                &mut output,
+                true,
+                None,
+                Some(Path::new("/tmp/result with spaces; literal"))
+            )
+            .unwrap(),
             process_adapter::ProcessExit::Code(7)
         );
         let output = String::from_utf8(output).unwrap();
         assert_eq!(fs::read_to_string(&child_output).unwrap(), "child failed\n");
-        assert!(output.contains("Node setup failed (exit 7)."));
+        assert_eq!(
+            fs::read_to_string(&child_arguments).unwrap(),
+            "node\nadd\n--desktop-workspace\n--desktop-result-socket\n/tmp/result with spaces; literal\n"
+        );
+        assert!(output.contains("Remote connection failed (exit 7)."));
         assert!(output.contains("Press Enter to close."));
         assert!(!output.contains("Input closed before a newline"));
 
         let mut eof = io::Cursor::new(b"partial");
         let mut output = Vec::new();
         assert_eq!(
-            guided_node_add_with(&child, &mut eof, &mut output, true, None).unwrap(),
+            guided_node_add_with(&child, &mut eof, &mut output, true, None, None).unwrap(),
             process_adapter::ProcessExit::Code(7)
         );
         assert!(
@@ -12866,6 +13026,7 @@ mod tests {
                 &mut eof,
                 &mut output,
                 true,
+                None,
                 None,
             )
             .unwrap(),
@@ -12892,6 +13053,7 @@ mod tests {
             &mut output,
             true,
             Some(stdin.as_raw_fd()),
+            None,
         )
         .unwrap();
         std::process::exit(match outcome {
@@ -12922,8 +13084,8 @@ mod tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -12942,7 +13104,8 @@ mod tests {
             .stderr(stderr);
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(())
@@ -12976,7 +13139,7 @@ mod tests {
         let status = wrapper.wait().unwrap();
         assert_eq!(status.code(), Some(130));
         let output = String::from_utf8_lossy(&output);
-        assert!(output.contains("Node setup failed (signal 2)."));
+        assert!(output.contains("Remote connection failed (signal 2)."));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -13006,8 +13169,8 @@ mod tests {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
@@ -13024,7 +13187,8 @@ mod tests {
             .stderr(Stdio::from(slave));
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
                     Err(io::Error::last_os_error())
                 } else {
                     Ok(())
@@ -13043,7 +13207,7 @@ mod tests {
         read_pty_until(
             &mut master,
             &mut output,
-            b"Node setup failed to continue",
+            b"Remote connection failed to continue",
             Duration::from_secs(3),
         );
         read_pty_until(
@@ -14232,18 +14396,48 @@ mod tests {
     }
 
     #[test]
+    fn kiro_tracking_does_not_infer_engine_from_bare_or_custom_agent_launches() {
+        for arguments in [
+            vec![],
+            vec!["chat"],
+            vec!["--v3"],
+            vec!["--agent", "reviewer"],
+            vec!["chat", "--agent-engine", "v2"],
+        ] {
+            assert!(kiro_tracking_eligible(
+                &arguments
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        for arguments in [
+            vec!["--version"],
+            vec!["agent", "list"],
+            vec!["chat", "--cloud"],
+            vec!["--v3", "chat", "--cloud"],
+        ] {
+            assert!(!kiro_tracking_eligible(
+                &arguments
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    #[test]
     fn kiro_supervised_argv_and_exit_status_remain_exact() {
         assert_eq!(
             kiro_argv(
                 "/exact/kiro-cli".into(),
                 vec!["chat".into(), "literal; value".into()],
-                false,
             ),
             ["/exact/kiro-cli", "chat", "literal; value"].map(OsString::from)
         );
         assert_eq!(
-            kiro_argv("/exact/kiro-cli".into(), Vec::new(), true),
-            ["/exact/kiro-cli", "--v3"].map(OsString::from)
+            kiro_argv("/exact/kiro-cli".into(), Vec::new()),
+            ["/exact/kiro-cli"].map(OsString::from)
         );
         let status = Command::new("/bin/sh")
             .args(["-c", "exit 23"])
@@ -15515,7 +15709,8 @@ mod tests {
 
     #[test]
     fn formats_integration_output_without_tab_alignment() {
-        let integrations = integration_management::IntegrationId::all()
+        let integrations = boomux::integrations::ALL
+            .iter()
             .map(integration_management::IntegrationSummary::from)
             .collect::<Vec<_>>();
         assert_eq!(
@@ -15525,7 +15720,8 @@ mod tests {
              pi        @earendil-works/pi-coding-agent  0.84.1\n\
              claude    @anthropic-ai/claude-code        2.1.236\n\
              codex     @openai/codex                    0.147.0\n\
-             kiro      kiro-cli                         2.18.0\n"
+             kiro-v2   -                                -\n\
+             kiro-v3   kiro-cli                         2.21.1\n\nkiro-v2: automatic lifecycle reporting is unavailable for Kiro v2; normal kiro-cli launches keep the user's agent and engine\n"
         );
 
         let status = integration_management::IntegrationStatus {
@@ -15564,7 +15760,7 @@ mod tests {
                 "kiro",
                 integration_management::RecommendedAction::RestartHost
             ),
-            "reopen managed ShellRun, then launch bare kiro-cli"
+            "reopen managed ShellRun, then launch kiro-cli normally"
         );
     }
 
@@ -15720,6 +15916,7 @@ mod tests {
             "desktop_notifications",
             "sound_notifications",
             "integration_management",
+            #[cfg(target_os = "linux")]
             "desktop_workspace_show",
             "node_reauthentication",
             "protocol_31",
@@ -15736,7 +15933,7 @@ mod tests {
                 .iter()
                 .filter(|feature| **feature == "desktop_workspace_show")
                 .count(),
-            1
+            usize::from(cfg!(target_os = "linux"))
         );
         assert!(!NON_PROTOCOL_FEATURES.contains(&"workspace_open_desktop_show"));
         assert_eq!(
@@ -15757,7 +15954,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 54);
+        assert_eq!(protocol::PROTOCOL_VERSION, 55);
     }
 
     #[test]

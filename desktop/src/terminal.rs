@@ -113,6 +113,7 @@ pub struct TerminalCell {
     pub foreground: u32,
     pub background: u32,
     pub bold: bool,
+    pub faint: bool,
     pub italic: bool,
     pub underline: bool,
     pub wide: bool,
@@ -122,6 +123,7 @@ pub struct TerminalCell {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalScreen {
+    pub background: u32,
     pub rows: u16,
     pub cols: u16,
     pub cells: Vec<TerminalCell>,
@@ -170,10 +172,13 @@ struct SharedTerminal {
     revision: AtomicU64,
     bracketed_paste: AtomicBool,
     mouse_tracking: AtomicBool,
+    pending_resize: Mutex<Option<(u16, u16, u16, u16)>>,
+    pending_focus: AtomicBool,
     pending_scroll_row: AtomicU64,
     pending_scroll_wakeup: AtomicBool,
     pending_theme: Mutex<Option<TerminalTheme>>,
     closed: AtomicBool,
+    cancelled: AtomicBool,
 }
 
 impl SharedTerminal {
@@ -191,10 +196,13 @@ impl SharedTerminal {
             revision: AtomicU64::new(1),
             bracketed_paste: AtomicBool::new(false),
             mouse_tracking: AtomicBool::new(false),
+            pending_resize: Mutex::new(None),
+            pending_focus: AtomicBool::new(false),
             pending_scroll_row: AtomicU64::new(0),
             pending_scroll_wakeup: AtomicBool::new(false),
             pending_theme: Mutex::new(Some(theme)),
             closed: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
         }
     }
 
@@ -203,13 +211,26 @@ impl SharedTerminal {
     }
 
     fn emulator_command(&self, command: EmulatorCommand) -> Result<(), String> {
-        self.emulator
+        // Output producers may wait for queue capacity, but must never keep
+        // the sender mutex locked while waiting: UI input and teardown use it.
+        let sender = self
+            .emulator
             .lock()
             .unwrap()
             .as_ref()
-            .ok_or_else(|| "Ghostty terminal core is not running".to_string())?
+            .cloned()
+            .ok_or_else(|| "Ghostty terminal core is not running".to_string())?;
+        sender
             .send(command)
             .map_err(|_| "Ghostty terminal core stopped".to_string())
+    }
+
+    fn cancel_emulator(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        // Disconnect instead of enqueueing Stop into a potentially full queue.
+        // The worker sees cancellation between replay chunks and drops its
+        // receiver, releasing any blocked output producer.
+        self.emulator.lock().unwrap().take();
     }
 
     fn try_emulator_command(&self, command: EmulatorCommand) -> Result<(), String> {
@@ -221,6 +242,57 @@ impl SharedTerminal {
             Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
         }
+    }
+
+    fn request_resize(&self, size: (u16, u16, u16, u16)) -> Result<(), String> {
+        let wake = self.pending_resize.lock().unwrap().replace(size).is_none();
+        if wake {
+            self.try_emulator_command(EmulatorCommand::ResizeLatest)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_resize(&self, core: &mut EmulatorCore) -> Result<(), String> {
+        let pending = self.pending_resize.lock().unwrap().take();
+        if let Some((rows, cols, pixel_width, pixel_height)) = pending {
+            {
+                let mut profile = self.profile.lock().unwrap();
+                profile.rows = rows;
+                profile.cols = cols;
+                profile.pixel_width = pixel_width;
+                profile.pixel_height = pixel_height;
+            }
+            core.apply(EmulatorCommand::Resize {
+                rows,
+                cols,
+                cell_width: cell_dimension(pixel_width, cols),
+                cell_height: cell_dimension(pixel_height, rows),
+            })?;
+            self.send(AttachFrame::Resize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            })?;
+            self.bump_revision();
+        }
+        Ok(())
+    }
+
+    fn request_focus(&self) -> Result<(), String> {
+        if self.pending_focus.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // A full queue already wakes the worker. The pending flag retains the
+        // notification until that worker can write it, without blocking GPUI.
+        self.try_emulator_command(EmulatorCommand::FocusLatest)
+    }
+
+    fn flush_pending_focus(&self) -> Result<(), String> {
+        if self.pending_focus.swap(false, Ordering::AcqRel) {
+            self.send(AttachFrame::FocusGained)?;
+        }
+        Ok(())
     }
 
     fn try_key_command(&self, keystroke: Keystroke, action: KeyAction) -> Result<(), String> {
@@ -341,12 +413,10 @@ impl SharedTerminal {
             return;
         }
         *self.writer.lock().unwrap() = None;
-        // Publish detachment before Stop can block on a full queue or let the
-        // worker close the update channel. The view must see control loss now.
+        // Publish control loss before the worker finishes draining queued output.
         self.replace_status(status);
-        if let Some(emulator) = self.emulator.lock().unwrap().take() {
-            let _ = emulator.send(EmulatorCommand::Stop);
-        }
+        // Dropping the sender preserves queued output without requiring capacity.
+        self.emulator.lock().unwrap().take();
     }
 }
 
@@ -362,9 +432,16 @@ enum EmulatorCommand {
         cell_width: u32,
         cell_height: u32,
     },
+    CopySelection {
+        anchor: (usize, usize),
+        head: (usize, usize),
+        reply: async_channel::Sender<Result<String, String>>,
+    },
     Scroll(ScrollViewport),
     ScrollLatest,
     ThemeLatest,
+    FocusLatest,
+    ResizeLatest,
     MouseWheel {
         lines: isize,
         x: f32,
@@ -373,13 +450,14 @@ enum EmulatorCommand {
         screen_height: u32,
         modifiers: Modifiers,
     },
-    Stop,
 }
 
 pub struct TerminalSession {
     pub shell_id: String,
+    pub run_id: Option<String>,
     pub shell_name: String,
     pub setup_workspace_cleanup: Option<SetupWorkspaceCleanup>,
+    pub connect_result: Option<boomux::desktop_connect::ConnectResultReceiver>,
     shared: Arc<SharedTerminal>,
     last_size: Mutex<(u16, u16)>,
 }
@@ -398,6 +476,22 @@ impl TerminalSession {
         Self::attach_with_client(client, shell, rows, cols, pixel_width, pixel_height)
     }
 
+    pub fn restore(
+        shell: ShellChoice,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<Self, String> {
+        if !matches!(shell.status, ShellStatus::Running) || shell.run_id.is_none() {
+            return Err("Saved Shell is stopped; start it explicitly".into());
+        }
+        let client = client::connect_if_running()
+            .map_err(|e| e.to_string())?
+            .ok_or("Boomux is not running")?;
+        Self::attach_with_policy(client, shell, rows, cols, pixel_width, pixel_height, false)
+    }
+
     fn attach_with_client(
         client: Client,
         shell: ShellChoice,
@@ -406,8 +500,21 @@ impl TerminalSession {
         pixel_width: u16,
         pixel_height: u16,
     ) -> Result<Self, String> {
+        Self::attach_with_policy(client, shell, rows, cols, pixel_width, pixel_height, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attach_with_policy(
+        client: Client,
+        shell: ShellChoice,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+        takeover: bool,
+    ) -> Result<Self, String> {
         let profile = terminal_profile(rows, cols, pixel_width, pixel_height);
-        let attachment = attach_shell(&client, &shell, profile.clone(), true)?;
+        let attachment = attach_shell(&client, &shell, profile.clone(), takeover)?;
         let shared = Arc::new(SharedTerminal::new(profile));
         let stream = attachment.stream;
         shared.install_writer(&stream)?;
@@ -427,7 +534,7 @@ impl TerminalSession {
         spawn_reader(
             client,
             shell.id.clone(),
-            expected_run_id,
+            expected_run_id.clone(),
             stream,
             Arc::clone(&shared),
         );
@@ -438,9 +545,11 @@ impl TerminalSession {
         shared.set_status("attached");
 
         Ok(Self {
+            run_id: expected_run_id,
             shell_id: shell.id,
             shell_name: shell.name,
             setup_workspace_cleanup: None,
+            connect_result: None,
             shared,
             // Attachment already established this geometry. Avoid an unchanged
             // first-render resize canceling the reader's temporary redraw size.
@@ -496,6 +605,21 @@ impl TerminalSession {
             self.shared.set_status(error);
         }
         true
+    }
+
+    pub fn selected_text(
+        &self,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> Result<async_channel::Receiver<Result<String, String>>, String> {
+        let (reply, receiver) = async_channel::bounded(1);
+        self.shared
+            .emulator_command(EmulatorCommand::CopySelection {
+                anchor,
+                head,
+                reply,
+            })?;
+        Ok(receiver)
     }
 
     pub fn scroll(&self, lines: isize) -> bool {
@@ -567,30 +691,17 @@ impl TerminalSession {
             return false;
         }
         *last_size = (rows, cols);
+        if let Err(error) = self
+            .shared
+            .request_resize((rows, cols, pixel_width, pixel_height))
         {
-            let mut profile = self.shared.profile.lock().unwrap();
-            profile.rows = rows;
-            profile.cols = cols;
-            profile.pixel_width = pixel_width;
-            profile.pixel_height = pixel_height;
-        }
-        self.shared
-            .resize_emulator(rows, cols, pixel_width, pixel_height);
-        if let Err(error) = self.shared.send(AttachFrame::Resize {
-            rows,
-            cols,
-            pixel_width,
-            pixel_height,
-        }) {
             self.shared.set_status(error);
-        } else {
-            self.shared.bump_revision();
         }
         true
     }
 
     pub fn focus(&self) {
-        if let Err(error) = self.shared.send(AttachFrame::FocusGained) {
+        if let Err(error) = self.shared.request_focus() {
             self.shared.set_status(error);
         }
     }
@@ -612,97 +723,12 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = self.shared.send(AttachFrame::Detached);
         self.shared.closed.store(true, Ordering::Release);
-        if let Some(emulator) = self.shared.emulator.lock().unwrap().take() {
-            let _ = emulator.send(EmulatorCommand::Stop);
-        }
+        self.shared.cancel_emulator();
     }
 }
 
 pub fn discover_overview() -> Result<BoomuxOverview, String> {
     discover_overview_and_nodes().0
-}
-
-/// Desktop refresh policy, separate from read-only discovery. Only the owner
-/// can confirm emptiness; the guarded close rejects concurrent Shell creation.
-pub fn refresh_overview_and_nodes() -> (
-    Result<BoomuxOverview, String>,
-    Result<Vec<crate::nodes::NodeView>, String>,
-) {
-    let (mut overview, nodes) = discover_overview_and_nodes();
-    if let Ok(current) = &mut overview {
-        let candidates = current
-            .workspaces
-            .iter()
-            .filter(|workspace| {
-                workspace.shells.is_empty()
-                    && crate::remote::identity(&workspace.id).is_none_or(|id| {
-                        nodes.as_ref().is_ok_and(|nodes| {
-                            nodes
-                                .iter()
-                                .any(|node| node.id == id.node_id && node.connected())
-                        })
-                    })
-            })
-            .take(8)
-            .map(|workspace| workspace.id.clone())
-            .collect::<Vec<_>>();
-        if !candidates.is_empty() {
-            let cleanup = (|| {
-                let client = client::connect_if_running()
-                    .map_err(|error| error.to_string())?
-                    .ok_or("Boomux is not running")?;
-                for id in candidates {
-                    if close_empty_workspace(&client, &id).map_err(|error| error.to_string())? {
-                        current.workspaces.retain(|workspace| workspace.id != id);
-                    }
-                }
-                Ok::<_, String>(())
-            })();
-            if let Err(error) = cleanup {
-                overview = Err(format!("Could not remove empty Workspace: {error}"));
-            }
-        }
-    }
-    (overview, nodes)
-}
-
-fn close_empty_workspace(client: &Client, id: &str) -> Result<bool, client::ClientError> {
-    use boomux::protocol::{RoutedOperation, RoutedOperationResult};
-    let result = (|| {
-        let workspace = crate::remote::workspace(client, id)?;
-        if !workspace.shells.is_empty() {
-            return Ok(false);
-        }
-        if let Some(owner) = crate::remote::identity(id) {
-            match client.route_node_operation(
-                owner.node_id,
-                RoutedOperation::CloseWorkspace {
-                    workspace_id: owner.inner_id,
-                    expected_revision: workspace.revision,
-                },
-            )? {
-                RoutedOperationResult::Ok => Ok(true),
-                _ => Ok(false),
-            }
-        } else {
-            match client.request(Request::GuardedCloseWorkspace {
-                workspace_id: workspace.id,
-                expected_revision: workspace.revision,
-            })? {
-                Response::Ok => Ok(true),
-                _ => Ok(false),
-            }
-        }
-    })();
-    match result {
-        Err(client::ClientError::Remote(error)) if error.code == Some(ErrorCode::NotFound) => {
-            Ok(true)
-        }
-        Err(client::ClientError::Remote(error)) if error.code == Some(ErrorCode::RevisionAhead) => {
-            Ok(false)
-        }
-        result => result,
-    }
 }
 
 fn discover_local_overview() -> Result<BoomuxOverview, String> {
@@ -1000,7 +1026,7 @@ fn agent_is_visible(state: AgentState, has_attention: bool, attached_to_current_
         || attached_to_current_run && !matches!(state, AgentState::Inactive | AgentState::Done)
 }
 
-fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
+pub(crate) fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
     ShellChoice {
         id: shell.id,
         name: shell.name,
@@ -1009,7 +1035,11 @@ fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
         status: shell.status,
         run_id: shell.run.map(|run| run.id),
         desktop_setup: match shell.command.get(1).map(String::as_str) {
-            Some("__desktop-setup" | "__guided-node-add") => shell.command.len() == 2,
+            Some("__desktop-setup") => shell.command.len() == 2,
+            Some("__guided-node-add") => {
+                shell.command.len() == 2
+                    || (shell.command.len() == 4 && shell.command[2] == "--result-socket")
+            }
             Some(
                 "__guided-node-upgrade"
                 | "__guided-node-reauthenticate"
@@ -1018,6 +1048,16 @@ fn shell_choice(shell: ShellSnapshot) -> ShellChoice {
             _ => false,
         },
     }
+}
+
+pub fn connected_shell(
+    identity: boomux::protocol::QualifiedIdentity,
+) -> Result<ShellChoice, String> {
+    let client = client::connect().map_err(|e| e.to_string())?;
+    let key = crate::remote::key(&identity.node_id, &identity.inner_id);
+    let mut shell = crate::remote::shell(&client, &key).map_err(|e| e.to_string())?;
+    crate::remote::qualify_shell(&identity.node_id, &mut shell);
+    Ok(shell_choice(shell))
 }
 
 /// Create a pending shell next to an existing shell. Boomux remains the owner
@@ -1097,6 +1137,7 @@ pub enum WorkspaceLaunch {
     Setup,
     ConfigEdit,
     AddNode,
+    AddNodeResult(std::path::PathBuf),
     RemoteWorkspace {
         node_id: String,
         name: String,
@@ -1107,11 +1148,12 @@ pub enum WorkspaceLaunch {
 }
 
 impl WorkspaceLaunch {
-    fn temporary_setup(&self) -> bool {
+    pub(crate) fn temporary_setup(&self) -> bool {
         matches!(
             self,
             Self::Setup
                 | Self::AddNode
+                | Self::AddNodeResult(_)
                 | Self::UpgradeNode(_)
                 | Self::ReauthenticateNode(_)
                 | Self::UninstallNode(_)
@@ -1139,6 +1181,14 @@ impl WorkspaceLaunch {
             Self::Setup => Some(("Set up agents", vec!["__desktop-setup".into()])),
             Self::ConfigEdit => Some(("Edit Boomux config", vec!["config".into(), "edit".into()])),
             Self::AddNode => Some(("Connect remote machine", vec!["__guided-node-add".into()])),
+            Self::AddNodeResult(path) => Some((
+                "Connect remote machine",
+                vec![
+                    "__guided-node-add".into(),
+                    "--result-socket".into(),
+                    path.to_string_lossy().into_owned(),
+                ],
+            )),
             Self::UpgradeNode(id) => Some((
                 "Update remote Boomux",
                 vec!["__guided-node-upgrade".into(), id.clone()],
@@ -1326,6 +1376,22 @@ pub fn cleanup_setup_workspace(cleanup: SetupWorkspaceCleanup) -> Result<(), Str
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Boomux is not running".to_string())?;
     cleanup.cleanup(&client)
+}
+
+pub fn rename_connection(node_id: &str, previous_name: &str, name: &str) -> Result<(), String> {
+    let client = client::connect_if_running()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Boomux is not running".to_string())?;
+    let registration = client
+        .node_registration(node_id)
+        .map_err(|error| error.to_string())?;
+    if registration.alias != previous_name {
+        return Err("Connection name changed. Close this dialog and try again.".into());
+    }
+    client
+        .rename_node_registration(node_id, name, registration.revision)
+        .map(|_| ())
+        .map_err(|error| format!("Could not rename connection: {error}"))
 }
 
 pub fn rename_workspace(workspace_id: &str, name: &str) -> Result<(), String> {
@@ -1523,6 +1589,13 @@ impl EmulatorCore {
                 self.cell_width = cell_width;
                 self.cell_height = cell_height;
             }
+            EmulatorCommand::CopySelection {
+                anchor,
+                head,
+                reply,
+            } => {
+                let _ = reply.try_send(self.selected_text(anchor, head));
+            }
             EmulatorCommand::Scroll(viewport) => self.terminal.scroll_viewport(viewport),
             EmulatorCommand::ScrollLatest => {
                 unreachable!("latest scroll requests are resolved by the emulator worker")
@@ -1530,12 +1603,56 @@ impl EmulatorCore {
             EmulatorCommand::ThemeLatest => {
                 unreachable!("latest theme requests are resolved by the emulator worker")
             }
+            EmulatorCommand::FocusLatest => {
+                unreachable!("focus notifications are resolved by the emulator worker")
+            }
+            EmulatorCommand::ResizeLatest => {
+                unreachable!("UI resize requests are resolved by the emulator worker")
+            }
             EmulatorCommand::MouseWheel { .. } => {
                 unreachable!("mouse events are resolved by the emulator worker")
             }
-            EmulatorCommand::Stop => return Ok(false),
         }
         Ok(true)
+    }
+
+    fn selected_text(
+        &self,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> Result<String, String> {
+        use libghostty_vt::selection::{FormatOptions, Selection};
+        use libghostty_vt::terminal::{Point, PointCoordinate};
+        let endpoint = |(row, col): (usize, usize)| {
+            let point = PointCoordinate {
+                x: u16::try_from(col)
+                    .map_err(|_| "selection column is out of range".to_string())?,
+                y: u32::try_from(row).map_err(|_| "selection row is out of range".to_string())?,
+            };
+            self.terminal
+                .grid_ref(Point::Screen(point))
+                .map_err(|error| error.to_string())
+        };
+        let selection = Selection::new(endpoint(anchor)?, endpoint(head)?, false);
+        let options = || {
+            FormatOptions::new()
+                .with_selection(&selection)
+                .with_trim(true)
+        };
+        // Clipboard extraction stays on the worker and allocates only on copy.
+        // Refuse oversized copies instead of truncating or duplicating scrollback.
+        let mut bytes = vec![0; 8192];
+        let length = match self.terminal.format_selection_buf(options(), &mut bytes) {
+            Err(libghostty_vt::Error::OutOfSpace { required }) if required <= 4 * 1024 * 1024 => {
+                bytes.resize(required, 0);
+                self.terminal.format_selection_buf(options(), &mut bytes)
+            }
+            result => result,
+        }
+        .map_err(|error| format!("could not copy selection (4 MiB maximum): {error}"))?
+        .unwrap_or(0);
+        bytes.truncate(length);
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn screen(&mut self) -> Result<TerminalScreen, String> {
@@ -1618,6 +1735,7 @@ impl EmulatorCore {
                     foreground: rgb_value(foreground),
                     background: rgb_value(background),
                     bold: style.bold,
+                    faint: style.faint,
                     italic: style.italic,
                     underline: style.underline != Underline::None,
                     wide: wide == CellWide::Wide,
@@ -1630,6 +1748,7 @@ impl EmulatorCore {
         }
 
         Ok(TerminalScreen {
+            background: rgb_value(colors.background),
             rows,
             cols,
             cells: output,
@@ -1647,7 +1766,26 @@ fn apply_emulator_command(
     shared: &SharedTerminal,
     command: EmulatorCommand,
 ) -> Result<bool, String> {
+    if shared.cancelled.load(Ordering::Acquire) {
+        return Ok(false);
+    }
+    shared.flush_pending_resize(core)?;
+    shared.flush_pending_focus()?;
     match command {
+        EmulatorCommand::FocusLatest | EmulatorCommand::ResizeLatest => Ok(true),
+        EmulatorCommand::Output(bytes) => {
+            // A reconstruction can contain a large transcript. Yield to pane
+            // cancellation between chunks without changing byte ordering.
+            for chunk in bytes.chunks(16 * 1024) {
+                if shared.cancelled.load(Ordering::Acquire) {
+                    return Ok(false);
+                }
+                shared.flush_pending_resize(core)?;
+                shared.flush_pending_focus()?;
+                core.terminal.vt_write(chunk);
+            }
+            Ok(true)
+        }
         EmulatorCommand::Key { keystroke, action } => {
             // Typing follows conventional terminal behavior and returns the
             // viewport to the live prompt before the PTY produces more output.
@@ -1990,9 +2128,11 @@ fn run_emulator(
             return;
         }
     }
-    // Stop may share a batch with final output, or end synchronized output.
-    // Preserve those bytes in the detached pane before releasing the core.
-    if let Err(error) = publish_screen(core, worker_shared) {
+    // Transport closure may end synchronized output. Preserve the final screen
+    // unless the pane itself was discarded and cancelled its replay.
+    if !worker_shared.cancelled.load(Ordering::Acquire)
+        && let Err(error) = publish_screen(core, worker_shared)
+    {
         worker_shared.close(error);
     }
 }
@@ -2041,6 +2181,7 @@ fn configure_terminal(
 fn blank_screen(rows: u16, cols: u16) -> TerminalScreen {
     let theme = crate::theme::current_terminal();
     TerminalScreen {
+        background: theme.background,
         rows,
         cols,
         cells: vec![
@@ -2049,6 +2190,7 @@ fn blank_screen(rows: u16, cols: u16) -> TerminalScreen {
                 foreground: theme.foreground,
                 background: theme.background,
                 bold: false,
+                faint: false,
                 italic: false,
                 underline: false,
                 wide: false,
@@ -2642,6 +2784,7 @@ mod tests {
     fn remote_setup_cleanup_owns_only_the_created_temporary_workspace() {
         for launch in [
             super::WorkspaceLaunch::AddNode,
+            super::WorkspaceLaunch::AddNodeResult("/tmp/setup-result".into()),
             super::WorkspaceLaunch::UpgradeNode("remote".into()),
             super::WorkspaceLaunch::UninstallNode("remote".into()),
             super::WorkspaceLaunch::ReauthenticateNode("remote".into()),
@@ -2695,11 +2838,92 @@ mod tests {
     }
 
     #[test]
+    fn layout_restore_requests_exact_run_without_restart_or_takeover() {
+        use boomux::protocol::{self, Envelope, Request, Response, ShellStatus};
+        use std::os::unix::net::UnixListener;
+        let directory = std::env::temp_dir().join(format!("la-{:016x}", fastrand::u64(..)));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let envelope: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+            let Request::Attach {
+                shell_id,
+                expected_run_id,
+                takeover,
+                restart_exited,
+                ..
+            } = envelope.message
+            else {
+                panic!("expected exact attachment")
+            };
+            assert_eq!(shell_id, "saved-shell");
+            assert_eq!(expected_run_id.as_deref(), Some("saved-run"));
+            assert!(!takeover && !restart_exited);
+            protocol::write_message(
+                &mut stream,
+                &Envelope::with_version(
+                    envelope.version,
+                    Response::Error {
+                        code: None,
+                        message: "run exited during restore".into(),
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let shell = super::ShellChoice {
+            id: "saved-shell".into(),
+            name: "saved".into(),
+            workspace_id: "w".into(),
+            cwd: directory.clone(),
+            status: ShellStatus::Running,
+            run_id: Some("saved-run".into()),
+            desktop_setup: false,
+        };
+        let result = super::TerminalSession::attach_with_policy(
+            boomux::client::Client::from_socket_path(socket),
+            shell,
+            24,
+            80,
+            800,
+            480,
+            false,
+        );
+        assert!(result.is_err());
+        server.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn layout_restore_never_starts_pending_or_exited_shells() {
+        use boomux::protocol::ShellStatus;
+        for status in [ShellStatus::Pending, ShellStatus::Exited { code: Some(0) }] {
+            let shell = super::ShellChoice {
+                id: "saved".into(),
+                name: "saved".into(),
+                workspace_id: "workspace".into(),
+                cwd: std::path::PathBuf::new(),
+                status,
+                run_id: None,
+                desktop_setup: false,
+            };
+            let error = super::TerminalSession::restore(shell, 24, 80, 800, 480)
+                .err()
+                .unwrap();
+            assert!(error.contains("start it explicitly"));
+        }
+    }
+
+    #[test]
     fn remote_attachment_and_reconnect_keep_exact_owner_and_run() {
         use boomux::protocol::{self, Envelope, Request, Response};
         use std::os::unix::net::UnixListener;
-        let directory =
-            std::env::temp_dir().join(format!("remote-attach-{}", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("ra-{:016x}", fastrand::u64(..)));
         std::fs::create_dir(&directory).unwrap();
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -2755,76 +2979,21 @@ mod tests {
     }
 
     #[test]
-    fn empty_workspace_cleanup_rechecks_shells_and_rejects_concurrent_changes() {
-        use boomux::protocol::{self, Envelope, ErrorCode, Request, Response};
-        use std::os::unix::net::UnixListener;
-
-        for (has_shell, race) in [(true, false), (false, false), (false, true)] {
-            let directory =
-                std::env::temp_dir().join(format!("desktop-empty-cleanup-{}", fastrand::u64(..)));
-            std::fs::create_dir(&directory).unwrap();
-            let socket = directory.join("daemon.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
-            let mut workspace = setup_workspace_creation();
-            if !has_shell {
-                workspace.shells.clear();
-            }
-            workspace.revision = 7;
-            let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
-            let server = std::thread::spawn(move || {
-                let mut exchanges = vec![(
-                    Request::GetWorkspace {
-                        workspace_id: workspace.id.clone(),
-                    },
-                    Response::Workspace { workspace },
-                )];
-                if !has_shell {
-                    exchanges.push((
-                        Request::GuardedCloseWorkspace {
-                            workspace_id: "created-workspace".into(),
-                            expected_revision: 7,
-                        },
-                        if race {
-                            Response::Error {
-                                code: Some(ErrorCode::RevisionAhead),
-                                message: "Shell added after inspection".into(),
-                            }
-                        } else {
-                            Response::Ok
-                        },
-                    ));
-                }
-                for (expected, response) in exchanges {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
-                    assert_eq!(request.message, expected);
-                    protocol::write_message(
-                        &mut stream,
-                        &Envelope::with_version(request.version, response),
-                    )
-                    .unwrap();
-                }
-                finished_receiver
-                    .recv_timeout(Duration::from_secs(2))
-                    .unwrap();
-                listener.set_nonblocking(true).unwrap();
-                assert!(
-                    listener.accept().is_err(),
-                    "never retry an empty-workspace close after a race"
-                );
+    fn overview_retains_empty_workspaces_and_their_identity() {
+        let mut workspace = setup_workspace_creation();
+        workspace.shells.clear();
+        workspace.agents.clear();
+        let original_id = workspace.id.clone();
+        for name in ["saved conversations", "renamed workspace"] {
+            workspace.name = name.into();
+            let overview = super::overview_from_snapshot(boomux::protocol::Snapshot {
+                workspaces: vec![workspace.clone()],
+                focused_terminal: None,
             });
-            let result = super::close_empty_workspace(
-                &boomux::client::Client::from_socket_path(socket),
-                "created-workspace",
-            )
-            .unwrap();
-            assert_eq!(result, !has_shell && !race);
-            finished_sender.send(()).unwrap();
-            server.join().unwrap();
-            std::fs::remove_dir_all(directory).unwrap();
+            assert_eq!(overview.workspaces.len(), 1);
+            assert_eq!(overview.workspaces[0].id, original_id);
+            assert_eq!(overview.workspaces[0].name, name);
+            assert!(overview.workspaces[0].shells.is_empty());
         }
     }
 
@@ -3047,6 +3216,42 @@ mod tests {
     }
 
     #[test]
+    fn remote_result_setup_retains_exact_cleanup_ownership() {
+        let path = std::path::PathBuf::from("/tmp/result with spaces; literal");
+        let launch = super::WorkspaceLaunch::AddNodeResult(path.clone());
+        let command = launch.command().unwrap().1;
+        assert_eq!(
+            command,
+            [
+                "__guided-node-add",
+                "--result-socket",
+                path.to_str().unwrap()
+            ]
+        );
+        let mut shell: boomux::protocol::ShellSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "setup", "workspace_id": "workspace", "name": "connect", "cwd": "/tmp", "status": "pending",
+            "command": ["/bin/boomux", "__guided-node-add", "--result-socket", path]
+        })).unwrap();
+        assert!(super::shell_choice(shell.clone()).desktop_setup);
+        let mut workspace: boomux::protocol::WorkspaceSnapshot =
+            serde_json::from_value(serde_json::json!({
+                "id": "workspace", "name": "temporary", "revision": 1, "shells": [shell]
+            }))
+            .unwrap();
+        assert!(
+            super::SetupWorkspaceCleanup::from_creation(&launch, "owner".into(), &workspace)
+                .is_some()
+        );
+        workspace.shells[0].command[3] = "/tmp/another-launch".into();
+        assert!(
+            super::SetupWorkspaceCleanup::from_creation(&launch, "owner".into(), &workspace)
+                .is_none()
+        );
+        shell.command[2] = "--other".into();
+        assert!(!super::shell_choice(shell).desktop_setup);
+    }
+
+    #[test]
     fn node_launches_preserve_exact_arguments_and_do_not_request_upgrades() {
         use super::WorkspaceLaunch;
         assert!(WorkspaceLaunch::Shell.command().is_none());
@@ -3090,9 +3295,10 @@ mod tests {
 
     use super::{
         AgentChoice, EMULATOR_QUEUE_CAPACITY, EmulatorCommand, EmulatorCore, SharedTerminal,
-        agent_is_visible, blank_screen, configure_terminal, distinguish_agent_rows, encode_key,
-        encode_mouse_wheel, encode_paste, image_bgra, indexed_color, resynchronize_terminal_size,
-        run_emulator, spawn_reader, start_emulator, terminal_profile,
+        agent_is_visible, apply_emulator_command, blank_screen, configure_terminal,
+        distinguish_agent_rows, encode_key, encode_mouse_wheel, encode_paste, image_bgra,
+        indexed_color, resynchronize_terminal_size, run_emulator, spawn_reader, start_emulator,
+        terminal_profile,
     };
     use crate::theme::TerminalTheme;
     use std::sync::{Arc, mpsc};
@@ -3325,7 +3531,13 @@ mod tests {
                 KeyAction::Press,
             )
             .unwrap(),
-            b"\x1ba"
+            // Ghostty defaults to native Option text on macOS; Linux Alt
+            // prefixes the text with Escape.
+            if cfg!(target_os = "macos") {
+                b"a".as_slice()
+            } else {
+                b"\x1ba".as_slice()
+            }
         );
         assert_eq!(
             encode_key(
@@ -3549,6 +3761,46 @@ mod tests {
     }
 
     #[test]
+    fn terminal_colors_preserve_faint_and_resolved_background() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(2, 10, 100, 40)));
+        let mut core = EmulatorCore::new(&shared, 2, 10, 100, 40).unwrap();
+        let theme = TerminalTheme {
+            foreground: 0xdcd7ba,
+            background: 0x1f1f28,
+            cursor: 0xdcd7ba,
+            ansi: [0x7e9cd8; 16],
+        };
+        configure_terminal(&mut core.terminal, theme).unwrap();
+        core.apply(EmulatorCommand::Output(
+            b"\x1b[34mA\x1b[2mB\x1b[22mC\x1b[0mD".to_vec(),
+        ))
+        .unwrap();
+        let screen = core.screen().unwrap();
+        assert_eq!(screen.background, theme.background);
+        assert_eq!(screen.cells[0].foreground, theme.ansi[4]);
+        assert_eq!(screen.cells[1].foreground, theme.ansi[4]);
+        assert!(!screen.cells[0].faint);
+        assert!(screen.cells[1].faint);
+        assert!(!screen.cells[2].faint);
+        assert_eq!(screen.cells[3].foreground, theme.foreground);
+        assert!(
+            screen
+                .cells
+                .iter()
+                .all(|cell| cell.background == screen.background)
+        );
+
+        core.apply(EmulatorCommand::Output(b"\x1b]11;#123456\x07".to_vec()))
+            .unwrap();
+        let screen = core.screen().unwrap();
+        assert_eq!(screen.background, 0x123456);
+        assert_eq!(screen.cells[0].background, screen.background);
+        core.apply(EmulatorCommand::Output(b"\x1b]111\x07".to_vec()))
+            .unwrap();
+        assert_eq!(core.screen().unwrap().background, theme.background);
+    }
+
+    #[test]
     fn terminal_palette_updates_existing_default_cells() {
         let shared = Arc::new(SharedTerminal::new(terminal_profile(2, 10, 100, 40)));
         let mut core = EmulatorCore::new(&shared, 2, 10, 100, 40).unwrap();
@@ -3721,6 +3973,30 @@ mod tests {
     }
 
     #[test]
+    fn terminal_selection_copy_includes_offscreen_history_in_both_directions() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        core.apply(EmulatorCommand::Output(
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive".to_vec(),
+        ))
+        .unwrap();
+        assert!(core.screen().unwrap().scroll_offset > 0);
+        assert_eq!(
+            core.selected_text((0, 1), (4, 2)).unwrap(),
+            "ne\ntwo\nthree\nfour\nfiv"
+        );
+        core.apply(EmulatorCommand::Scroll(
+            libghostty_vt::terminal::ScrollViewport::Top,
+        ))
+        .unwrap();
+        assert_eq!(
+            core.selected_text((4, 2), (0, 1)).unwrap(),
+            "ne\ntwo\nthree\nfour\nfiv"
+        );
+        assert!(core.selected_text((99999, 0), (0, 0)).is_err());
+    }
+
+    #[test]
     fn ghostty_scrolls_history_and_returns_to_bottom() {
         let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
         let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
@@ -3820,6 +4096,208 @@ mod tests {
             panic!("expected a keyboard enhancement response");
         };
         assert_eq!(bytes, b"\x1b[?0u");
+    }
+
+    #[test]
+    fn terminal_resize_coalesces_without_waiting_for_output_or_socket_capacity() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        shared.install_writer(&client).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared
+            .emulator_command(EmulatorCommand::Output(vec![b'a']))
+            .unwrap();
+        let writer = shared.writer.lock().unwrap();
+        let profile = shared.profile.lock().unwrap();
+        let (done, completed) = mpsc::channel();
+        let pending = shared.clone();
+        let requester = std::thread::spawn(move || {
+            for cols in 10..=109 {
+                pending.request_resize((6, cols, cols * 10, 120)).unwrap();
+            }
+            let _ = done.send(());
+        });
+        let result = completed.recv_timeout(Duration::from_millis(250));
+        drop(profile);
+        drop(writer);
+        requester.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "resize waited on a worker lock or full queue"
+        );
+        assert_eq!(
+            *shared.pending_resize.lock().unwrap(),
+            Some((6, 109, 1090, 120))
+        );
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        assert!(apply_emulator_command(&mut core, &shared, receiver.recv().unwrap()).unwrap());
+        assert!(matches!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 6,
+                cols: 109,
+                pixel_width: 1090,
+                pixel_height: 120
+            }
+        ));
+        assert_eq!(
+            (core.screen().unwrap().rows, core.screen().unwrap().cols),
+            (6, 109)
+        );
+        assert!(shared.pending_resize.lock().unwrap().is_none());
+        assert!(receiver.try_recv().is_err(), "resize flood grew the queue");
+        shared.request_resize((3, 10, 100, 60)).unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            EmulatorCommand::ResizeLatest
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual native terminal replay and fullscreen resize measurement"]
+    fn terminal_replay_resize_measurement() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(40, 120, 1200, 800)));
+        let mut core = EmulatorCore::new(&shared, 40, 120, 1200, 800).unwrap();
+        let bytes = b"\x1b[32mterminal replay fixture with colored output and normal line wrapping\x1b[0m\r\n".repeat(2048);
+        let replay = std::time::Instant::now();
+        core.apply(EmulatorCommand::Output(bytes.clone())).unwrap();
+        let replay_elapsed = replay.elapsed();
+        let resize = std::time::Instant::now();
+        for (rows, cols) in [(80, 200), (40, 120), (80, 200), (40, 120)] {
+            core.apply(EmulatorCommand::Resize {
+                rows,
+                cols,
+                cell_width: 10,
+                cell_height: 20,
+            })
+            .unwrap();
+            let _ = core.screen().unwrap();
+        }
+        eprintln!(
+            "native replay/resize: bytes={} replay_ms={:.3} resize_ms={:.3}",
+            bytes.len(),
+            replay_elapsed.as_secs_f64() * 1000.0,
+            resize.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    #[test]
+    fn terminal_focus_does_not_wait_for_the_socket_writer_or_queue_capacity() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        shared.install_writer(&client).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared
+            .emulator_command(EmulatorCommand::Output(vec![b'a']))
+            .unwrap();
+        let writer = shared.writer.lock().unwrap();
+        let (done, completed) = mpsc::channel();
+        let pending = shared.clone();
+        let requester = std::thread::spawn(move || {
+            for _ in 0..100 {
+                pending.request_focus().unwrap();
+            }
+            let _ = done.send(());
+        });
+        let result = completed.recv_timeout(Duration::from_millis(250));
+        drop(writer);
+        requester.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "focus blocked the UI on the socket or full queue"
+        );
+        assert!(shared.pending_focus.load(Ordering::Acquire));
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        assert!(apply_emulator_command(&mut core, &shared, receiver.recv().unwrap()).unwrap());
+        assert!(matches!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::FocusGained
+        ));
+        assert!(!shared.pending_focus.load(Ordering::Acquire));
+        assert!(
+            receiver.try_recv().is_err(),
+            "focus requests grew the full queue"
+        );
+        // On an idle queue, one marker wakes the worker and duplicate requests coalesce.
+        shared.request_focus().unwrap();
+        shared.request_focus().unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            EmulatorCommand::FocusLatest
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_full_output_queue_does_not_block_pane_cancellation_or_transport_close() {
+        for cancel in [true, false] {
+            let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+            let (sender, receiver) = mpsc::sync_channel(1);
+            shared.install_emulator(sender);
+            shared
+                .emulator_command(EmulatorCommand::Output(vec![b'a']))
+                .unwrap();
+            let (started, ready) = mpsc::channel();
+            let producer_shared = shared.clone();
+            let producer = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                producer_shared.emulator_command(EmulatorCommand::Output(vec![b'b']))
+            });
+            ready.recv().unwrap();
+            // Let the producer block behind the deliberately full queue.
+            std::thread::sleep(Duration::from_millis(20));
+            let (done, completed) = mpsc::channel();
+            let cleanup_shared = shared.clone();
+            let cleanup = std::thread::spawn(move || {
+                if cancel {
+                    cleanup_shared.cancel_emulator();
+                } else {
+                    cleanup_shared.close("detached");
+                }
+                let _ = done.send(());
+            });
+            let result = completed.recv_timeout(Duration::from_millis(250));
+            // Always release the blocked producer, including on regression.
+            drop(receiver);
+            assert!(producer.join().unwrap().is_err());
+            cleanup.join().unwrap();
+            assert!(result.is_ok(), "cleanup waited for output queue capacity");
+            assert!(shared.emulator.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_replay_chunking_preserves_escape_sequences_and_honors_cancellation() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 80, 800, 60)));
+        let mut chunked = EmulatorCore::new(&shared, 3, 80, 800, 60).unwrap();
+        let whole_shared = Arc::new(SharedTerminal::new(terminal_profile(3, 80, 800, 60)));
+        let mut whole = EmulatorCore::new(&whole_shared, 3, 80, 800, 60).unwrap();
+        let mut bytes = vec![b'\r'; 16 * 1024 - 1];
+        bytes.extend_from_slice("\x1b[31mhello 世界".as_bytes());
+        whole.apply(EmulatorCommand::Output(bytes.clone())).unwrap();
+        assert!(
+            apply_emulator_command(&mut chunked, &shared, EmulatorCommand::Output(bytes)).unwrap()
+        );
+        assert_eq!(whole.screen().unwrap(), chunked.screen().unwrap());
+        let before = chunked.screen().unwrap();
+        shared.cancel_emulator();
+        assert!(
+            !apply_emulator_command(
+                &mut chunked,
+                &shared,
+                EmulatorCommand::Output(b"discarded".to_vec())
+            )
+            .unwrap()
+        );
+        assert_eq!(before, chunked.screen().unwrap());
     }
 
     #[test]

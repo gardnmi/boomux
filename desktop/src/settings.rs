@@ -19,6 +19,7 @@ pub struct Settings {
     pub pane_gap: f32,
     pub focus_highlight_strength: u8,
     pub motion_speed: MotionSpeed,
+    pub button_hover_animations: bool,
     pub layout_overlay_visible: bool,
     pub copy_on_select: bool,
     pub workspace_pane_mode: WorkspacePaneMode,
@@ -36,10 +37,11 @@ impl Default for Settings {
             sidebar_git_tab: false,
             sidebar_width: crate::SIDEBAR_WIDTH,
             pane_headings_visible: true,
-            pane_corner_style: PaneCornerStyle::Rounded,
+            pane_corner_style: PaneCornerStyle::default(),
             pane_gap: 8.0,
             focus_highlight_strength: 100,
             motion_speed: MotionSpeed::Smooth,
+            button_hover_animations: true,
             layout_overlay_visible: true,
             copy_on_select: true,
             workspace_pane_mode: WorkspacePaneMode::Workspace,
@@ -118,7 +120,11 @@ impl Settings {
                         .as_float()
                         .or_else(|| value.as_integer().map(|n| n as f64))
                         .ok_or_else(invalid)?;
-                    if !n.is_finite() || !(280.0..=600.0).contains(&n) {
+                    if !n.is_finite()
+                        || !(f64::from(crate::SIDEBAR_MIN_WIDTH)
+                            ..=f64::from(crate::SIDEBAR_MAX_WIDTH))
+                            .contains(&n)
+                    {
                         return Err(invalid());
                     }
                     s.sidebar_width = n as f32;
@@ -152,6 +158,9 @@ impl Settings {
                 "layout_overlay_visible" => {
                     s.layout_overlay_visible = value.as_bool().ok_or_else(invalid)?
                 }
+                "button_hover_animations" => {
+                    s.button_hover_animations = value.as_bool().ok_or_else(invalid)?;
+                }
                 "motion_speed" => {
                     s.motion_speed = match value.as_str() {
                         Some("instant") => MotionSpeed::Instant,
@@ -184,7 +193,7 @@ impl Settings {
     }
     fn encode(&self) -> String {
         let mut encoded = format!(
-            "# Boomux Desktop preferences; shared Boomux configuration is separate.\nsidebar_visible = {}\nsidebar_width = {}\npane_headings_visible = {}\npane_corner_style = \"{}\"\npane_gap = {}\nfocus_highlight_strength = {}\nmotion_speed = \"{}\"\nworkspace_pane_mode = \"{}\"\npane_layout_mode = \"{}\"\nconfirm_destructive_actions = {}\nonboarding_complete = {}\nsettings_restart_pending = {}\ndismissed_desktop_update = \"{}\"\ndismissed_boomux_update = \"{}\"\n",
+            "# Boomux Desktop preferences; shared Boomux configuration is separate.\nsidebar_visible = {}\nsidebar_width = {}\npane_headings_visible = {}\npane_corner_style = \"{}\"\npane_gap = {}\nfocus_highlight_strength = {}\nmotion_speed = \"{}\"\nbutton_hover_animations = {}\nworkspace_pane_mode = \"{}\"\npane_layout_mode = \"{}\"\nconfirm_destructive_actions = {}\nonboarding_complete = {}\nsettings_restart_pending = {}\ndismissed_desktop_update = \"{}\"\ndismissed_boomux_update = \"{}\"\n",
             self.sidebar_visible,
             self.sidebar_width,
             self.pane_headings_visible,
@@ -200,6 +209,7 @@ impl Settings {
                 MotionSpeed::Fast => "fast",
                 MotionSpeed::Smooth => "smooth",
             },
+            self.button_hover_animations,
             match self.workspace_pane_mode {
                 WorkspacePaneMode::Workspace => "workspace",
                 WorkspacePaneMode::Mixed => "mixed",
@@ -282,6 +292,19 @@ mod tests {
     }
 
     #[test]
+    fn button_hover_animations_default_and_round_trip() {
+        assert!(Settings::parse("").unwrap().button_hover_animations);
+        for enabled in [false, true] {
+            let settings = Settings {
+                button_hover_animations: enabled,
+                ..Settings::default()
+            };
+            assert_eq!(Settings::parse(&settings.encode()).unwrap(), settings);
+        }
+        assert!(Settings::parse("button_hover_animations = 'off'").is_err());
+    }
+
+    #[test]
     fn edge_drag_sidebar_width_round_trips_and_rejects_invalid_values() {
         let settings = Settings {
             sidebar_width: 440.0,
@@ -292,7 +315,14 @@ mod tests {
             Settings::parse("").unwrap().sidebar_width,
             crate::SIDEBAR_WIDTH
         );
-        for value in ["279", "601", "nan", "inf", "'wide'"] {
+        for width in [200.0, 240.0, 280.0, 600.0] {
+            let compact = Settings {
+                sidebar_width: width,
+                ..Settings::default()
+            };
+            assert_eq!(Settings::parse(&compact.encode()).unwrap(), compact);
+        }
+        for value in ["199", "601", "nan", "inf", "'wide'"] {
             assert!(Settings::parse(&format!("sidebar_width = {value}")).is_err());
         }
     }

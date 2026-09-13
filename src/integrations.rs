@@ -100,6 +100,7 @@ pub struct IntegrationDescriptor {
     pub key: &'static str,
     pub display_name: &'static str,
     pub installation: Option<InstallationCapability>,
+    pub lifecycle_limitation: Option<&'static str>,
     pub titles: Option<TitleCapability>,
     pub resume: Option<ResumeCapability>,
     pub foreground: Option<ForegroundCapability>,
@@ -118,6 +119,7 @@ pub const OPENCODE: IntegrationDescriptor = IntegrationDescriptor {
         reload_message: "Restart any running OpenCode process to activate the plugin",
         target: InstallTargetKind::OpenCode,
     }),
+    lifecycle_limitation: None,
     titles: Some(TitleCapability {
         provider: TitleProvider::OpenCode,
         provides_catalog: true,
@@ -144,6 +146,7 @@ pub const PI: IntegrationDescriptor = IntegrationDescriptor {
         reload_message: "Restart any running Pi process to activate the extension",
         target: InstallTargetKind::Pi,
     }),
+    lifecycle_limitation: None,
     titles: Some(TitleCapability {
         provider: TitleProvider::Pi,
         provides_catalog: false,
@@ -168,6 +171,7 @@ pub const CLAUDE: IntegrationDescriptor = IntegrationDescriptor {
         reload_message: "Restart any running Claude Code process to activate the plugin",
         target: InstallTargetKind::Claude,
     }),
+    lifecycle_limitation: None,
     titles: Some(TitleCapability {
         provider: TitleProvider::Claude,
         provides_catalog: false,
@@ -194,6 +198,7 @@ pub const CODEX: IntegrationDescriptor = IntegrationDescriptor {
         reload_message: "Restart Codex, then review and trust the Boomux hook with /hooks",
         target: InstallTargetKind::Codex,
     }),
+    lifecycle_limitation: None,
     titles: Some(TitleCapability {
         provider: TitleProvider::Codex,
         provides_catalog: true,
@@ -208,18 +213,21 @@ pub const CODEX: IntegrationDescriptor = IntegrationDescriptor {
     run_scoped_launcher: Some(RunScopedLauncher::Codex),
 };
 
+// The legacy `kiro` lifecycle key remains v3 so existing holder reports and
+// durable Sessions keep their identity across upgrades.
 pub const KIRO: IntegrationDescriptor = IntegrationDescriptor {
-    key: "kiro",
-    display_name: "Kiro CLI",
+    key: "kiro-v3",
+    display_name: "Kiro CLI v3",
     installation: Some(InstallationCapability {
         package: "kiro-cli",
-        validated_version: "2.18.0",
+        validated_version: "2.21.1",
         asset_name: "hooks",
-        content: include_str!("../integrations/kiro/boomux.json"),
+        content: include_str!("../integrations/kiro-v3/boomux.json"),
         executable: "kiro-cli",
         reload_message: "Reopen its managed ShellRun, then start Kiro CLI in v3 mode to activate the hooks",
         target: InstallTargetKind::Kiro,
     }),
+    lifecycle_limitation: None,
     titles: Some(TitleCapability {
         provider: TitleProvider::Kiro,
         provides_catalog: false,
@@ -234,10 +242,23 @@ pub const KIRO: IntegrationDescriptor = IntegrationDescriptor {
     run_scoped_launcher: Some(RunScopedLauncher::Kiro),
 };
 
-pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE, CODEX, KIRO];
+pub const KIRO_V2: IntegrationDescriptor = IntegrationDescriptor {
+    key: "kiro-v2",
+    display_name: "Kiro CLI v2",
+    installation: None,
+    lifecycle_limitation: Some(
+        "automatic lifecycle reporting is unavailable for Kiro v2; normal kiro-cli launches keep the user's agent and engine",
+    ),
+    titles: None,
+    resume: None,
+    foreground: None,
+    run_scoped_launcher: None,
+};
+
+pub const ALL: &[IntegrationDescriptor] = &[OPENCODE, PI, CLAUDE, CODEX, KIRO_V2, KIRO];
 
 pub fn by_key(key: &str) -> Option<&'static IntegrationDescriptor> {
-    descriptor_by_key(ALL, key)
+    descriptor_by_key(ALL, if key == "kiro" { "kiro-v3" } else { key })
 }
 
 pub fn by_foreground_process(process_name: &str) -> Option<&'static IntegrationDescriptor> {
@@ -288,6 +309,7 @@ mod tests {
             key: "partial",
             display_name: "Partial Host",
             installation: None,
+            lifecycle_limitation: None,
             titles: Some(TitleCapability {
                 provider: TitleProvider::Pi,
                 provides_catalog: false,

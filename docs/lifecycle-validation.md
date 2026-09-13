@@ -11,6 +11,50 @@ This record separates observed host behavior from reducer fixtures and intended
 semantics. Host compatibility is not inferred from process names, terminal
 output, or database recency.
 
+## 2026-09-10: Kiro engine selection and hook limitations
+
+Kiro CLI `2.21.1` was exercised in temporary projects with existing host
+authentication. No global agent profile, default engine, or installed Boomux
+binary was changed. Prompts requested a tool-free `OK` response.
+
+| Probe | Direct host evidence | Scope |
+| --- | --- | --- |
+| v2 with a temporary custom profile in a PTY | `agentSpawn` and `userPromptSubmit` carried the same canonical Session ID. | Demonstrates profile hooks only. The profile approach is not shipped because it changes which agent the user must select. |
+| v2 custom profile with `--no-interactive` | Successful response and `userPromptSubmit`; no startup event captured. | Not evidence for automatic default-agent integration. |
+| Normal built-in v2 agent | Agent editing rejects the built-in agent; an invocation-local agent-directory override did not attach the capture hook. | No safe transparent global lifecycle facility was established. |
+| v3 terminal UI | SessionStart, UserPromptSubmit, and Stop payloads carried the same canonical Session ID. | No tools, permission wait, subagents, or cloud execution exercised. |
+| v3 with `--no-interactive` | Successful response, but none of the temporary capture hooks fired. | No headless notification claim. |
+
+The official [2.x reference](https://kiro.dev/docs/cli/2x-reference/) places
+hooks inside agent configurations; [global hooks](https://kiro.dev/changelog/cli/2-13/)
+are documented for v3. Automatic v2 lifecycle reporting is therefore declared
+unavailable rather than installing or selecting a special agent profile.
+
+Focused native fixtures exercise an unchanged bare command whose host emits v3
+hooks, an unchanged bare command that emits no hooks and creates no Agent,
+current-run holder reporting, cleanup, handoff rollback, and exact v3 recovery.
+They do not infer engine from package version or flags. Installation fixtures
+preserve custom agent and default-agent settings and create no v2 profile.
+Host capture and Boomux reporting were checked separately; this is not a live
+end-to-end desktop notification test. The v3 legacy `kiro` Session key and
+installation receipt remain preserved. See [Kiro usage](kiro.md).
+
+## 2026-09-10: macOS preview native fixtures
+
+Apple Silicon macOS 15.7.9 passed the selected native lifecycle tests at
+`caeae0d` ([CI evidence](https://github.com/gardnmi/boomux/actions/runs/34421149607)).
+This includes descriptor ownership transfer, detached live handoff, attached
+client reconnect, explicit replacement rollback, exited-run terminal state,
+cold metadata recovery, and bounded stalled-connection recovery.
+
+The OpenCode Shared Harness Runtime and Kiro holder scenarios use controlled
+fixture executables. They passed live-run handoff and destructive-stop cleanup;
+Kiro also passed failed-replacement rollback and standalone launcher-parent-death
+cleanup through the new native guard. These are backend/adapter fixtures, **not
+live compatibility claims for any installed macOS OpenCode or Kiro version**.
+Other harness reducers retain their existing contracts; actual macOS host
+versions, provider calls, permissions, and remote SSH require separate evidence.
+
 ## 2026-09-09: installed harness smoke refresh
 
 Tested on Linux with a freshly built debug Boomux `1.11.1`, protocol `54`.
@@ -424,3 +468,26 @@ cargo clippy --all-targets --all-features -- -D warnings
 Reducer tests remain compatibility evidence, not substitutes for the live cases
 listed above. Future host-version bumps should append a dated record rather than
 silently reusing this one.
+
+
+## 2026-09-11: Isolated Linux Remote Maintenance Recovery
+
+The development binary at version 1.18.0/protocol 54 was exercised in isolated
+HOME, state, config, and runtime directories. These are local native-process
+fixtures, not validation against a deployed remote host or macOS.
+
+- Repaired a missing executable while retaining the existing Node identity and
+  saved data; repeated uninstall succeeded with no executable left to remove.
+- Updated a running owner at a custom user installation path, then repaired the
+  same owner after unlinking its executable. The Shell run identity and actual
+  process survived both executable handoffs. Removal stopped that owner.
+- Rejected changed identity, changed executable, unsafe directory links, and
+  incompatible saved state before executable replacement. Removal preserved
+  incompatible saved state instead of requiring it to load.
+- Kept a legacy update transaction intact, rejected a held recovery lock, and
+  reclaimed an abandoned recovery lock.
+
+Focused fixtures separately exercise integration cleanup failures, unfamiliar
+integration names, local forget during maintenance, failed forget persistence,
+rollback with a copied backup, and expiration of staged recovery helpers. These
+checks do not establish live mixed-version protocol-52 or macOS recovery support.

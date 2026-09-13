@@ -12,6 +12,7 @@ records are separate from everyday usage instructions.
 | Manage projects and preferences | [Settings](../desktop/README.md#settings) |
 | Connect a remote machine | [Remotes](../desktop/README.md#remotes) |
 | Understand Git status | [Git overview](../desktop/README.md#git-overview) and [status semantics](desktop/git-panel.md#status-semantics) |
+| Select Kiro v2 or v3 | [Kiro integrations and lifecycle limits](kiro.md) |
 | Manage harness integrations | [Automatic integration management](install.md#automatic-integration-management) |
 | Update or migrate | [Desktop release guide](desktop/releases.md#distribution-and-installation) |
 | Remove Desktop | [Desktop uninstall](desktop/releases.md#uninstall) |

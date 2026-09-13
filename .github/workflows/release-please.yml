@@ -226,6 +226,66 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  macos-release:
+    name: Prepare macOS release
+    needs: release-please
+    if: >-
+      ${{ needs.release-please.outputs.release-created == 'true' ||
+          (inputs.tag != '' && needs.release-please.outputs.release-published != 'true') }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && 'macos-15' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    env:
+      TAG: ${{ needs.release-please.outputs.tag-name }}
+      SOURCE_REF: ${{ needs.release-please.outputs.source-ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_REF }}
+      - name: Download validated macOS release candidate
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: boomux-desktop-macos-aarch64
+          path: dist/macos/release
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Verify CI macOS provenance and checksum
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$VALIDATED_SHA"
+          python3 .github/scripts/ci-release-source.py verify dist/macos/release "$VALIDATED_SHA" "$TAG" aarch64-apple-darwin desktop
+      - name: Install Rust for recovery
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: rustup toolchain install stable --profile minimal
+      - name: Install Zig for recovery
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+      - name: Cache recovery dependencies
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-preview-release-v1
+          save-if: false
+      - name: Build and smoke test macOS recovery bundle
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          cargo +stable build --release --locked -p boomux -p boomux-desktop
+          python3 desktop/scripts/package-macos.py
+          python3 desktop/scripts/smoke-macos.py
+          sh desktop/scripts/test-macos-install.sh
+          python3 .github/scripts/ci-release-source.py verify dist/macos/release "$(git rev-parse HEAD)" "$TAG" aarch64-apple-darwin desktop
+      - name: Upload macOS release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: boomux-desktop-macos-aarch64
+          path: dist/macos/release/
+          if-no-files-found: error
+          retention-days: 14
+
   desktop-bundle:
     needs: [release-please, build-release]
     uses: ./.github/workflows/desktop-build.yml
@@ -289,6 +349,7 @@ jobs:
     if: >-
       ${{ !cancelled() && needs.build-release.result == 'success' &&
           needs.desktop-bundle.result == 'success' &&
+          needs.macos-release.result == 'success' &&
           needs.validate-omarchy-boomux.result == 'success' &&
           (github.event_name == 'workflow_run' || needs.desktop-recovery-smoke.result == 'success') }}
     needs:
@@ -297,6 +358,7 @@ jobs:
       - validate-omarchy-boomux
       - desktop-bundle
       - desktop-recovery-smoke
+      - macos-release
     timeout-minutes: 30
     runs-on: ubuntu-latest
     env:
@@ -323,13 +385,19 @@ jobs:
           name: boomux-desktop-linux-x86_64
           path: dist
 
+      - name: Download macOS release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: boomux-desktop-macos-aarch64
+          path: dist
+
       - name: Render release installers
         run: |
           packaging/render-installer.sh "$TAG" dist/boomux-installer.sh
           python3 desktop/scripts/render-installer.py "$TAG" dist/boomux-desktop-installer.sh
 
       - name: Upload assets to GitHub Release
-        run: bash .github/scripts/upload-release-assets.sh "$TAG" dist/*.tar.gz dist/*.sha256 dist/*-installer.sh
+        run: bash .github/scripts/upload-release-assets.sh "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 dist/*-installer.sh
 
       - name: Add installation handoff to release notes
         run: bash .github/scripts/update-release-notes.sh "$TAG"

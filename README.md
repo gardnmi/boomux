@@ -3,8 +3,9 @@
 **Hyprland-inspired control for your terminals.**
 
 Drag panes into place, resize your splits, and move around from the keyboard.
-Boomux brings your terminals, AI agents, and Git context into one native Linux
-workspace—with persistent Shells behind every view.
+Boomux brings your terminals, AI agents, and Git context into one native
+workspace on Linux, with a largely untested macOS preview and persistent Shells
+behind every view.
 
 [Website](https://gardnmi.github.io/boomux/) ·
 [Install Desktop](#install) ·
@@ -35,10 +36,17 @@ controls, or view the [recording notes](website/demos.md).*
   decoding, plus Omarchy theme integration.
 
 The panes live inside Boomux’s own window. Hyprland inspires the interaction,
-but is **not required**: Desktop runs on X11 or Wayland. It does not embed
+but is **not required**: Desktop runs on X11, Wayland, or macOS. It does not embed
 arbitrary desktop applications or replace your window manager.
 
 ## Install
+
+> [!WARNING]
+> **macOS is a largely untested experimental preview.** It has limited automated
+> CI and smoke-test coverage, with very little real-world testing. Everyday use,
+> hardware compatibility, and session reliability are not established. Expect
+> bugs; use it for evaluation only, not important work. Inclusion in a regular
+> release does not make the macOS build stable or production-ready.
 
 Install **Boomux Desktop**, including its matching Boomux CLI:
 
@@ -48,26 +56,30 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 ```
 
 This downloads and runs the official release installer. It verifies the
-release-pinned package and checksum, installs without sudo, and adds an
-application-menu entry. Review the [installation contract](docs/install.md)
+release-pinned package and checksum and installs without sudo. The same command
+selects Linux x86_64 or Apple Silicon macOS 15+. On Mac, open the versioned app
+in `~/Applications`; see the [Mac guide](docs/platforms/macos-testing.md) for
+first launch and updates. macOS support is experimental, ad-hoc signed, and not
+notarized. On Linux, it adds an application-menu entry. Review the [installation contract](docs/install.md)
 and [release downloads](https://github.com/gardnmi/boomux/releases/latest).
 
-Launch **Boomux Desktop** from your application menu, or run:
+On Linux, launch **Boomux Desktop** from your application menu, or run:
 
 ```sh
 boomux-desktop
 ```
 
 The launcher starts or reuses the Boomux service automatically. Command links
-live in `~/.local/bin`; add that directory to your PATH if your shell does not
+on Linux live in `~/.local/bin`; add that directory to your PATH if your shell does not
 already include it. Existing independent CLI installations are preserved.
 
 ### Requirements
 
 The current Desktop bundle supports **GNU/Linux x86_64**, glibc **2.39+**, an
 X11 or Wayland session, and a working Vulkan driver. Ubuntu 24.04+ and current
-Arch are the initial runtime baseline. Desktop bundles for ARM64, macOS,
-Windows, and musl/Alpine are not currently provided.
+Arch are the Linux runtime baseline. An experimental Desktop bundle supports
+**Apple Silicon macOS 15+**. Intel macOS, ARM64 Linux Desktop, Windows, and
+musl/Alpine Desktop bundles are not currently provided.
 
 - **Ubuntu/Debian runtime libraries:** `libfontconfig1`, `libwayland-client0`,
   `libx11-6`, `libxcb1`, `libxcb-shape0`, `libxcb-xfixes0`, `libxkbcommon0`,
@@ -77,7 +89,7 @@ Windows, and musl/Alpine are not currently provided.
   `libxkbcommon`, `libxkbcommon-x11`, `vulkan-icd-loader`, and your GPU’s driver.
 - An absolute `XDG_RUNTIME_DIR` for the service.
 
-The installer checks glibc and required graphics libraries; it does not install
+On Linux, the installer checks glibc and required graphics libraries; it does not install
 system packages. Rust and Zig are only needed for source builds.
 
 > [!NOTE]
@@ -120,7 +132,7 @@ here use Tree layout.
 
 ### Coding Agents, Ready To Go
 
-Boomux bundles integrations for **Claude Code, Codex, OpenCode, Pi, and Kiro CLI**.
+Boomux bundles integrations for **Claude Code, Codex, OpenCode, Pi, and Kiro CLI v3**.
 The service prepares them automatically on startup, including on remote
 machines, and updates unchanged managed integrations with the bundled version.
 
@@ -133,6 +145,9 @@ Integrations report lifecycle events; quiet terminal output or process exit
 alone does not establish Agent completion.
 See [automatic integration management](docs/install.md#automatic-integration-management)
 for opt-outs, customization protection, and troubleshooting.
+See [Kiro v2 and v3](docs/kiro.md) for engine support and notification
+limits. Use `kiro-cli` normally; Boomux preserves its default engine and agent.
+Automatic v2 lifecycle reporting is unavailable.
 
 ### Remote Workspaces
 

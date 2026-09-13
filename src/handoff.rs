@@ -18,7 +18,10 @@ use crate::state_store;
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const CHANNEL_FD: RawFd = 198;
+#[cfg(target_os = "linux")]
 pub(crate) const HEADER: &[u8; 8] = b"BOOMUXH8";
+#[cfg(target_os = "macos")]
+pub(crate) const HEADER: &[u8; 8] = b"BOOMUXM1";
 pub(crate) const LISTENER_MARKER: u8 = 1;
 pub(crate) const RUNTIME_LOCK_MARKER: u8 = 2;
 pub(crate) const STATE_LOCK_MARKER: u8 = 3;
@@ -102,7 +105,7 @@ pub(crate) struct KiroLaunchHolderManifest {
 pub(crate) struct TransferredRuntime {
     pub(crate) manifest: RuntimeManifest,
     pub(crate) pty: OwnedFd,
-    pub(crate) pidfd: OwnedFd,
+    pub(crate) pidfd: crate::platform::ProcessHandle,
     pub(crate) reconstruction: Vec<u8>,
 }
 
@@ -113,7 +116,7 @@ pub(crate) struct TransferredExited {
 
 pub(crate) struct TransferredOpenCodeRuntime {
     pub(crate) manifest: OpenCodeRuntimeManifest,
-    pub(crate) pidfd: OwnedFd,
+    pub(crate) pidfd: crate::platform::ProcessHandle,
 }
 
 pub(crate) enum Bootstrap {
@@ -168,7 +171,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
     let opencode_runtime = opencode_runtime
         .map(|manifest| {
             let pidfd = receive_descriptor(&channel, OPENCODE_PIDFD_MARKER)?;
-            validate_pidfd(&pidfd, manifest.pid)?;
+            let pidfd = crate::platform::import_process(pidfd, manifest.pid)?;
             Ok::<_, io::Error>(TransferredOpenCodeRuntime { manifest, pidfd })
         })
         .transpose()?;
@@ -177,7 +180,7 @@ pub(crate) fn receive_bootstrap(channel: RawFd) -> io::Result<Bootstrap> {
         let pty = receive_descriptor(&channel, PTY_MARKER)?;
         validate_pty(&pty, manifest.pid)?;
         let pidfd = receive_descriptor(&channel, PIDFD_MARKER)?;
-        validate_pidfd(&pidfd, manifest.pid)?;
+        let pidfd = crate::platform::import_process(pidfd, manifest.pid)?;
         let reconstruction: Vec<u8> = protocol::read_message(&mut channel)?;
         if reconstruction.len() > protocol::MAX_ATTACH_FRAME {
             return Err(io::Error::new(
@@ -254,6 +257,7 @@ fn supported_header(header: &[u8; 8]) -> bool {
     header == HEADER
 }
 
+#[cfg(target_os = "linux")]
 fn validate_pty(descriptor: &OwnedFd, expected_session: u32) -> io::Result<()> {
     let mut pty_number = 0_u32;
     // TIOCGPTN succeeds only for a Unix PTY master and initializes the number.
@@ -277,22 +281,6 @@ fn validate_pty(descriptor: &OwnedFd, expected_session: u32) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-fn validate_pidfd(descriptor: &OwnedFd, expected_pid: u32) -> io::Result<()> {
-    let contents = fs::read_to_string(format!("/proc/self/fdinfo/{}", descriptor.as_raw_fd()))?;
-    let actual_pid = contents.lines().find_map(|line| {
-        line.strip_prefix("Pid:")
-            .and_then(|value| value.trim().parse::<u32>().ok())
-    });
-    if actual_pid == Some(expected_pid) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "transferred pidfd does not match its process",
-        ))
-    }
 }
 
 fn validate_manifest(manifest: &Manifest) -> io::Result<()> {
@@ -469,26 +457,31 @@ fn adopt_channel(channel: RawFd) -> io::Result<UnixStream> {
 }
 
 fn validate_listener(listener: &UnixListener) -> io::Result<()> {
-    let mut accepting = 0_i32;
-    let mut length = std::mem::size_of_val(&accepting) as libc::socklen_t;
-    // The output pointer and length describe a writable integer.
-    if unsafe {
-        libc::getsockopt(
-            listener.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_ACCEPTCONN,
-            (&mut accepting as *mut i32).cast(),
-            &mut length,
-        )
-    } == -1
+    #[cfg(target_os = "macos")]
+    crate::platform::validate_listener(std::os::fd::AsFd::as_fd(listener))?;
+    #[cfg(target_os = "linux")]
     {
-        return Err(io::Error::last_os_error());
-    }
-    if accepting != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "transferred descriptor is not a listening socket",
-        ));
+        let mut accepting = 0_i32;
+        let mut length = std::mem::size_of_val(&accepting) as libc::socklen_t;
+        // The output pointer and length describe a writable integer.
+        if unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                (&mut accepting as *mut i32).cast(),
+                &mut length,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if accepting != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transferred descriptor is not a listening socket",
+            ));
+        }
     }
     let flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFL) };
     if flags == -1
@@ -514,9 +507,13 @@ fn validate_lock(descriptor: &OwnedFd, path: &Path) -> io::Result<()> {
     }
     // fstat succeeded, so the structure is initialized.
     let descriptor_metadata = unsafe { descriptor_metadata.assume_init() };
+    #[cfg(target_os = "linux")]
+    let descriptor_device = descriptor_metadata.st_dev;
+    #[cfg(target_os = "macos")]
+    let descriptor_device = descriptor_metadata.st_dev as u64;
     if !path_metadata.file_type().is_file()
         || path_metadata.uid() != unsafe { libc::geteuid() }
-        || path_metadata.dev() != descriptor_metadata.st_dev
+        || path_metadata.dev() != descriptor_device
         || path_metadata.ino() != descriptor_metadata.st_ino
     {
         return Err(io::Error::new(
@@ -531,6 +528,11 @@ fn validate_lock(descriptor: &OwnedFd, path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_pty(descriptor: &OwnedFd, expected_pid: u32) -> io::Result<()> {
+    crate::platform::validate_pty(descriptor, expected_pid)
 }
 
 #[cfg(test)]
@@ -564,9 +566,13 @@ mod tests {
     }
 
     #[test]
-    fn only_h8_bootstrap_header_is_accepted() {
+    fn only_host_bootstrap_header_is_accepted() {
         assert!(supported_header(HEADER));
         assert!(!supported_header(b"BOOMUXH7"));
+        #[cfg(target_os = "linux")]
+        assert!(!supported_header(b"BOOMUXM1"));
+        #[cfg(target_os = "macos")]
+        assert!(!supported_header(b"BOOMUXH8"));
     }
 
     #[test]

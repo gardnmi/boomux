@@ -336,6 +336,7 @@ impl Workspace {
                     "⌕",
                     self.git_panel.search_open,
                 )
+                .button_chrome()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.git_panel.search_open = !this.git_panel.search_open;
                     this.git_panel.search_focused = this.git_panel.search_open;
@@ -356,6 +357,7 @@ impl Workspace {
                     "↻",
                     refreshing,
                 )
+                .button_chrome()
                 .on_click(cx.listener(|this, _, _, cx| this.refresh_git_panel(true, cx))),
             )
     }
@@ -522,6 +524,7 @@ impl Workspace {
                             .min_w_0()
                             .text_sm()
                             .font_weight(gpui::FontWeight::NORMAL)
+                            .button_chrome()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.git_panel.expanded.remove(&toggle) {
                                     this.git_panel.expanded.clear();
@@ -620,6 +623,7 @@ impl Workspace {
                                 } else {
                                     gpui::CursorStyle::Arrow
                                 })
+                                .button_chrome()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.git_panel.search_focused = false;
                                     if local
@@ -661,6 +665,7 @@ impl Workspace {
                                 } else {
                                     gpui::CursorStyle::Arrow
                                 })
+                                .button_chrome()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if local
                                         && this.boomux_shells.iter().any(|s| {
@@ -711,6 +716,7 @@ impl Workspace {
                         .px_2()
                         .border_0()
                         .text_xs()
+                        .button_chrome()
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(path.clone()))
                         })),
@@ -733,6 +739,7 @@ impl Workspace {
                             .px_2()
                             .border_0()
                             .text_xs()
+                            .button_chrome()
                             .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
                         );
                     }
@@ -768,6 +775,7 @@ impl Workspace {
                     panel.child(
                         div()
                             .id("git-search")
+                            .role(gpui::Role::SearchInput)
                             .mx_3()
                             .mb_2()
                             .p_2()
@@ -780,6 +788,7 @@ impl Workspace {
                             }))
                             .text_xs()
                             .cursor_pointer()
+                            .button_chrome()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.git_panel.search_focused = true;
                                 cx.notify();

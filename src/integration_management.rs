@@ -115,7 +115,14 @@ impl FromStr for IntegrationId {
         boomux::integrations::by_key(value)
             .filter(|descriptor| descriptor.installation.is_some())
             .map(Self)
-            .ok_or_else(|| format!("unknown installable integration: {value}"))
+            .ok_or_else(|| {
+                boomux::integrations::by_key(value)
+                    .and_then(|descriptor| descriptor.lifecycle_limitation)
+                    .map_or_else(
+                        || format!("unknown installable integration: {value}"),
+                        |reason| format!("{value}: {reason}"),
+                    )
+            })
     }
 }
 
@@ -178,17 +185,27 @@ pub(crate) struct IntegrationSummary {
     pub(crate) display_name: &'static str,
     pub(crate) package: &'static str,
     pub(crate) validated_version: &'static str,
+    pub(crate) lifecycle_limitation: Option<&'static str>,
 }
 
 impl From<IntegrationId> for IntegrationSummary {
     fn from(id: IntegrationId) -> Self {
-        let spec = id.spec();
-        let installation = id.installation();
+        Self::from(id.spec())
+    }
+}
+
+impl From<&'static IntegrationDescriptor> for IntegrationSummary {
+    fn from(spec: &'static IntegrationDescriptor) -> Self {
         Self {
             name: spec.key,
             display_name: spec.display_name,
-            package: installation.package,
-            validated_version: installation.validated_version,
+            package: spec
+                .installation
+                .map_or("-", |installation| installation.package),
+            validated_version: spec
+                .installation
+                .map_or("-", |installation| installation.validated_version),
+            lifecycle_limitation: spec.lifecycle_limitation,
         }
     }
 }
@@ -299,11 +316,7 @@ pub(crate) fn verification_targets(
     id: IntegrationId,
     shell_id: Option<&str>,
 ) -> Vec<VerificationTarget> {
-    let executable = id
-        .spec()
-        .foreground
-        .expect("CLI integration must recognize its foreground process")
-        .process_name;
+    let executable = id.installation().executable;
     let mut targets = snapshot
         .workspaces
         .iter()
@@ -330,9 +343,7 @@ pub(crate) fn check_verification_target(
     target: &VerificationTarget,
 ) -> VerificationCheck {
     let descriptor = id.spec();
-    let foreground = descriptor
-        .foreground
-        .expect("CLI integration must recognize its foreground process");
+    let executable = id.installation().executable;
     for workspace in &snapshot.workspaces {
         let Some(shell) = workspace
             .shells
@@ -342,7 +353,7 @@ pub(crate) fn check_verification_target(
             continue;
         };
         if !matches!(shell.status, ShellStatus::Running)
-            || shell.foreground_process.as_deref() != Some(foreground.process_name)
+            || shell.foreground_process.as_deref() != Some(executable)
         {
             return VerificationCheck::Missing;
         }
@@ -557,7 +568,10 @@ fn inspect_runtime(
             untracked_processes: 0,
         };
     };
-    let Some(foreground) = descriptor.foreground else {
+    let Some(executable) = descriptor
+        .installation
+        .map(|installation| installation.executable)
+    else {
         return RuntimeStatus {
             state: RuntimeState::NotObservable,
             running_processes: 0,
@@ -568,25 +582,43 @@ fn inspect_runtime(
     let running = snapshot.workspaces.iter().flat_map(|workspace| {
         workspace.shells.iter().filter_map(move |shell| {
             (matches!(shell.status, ShellStatus::Running)
-                && shell.foreground_process.as_deref() == Some(foreground.process_name))
+                && shell.foreground_process.as_deref() == Some(executable))
             .then_some((workspace, shell))
         })
     });
     let mut running_processes = 0;
     let mut tracked_processes = 0;
+    let mut ambiguous_kiro = false;
     for (workspace, shell) in running {
-        running_processes += 1;
-        if shell.run.as_ref().is_some_and(|run| {
+        let tracked = shell.run.as_ref().is_some_and(|run| {
             workspace
                 .agents
                 .iter()
                 .any(|agent| authoritative_agent_matches(agent, descriptor, shell, run))
-        }) {
+        });
+        if matches!(descriptor.key, "kiro-v2" | "kiro-v3") && !tracked {
+            // Both engines have the same foreground executable. A known peer
+            // version is not a broken integration; absent hook evidence cannot
+            // identify which version needs setup.
+            let known_kiro = shell.run.as_ref().is_some_and(|run| {
+                workspace.agents.iter().any(|agent| {
+                    [boomux::integrations::KIRO_V2, boomux::integrations::KIRO]
+                        .iter()
+                        .any(|version| authoritative_agent_matches(agent, version, shell, run))
+                })
+            });
+            ambiguous_kiro |= !known_kiro;
+            continue;
+        }
+        running_processes += 1;
+        if tracked {
             tracked_processes += 1;
         }
     }
     let untracked_processes = running_processes - tracked_processes;
-    let state = if running_processes == 0 {
+    let state = if ambiguous_kiro {
+        RuntimeState::NotObservable
+    } else if running_processes == 0 {
         RuntimeState::NotRunning
     } else if untracked_processes == 0 {
         RuntimeState::Reporting
@@ -607,7 +639,8 @@ fn authoritative_agent_matches(
     shell: &boomux::protocol::ShellSnapshot,
     run: &boomux::protocol::ShellRunSnapshot,
 ) -> bool {
-    agent.integration == descriptor.key
+    (agent.integration == descriptor.key
+        || (descriptor.key == "kiro-v3" && agent.integration == "kiro"))
         && agent.observation.authority == AgentAuthority::LifecycleIntegration
         && crate::session_projection::agent_is_active_for_run(agent, &shell.id, &run.id)
 }
@@ -1980,6 +2013,40 @@ mod tests {
     }
 
     #[test]
+    fn kiro_v2_declares_its_limit_without_installing_an_agent_profile() {
+        let home = TestDirectory::new("kiro-versions");
+        let environment = environment(&home.0);
+        assert!(
+            "kiro-v2"
+                .parse::<IntegrationId>()
+                .unwrap_err()
+                .contains("automatic lifecycle reporting is unavailable")
+        );
+        let v3: IntegrationId = "kiro-v3".parse().unwrap();
+        assert_eq!("kiro".parse::<IntegrationId>().unwrap(), v3);
+        for id in IntegrationId::all() {
+            install(id, &environment, false).unwrap();
+        }
+        assert!(!home.0.join(".kiro/agents").exists());
+        assert!(home.0.join(".kiro/hooks/boomux.json").exists());
+        let agents = home.0.join(".kiro/agents");
+        fs::create_dir_all(&agents).unwrap();
+        let profile = br#"{"name":"reviewer","prompt":"preserve this","hooks":{}}"#;
+        fs::write(agents.join("reviewer.json"), profile).unwrap();
+        let settings = br#"{"chat.defaultAgent":"reviewer"}"#;
+        fs::write(home.0.join(".kiro/settings.json"), settings).unwrap();
+        for id in IntegrationId::all() {
+            install(id, &environment, false).unwrap();
+        }
+        assert_eq!(fs::read(agents.join("reviewer.json")).unwrap(), profile);
+        assert_eq!(
+            fs::read(home.0.join(".kiro/settings.json")).unwrap(),
+            settings
+        );
+        assert!(!agents.join("boomux-v2.json").exists());
+    }
+
+    #[test]
     fn kiro_install_owns_only_its_dedicated_hook_file() {
         let home = TestDirectory::new("kiro-install");
         let mut environment = environment(&home.0);
@@ -2104,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_status_requires_exact_current_run_registration() {
+    fn runtime_status_requires_exact_current_run_and_kiro_version() {
         let shell = ShellSnapshot {
             id: "s1".into(),
             revision: 1,
@@ -2212,5 +2279,32 @@ mod tests {
             ),
             VerificationCheck::Pending
         ));
+        let mut kiro_snapshot = snapshot.clone();
+        kiro_snapshot.workspaces[0].shells[0].foreground_process = Some("kiro-cli".into());
+        let v3 = "kiro-v3".parse::<IntegrationId>().unwrap();
+        assert_eq!(
+            inspect_runtime(v3.spec(), Some(&kiro_snapshot)).state,
+            RuntimeState::NotObservable
+        );
+        kiro_snapshot.workspaces[0].agents[0].observation.authority =
+            AgentAuthority::LifecycleIntegration;
+        for (key, reporting) in [("kiro", v3), ("kiro-v3", v3)] {
+            kiro_snapshot.workspaces[0].agents[0].integration = key.into();
+            assert_eq!(
+                inspect_runtime(reporting.spec(), Some(&kiro_snapshot)).state,
+                RuntimeState::Reporting
+            );
+            assert!(matches!(
+                check_verification_target(
+                    &kiro_snapshot,
+                    reporting,
+                    &VerificationTarget {
+                        shell_id: "s1".into(),
+                        run_id: "r1".into(),
+                    }
+                ),
+                VerificationCheck::Verified { .. }
+            ));
+        }
     }
 }

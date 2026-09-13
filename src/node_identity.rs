@@ -36,6 +36,10 @@ pub(crate) struct NodeIdentityLease {
 }
 
 impl NodeIdentity {
+    pub(crate) fn load_existing_from_environment() -> io::Result<Self> {
+        load(&state_directory_from_environment()?.join("node.json"))
+    }
+
     pub(crate) fn load_or_create_from_environment() -> io::Result<Self> {
         Self::load_or_create_at(state_directory_from_environment()?.join("node.json"))
     }

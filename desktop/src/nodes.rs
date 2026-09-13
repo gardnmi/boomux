@@ -16,7 +16,37 @@ pub struct NodeView {
     pub shell_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimaryAction {
+    NewWorkspace,
+    SignIn,
+    Update,
+    Review,
+}
+
+impl PrimaryAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NewWorkspace => "New workspace",
+            Self::SignIn => "Sign in…",
+            Self::Update => "Review update…",
+            Self::Review => "Review connection…",
+        }
+    }
+}
+
 impl NodeView {
+    pub fn primary_action(&self) -> PrimaryAction {
+        if self.connected() {
+            return PrimaryAction::NewWorkspace;
+        }
+        match self.health {
+            NodeProjectionHealthCode::AuthenticationRequired => PrimaryAction::SignIn,
+            NodeProjectionHealthCode::Unsupported => PrimaryAction::Update,
+            _ => PrimaryAction::Review,
+        }
+    }
+
     pub fn connected(&self) -> bool {
         self.current && self.health == NodeProjectionHealthCode::Online
     }
@@ -24,47 +54,47 @@ impl NodeView {
     pub fn status(&self) -> &'static str {
         match self.health {
             NodeProjectionHealthCode::Online if self.current => "Connected",
-            NodeProjectionHealthCode::Online | NodeProjectionHealthCode::Stale => "Stale",
+            NodeProjectionHealthCode::Online | NodeProjectionHealthCode::Stale => "Connection lost",
             NodeProjectionHealthCode::Unobserved => "Not yet connected",
             NodeProjectionHealthCode::Reconnecting => "Reconnecting",
-            NodeProjectionHealthCode::Unreachable => "Unreachable",
+            NodeProjectionHealthCode::Unreachable => "Cannot reach machine",
             NodeProjectionHealthCode::AuthenticationRequired => "Sign-in required",
-            NodeProjectionHealthCode::IdentityChanged => "Identity changed",
-            NodeProjectionHealthCode::IdentityConflict => "Identity conflict",
-            NodeProjectionHealthCode::Unsupported => "Incompatible",
+            NodeProjectionHealthCode::IdentityChanged => "Machine identity changed",
+            NodeProjectionHealthCode::IdentityConflict => "Machine identity conflict",
+            NodeProjectionHealthCode::Unsupported => "Version incompatible",
         }
     }
 
     pub fn guidance(&self) -> &'static str {
         match self.health {
             NodeProjectionHealthCode::AuthenticationRequired => {
-                "Sign in through your existing SSH route to reconnect."
+                "Sign in again to reconnect to this machine."
             }
             NodeProjectionHealthCode::IdentityChanged
             | NodeProjectionHealthCode::IdentityConflict => {
-                "This route no longer identifies the expected Node. Inspect it before changing the registration."
+                "This SSH address no longer matches the machine you connected. Verify the machine before changing the saved connection."
             }
             NodeProjectionHealthCode::Unsupported => {
-                "The remote Boomux version is incompatible. Update Boomux on that machine to match this installation."
+                "Review the remote Boomux update. Older incompatible versions may require a manual update on that machine; the guided flow will explain if it cannot proceed."
             }
             _ if !self.connected() => {
-                "Showing the last observation. A lost connection does not establish whether remote work has stopped."
+                "Remote work may still be running. Check the machine and your network; Boomux reconnects automatically when possible."
             }
-            _ => "Closing a terminal pane detaches it; its Shell stays on the owning Node.",
+            _ => "Closing a terminal pane leaves its Shell running on this machine.",
         }
     }
 
     pub fn last_seen(&self, now_ms: u64) -> String {
         if self.observed_at_ms == 0 {
-            return "No observation yet".into();
+            return "Not connected yet".into();
         }
         let seconds = now_ms.saturating_sub(self.observed_at_ms) / 1_000;
         if seconds < 60 {
-            "Last observed less than a minute ago".into()
+            "Last seen less than a minute ago".into()
         } else if seconds < 3_600 {
-            format!("Last observed {} min ago", seconds / 60)
+            format!("Last seen {} min ago", seconds / 60)
         } else {
-            format!("Last observed {} h ago", seconds / 3_600)
+            format!("Last seen {} h ago", seconds / 3_600)
         }
     }
 }
@@ -140,6 +170,41 @@ mod tests {
     }
 
     #[test]
+    fn recovery_actions_remain_available_without_a_healthy_connection() {
+        for (health, action) in [
+            (
+                NodeProjectionHealthCode::AuthenticationRequired,
+                PrimaryAction::SignIn,
+            ),
+            (NodeProjectionHealthCode::Unsupported, PrimaryAction::Update),
+            (
+                NodeProjectionHealthCode::IdentityChanged,
+                PrimaryAction::Review,
+            ),
+            (
+                NodeProjectionHealthCode::IdentityConflict,
+                PrimaryAction::Review,
+            ),
+            (NodeProjectionHealthCode::Unreachable, PrimaryAction::Review),
+            (
+                NodeProjectionHealthCode::Reconnecting,
+                PrimaryAction::Review,
+            ),
+        ] {
+            let mut input = node("remote", false);
+            input.health = health;
+            input.current = false;
+            let nodes = project(&CombinedNodeSnapshot {
+                nodes: vec![input],
+                workspaces: vec![],
+                external_workspaces: vec![],
+                focused_terminal: None,
+            });
+            assert_eq!(nodes[0].primary_action(), action);
+        }
+    }
+
+    #[test]
     fn node_identity_survives_equal_labels_and_routes() {
         let nodes = project(&CombinedNodeSnapshot {
             nodes: vec![node("b", false), node("local", true), node("a", false)],
@@ -168,32 +233,35 @@ mod tests {
             focused_terminal: None,
         });
         assert!(!nodes[0].connected());
-        assert_eq!(nodes[0].status(), "Stale");
-        assert_eq!(nodes[0].last_seen(121_000), "Last observed 2 min ago");
-        assert_eq!(
-            nodes[0].last_seen(0),
-            "Last observed less than a minute ago"
-        );
+        assert_eq!(nodes[0].status(), "Connection lost");
+        assert_eq!(nodes[0].last_seen(121_000), "Last seen 2 min ago");
+        assert_eq!(nodes[0].last_seen(0), "Last seen less than a minute ago");
     }
     #[test]
     fn health_states_keep_distinct_recovery_meanings() {
         let cases = [
             (NodeProjectionHealthCode::Unobserved, "Not yet connected"),
             (NodeProjectionHealthCode::Reconnecting, "Reconnecting"),
-            (NodeProjectionHealthCode::Unreachable, "Unreachable"),
+            (
+                NodeProjectionHealthCode::Unreachable,
+                "Cannot reach machine",
+            ),
             (
                 NodeProjectionHealthCode::AuthenticationRequired,
                 "Sign-in required",
             ),
             (
                 NodeProjectionHealthCode::IdentityChanged,
-                "Identity changed",
+                "Machine identity changed",
             ),
             (
                 NodeProjectionHealthCode::IdentityConflict,
-                "Identity conflict",
+                "Machine identity conflict",
             ),
-            (NodeProjectionHealthCode::Unsupported, "Incompatible"),
+            (
+                NodeProjectionHealthCode::Unsupported,
+                "Version incompatible",
+            ),
         ];
         for (health, label) in cases {
             let mut input = node("remote", false);

@@ -10,10 +10,18 @@ Ghostty’s terminal core, backed by persistent Boomux Shells.
 > [!NOTE]
 > Stable Desktop releases support GNU/Linux x86_64 with glibc 2.39+, X11 or
 > Wayland, and a working Vulkan driver. Ubuntu 24.04+ and current Arch are the
-> runtime baseline. Shells persist when you close Desktop; pane arrangements
-> and window geometry are not yet saved. See [current limitations](#current-limitations).
+> runtime baseline. Releases also include experimental Apple Silicon macOS 15+
+> builds, ad-hoc signed and not notarized. Shells persist when you close Desktop; internal pane arrangements are saved across restarts. Outer window geometry
+> is not saved. See [current limitations](#current-limitations).
 
 ## Install Release Builds
+
+> [!WARNING]
+> **macOS is a largely untested experimental preview.** It has limited automated
+> CI and smoke-test coverage, with very little real-world testing. Everyday use,
+> hardware compatibility, and session reliability are not established. Expect
+> bugs; use it for evaluation only, not important work. Inclusion in a regular
+> release does not make the macOS build stable or production-ready.
 
 Install Desktop and its matching Boomux CLI together:
 
@@ -22,15 +30,19 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/gardnmi/boomux/releases/latest/download/boomux-installer.sh | sh -s -- --desktop
 ```
 
-**Requires:** GNU/Linux x86_64, glibc 2.39+, X11 or Wayland, and a working Vulkan
-driver. Hyprland is not required. See [runtime packages](../README.md#requirements)
+**Requires:** GNU/Linux x86_64 with glibc 2.39+, X11 or Wayland, and Vulkan;
+or Apple Silicon macOS 15+. The same command detects the OS. Hyprland is not
+required. macOS builds are experimental, ad-hoc signed, and not notarized. See [runtime packages](../README.md#requirements)
 and the [installation contract](../docs/install.md).
 
-The installer runs without sudo or a local Rust/Zig toolchain. It adds an
+On Mac, open the installed version of Boomux in `~/Applications`. See the
+[Mac guide](../docs/platforms/macos-testing.md) for first launch and updates.
+
+The installer runs without sudo or a local Rust/Zig toolchain. On Linux it adds an
 application-menu entry and command links under `~/.local/bin`, preserving any
 independent Boomux CLI installation.
 
-Launch **Boomux Desktop** from the application menu, or run:
+On Linux, launch **Boomux Desktop** from the application menu, or run:
 
 ```sh
 boomux-desktop
@@ -38,19 +50,48 @@ boomux-desktop
 
 The launcher starts or reuses the Boomux service automatically.
 
+## Conversations
+
+Select a Workspace and click the **Workspace conversations** button beside Settings
+in the sidebar header to open the right-side panel. Conversations observed by
+Boomux integrations appear together across supported harnesses. Click
+**Open** to focus a running conversation or **Resume** to open its original
+harness in a tiled terminal pane. Remote conversations stay on their owner;
+connect unavailable machines from Remotes first. Resume requires protocol 55 on
+the local daemon and remote owner. Harness history and the saved directory must
+still be available to the harness.
+
+The panel opens on **Recent**, with pinned conversations first and the rest
+ordered by their latest observed activity. Search filters titles and harness names
+within the current view. **Open** focuses or attaches a running conversation;
+**Resume** starts its original harness in a tiled pane.
+
+Use **Pin / Unpin** to keep a conversation handy. **Archive** moves it out of Recent;
+open **Archived** and choose **Restore** to bring it back. Archiving does not stop
+an agent, close a terminal, or delete harness history. Pins and archive preferences
+are saved on this Desktop, separately for each Workspace and harness conversation,
+and survive harness restarts. They do not sync between computers.
+
+Closing a terminal or Shell keeps its conversation entry. Renaming the Workspace
+keeps the association. Removing the Workspace removes its entries from Boomux,
+but does not delete the harness's own history files. A new Workspace with the
+same name starts empty. The first version lists conversations observed inside
+Boomux. Titles come from the original harness when available, with the recorded
+Agent name as a fallback. New OpenCode sessions briefly refresh more frequently
+while their generated titles are pending; later renames can take about 30 seconds
+to refresh. Outside harness history is not imported.
+
 ## Workspaces And Shells
 
-Desktop automatically removes Workspaces that have no Shells, including empty
-entries left from earlier use. Opening a project again creates a fresh Workspace;
-project shortcuts and files on disk are preserved. Workspace-specific launchers,
-folder defaults, and retained Agent history are removed with the Workspace.
-Exited Shells still count as Shells until explicitly removed. Unavailable remote
-Workspaces remain visible until their owning machine can confirm they are empty.
+Workspaces remain until you explicitly remove them, even when they have no
+Shells or conversations. Closing the last Shell preserves the Workspace's
+identity, conversations, launchers, and folder defaults for later use. This
+applies to local and remote Workspaces.
 
 | To… | Use… |
 | --- | --- |
 | Create a Workspace | **+ → New workspace** |
-| Open a project | Choose a configured project from **+** |
+| Open a project | Open **+**, type to filter projects by name or path, then choose a project |
 | Add project folders | **Settings → Projects → Browse for folders** |
 | Create a Shell | **Ctrl + Enter** |
 | Rename a Workspace or Shell | Select it, then **F2** |
@@ -144,7 +185,7 @@ These shortcuts apply **inside layout mode**.
 | **J** or **S** | Toggle split orientation |
 | **E / R** | Equalize / swap the nearest split |
 | **O / F / B** | Toggle floating / expand pane / toggle sidebar |
-| **Page Up / Page Down** | Switch Workspaces in sidebar order |
+| **Page Up / Page Down** | Switch Workspaces in sidebar order; also works when the sidebar has keyboard focus |
 
 For floating panes, **Alt + Shift + Arrow keys** aligns to a canvas edge and
 **C** centers the pane. Note that **J toggles a split**; use Down to focus below.
@@ -218,15 +259,32 @@ you view Git. See [Git panel behavior](../docs/desktop/git-panel.md).
 
 ### Remotes
 
-Connect another machine using the general connect action above the machine
-cards, or **+ → New remote workspace…**.
+Use **+ → New remote workspace…** to choose a machine. Select a connected
+machine to create and open a Workspace there, or choose **Connect another
+machine…** to set up a new SSH connection. Use Up/Down and Enter to choose;
+Escape closes the picker. You can also connect from the Remotes tab.
+
+Setup asks for an SSH address and a display name, using your existing SSH
+configuration. Authentication and any installation consent happen in the setup
+terminal. After successful setup, press Enter to close setup and open the exact
+remote Shell it created. If opening fails, use the sidebar to reopen that Shell
+rather than repeating setup. If the starter Workspace name already exists on
+the machine, connection still succeeds: press Enter, then open an existing
+Workspace from the sidebar or create a new one from the **+** menu. Setup does
+not select or modify an existing Workspace based on its name.
 
 Remote Workspaces use a machine icon and show connection status. Their Shells
-run on that machine. Connecting creates an initial Workspace and Shell;
-open it from the sidebar.
+run on that machine. Connection loss does not mean remote work has stopped.
+
+Use **Rename connection…** in an expanded machine card to change its local
+display name, including while disconnected. This leaves its SSH address and
+remote Workspace names unchanged.
 
 Machine cards start collapsed. Click a header to expand it, or use Enter/Space
-when the Remotes panel has keyboard focus.
+when the Remotes panel has keyboard focus. Unavailable machines show a recovery
+action even while collapsed: **Sign in…**, **Review update…**, or **Review
+connection…**. Update review retains identity verification and installation
+consent; older incompatible versions may require manual updates on the machine.
 
 | Machine action | Result |
 | --- | --- |
@@ -251,7 +309,8 @@ a service restart produce one reminder after you finish editing.
 | Area | Options |
 | --- | --- |
 | Layout | Tree/Tabs, Workspace/Mixed scope, pane headings |
-| Appearance | Rounded/square/mixed corners, pane spacing, focus emphasis |
+| Appearance | Square corners by default; rounded/mixed options, pane spacing, focus emphasis |
+| Button hover animations | On by default; turn off for instant hover highlights without changing pane motion |
 | Motion | Instant, Fast, or Smooth — the default |
 | Clipboard | Copy on select (enabled by default) |
 | Projects | Browse for folders and set search depth |
@@ -283,7 +342,24 @@ Desktop preferences live in
 Service configuration is separate; the Advanced config action opens its
 validated editor.
 
-**Pane arrangements and window geometry are not yet saved.**
+**Internal pane arrangements are saved automatically.** Desktop remembers split
+ratios, floating positions/sizes and stacking, focus, expanded panes, minimized
+Shells, Workspace ordering, and separate Workspace/Mixed arrangements. Switching
+Workspaces restores each saved arrangement.
+
+State lives in `~/.local/state/boomux-desktop/layout-state.json`, respecting
+`XDG_STATE_HOME` and the development-only `BOOMUX_STATE_HOME` override. Writes are
+atomic and debounced by 250 ms; normal quit and update restart flush the final
+snapshot. A crash may lose the most recent unsaved adjustment. Corrupt state is
+retained and a notice explains why saving is disabled; close Desktop and move
+that file aside to reset layouts. Concurrent Desktop instances cannot overwrite
+one another's newer saved state; reopen the older instance if a conflict appears.
+
+Restoration reconnects running Shells without taking over another attachment.
+Stopped or unavailable Shells keep a placeholder with an explicit reconnect/start
+button. Restoration does not start or restart processes. Floating panes are fit
+to the available canvas if its dimensions changed. Outer application window
+geometry, terminal selections, and in-progress drag animations are not saved.
 See [preferences](../docs/desktop/releases.md#desktop-integration-and-preferences).
 
 ### Optional Advanced Setup
@@ -328,7 +404,7 @@ See [update ownership and older-install migration](../docs/desktop/releases.md#d
 - IME, hyperlinks, ligatures, and selection across unloaded scrollback remain
   incomplete.
 - Animation curves are not freely configurable.
-- Pane arrangements and window geometry are not persisted.
+- Outer application window geometry is not persisted.
 
 Per-pane scrollback uses a 4 MiB Ghostty page-memory budget, allocated as output
 arrives. Retained line count varies with terminal width and content. This is
@@ -378,3 +454,11 @@ Queues and caches are bounded, and pane-owned resources are reclaimed on detach.
 - [Architecture and ownership](../docs/desktop/architecture.md)
 - [Performance measurements and guardrails](../docs/desktop/performance.md)
 - [Continuous integration](../docs/desktop/ci.md)
+
+### Remove an offline remote Workspace from the sidebar
+
+Choose **Hide from sidebar** in the remote Workspace's three-dot menu. This
+works offline, remembers the choice, and leaves remote work running. Restore it
+under **Remotes → Hidden Workspaces → Show**. Deleting remote Shells still
+requires the owner to be reachable; forgetting a machine's connection removes
+all its entries instead.
