@@ -342,8 +342,8 @@ the compact palette list.
 Selecting a palette only changes the preview. Applying it closes Settings and
 reveals the new colors from the center of the window outward, over the previous
 theme. Content stays stationary throughout the wipe; Shells keep running and
-pane sizes and saved layouts stay intact. The wipe opens along angled `\` edges
-and uses the web picker’s easing curve.
+pane sizes and saved layouts stay intact. The wipe uses the native rectangular clipping path for smooth motion
+and the web picker’s easing curve.
 The transition and carousel motion follow the **Motion** preference; **Instant**
 applies colors immediately.
 

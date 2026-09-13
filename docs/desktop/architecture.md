@@ -208,11 +208,14 @@ to existing terminal paint caches, without copying transcripts or reconfiguring
 workers on each frame. Both layers share unchanged layout geometry; only the
 mask expands. The frozen render skips terminal resize and cache refresh, and
 has no keyboard focus. The previous palette/cache references are released at
-completion. Instant motion skips the extra layer. The vendored GPUI extension clips the wipe and preview cards to parallelograms
+completion. Instant motion skips the extra layer. The vendored GPUI extension clips only preview cards to shallow parallelograms
 without moving text or changing GPU shaders. Only primitives crossing an angled
 edge are sliced into rectangular masks, bounded to 512 bands per primitive;
 interior/exterior primitives use a constant-time path. See
-`vendor/gpui-ce/BOOMUX_PATCH.md` for provenance and focused validation.
+`vendor/gpui-ce/BOOMUX_PATCH.md` for provenance and focused validation. The
+whole-window wipe uses the native rectangular mask; slicing a terminal-heavy
+window along angled edges caused visible animation regressions. Preview-card
+clipping is limited to three synthetic cards with a 4% lean.
 
 ## Rendering
 

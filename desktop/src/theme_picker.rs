@@ -271,6 +271,7 @@ impl Workspace {
                         child: current,
                         progress: 0.0,
                         card: false,
+                        border: None,
                     }
                     .with_animation(
                         SharedString::from(format!("theme-reveal-{generation}")),
@@ -326,7 +327,7 @@ impl Workspace {
         div()
             .size_full()
             .overflow_hidden()
-            .px(relative(0.075))
+            .px(relative(0.035))
             .flex()
             .flex_col()
             .bg(gpui::rgb(palette.canvas))
@@ -448,6 +449,7 @@ impl Workspace {
                     child: self.theme_card(index).into_any_element(),
                     progress: 1.0,
                     card: true,
+                    border: Some(self.candidate_theme(index).accent),
                 })
         });
         let deck = div().relative().size_full().children(cards);
@@ -828,7 +830,7 @@ fn web_reveal_easing(progress: f32) -> f32 {
 }
 
 fn reveal_edges(progress: f32) -> (f32, f32) {
-    let half = progress.clamp(0.0, 1.0) * 0.58;
+    let half = progress.clamp(0.0, 1.0) * 0.5;
     (0.5 - half, 0.5 + half)
 }
 
@@ -836,6 +838,7 @@ struct RevealClip {
     child: gpui::AnyElement,
     progress: f32,
     card: bool,
+    border: Option<u32>,
 }
 
 impl IntoElement for RevealClip {
@@ -884,19 +887,47 @@ impl gpui::Element for RevealClip {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (left, right, slant) = if self.card {
-            (0.07, 0.93, 0.14)
+        if self.card {
+            // Reference: the top edge sits slightly to the right of the bottom.
+            // Keep the lean shallow and the text upright.
+            window.with_slanted_content_mask(
+                bounds,
+                bounds.left() + bounds.size.width * 0.02,
+                bounds.left() + bounds.size.width * 0.98,
+                bounds.size.width * -0.04,
+                |window| self.child.paint(window, cx),
+            );
+            if let Some(border) = self.border {
+                let inset = px(1.0);
+                let mut outline = gpui::PathBuilder::stroke(px(1.5));
+                let top_left = point(
+                    bounds.left() + bounds.size.width * 0.04,
+                    bounds.top() + inset,
+                );
+                outline.move_to(top_left);
+                outline.line_to(point(bounds.right() - inset, bounds.top() + inset));
+                outline.line_to(point(
+                    bounds.left() + bounds.size.width * 0.96,
+                    bounds.bottom() - inset,
+                ));
+                outline.line_to(point(bounds.left() + inset, bounds.bottom() - inset));
+                outline.line_to(top_left);
+                if let Ok(path) = outline.build() {
+                    window.paint_path(path, gpui::rgb(border));
+                }
+            }
         } else {
+            // Whole-window animation must keep the native rectangular fast path.
+            // Slicing every crossing primitive made the angled wipe frame-heavy.
             let (left, right) = reveal_edges(self.progress);
-            (left, right, 0.16)
-        };
-        window.with_slanted_content_mask(
-            bounds,
-            bounds.left() + bounds.size.width * left,
-            bounds.left() + bounds.size.width * right,
-            bounds.size.width * slant,
-            |window| self.child.paint(window, cx),
-        );
+            let mask = gpui::ContentMask {
+                bounds: Bounds::new(
+                    point(bounds.left() + bounds.size.width * left, bounds.top()),
+                    size(bounds.size.width * (right - left), bounds.size.height),
+                ),
+            };
+            window.with_content_mask(Some(mask), |window| self.child.paint(window, cx));
+        }
     }
 }
 
@@ -918,8 +949,8 @@ mod tests {
     fn reveal_mask_expands_continuously_without_moving_content() {
         assert_eq!(reveal_edges(0.0), (0.5, 0.5));
         let (left, right) = reveal_edges(1.0);
-        assert!(left + 0.08 <= 0.00001);
-        assert!(right - 0.08 >= 0.99999);
+        assert_eq!((left, right), (0.0, 1.0));
+        assert_eq!(reveal_edges(0.5), (0.25, 0.75));
     }
 
     #[test]
