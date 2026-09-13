@@ -18,6 +18,7 @@ pub struct Settings {
     pub pane_corner_style: PaneCornerStyle,
     pub pane_gap: f32,
     pub focus_highlight_strength: u8,
+    pub color_theme: String,
     pub motion_speed: MotionSpeed,
     pub button_hover_animations: bool,
     pub layout_overlay_visible: bool,
@@ -40,6 +41,7 @@ impl Default for Settings {
             pane_corner_style: PaneCornerStyle::default(),
             pane_gap: 8.0,
             focus_highlight_strength: 100,
+            color_theme: "system".into(),
             motion_speed: MotionSpeed::Smooth,
             button_hover_animations: true,
             layout_overlay_visible: true,
@@ -90,6 +92,15 @@ impl Settings {
         for (key, value) in values {
             let invalid = || format!("invalid Desktop setting: {key}");
             match key.as_str() {
+                "color_theme" => {
+                    let id = value.as_str().ok_or_else(invalid)?;
+                    s.color_theme = if crate::theme_picker::valid_id(id) {
+                        id
+                    } else {
+                        "system"
+                    }
+                    .into();
+                }
                 "dismissed_desktop_update" | "dismissed_boomux_update" => {
                     let text = value
                         .as_str()
@@ -230,6 +241,10 @@ impl Settings {
             self.layout_overlay_visible
         ));
         encoded.push_str(&format!("copy_on_select = {}\n", self.copy_on_select));
+        encoded.push_str(&format!(
+            "color_theme = {}\n",
+            serde_json::to_string(&self.color_theme).unwrap()
+        ));
         encoded
     }
     fn save(&self, path: &Path) -> Result<(), String> {
@@ -384,6 +399,24 @@ mod tests {
                 .workspace_pane_mode,
             WorkspacePaneMode::Workspace
         );
+    }
+    #[test]
+    fn color_theme_preferences_round_trip_and_fallback() {
+        assert_eq!(Settings::parse("").unwrap().color_theme, "system");
+        for preset in crate::theme_picker::presets() {
+            let settings = Settings {
+                color_theme: preset.id.clone(),
+                ..Settings::default()
+            };
+            assert_eq!(Settings::parse(&settings.encode()).unwrap(), settings);
+        }
+        assert_eq!(
+            Settings::parse("color_theme = 'removed-palette'")
+                .unwrap()
+                .color_theme,
+            "system"
+        );
+        assert!(Settings::parse("color_theme = 42").is_err());
     }
     #[test]
     fn malformed_or_out_of_range_preferences_are_rejected() {
