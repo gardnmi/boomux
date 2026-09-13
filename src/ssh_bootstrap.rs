@@ -1659,12 +1659,16 @@ impl BootstrapSession {
             }
             if Instant::now() >= deadline {
                 let _ = kill_process_group(master_pid, &mut master);
-                let _ = stderr_reader.finish();
+                let (result, event) = stderr_reader.finish();
                 let _ = fs::remove_dir_all(&directory);
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "SSH connection or sign-in did not complete before the deadline; check that the remote machine is online and reachable, then retry",
-                ));
+                if let Some(event) = event {
+                    return Err(master_stderr_event_error(event));
+                }
+                let (stderr, truncated) = result?;
+                if truncated {
+                    return Err(master_stderr_event_error(MasterStderrEvent::Truncated));
+                }
+                return Err(classify_ssh_deadline(&stderr));
             }
             thread::sleep(CHILD_POLL_INTERVAL);
         }
@@ -2743,9 +2747,31 @@ fn prepare_ssh_directory(
     Ok((directory, config_path, control_path))
 }
 
+fn ssh_signin_required(stderr: &str) -> bool {
+    stderr.contains("tailscale ssh requires an additional check")
+        || stderr.contains("to authenticate, visit:")
+}
+
+fn classify_ssh_deadline(stderr: &[u8]) -> io::Error {
+    let classified = classify_ssh_start_failure(None, stderr);
+    if classified.kind() == io::ErrorKind::PermissionDenied {
+        return classified;
+    }
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "SSH connection or sign-in did not complete before the deadline; check that the remote machine is online and reachable, then retry",
+    )
+}
+
 fn classify_ssh_start_failure(status: Option<i32>, stderr: &[u8]) -> io::Error {
     let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    if stderr.contains("permission denied")
+    if ssh_signin_required(&stderr) {
+        classified_error(
+            io::ErrorKind::PermissionDenied,
+            "bootstrap_authentication_failed",
+            "SSH sign-in required; use Sign in in Remotes to authenticate and reconnect",
+        )
+    } else if stderr.contains("permission denied")
         || stderr.contains("authentication failed")
         || stderr.contains("host key verification failed")
     {
@@ -6188,6 +6214,50 @@ mod tests {
             );
             fs::remove_dir_all(runtime).unwrap();
         }
+    }
+
+    #[test]
+    fn bootstrap_batch_waiting_for_browser_auth_reports_signin_on_timeout() {
+        let runtime = runtime_directory();
+        fs::create_dir_all(&runtime).unwrap();
+        let ssh = write_master_stderr_ssh(
+            &runtime,
+            "printf '# Tailscale SSH requires an additional check.\\n# To authenticate, visit: https://login.tailscale.com/a/PRIVATE\\n' >&2; while :; do /bin/sleep 60; done",
+        );
+        let error = BootstrapSession::open_at(
+            &runtime,
+            None,
+            SshTarget::parse("workbox").unwrap(),
+            SshAuthenticationMode::Batch,
+            Duration::from_millis(300),
+            ssh.as_os_str(),
+        )
+        .err()
+        .expect("browser sign-in must not connect unattended");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!error.to_string().contains("PRIVATE"));
+        assert!(
+            fs::read_dir(&runtime)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_type().unwrap().is_dir())
+        );
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_deadline_preserves_tailscale_signin_challenge() {
+        let prompt = b"# Tailscale SSH requires an additional check.\n# To authenticate, visit: https://login.tailscale.com/a/PRIVATE";
+        for error in [
+            classify_ssh_deadline(prompt),
+            classify_ssh_start_failure(Some(255), prompt),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error_code(&error), "bootstrap_authentication_failed");
+            assert!(error.to_string().contains("sign-in required"));
+            assert!(!error.to_string().contains("PRIVATE"));
+        }
+        assert_eq!(classify_ssh_deadline(b"").kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

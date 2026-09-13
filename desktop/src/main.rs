@@ -6518,6 +6518,7 @@ impl Workspace {
                 self.open_nodes(cx);
                 self.selected_node = Some(node_id.clone());
                 self.expanded_node = Some(node_id);
+                cx.notify();
             }
         }
     }
@@ -6666,27 +6667,32 @@ impl Workspace {
                 let id = node.id.clone();
                 div()
                     .id(SharedString::from(format!("node-row-{}", node.id)))
+                    // Keep expanded actions in the parent's scrollable content.
+                    .flex_none()
                     .px_2()
                     .py_2()
                     .rounded_md()
-                    .cursor_pointer()
                     .bg(rgb(if self.selected_node.as_ref() == Some(&node.id) {
                         0x313244
                     } else {
                         0x1e1e2e
                     }))
-                    .hover(|row| row.bg(rgb(0x313244)))
-                    .button_chrome().on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.selected_node = Some(id.clone());
-                        this.expanded_node = if this.expanded_node.as_ref() == Some(&id) {
-                            None
-                        } else {
-                            Some(id.clone())
-                        };
-                        cx.notify();
-                    }))
-                    .child(div().flex().items_center().gap_2()
+                    .child(div()
+                        .id(SharedString::from(format!("node-header-{}", node.id)))
+                        .flex().items_center().gap_2()
+                        .cursor_pointer()
+                        .hover(|header| header.bg(rgb(0x313244)))
+                        .button_chrome()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.selected_node = Some(id.clone());
+                            this.expanded_node = if this.expanded_node.as_ref() == Some(&id) {
+                                None
+                            } else {
+                                Some(id.clone())
+                            };
+                            cx.notify();
+                        }))
                         .child(div().flex_1().min_w_0().text_sm().truncate().child(node.label.clone()))
                         .child(div().flex_none().text_xs().text_color(rgb(0x7f849c))
                             .child(if self.expanded_node.as_ref() == Some(&node.id) { "▾" } else { "▸" })))
@@ -6696,7 +6702,7 @@ impl Workspace {
                             .text_color(rgb(if node.connected() { 0xa6e3a1 } else { 0xf9e2af }))
                             .child(node.status()),
                     )
-            .when(!node.connected(), |panel| {
+            .when(!node.connected() && (node.primary_action() != nodes::PrimaryAction::Review || self.expanded_node.as_ref() != Some(&node.id)), |panel| {
                 let id = node.id.clone();
                 panel.child(Self::settings_option("remote-recovery", node.primary_action().label(), false)
                     .button_chrome().on_click(cx.listener(move |this, _, window, cx| {
