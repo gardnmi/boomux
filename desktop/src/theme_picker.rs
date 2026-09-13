@@ -104,17 +104,12 @@ fn resolve_selection(id: &str, system: Option<AppTheme>, light: bool) -> AppThem
 pub(super) struct Reveal {
     generation: u64,
     duration: Duration,
-    closing: bool,
-    target: AppTheme,
+    previous: AppTheme,
+    caches: HashMap<usize, Arc<TerminalPaintCache>>,
 }
 
 fn carousel_index(index: usize, delta: isize) -> usize {
     (index as isize + delta).rem_euclid((presets().len() + 1) as isize) as usize
-}
-
-fn split_half_left(right: bool, closing: bool, progress: f32) -> f32 {
-    let distance = if closing { 1.0 - progress } else { progress } * 0.5;
-    if right { 0.5 + distance } else { -distance }
 }
 
 impl Workspace {
@@ -181,110 +176,110 @@ impl Workspace {
         };
         self.close_settings(cx);
         let target = self.candidate_theme(index);
-        let Some(duration) = self
+        self.theme_reveal = None;
+        if let Some(duration) = self
             .motion_speed
             .duration()
             .filter(|_| target != self.theme)
-        else {
-            self.commit_theme(index, cx);
-            return;
-        };
-        self.theme_carousel_generation = self.theme_carousel_generation.wrapping_add(1);
-        let generation = self.theme_carousel_generation;
-        self.theme_reveal = Some(Reveal {
-            generation,
-            duration: duration / 2,
-            closing: false,
-            target,
-        });
-        cx.notify();
-        // One bounded transition per window, with no polling or terminal snapshots.
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(duration / 2).await;
-            let applied = this
-                .update(cx, |this, cx| {
-                    if !this
+        {
+            self.theme_carousel_generation = self.theme_carousel_generation.wrapping_add(1);
+            let generation = self.theme_carousel_generation;
+            self.theme_reveal = Some(Reveal {
+                generation,
+                duration,
+                previous: self.theme,
+                caches: self
+                    .terminals
+                    .iter()
+                    .filter_map(|(id, pane)| {
+                        pane.paint_cache
+                            .as_ref()
+                            .map(|cache| (*id, Arc::clone(cache)))
+                    })
+                    .collect(),
+            });
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(duration).await;
+                this.update(cx, |this, cx| {
+                    if this
                         .theme_reveal
                         .as_ref()
                         .is_some_and(|r| r.generation == generation)
                     {
-                        return false;
+                        this.theme_reveal = None;
+                        cx.notify();
                     }
-                    this.commit_theme(index, cx);
-                    this.theme_reveal.as_mut().unwrap().closing = true;
-                    cx.notify();
-                    true
                 })
-                .unwrap_or(false);
-            if !applied {
-                return;
-            }
-            cx.background_executor().timer(duration / 2).await;
-            this.update(cx, |this, cx| {
-                if this
-                    .theme_reveal
-                    .as_ref()
-                    .is_some_and(|r| r.generation == generation)
-                {
-                    this.theme_reveal = None;
-                    cx.notify();
-                }
+                .ok();
             })
-            .ok();
-        })
-        .detach();
+            .detach();
+        }
+        // Commit once, before the first animation frame. Only the paint mask moves.
+        self.commit_theme(index, cx);
     }
 
-    pub(super) fn theme_split_pane(&self, id: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(reveal) = &self.theme_reveal else {
-            return self
-                .pane_with_heading(id, self.pane_headings_visible, cx)
-                .into_any_element();
+    pub(super) fn render_theme_transition(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let current = self.render_frame(window, cx, false);
+        let Some(reveal) = self.theme_reveal.take() else {
+            return current;
         };
-        let halves = [false, true].map(|right| {
-            let closing = reveal.closing;
-            let content = self.pane_with_heading(id, self.pane_headings_visible, cx);
-            div()
-                .id((if right { "theme-right" } else { "theme-left" }, id))
-                .absolute()
-                .top_0()
-                .h_full()
-                .w(relative(0.5))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .h_full()
-                        .w(relative(2.0))
-                        .left(relative(if right { -1.0 } else { 0.0 }))
-                        .child(content),
-                )
-                .with_animation(
-                    SharedString::from(format!(
-                        "theme-split-{}-{id}-{right}-{closing}",
-                        reveal.generation
-                    )),
-                    Animation::new(reveal.duration).with_easing(ease_out_quint()),
-                    move |element, progress| {
-                        element.left(relative(split_half_left(right, closing, progress)))
-                    },
-                )
-                .into_any_element()
-        });
+        let new_theme = self.theme;
+        self.theme = reveal.previous;
+        theme::install(self.theme);
+        // Arc swaps preserve the old terminal view without copying transcripts or
+        // asking workers to oscillate between palettes on animation frames.
+        let mut restored = Vec::with_capacity(reveal.caches.len());
+        for (id, cache) in &reveal.caches {
+            if let Some(pane) = self.terminals.get_mut(id) {
+                restored.push((
+                    *id,
+                    pane.paint_cache.replace(Arc::clone(cache)),
+                    pane.screen.replace(Arc::clone(&cache.screen)),
+                ));
+            }
+        }
+        let previous = self.render_frame(window, cx, true);
+        for (id, cache, screen) in restored {
+            if let Some(pane) = self.terminals.get_mut(&id) {
+                pane.paint_cache = cache;
+                pane.screen = screen;
+            }
+        }
+        self.theme = new_theme;
+        theme::install(new_theme);
+        let generation = reveal.generation;
+        let duration = reveal.duration;
+        self.theme_reveal = Some(reveal);
         div()
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(gpui::rgb(reveal.target.terminal.background))
-            .children(halves)
-            // Animated copies are visual only; do not expose duplicate pane controls.
             .child(
                 div()
+                    .id("theme-previous-frame")
                     .absolute()
                     .inset_0()
-                    .occlude()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                    .child(previous),
+            )
+            .child(
+                div().absolute().inset_0().child(
+                    RevealClip {
+                        child: current,
+                        progress: 0.0,
+                    }
+                    .with_animation(
+                        SharedString::from(format!("theme-reveal-{generation}")),
+                        Animation::new(duration).with_easing(web_reveal_easing),
+                        |mut element, progress| {
+                            element.progress = progress;
+                            element
+                        },
+                    ),
+                ),
             )
             .into_any_element()
     }
@@ -797,22 +792,114 @@ impl Workspace {
     }
 }
 
+// CSS cubic-bezier(.35, 0, .2, 1), matching the web UI's timing curve.
+fn web_reveal_easing(progress: f32) -> f32 {
+    if progress <= 0.0 {
+        return 0.0;
+    }
+    if progress >= 1.0 {
+        return 1.0;
+    }
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..16 {
+        let t = (low + high) * 0.5;
+        let x = 3.0 * (1.0 - t) * (1.0 - t) * t * 0.35 + 3.0 * (1.0 - t) * t * t * 0.2 + t * t * t;
+        if x < progress {
+            low = t;
+        } else {
+            high = t;
+        }
+    }
+    let t = (low + high) * 0.5;
+    3.0 * (1.0 - t) * t * t + t * t * t
+}
+
+fn reveal_edges(progress: f32) -> (f32, f32) {
+    let half = progress.clamp(0.0, 1.0) * 0.5;
+    (0.5 - half, 0.5 + half)
+}
+
+struct RevealClip {
+    child: gpui::AnyElement,
+    progress: f32,
+}
+
+impl IntoElement for RevealClip {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for RevealClip {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<gpui::Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.prepaint(window, cx);
+    }
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let (left, right) = reveal_edges(self.progress);
+        let mask = gpui::ContentMask {
+            bounds: Bounds::new(
+                point(bounds.left() + bounds.size.width * left, bounds.top()),
+                size(bounds.size.width * (right - left), bounds.size.height),
+            ),
+        };
+        window.with_content_mask(Some(mask), |window| self.child.paint(window, cx));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn split_halves_open_symmetrically_and_return_to_original_bounds() {
-        for right in [false, true] {
-            let original = if right { 0.5 } else { 0.0 };
-            assert_eq!(split_half_left(right, false, 0.0), original);
-            assert_eq!(split_half_left(right, true, 1.0), original);
-            assert_eq!(
-                split_half_left(right, false, 1.0),
-                split_half_left(right, true, 0.0)
-            );
-        }
-        assert_eq!(split_half_left(false, false, 1.0), -0.5);
-        assert_eq!(split_half_left(true, false, 1.0), 1.0);
+    fn web_timing_curve_is_continuous_monotonic_and_finishes_exactly() {
+        assert_eq!(web_reveal_easing(0.0), 0.0);
+        assert_eq!(web_reveal_easing(1.0), 1.0);
+        let values = (0..=100)
+            .map(|i| web_reveal_easing(i as f32 / 100.0))
+            .collect::<Vec<_>>();
+        assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(web_reveal_easing(0.5) > 0.7);
+    }
+
+    #[test]
+    fn reveal_mask_expands_continuously_without_moving_content() {
+        assert_eq!(reveal_edges(0.0), (0.5, 0.5));
+        assert_eq!(reveal_edges(0.5), (0.25, 0.75));
+        assert_eq!(reveal_edges(1.0), (0.0, 1.0));
     }
 
     #[test]

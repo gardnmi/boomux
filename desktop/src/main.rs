@@ -10100,7 +10100,8 @@ impl Workspace {
     }
 
     fn pane(&self, id: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
-        self.theme_split_pane(id, cx)
+        self.pane_with_heading(id, self.pane_headings_visible, cx)
+            .into_any_element()
     }
 
     fn pane_with_heading(
@@ -10624,6 +10625,17 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_theme_transition(window, cx)
+    }
+}
+
+impl Workspace {
+    fn render_frame(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        frozen: bool,
+    ) -> gpui::AnyElement {
         cx.set_global(buttons::Motion(
             self.motion_speed
                 .duration()
@@ -10646,27 +10658,30 @@ impl Render for Workspace {
         if window.window_title() != desktop_title {
             window.set_window_title(&desktop_title);
         }
-        for (&id, pane) in &self.terminals {
-            if self
-                .minimizing_panes
-                .iter()
-                .any(|animation| animation.pane_id == id)
-                || self
-                    .workspace_transition
-                    .as_ref()
-                    .is_some_and(|transition| {
-                        transition.outgoing.iter().any(|outgoing| outgoing.id == id)
-                    })
-            {
-                continue;
+        if !frozen {
+            for (&id, pane) in &self.terminals {
+                if self
+                    .minimizing_panes
+                    .iter()
+                    .any(|animation| animation.pane_id == id)
+                    || self
+                        .workspace_transition
+                        .as_ref()
+                        .is_some_and(|transition| {
+                            transition.outgoing.iter().any(|outgoing| outgoing.id == id)
+                        })
+                {
+                    continue;
+                }
+                if let Some(terminal) = pane.session.as_ref() {
+                    let (rows, cols, pixel_width, pixel_height) =
+                        self.terminal_grid_size(id, window);
+                    terminal.resize(rows, cols, pixel_width, pixel_height);
+                }
             }
-            if let Some(terminal) = pane.session.as_ref() {
-                let (rows, cols, pixel_width, pixel_height) = self.terminal_grid_size(id, window);
-                terminal.resize(rows, cols, pixel_width, pixel_height);
-            }
+            self.refresh_terminal_images(window);
+            self.refresh_terminal_paint_caches(window);
         }
-        self.refresh_terminal_images(window);
-        self.refresh_terminal_paint_caches(window);
         let tiled = if let Some(layout) = &self.layout {
             self.render_layout(layout, cx)
         } else if self.boomux_overview.workspaces.is_empty() && self.terminals.is_empty() {
@@ -11059,7 +11074,7 @@ impl Render for Workspace {
                         .child(format!("Layout not saved: {error}")),
                 )
             })
-            .track_focus(&self.focus_handle)
+            .when(!frozen, |element| element.track_focus(&self.focus_handle))
             .key_context(if self.theme_candidate.is_some() {
                 "ThemePicker"
             } else {
@@ -11153,6 +11168,7 @@ impl Render for Workspace {
             .when_some(help, |element, help| element.child(help))
             .when_some(resource_dialog, |element, dialog| element.child(dialog))
             .when_some(theme_dialog, |element, dialog| element.child(dialog))
+            .into_any_element()
     }
 }
 

@@ -202,12 +202,15 @@ that cache immediately. A failed reload retains the last valid palette. The
 picker keeps its candidate separate from the applied preference, so preview and
 Cancel never reconfigure terminals. Apply uses the same bounded terminal update
 path as a System theme change. The carousel renders only three synthetic previews
-and wraps through System and the bundled catalog. Applying a palette uses one
-bounded, two-phase transition: clipped copies of the existing visible pane views
-slide apart, the palette commits at the midpoint, and the halves return. These
-views share existing terminal paint caches; there is no screenshot capture,
-extra PTY attachment, or layout/terminal resize mutation. The temporary reveal
-state is cleared at completion; Instant motion skips it entirely.
+and wraps through System and the bundled catalog. Applying a palette commits
+once before animation and uses a bounded center-out paint mask over the stationary previous view. The old view holds shared references
+to existing terminal paint caches, without copying transcripts or reconfiguring
+workers on each frame. Both layers share unchanged layout geometry; only the
+mask expands. The frozen render skips terminal resize and cache refresh, and
+has no keyboard focus. The previous palette/cache references are released at
+completion. Instant motion skips the extra layer. GPUI’s rectangular content
+mask gives this wipe straight edges, rather than the web view transition’s
+diagonal polygon; its easing matches the web implementation.
 
 ## Rendering
 

@@ -340,8 +340,10 @@ the center card or **Apply** to select it; Escape cancels. **List view** provide
 the compact palette list.
 
 Selecting a palette only changes the preview. Applying it closes Settings and
-splits the visible panes into halves, changes their colors, then brings them
-back together. Shells keep running and pane sizes and saved layouts stay intact.
+reveals the new colors from the center of the window outward, over the previous
+theme. Content stays stationary throughout the wipe; Shells keep running and
+pane sizes and saved layouts stay intact. The native wipe has straight edges
+and uses the web picker’s easing curve.
 The transition and carousel motion follow the **Motion** preference; **Instant**
 applies colors immediately.
 
