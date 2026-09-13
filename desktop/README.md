@@ -333,9 +333,16 @@ not also invoke a harness's mouse-based copy handler.
 
 ### Themes And Saved Preferences
 
-On Omarchy, the active theme updates the interface and terminal palette live.
-A missing or invalid theme uses Boomux’s built-in palette. Settings shows which
-provider is active.
+Choose **Settings → Appearance → Color theme** to preview and apply one of 23
+bundled palettes. Selecting a palette only changes the preview; **Apply** updates
+the interface and terminal palette without restarting your Shells. Use the arrow
+keys to browse, Enter to apply, or Escape to cancel.
+
+**System** is the default. It follows the active Omarchy theme live when available,
+or the desktop’s light/dark appearance otherwise. A selected preset stays fixed
+until you choose System again. Applications that draw their own truecolor themes
+keep those colors. The saved `color_theme` preference uses a stable palette ID;
+an unknown ID falls back to System.
 
 Desktop preferences live in
 `~/.config/boomux-desktop/settings.toml` (`XDG_CONFIG_HOME` is respected).

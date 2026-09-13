@@ -140,6 +140,8 @@ and history but does not remove project shortcuts or filesystem contents.
 - `src/layout_badge.rs`: shared animated Layout-mode icons and pane overlays.
 - `src/theme.rs`: bounded Omarchy palette loading, semantic application and
   terminal colors, built-in fallback, and the current-theme filesystem watcher.
+- `src/theme_picker.rs`: bundled palettes, System/preset selection, and an isolated
+  preview dialog; palette data and attribution live in `desktop/assets/`.
 
 ## Threading And Backpressure
 
@@ -191,6 +193,15 @@ a bounded `colors.toml` read runs on the background executor. GPUI installs the
 result through atomic semantic color slots and notifies once. Each terminal
 worker receives only its latest pending palette through its existing bounded
 command path and republishes a screen without reconnecting the Boomux Shell.
+
+Desktop stores a stable `color_theme` ID in its local preferences, defaulting to
+`system`. System uses the latest valid Omarchy palette, with an OS light/dark
+fallback when unavailable. A preset overrides System; watcher results still
+refresh the cached System palette without applying it. Returning to System uses
+that cache immediately. A failed reload retains the last valid palette. The
+picker keeps its candidate separate from the applied preference, so preview and
+Cancel never reconfigure terminals. Apply uses the same bounded terminal update
+path as a System theme change.
 
 ## Rendering
 
