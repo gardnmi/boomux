@@ -334,7 +334,7 @@ not also invoke a harness's mouse-based copy handler.
 ### Themes And Saved Preferences
 
 Choose **Settings → Appearance → Color theme** to preview and apply one of 23
-bundled palettes. The default carousel shows overlapping workspace previews:
+bundled palettes. The default carousel shows large, overlapping parallelogram previews:
 scroll, use the arrow buttons/keys, or click a neighboring card to browse. Click
 the center card or **Apply** to select it; Escape cancels. **List view** provides
 the compact palette list.
@@ -342,7 +342,7 @@ the compact palette list.
 Selecting a palette only changes the preview. Applying it closes Settings and
 reveals the new colors from the center of the window outward, over the previous
 theme. Content stays stationary throughout the wipe; Shells keep running and
-pane sizes and saved layouts stay intact. The native wipe has straight edges
+pane sizes and saved layouts stay intact. The wipe opens along angled `\` edges
 and uses the web picker’s easing curve.
 The transition and carousel motion follow the **Motion** preference; **Instant**
 applies colors immediately.

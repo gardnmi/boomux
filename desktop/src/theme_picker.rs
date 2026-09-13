@@ -270,6 +270,7 @@ impl Workspace {
                     RevealClip {
                         child: current,
                         progress: 0.0,
+                        card: false,
                     }
                     .with_animation(
                         SharedString::from(format!("theme-reveal-{generation}")),
@@ -325,6 +326,7 @@ impl Workspace {
         div()
             .size_full()
             .overflow_hidden()
+            .px(relative(0.075))
             .flex()
             .flex_col()
             .bg(gpui::rgb(palette.canvas))
@@ -408,7 +410,6 @@ impl Workspace {
         let cards = [-1_isize, 1, 0].map(|offset| {
             let index = carousel_index(selected, offset);
             let center = offset == 0;
-            let palette = self.candidate_theme(index);
             let name = if index == 0 {
                 "System"
             } else {
@@ -418,19 +419,15 @@ impl Workspace {
                 .id(SharedString::from(format!("theme-card-{offset}")))
                 .absolute()
                 .left(relative(match offset {
-                    -1 => 0.0,
-                    1 => 0.46,
-                    _ => 0.23,
+                    -1 => -0.12,
+                    1 => 0.42,
+                    _ => 0.15,
                 }))
                 .top(relative(if center { 0.02 } else { 0.14 }))
-                .w(relative(0.54))
+                .w(relative(0.70))
                 .h(relative(if center { 0.96 } else { 0.72 }))
                 .occlude()
                 .overflow_hidden()
-                .rounded(px(4.0))
-                .border_1()
-                .border_color(gpui::rgb(palette.accent))
-                .shadow_lg()
                 .opacity(if center { 1.0 } else { 0.48 })
                 .hover(|card| card.opacity(1.0))
                 .cursor_pointer()
@@ -447,7 +444,11 @@ impl Workspace {
                         this.step_theme(offset, cx);
                     }
                 }))
-                .child(self.theme_card(index))
+                .child(RevealClip {
+                    child: self.theme_card(index).into_any_element(),
+                    progress: 1.0,
+                    card: true,
+                })
         });
         let deck = div().relative().size_full().children(cards);
         let deck = if let Some(duration) = self.motion_speed.duration() {
@@ -485,6 +486,9 @@ impl Workspace {
                     .gap_2()
                     .child(
                         Self::settings_control("theme-previous", "‹", false, true)
+                            .flex_none()
+                            .w(px(42.0))
+                            .h(px(42.0))
                             .button_chrome()
                             .on_click(cx.listener(|this, _, _, cx| this.step_theme(-1, cx))),
                     )
@@ -520,6 +524,9 @@ impl Workspace {
                     )
                     .child(
                         Self::settings_control("theme-next", "›", false, true)
+                            .flex_none()
+                            .w(px(42.0))
+                            .h(px(42.0))
                             .button_chrome()
                             .on_click(cx.listener(|this, _, _, cx| this.step_theme(1, cx))),
                     ),
@@ -695,9 +702,9 @@ impl Workspace {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     div()
-                        .w(px(if self.theme_carousel { 1040.0 } else { 680.0 }))
+                        .w(px(if self.theme_carousel { 1180.0 } else { 680.0 }))
                         .max_w_full()
-                        .h(px(if self.theme_carousel { 580.0 } else { 490.0 }))
+                        .h(px(if self.theme_carousel { 640.0 } else { 490.0 }))
                         .max_h_full()
                         .m_3()
                         .p_4()
@@ -726,6 +733,8 @@ impl Workspace {
                                         false,
                                         true,
                                     )
+                                    .flex_none()
+                                    .w(px(110.0))
                                     .button_chrome()
                                     .on_click(cx.listener(
                                         |this, _, _, cx| {
@@ -770,6 +779,8 @@ impl Workspace {
                                 .gap_2()
                                 .child(
                                     Self::settings_control("cancel-theme", "Cancel", false, true)
+                                        .flex_none()
+                                        .w(px(110.0))
                                         .button_chrome()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             cx.stop_propagation();
@@ -779,6 +790,8 @@ impl Workspace {
                                 )
                                 .child(
                                     Self::settings_control("apply-theme", "Apply", true, true)
+                                        .flex_none()
+                                        .w(px(110.0))
                                         .button_chrome()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             cx.stop_propagation();
@@ -815,13 +828,14 @@ fn web_reveal_easing(progress: f32) -> f32 {
 }
 
 fn reveal_edges(progress: f32) -> (f32, f32) {
-    let half = progress.clamp(0.0, 1.0) * 0.5;
+    let half = progress.clamp(0.0, 1.0) * 0.58;
     (0.5 - half, 0.5 + half)
 }
 
 struct RevealClip {
     child: gpui::AnyElement,
     progress: f32,
+    card: bool,
 }
 
 impl IntoElement for RevealClip {
@@ -870,14 +884,19 @@ impl gpui::Element for RevealClip {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (left, right) = reveal_edges(self.progress);
-        let mask = gpui::ContentMask {
-            bounds: Bounds::new(
-                point(bounds.left() + bounds.size.width * left, bounds.top()),
-                size(bounds.size.width * (right - left), bounds.size.height),
-            ),
+        let (left, right, slant) = if self.card {
+            (0.07, 0.93, 0.14)
+        } else {
+            let (left, right) = reveal_edges(self.progress);
+            (left, right, 0.16)
         };
-        window.with_content_mask(Some(mask), |window| self.child.paint(window, cx));
+        window.with_slanted_content_mask(
+            bounds,
+            bounds.left() + bounds.size.width * left,
+            bounds.left() + bounds.size.width * right,
+            bounds.size.width * slant,
+            |window| self.child.paint(window, cx),
+        );
     }
 }
 
@@ -898,8 +917,9 @@ mod tests {
     #[test]
     fn reveal_mask_expands_continuously_without_moving_content() {
         assert_eq!(reveal_edges(0.0), (0.5, 0.5));
-        assert_eq!(reveal_edges(0.5), (0.25, 0.75));
-        assert_eq!(reveal_edges(1.0), (0.0, 1.0));
+        let (left, right) = reveal_edges(1.0);
+        assert!(left + 0.08 <= 0.00001);
+        assert!(right - 0.08 >= 0.99999);
     }
 
     #[test]
@@ -952,3 +972,8 @@ mod tests {
         assert_ne!(system_fallback(true), system_fallback(false));
     }
 }
+
+// Exercise the vendored mask implementation in normal Desktop CI as well.
+#[cfg(test)]
+#[path = "../../vendor/gpui-ce/src/slanted_mask.rs"]
+mod slanted_mask_geometry;
