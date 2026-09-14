@@ -320,6 +320,7 @@ enum ResourceAction {
         workspace: bool,
     },
     CreateWorkspace {
+        #[serde(default)]
         name: String,
         cwd: Option<PathBuf>,
         owner: Option<String>,
@@ -615,8 +616,8 @@ async fn resource_action(
                 name,
                 workspace,
             } => {
-                if name.trim().is_empty() || name.len() > 256 {
-                    return Err("Use a name between 1 and 256 bytes".into());
+                if name.len() > 256 {
+                    return Err("Use a name of at most 256 bytes".into());
                 }
                 if remote::identity(&id).is_some() {
                     remote::rename(&app.client, &id, &name, workspace)?;
@@ -645,9 +646,20 @@ async fn resource_action(
                 Ok(json!({"ok":true}))
             }
             ResourceAction::CreateWorkspace { name, cwd, owner } => {
-                if name.trim().is_empty() || name.len() > 256 {
-                    return Err("Use a name between 1 and 256 bytes".into());
+                if name.len() > 256 {
+                    return Err("Use a name of at most 256 bytes".into());
                 }
+                let name = if name.trim().is_empty() {
+                    let names: Vec<String> = if let Some(owner) = owner.as_ref().filter(|owner| *owner != &app.node_id) {
+                        app.client.combined_node_snapshot(None).map_err(|e| e.to_string())?.nodes.into_iter()
+                            .filter(|node| &node.node_id == owner)
+                            .filter_map(|node| node.remote_projection)
+                            .flat_map(|projection| projection.workspaces.into_iter().map(|workspace| workspace.name)).collect()
+                    } else {
+                        app.client.snapshot().map_err(|e| e.to_string())?.workspaces.into_iter().map(|workspace| workspace.name).collect()
+                    };
+                    boomux::generated_names::random_excluding(names.iter().map(String::as_str)).ok_or("Workspace names exhausted")?
+                } else { name };
                 if let Some(owner) = owner.filter(|owner| owner != &app.node_id) {
                     let shell = remote::create_workspace(&app.client, &owner, &name)?;
                     Ok(json!({"workspace_id":shell.workspace_id}))
@@ -732,11 +744,13 @@ fn profile(rows: u16, cols: u16) -> TerminalProfile {
         pixel_height: 0,
     }
 }
-fn shell_spec(cwd: PathBuf) -> ShellSpec {
-    ShellSpec::login(
-        format!("web-{}", &uuid::Uuid::new_v4().to_string()[..8]),
-        cwd,
-    )
+fn shell_spec<'a>(
+    cwd: PathBuf,
+    unavailable: impl IntoIterator<Item = &'a str>,
+) -> Result<ShellSpec, String> {
+    let name =
+        boomux::generated_names::random_excluding(unavailable).ok_or("Shell names exhausted")?;
+    Ok(ShellSpec::login(name, cwd))
 }
 
 async fn create_shell(State(app): State<App>, Json(request): Json<CreateShell>) -> ApiResult {
@@ -779,9 +793,12 @@ async fn create_shell(State(app): State<App>, Json(request): Json<CreateShell>) 
             .client
             .create_started_shell(
                 &workspace.id,
-                shell_spec(workspace.default_cwd.unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-                })),
+                shell_spec(
+                    workspace.default_cwd.unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+                    }),
+                    workspace.shells.iter().map(|shell| shell.name.as_str()),
+                )?,
                 profile(24, 80),
             )
             .map_err(|e| e.to_string())?;
@@ -1054,7 +1071,7 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
                 let workspace = client.create_workspace_with_default_cwd(
                     "WebGPU playground",
                     Some(root.clone()),
-                    vec![shell_spec(root.clone())],
+                    vec![shell_spec(root.clone(), [])?],
                 )?;
                 std::fs::create_dir_all(manifest.parent().unwrap())?;
                 let temporary = manifest.with_extension("tmp");
@@ -1206,7 +1223,14 @@ mod tests {
     #[test]
     fn web_shell_uses_owner_default_startup() {
         let cwd = PathBuf::from("/workspace with spaces");
-        let spec = shell_spec(cwd.clone());
+        let spec = shell_spec(cwd.clone(), ["gentle-whale"]).unwrap();
+        assert_ne!(spec.name, "gentle-whale");
+        assert_eq!(spec.name.split('-').count(), 2);
+        assert!(
+            spec.name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '-')
+        );
         assert_eq!(spec.command, ShellSpec::login("desktop", &cwd).command);
         assert!(spec.command.is_empty());
         assert_eq!(spec.cwd, cwd);
