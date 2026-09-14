@@ -10,7 +10,7 @@ try{
  await page.route('**/api/attach',r=>r.fulfill({json:{token:'fixture'}}));
  await page.routeWebSocket('**/pty',ws=>{ws.send(JSON.stringify({type:'attached'}));ws.send(Buffer.from('same session'));});
  const ready=count=>page.waitForFunction(n=>document.querySelectorAll('#panes .pane-body[data-connected="true"]').length===n,count);
- const pref=async(key,value)=>{await page.locator('#settings').evaluate(el=>el.open=true);await page.locator(`[data-preference="${key}"][data-value="${value}"]`).click();};
+ const pref=async(key,value)=>{await page.locator('#settings').evaluate(el=>el.open=true);await page.locator(`[data-preference="${key}"][data-value="${value}"]`).click();await page.getByRole("button",{name:"Close Settings",exact:true}).click();};
  await page.goto((process.env.POC_URL||'http://127.0.0.1:4389')+'/?fallback');await ready(2);
  assert.ok(await page.evaluate(()=>document.fonts.check('13px "Boomux Terminal"')),'bundled terminal font loaded');
  await pref('scope','mixed');await page.locator('[data-workspace-id="w1"] .workspace-button').click();await ready(4);
