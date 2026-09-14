@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.5](https://github.com/gardnmi/boomux/compare/v1.21.4...v1.21.5) (2026-09-14)
+
+
+### Bug Fixes
+
+* **web:** take control without a second confirmation ([#446](https://github.com/gardnmi/boomux/issues/446)) ([5ff95e6](https://github.com/gardnmi/boomux/commit/5ff95e6907122fdcf6dda3d3b027b29f34b332ad))
+
 ## [1.21.4](https://github.com/gardnmi/boomux/compare/v1.21.3...v1.21.4) (2026-09-14)
 
 
