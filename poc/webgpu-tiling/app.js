@@ -663,8 +663,8 @@ function connectPane(id,p,takeover=false){
       if(code==='busy'){
         panel.classList.add('attachment-control');
         p.el.querySelector('.terminal-status').textContent='Controlled elsewhere';
-        const button=document.createElement('button');button.textContent='Take control';button.onclick=async()=>{
-          if(await confirmAction('Take control','Its current terminal controller will be detached.'))connectPane(id,p,true);
+        const button=document.createElement('button');button.textContent='Take control';button.onclick=()=>{
+          connectPane(id,p,true);
         };panel.append(button);
       }
       p.el.querySelector('.pane-body').append(panel);
