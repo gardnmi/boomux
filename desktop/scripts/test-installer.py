@@ -72,6 +72,7 @@ else:
             "bin/boomux-desktop": (ROOT / "packaging/boomux-desktop").read_bytes(),
             "bin/boomux": f'#!/bin/sh\n[ "$1" != --version ] || {{ echo "boomux {version[1:]}"; exit; }}\nprintf "boomux:%s\\n" "$*" >> "$TRACE"\n'.encode(),
             "libexec/boomux-desktop": f'#!/bin/sh\n[ "$1" != --version ] || {{ echo "boomux-desktop {version[1:]}"; exit; }}\nif [ "$1" = --check-runtime ]; then [ -z "$MOCK_MISSING_LIBRARY" ] || {{ echo "Missing graphics libraries: $MOCK_MISSING_LIBRARY" >&2; exit 1; }}; exit 0; fi\nprintf "desktop:{version}:%s\\n" "$*" >> "$TRACE"\ncommand -v boomux >> "$TRACE"\n'.encode(),
+            "libexec/webgpu_gateway": b'#!/bin/sh\n[ "$1" = --check-assets ]\n',
             "THIRD_PARTY_NOTICES.md": b"fixture notices",
             "LICENSE": b"fixture",
             "LICENSE.boomux": b"fixture",
@@ -104,7 +105,9 @@ else:
         self.assertEqual(trace[:2], ["boomux:daemon start", "desktop:v0.1.0:argument with spaces"])
         self.assertEqual(trace[2], str(first / "bin/boomux"))
         self.assertEqual((self.bin / "boomux").resolve(), first / "bin/boomux")
+        (first / "libexec/webgpu_gateway").unlink()
         self.run_installer()
+        self.assertTrue((first / "libexec/webgpu_gateway").is_file())
         self.assertEqual((self.install / "current").resolve(), first)
         self.assertFalse(list(self.install.glob(".install.*")))
         entry = Path(self.env["XDG_DATA_HOME"]) / "applications/org.omarchy.boomux-desktop.desktop"
@@ -185,6 +188,7 @@ else:
         self.assertEqual((self.install / "current").resolve(), previous)
         self.assertNotEqual((self.install / "pending").resolve(), previous)
         self.assertTrue((self.install / "pending/THIRD_PARTY_NOTICES.md").is_file())
+        self.assertTrue((self.install / "pending/libexec/webgpu_gateway").is_file())
         self.assertFalse(Path(self.env["TRACE"]).exists())
 
     def test_runtime_failure_preserves_active_release(self):
