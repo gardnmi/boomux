@@ -231,7 +231,7 @@ function resourceDialog(title,fields,submit){
   const dialog=document.createElement('dialog');dialog.className='resource-dialog';
   const heading=document.createElement('h2');heading.textContent=title;dialog.append(heading);
   const form=document.createElement('form');const inputs={};
-  for(const [key,label,value]of fields){const row=document.createElement('label');row.textContent=label;const input=document.createElement('input');input.value=value||'';input.required=true;input.maxLength=key==='cwd'?4096:256;inputs[key]=input;row.append(input);form.append(row);}
+  for(const [key,label,value,optional]of fields){const row=document.createElement('label');row.textContent=label;const input=document.createElement('input');input.value=value||'';input.required=!optional;if(optional)input.placeholder='Automatic name';input.maxLength=key==='cwd'?4096:256;inputs[key]=input;row.append(input);form.append(row);}
   const error=document.createElement('p');error.role='alert';const buttons=document.createElement('div');
   const cancel=document.createElement('button');cancel.type='button';cancel.textContent='Cancel';cancel.onclick=()=>dialog.close();
   const accept=document.createElement('button');accept.textContent=title;accept.className='primary';buttons.append(cancel,accept);form.append(error,buttons);dialog.append(form);document.body.append(dialog);
@@ -250,7 +250,7 @@ function renameSelected(){
   if(row){const workspace=daemon?.snapshot.workspaces.find(w=>w.id===row.dataset.workspaceId);const shellButton=document.activeElement?.closest('.shell-row');if(shellButton){const id=shellButton.querySelector('.shell-button')?.dataset.shellId;renameResource(workspace.shells.find(s=>s.id===id));}else renameResource(workspace,true);}
   else renameResource(panes.get(active)?.shell);
 }
-function newWorkspace(owner){resourceDialog('New Workspace',owner?[['name','Name','']]:[['name','Name',''],['cwd','Directory',currentWorkspace()?.default_cwd||currentWorkspace()?.shells[0]?.cwd||'/tmp']],async values=>{
+function newWorkspace(owner){resourceDialog('New Workspace',owner?[['name','Name (optional)','',true]]:[['name','Name (optional)','',true],['cwd','Directory',currentWorkspace()?.default_cwd||currentWorkspace()?.shells[0]?.cwd||'/tmp']],async values=>{
   const result=await resource({action:'create_workspace',...values,...(owner?{owner}:{})});await refreshDaemon();selectWorkspace(result.workspace_id);if(!currentWorkspace()?.shells.length)await createDaemonShell(result.workspace_id);
 });}
 function removeWorkspace(workspace){resourceDialog('Remove Workspace',[],async()=>{
