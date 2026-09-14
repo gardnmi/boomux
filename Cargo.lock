@@ -804,6 +804,7 @@ dependencies = [
  "clap",
  "criterion",
  "crossterm",
+ "fastrand",
  "futures-util",
  "gungraun",
  "libc",

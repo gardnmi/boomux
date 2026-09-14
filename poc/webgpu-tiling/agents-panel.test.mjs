@@ -1,0 +1,30 @@
+import assert from 'node:assert/strict';
+const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
+const browser=await chromium.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox','--disable-gpu']});
+try{
+ const page=await browser.newPage({viewport:{width:1200,height:900}}),errors=[],requests=[];let reject=true;
+ page.on('pageerror',e=>errors.push(e.message));
+ const shells=['fair-jay','gentle-whale','hazy-spruce'].map((name,i)=>({id:`s${i}`,name,cwd:'/tmp',status:'running',run:{id:`r${i}`}}));
+ const agents=shells.map((s,i)=>({id:`a${i}`,shell_id:s.id,run_id:s.run.id,name:'Codex',integration:'codex',observation:{state:i===0?'working':'idle',revision:i+1,observed_at_ms:Date.now()-180000}}));
+ agents[2].attention={reason:'completed',observation:{revision:42,observed_at_ms:Date.now()-120000}};
+ const info={node_id:'local',workspace_id:'w',nodes:[],snapshot:{workspaces:[{id:'w',name:'boomux',shells,agents}]}};
+ await page.route('**/api/snapshot',r=>r.fulfill({json:info}));
+ await page.route('**/api/changes',r=>r.fulfill({status:404}));
+ await page.route('**/api/attach',r=>r.fulfill({status:409,json:{error:'fixture'}}));
+ await page.route('**/api/resource',r=>{requests.push(r.request().postDataJSON());if(reject)return r.fulfill({status:409,json:{error:'Stale revision'}});agents[2].attention=null;return r.fulfill({json:{ok:true}});});
+ await page.goto(process.env.POC_URL||'http://127.0.0.1:4390');await page.waitForSelector('.agent-row');
+ const row=i=>page.locator(`[data-agent-id="a${i}"]`);
+ assert.equal(await row(0).locator('strong').textContent(),'fair-jay');
+ assert.equal(await row(0).locator('.agent-detail').textContent(),'working · boomux · codex');
+ assert.equal(await row(1).getByText('Dismiss',{exact:true}).count(),0,'initial idle is not finished');
+ assert.equal(await row(2).locator('.agent-detail').textContent(),'finished · boomux · codex');
+ assert.equal(await row(2).locator('.agent-age').textContent(),'2m');
+ agents[0].observation.state='idle';await page.locator('#activity-refresh').click();await page.waitForFunction(()=>document.querySelector('[data-agent-id="a0"] .agent-detail').textContent.startsWith('finished'));
+ await row(0).getByRole('button',{name:'Dismiss',exact:true}).click();assert.equal(await row(0).locator('.agent-detail').textContent(),'idle · boomux · codex');assert.equal(requests.length,0,'ephemeral completion dismiss stays local');
+ await row(2).getByRole('button',{name:'Dismiss',exact:true}).click();await page.waitForFunction(()=>document.querySelector('#gateway-status').textContent.includes('Stale revision'));
+ assert.equal(await row(2).locator('.agent-detail').textContent(),'finished · boomux · codex');assert.equal(requests[0].operation.revision,42);
+ reject=false;await row(2).getByRole('button',{name:'Dismiss',exact:true}).click();await page.waitForFunction(()=>document.querySelector('[data-agent-id="a2"] .agent-detail').textContent.startsWith('idle'));
+ agents[1].attention={reason:'blocked',observation:{revision:50,observed_at_ms:Date.now()}};await page.locator('#activity-refresh').click();await page.waitForFunction(()=>document.querySelector('[data-agent-id="a1"] .agent-detail').textContent.startsWith('blocked'));
+ assert.equal(await row(1).locator('.agent-state-icon').textContent(),'!');
+ assert.deepEqual(errors,[]);await page.screenshot({path:'/tmp/boomux-agent-panel.png'});console.log('Shell names, timestamps, completed/blocked attention, observed finish, and revision-safe dismissal passed');
+}finally{await browser.close();}

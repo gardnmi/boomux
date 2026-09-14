@@ -413,10 +413,10 @@ impl SharedTerminal {
             return;
         }
         *self.writer.lock().unwrap() = None;
-        // Transport closure still drains queued output and publishes the final
-        // screen. Disconnecting the sender does not require queue capacity.
-        self.emulator.lock().unwrap().take();
+        // Publish control loss before the worker finishes draining queued output.
         self.replace_status(status);
+        // Dropping the sender preserves queued output without requiring capacity.
+        self.emulator.lock().unwrap().take();
     }
 }
 
@@ -4333,6 +4333,32 @@ mod tests {
         let screen = shared.screen.lock().unwrap();
         let text: String = screen.cells.iter().map(|cell| cell.text.as_str()).collect();
         assert!(text.contains("Setup completed successfully."), "{text}");
+    }
+
+    #[test]
+    fn detachment_is_published_before_a_full_emulator_queue_drains() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(6, 80, 800, 120)));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(EmulatorCommand::Output(b"queued".to_vec()))
+            .unwrap();
+        shared.install_emulator(sender);
+        let closing = Arc::clone(&shared);
+        let thread = std::thread::spawn(move || closing.close("detached"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while shared.update_events.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let notified = shared.update_events.try_recv().is_ok();
+        let status = shared.status.lock().unwrap().clone();
+        // Release the blocked sender even if an assertion would fail.
+        drop(receiver);
+        thread.join().unwrap();
+        assert!(
+            notified,
+            "control loss must wake the view before draining output"
+        );
+        assert_eq!(status, "detached");
     }
 
     #[test]

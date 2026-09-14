@@ -39,6 +39,8 @@ unicode-width = "0.2"
 vt100 = "=0.16.2"
 
 [dev-dependencies]
+# The web gateway shares Desktop remote routing fixtures.
+fastrand = "=2.5.0"
 criterion = "0.8.2"
 gungraun = "0.19.4"
 tungstenite = "0.29"

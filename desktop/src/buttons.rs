@@ -107,6 +107,53 @@ impl ButtonChrome for Stateful<Div> {
     }
 }
 
+/// Small line icons avoid platform-dependent symbol fonts in pane headings.
+pub fn pane_icon(kind: &'static str) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let lines: &[&[(f32, f32)]] = match kind {
+                "rename" => &[
+                    &[
+                        (3., 10.),
+                        (10., 3.),
+                        (13., 6.),
+                        (6., 13.),
+                        (3., 13.),
+                        (3., 10.),
+                    ],
+                    &[(8., 5.), (11., 8.)],
+                ],
+                "float" => &[&[(4., 12.), (12., 4.)], &[(5., 4.), (12., 4.), (12., 11.)]],
+                "dock" => &[&[(12., 4.), (4., 12.)], &[(4., 5.), (4., 12.), (11., 12.)]],
+                "restore" => &[
+                    &[(6., 3.), (13., 3.), (13., 10.)],
+                    &[(3., 6.), (10., 6.), (10., 13.), (3., 13.), (3., 6.)],
+                ],
+                "expand" => &[&[(3., 3.), (13., 3.), (13., 13.), (3., 13.), (3., 3.)]],
+                "minimize" => &[&[(3., 10.), (13., 10.)]],
+                _ => &[&[(4., 4.), (12., 12.)], &[(12., 4.), (4., 12.)]],
+            };
+            let mut path = gpui::PathBuilder::stroke(px(1.5));
+            for line in lines {
+                for (i, &(x, y)) in line.iter().enumerate() {
+                    let p = bounds.origin + point(px(x), px(y));
+                    if i == 0 {
+                        path.move_to(p);
+                    } else {
+                        path.line_to(p);
+                    }
+                }
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, window.text_style().color);
+            }
+        },
+    )
+    .size(px(16.0))
+    .flex_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
