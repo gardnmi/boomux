@@ -459,12 +459,19 @@ needed. Existing handlers and public Funnel listeners are skipped; if all three
 ports are occupied, sharing reports an error without replacing any service. Cleanup
 removes only routes created by this publisher.
 
-This currently uses the development tiling gateway, not `boomux web`'s older
-mobile dashboard. Desktop finds `webgpu_gateway` beside its executable or in
-its `examples/` subdirectory. The gateway reads assets from its source checkout;
-keep that checkout and its installed dependencies available. Release bundles
-do not yet package this gateway. Missing binaries/assets produce an error beside
-the button rather than launching a different dashboard.
+Desktop uses the tiling gateway rather than `boomux web`'s older mobile dashboard.
+Release bundles include `webgpu_gateway` beside the Desktop executable, with web
+assets under `share/boomux/webui` on Linux or `Contents/Resources/webui` on macOS.
+Installed gateways resolve assets relative to their executable and never fall back
+to the build machine's checkout. Development gateways in `target/.../examples`
+continue to read the source checkout. Guided setup resolves the matching bundled
+CLI. Packaging checks every runtime asset and runs `--check-assets` before archiving.
+
+Validate relocation without a daemon or Tailscale mutation:
+
+```console
+BOOMUX_WEB_GATEWAY=target/debug/examples/webgpu_gateway python3 desktop/scripts/test-webui-bundle.py
+```
 
 For standalone publishing, run the gateway with `--tailscale`. `--desktop`
 selects existing Workspaces and ties sharing to stdin lifetime; the Desktop

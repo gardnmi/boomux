@@ -479,13 +479,13 @@ under **Remotes → Hidden Workspaces → Show**. Deleting remote Shells still
 requires the owner to be reachable; forgetting a machine's connection removes
 all its entries instead.
 
-### Development web UI sharing
+### Web UI sharing
 
 The sidebar **⋯ → Open WebUI** action starts the tiling web gateway and
 opens its private HTTPS URL. While running, the sidebar footer provides Open, Copy URL, and Stop
 sharing actions. Sharing ends when Desktop closes; managed Shells keep running.
-This development feature requires the matching `webgpu_gateway` example and
-source assets; it is not included in release bundles yet. See the
+Release bundles include the matching web gateway and its runtime assets. No source
+checkout or Bun installation is needed on the user’s machine. For development, see the
 [tiling gateway build and sharing instructions](../poc/webgpu-tiling/README.md#share-the-tiling-ui-from-desktop).
 
 Desktop shows **Open WebUI** in its three-dot menu while stopped. It starts sharing

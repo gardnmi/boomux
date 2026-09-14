@@ -3,6 +3,9 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 
+pub const REPAIR_URL: &str =
+    "https://github.com/gardnmi/boomux/blob/main/desktop/README.md#install-release-builds";
+pub const MISSING_GATEWAY: &str = "This Desktop installation does not include the web gateway. Reinstall or update Desktop to restore the missing component.";
 pub const INSTALL_URL: &str = "https://tailscale.com/download";
 pub const SETUP_URL: &str = "https://tailscale.com/docs/features/tailscale-serve";
 use std::path::PathBuf;
@@ -21,9 +24,7 @@ impl Publisher {
             .parent()
             .ok_or("Desktop executable has no directory")?
             .to_path_buf();
-        let executable = gateway_path(&directory).ok_or(
-            "Build the tiling web gateway beside Desktop: cargo build --locked --example webgpu_gateway",
-        )?;
+        let executable = gateway_path(&directory).ok_or(MISSING_GATEWAY)?;
         let tailscale_available = std::env::var_os("PATH").is_some_and(|paths| {
             std::env::split_paths(&paths).any(|directory| {
                 std::fs::metadata(directory.join("tailscale")).is_ok_and(|metadata| {

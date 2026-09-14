@@ -7389,24 +7389,37 @@ impl Workspace {
                             .text_color(rgb(0xf38ba8))
                             .child(error.clone()),
                     )
-                    .child(
-                        sidebar_menu_row("web-ui-install-help")
-                            .child("Install Tailscale ↗")
-                            .text_xs()
-                            .button_chrome()
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.open_url(web_share::INSTALL_URL);
-                            })),
-                    )
+                    .when(error != web_share::MISSING_GATEWAY, |section| {
+                        section.child(
+                            sidebar_menu_row("web-ui-install-help")
+                                .child("Install Tailscale ↗")
+                                .text_xs()
+                                .button_chrome()
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.open_url(web_share::INSTALL_URL);
+                                })),
+                        )
+                    })
                     .child(
                         sidebar_menu_row("web-ui-setup-help")
-                            .child("Set up Tailscale ↗")
+                            .child(if error == web_share::MISSING_GATEWAY {
+                                "Repair Desktop installation ↗"
+                            } else {
+                                "Set up Tailscale ↗"
+                            })
                             .text_xs()
                             .button_chrome()
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.open_url(web_share::SETUP_URL);
+                            .on_click(cx.listener({
+                                let missing_gateway = error == web_share::MISSING_GATEWAY;
+                                move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.open_url(if missing_gateway {
+                                        web_share::REPAIR_URL
+                                    } else {
+                                        web_share::SETUP_URL
+                                    });
+                                }
                             })),
                     )
             })

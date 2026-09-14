@@ -511,12 +511,16 @@ async fn resource_action(
                 let executable = std::env::current_exe().map_err(|e| e.to_string())?;
                 let cli = executable
                     .parent()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.join("boomux"))
-                    .filter(|p| p.is_file())
-                    .ok_or(
-                        "Matching Boomux CLI is unavailable; build the CLI beside this gateway",
-                    )?;
+                    .and_then(|directory| {
+                        [
+                            directory.join("boomux"),
+                            directory.join("../bin/boomux"),
+                            directory.join("../boomux"),
+                        ]
+                        .into_iter()
+                        .find(|path| path.is_file())
+                    })
+                    .ok_or("Matching Boomux CLI is missing from this installation")?;
                 let mut command = vec![cli.to_str().ok_or("CLI path is not UTF-8")?.to_string()];
                 command.extend(guided_arguments(&workflow, owner.as_deref())?);
                 if let Some(receiver) = &receiver {
@@ -755,7 +759,9 @@ async fn create_shell(State(app): State<App>, Json(request): Json<CreateShell>) 
             .client
             .create_started_shell(
                 &workspace.id,
-                shell_spec(workspace.default_cwd.unwrap_or_else(|| app.root.clone())),
+                shell_spec(workspace.default_cwd.unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+                })),
                 profile(24, 80),
             )
             .map_err(|e| e.to_string())?;
@@ -941,7 +947,50 @@ async fn main() {
         std::process::exit(1);
     }
 }
+fn asset_root() -> PathBuf {
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        // Installed gateways must never fall back to a build machine's checkout.
+        if directory.file_name().is_some_and(|name| name == "libexec") {
+            return directory.join("../share/boomux/webui");
+        }
+        if directory.file_name().is_some_and(|name| name == "MacOS") {
+            return directory.join("../Resources/webui");
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn validate_assets(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    for path in [
+        "poc/webgpu-tiling/index.html",
+        "poc/webgpu-tiling/app.js",
+        "poc/webgpu-tiling/desktop-panels.js",
+        "poc/webgpu-tiling/themes.js",
+        "poc/webgpu-tiling/terminal.js",
+        "poc/webgpu-tiling/renderer.js",
+        "poc/webgpu-tiling/layout.js",
+        "poc/webgpu-tiling/style.css",
+        "node_modules/ghostty-web/dist/ghostty-web.js",
+        "node_modules/ghostty-web/ghostty-vt.wasm",
+        "poc/webgpu-tiling/fonts/jetbrains-mono-nerd.woff2",
+        "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2",
+    ] {
+        if !root.join(path).is_file() {
+            return Err(format!("Missing web UI asset: {}", root.join(path).display()).into());
+        }
+    }
+    Ok(())
+}
+
 async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
+    let root = asset_root();
+    if std::env::args().any(|arg| arg == "--check-assets") {
+        validate_assets(&root)?;
+        println!("Web UI assets ready: {}", root.display());
+        return Ok(());
+    }
     let desktop = std::env::args().any(|arg| arg == "--desktop");
     let tailscale = std::env::args().any(|arg| arg == "--tailscale");
     let (closed, lifetime) = tokio::sync::oneshot::channel();
@@ -952,7 +1001,6 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
             let _ = closed.send(());
         });
     }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let client = client::connect_if_running()?
         .ok_or("Start the selected Boomux daemon before running the gateway")?;
     if !client.supports(ProtocolFeature::CreateStartedShell)? {
@@ -1004,19 +1052,7 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
     let origin = format!("http://{host}");
     // Bind before mutating Serve: a second publisher cannot clean up the live route.
     let listener = tokio::net::TcpListener::bind(&host).await?;
-    for asset in [
-        "poc/webgpu-tiling/index.html",
-        "node_modules/ghostty-web/ghostty-vt.wasm",
-        "node_modules/ghostty-web/dist/ghostty-web.js",
-    ] {
-        if !root.join(asset).is_file() {
-            return Err(format!(
-                "Web UI assets missing: {asset}; run bun install --frozen-lockfile in {}",
-                root.display()
-            )
-            .into());
-        }
-    }
+    validate_assets(&root)?;
     let exposure = if tailscale {
         Some(tailscale_serve::Exposure::enable_tiling(port)?)
     } else {
