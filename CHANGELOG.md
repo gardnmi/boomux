@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.21.2](https://github.com/gardnmi/boomux/compare/v1.21.1...v1.21.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* **installer:** extract and validate bundled web gateway ([#439](https://github.com/gardnmi/boomux/issues/439)) ([d9462b5](https://github.com/gardnmi/boomux/commit/d9462b57a3ca218154ddc60b6c0c0dd6e67cdf64))
+* **web:** surface sidebar menus and clean up completed setup workspaces ([#440](https://github.com/gardnmi/boomux/issues/440)) ([d352899](https://github.com/gardnmi/boomux/commit/d35289966712b7d51c1e74fe20c0e7ad25fb0356))
+
 ## [1.21.1](https://github.com/gardnmi/boomux/compare/v1.21.0...v1.21.1) (2026-09-14)
 
 
