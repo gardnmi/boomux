@@ -509,3 +509,13 @@ and opens the browser; while running, the sidebar footer shows **Open WebUI**, *
 The sharing footer is hidden when WebUI is stopped.
 
 The web Settings sheet follows Desktop’s grouped sidebar layout, switches, segmented choices, and spacing/focus steppers. Browser appearance preferences save automatically in this browser; shared notification, recovery, and project configuration opens Boomux’s validated configuration editor. These shared fields are not yet editable inline in the web Settings sheet.
+
+Workspace and Shell action menus use the browser top layer so row hover clipping
+and the sidebar scroll area cannot hide them. They are positioned within the
+viewport and dismissed with Escape or an outside click.
+
+Guided setup tracks its exact first run and removes an unchanged temporary
+Workspace after that run exits successfully. Failed runs remain for inspection.
+Pending cleanup tokens survive page refresh in session storage; the gateway still
+owns cleanup authority. Old setup-looking Workspaces without a live launch token
+are never adopted for automatic deletion. Exited Shells display their exit status.

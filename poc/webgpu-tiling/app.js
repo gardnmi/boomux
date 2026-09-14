@@ -193,16 +193,18 @@ async function resource(operation){
   const result=await response.json();if(!response.ok)throw Error(result.error||'Operation failed');return result;
 }
 let guidedRunning=false;
-const guidedSetups=new Map();
+const guidedSetups=new Map((()=>{try{return JSON.parse(sessionStorage.getItem('boomux.web.setups')||'[]').slice(0,8).map(([token,launch])=>[token,{...launch,busy:false}]);}catch{return [];}})());
+function saveGuidedSetups(){sessionStorage.setItem('boomux.web.setups',JSON.stringify([...guidedSetups]));}
 async function finishGuidedSetups(){
   if(!daemon||!guidedSetups.size)return;
   for(const [token,launch] of guidedSetups){
-    if(launch.busy||daemon.snapshot.workspaces.some(w=>w.shells.some(s=>s.id===launch.shell)))continue;
+    const shell=daemon.snapshot.workspaces.flatMap(w=>w.shells).find(s=>s.id===launch.shell);
+    if(launch.busy||(shell&&shell.status?.exited?.code!==0))continue;
     launch.busy=true;
     try{
       const result=await resource({action:'finish_setup',token});
       if(result.pending)continue;
-      guidedSetups.delete(token);
+      guidedSetups.delete(token);saveGuidedSetups();
       const navigate=workspaceId===launch.workspace;
       await refreshDaemon();
       if(navigate&&workspaceId===launch.workspace){
@@ -210,13 +212,13 @@ async function finishGuidedSetups(){
         if(daemon.snapshot.workspaces.some(w=>w.id===target)){selectWorkspace(target);if(result.shell)openShell(result.shell);}
       }
       if(result.warning)showError(result.warning);
-    }catch(error){guidedSetups.delete(token);showError(`${error.message}. Open the remote Workspace from the sidebar; do not repeat setup.`);}
+    }catch(error){guidedSetups.delete(token);saveGuidedSetups();showError(`${error.message}. Open the remote Workspace from the sidebar; do not repeat setup.`);}
     finally{launch.busy=false;}
   }
 }
 async function guided(workflow,owner){
   if(guidedRunning)return;guidedRunning=true;
-  try{const previous=workspaceId;const result=await resource({action:'guided',workflow,...(owner?{owner}:{})});if(result.setup_token)guidedSetups.set(result.setup_token,{workspace:result.workspace_id,shell:result.shell.id,previous,busy:false});await refreshDaemon();selectWorkspace(result.workspace_id);await startShell(result.shell);}catch(e){showError(e);}finally{guidedRunning=false;}
+  try{const previous=workspaceId;const result=await resource({action:'guided',workflow,...(owner?{owner}:{})});if(result.setup_token)guidedSetups.set(result.setup_token,{workspace:result.workspace_id,shell:result.shell.id,previous,busy:false});saveGuidedSetups();await refreshDaemon();selectWorkspace(result.workspace_id);await startShell(result.shell);}catch(e){showError(e);}finally{guidedRunning=false;}
 }
 function confirmAction(title,message){return new Promise(resolve=>{
   const dialog=document.createElement('dialog');dialog.className='resource-dialog';
@@ -423,13 +425,36 @@ activityResize.onpointerup=activityResize.onpointercancel=()=>{activityDrag=null
 activityResize.onkeydown=e=>{if(['ArrowUp','ArrowDown'].includes(e.key)){e.preventDefault();activityHeight($('#activity').offsetHeight+(e.key==='ArrowUp'?20:-20));}};
 document.addEventListener('pointerdown',e=>{if(!$('#settings').contains(e.target))$('#settings').open=false;});
 
+function closeSidebarMenus(except=null){
+  for(const menu of document.querySelectorAll('.sidebar-menu[open]'))if(menu!==except){
+    menu.open=false;menu.querySelector('[popover]')?.hidePopover();
+  }
+}
+document.addEventListener('pointerdown',e=>{if(!e.target.closest('.sidebar-menu'))closeSidebarMenus();});
+document.addEventListener('scroll',e=>{if(!e.target.closest?.('.sidebar-menu-items'))for(const menu of document.querySelectorAll('.sidebar-menu[open]'))positionSidebarMenu(menu);},true);
+window.addEventListener('resize',()=>closeSidebarMenus());
+function positionSidebarMenu(menu){
+  const items=menu.querySelector('.sidebar-menu-items');
+    const anchor=menu.querySelector('summary').getBoundingClientRect(),rect=items.getBoundingClientRect();
+    const left=Math.max(8,Math.min(anchor.right-rect.width,innerWidth-rect.width-8));
+    const top=anchor.bottom+rect.height+4<=innerHeight-8?anchor.bottom+4:Math.max(8,anchor.top-rect.height-4);
+    Object.assign(items.style,{left:`${left}px`,top:`${top}px`});
+}
 function sidebarMenu(label,actions){
   const menu=document.createElement('details');menu.className='sidebar-menu';
   const toggle=document.createElement('summary');toggle.textContent='⋮';toggle.setAttribute('aria-label',label);menu.append(toggle);
-  const items=document.createElement('div');items.className='sidebar-menu-items';
-  for(const [name,action]of actions){const button=document.createElement('button');button.textContent=name;button.onclick=()=>{menu.open=false;Promise.resolve().then(action).catch(showError);};items.append(button);}
-  menu.append(items);return menu;
+  const items=document.createElement('div');items.className='sidebar-menu-items';items.setAttribute('popover','manual');
+  for(const [name,action]of actions){const button=document.createElement('button');button.textContent=name;button.onclick=()=>{menu.open=false;items.hidePopover();Promise.resolve().then(action).catch(showError);};items.append(button);}
+  menu.append(items);
+  menu.addEventListener('toggle',()=>{
+    if(!menu.open||!menu.isConnected){items.hidePopover();return;}
+    closeSidebarMenus(menu);
+    items.showPopover();
+    positionSidebarMenu(menu);
+  });
+  return menu;
 }
+
 let workspaceMotion=null;
 function finishWorkspaceMotion(){workspaceMotion?.();workspaceMotion=null;}
 function slideWorkspace(outgoing,direction){
@@ -607,7 +632,7 @@ function syncDaemonSidebar(){
         const entry=[...panes].find(([,p])=>p.shell?.id===shell.id&&p.shell.run?.id===shell.run?.id);
         const row=document.createElement('div');row.className='shell-row'+(entry&&entry[0]===active?' selected':'');
         const item=document.createElement('button');item.className='shell-button';item.dataset.shellId=shell.id;item.disabled=false;item.title=shell.run?shell.cwd||'':'Start Shell';
-        item.innerHTML=`<span class="shell-dot ${shell.status==='running'?'running':'ended'}" aria-hidden="true"></span><span class="sidebar-text"><strong>${escapeHtml(shell.name)}</strong><small>${entry?'open':'detached'} · ${escapeHtml(shell.status)}</small></span>`;
+        item.innerHTML=`<span class="shell-dot ${shell.status==='running'?'running':'ended'}" aria-hidden="true"></span><span class="sidebar-text"><strong>${escapeHtml(shell.name)}</strong><small>${entry?'open':'detached'} · ${escapeHtml(typeof shell.status==='string'?shell.status:`exited${shell.status?.exited?.code!=null?' · '+shell.status.exited.code:''}`)}</small></span>`;
         item.onclick=()=>{selectWorkspace(workspace.id);shell.run?openShell(shell):startShell(shell);};row.append(item);
         const actions=[];
         if(shell.run)actions.push(['Open Shell',()=>{selectWorkspace(workspace.id);openShell(shell);}]);

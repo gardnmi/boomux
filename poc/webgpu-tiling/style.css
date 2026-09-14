@@ -409,3 +409,6 @@ aside,.daemon-mode aside{padding-left:12px;padding-right:12px}
 .pane-controls button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;pointer-events:none}
 .pane-controls button:hover,.pane-controls button[aria-pressed=true]{background:var(--ui-hover);color:var(--ui-fg)}
 .pane-controls button[data-action=close]:hover{background:#89384c;color:#f5e0e6}
+
+/* Top-layer menus escape row hover clipping and the scrollable workspace list. */
+.sidebar-menu-items[popover]{position:fixed;inset:auto;margin:0;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);overflow-y:auto;color:var(--ui-fg)}
