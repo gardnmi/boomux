@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.4](https://github.com/gardnmi/boomux/compare/v1.21.3...v1.21.4) (2026-09-14)
+
+
+### Bug Fixes
+
+* show control loss immediately with matching takeover views ([#444](https://github.com/gardnmi/boomux/issues/444)) ([1738504](https://github.com/gardnmi/boomux/commit/173850479d4be171c370cef8e6670f901619b389))
+
 ## [1.21.3](https://github.com/gardnmi/boomux/compare/v1.21.2...v1.21.3) (2026-09-14)
 
 
