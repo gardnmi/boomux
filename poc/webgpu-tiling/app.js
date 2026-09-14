@@ -661,6 +661,7 @@ function connectPane(id,p,takeover=false){
       const panel=document.createElement('div');panel.className='attachment-error';panel.contentEditable='false';
       const text=document.createElement('p');text.textContent=code==='busy'?'Another terminal controls this Shell. Take control to use it here.':message;panel.append(text);
       if(code==='busy'){
+        panel.classList.add('attachment-control');
         p.el.querySelector('.terminal-status').textContent='Controlled elsewhere';
         const button=document.createElement('button');button.textContent='Take control';button.onclick=async()=>{
           if(await confirmAction('Take control','Its current terminal controller will be detached.'))connectPane(id,p,true);
