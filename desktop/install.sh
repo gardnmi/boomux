@@ -92,11 +92,12 @@ main() {
 
     mkdir "$stage/payload"
     tar -xzf "$stage/$asset" -C "$stage/payload" --no-same-owner --no-same-permissions \
-        bin/boomux bin/boomux-desktop libexec/boomux-desktop LICENSE LICENSE.boomux THIRD_PARTY_NOTICES.md release.txt share
-    for file in bin/boomux bin/boomux-desktop libexec/boomux-desktop; do
+        bin/boomux bin/boomux-desktop libexec/boomux-desktop libexec/webgpu_gateway LICENSE LICENSE.boomux THIRD_PARTY_NOTICES.md release.txt share
+    for file in bin/boomux bin/boomux-desktop libexec/boomux-desktop libexec/webgpu_gateway; do
         [ -f "$stage/payload/$file" ] && [ ! -L "$stage/payload/$file" ] &&
             [ -x "$stage/payload/$file" ] || fail "invalid executable: $file"
     done
+    timeout --kill-after=1s 10s "$stage/payload/libexec/webgpu_gateway" --check-assets || fail 'the bundled web gateway or its assets are incomplete'
     [ -f "$stage/payload/share/applications/$app_id.desktop" ] || fail 'desktop entry missing'
     [ -f "$stage/payload/share/icons/hicolor/scalable/apps/$app_id.svg" ] || fail 'application icon missing'
     actual=$(timeout --kill-after=1s 10s "$stage/payload/bin/boomux" --version) || fail 'the bundled Boomux executable cannot run on this system'
@@ -108,6 +109,10 @@ main() {
     release=$install_dir/releases/$version-$digest
     if [ ! -d "$release" ]; then
         mv "$stage/payload" "$release"
+    elif [ ! -e "$release/libexec/webgpu_gateway" ]; then
+        # Repair installs made by the older extraction list using verified bytes.
+        cp "$stage/payload/libexec/webgpu_gateway" "$release/libexec/.webgpu_gateway.new"
+        mv "$release/libexec/.webgpu_gateway.new" "$release/libexec/webgpu_gateway"
     fi
     if [ "$prepare" = true ]; then
         ln -s "$release" "$stage/pending"
