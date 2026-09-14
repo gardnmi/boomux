@@ -107,36 +107,6 @@ impl ButtonChrome for Stateful<Div> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn hover_transition_is_bounded_reversible_and_respects_disabled_motion() {
-        let start = Instant::now();
-        let duration = Some(Duration::from_millis(160));
-        let mut transition = Transition {
-            from: 0.0,
-            target: 1.0,
-            started: start,
-        };
-        assert_eq!(transition.value(start, duration), 0.0);
-        let middle = transition.value(start + Duration::from_millis(80), duration);
-        assert!(middle > 0.0 && middle < 1.0);
-        transition = Transition {
-            from: middle,
-            target: 0.0,
-            started: start + Duration::from_millis(80),
-        };
-        assert_eq!(transition.value(transition.started, duration), middle);
-        assert_eq!(
-            transition.value(start + Duration::from_secs(1), duration),
-            0.0
-        );
-        transition.target = 1.0;
-        assert_eq!(transition.value(start, None), 1.0);
-    }
-}
-
 /// Small line icons avoid platform-dependent symbol fonts in pane headings.
 pub fn pane_icon(kind: &'static str) -> impl IntoElement {
     canvas(
@@ -182,4 +152,34 @@ pub fn pane_icon(kind: &'static str) -> impl IntoElement {
     )
     .size(px(16.0))
     .flex_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn hover_transition_is_bounded_reversible_and_respects_disabled_motion() {
+        let start = Instant::now();
+        let duration = Some(Duration::from_millis(160));
+        let mut transition = Transition {
+            from: 0.0,
+            target: 1.0,
+            started: start,
+        };
+        assert_eq!(transition.value(start, duration), 0.0);
+        let middle = transition.value(start + Duration::from_millis(80), duration);
+        assert!(middle > 0.0 && middle < 1.0);
+        transition = Transition {
+            from: middle,
+            target: 0.0,
+            started: start + Duration::from_millis(80),
+        };
+        assert_eq!(transition.value(transition.started, duration), middle);
+        assert_eq!(
+            transition.value(start + Duration::from_secs(1), duration),
+            0.0
+        );
+        transition.target = 1.0;
+        assert_eq!(transition.value(start, None), 1.0);
+    }
 }
