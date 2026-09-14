@@ -10027,6 +10027,7 @@ impl Workspace {
                         false,
                         !attaching,
                     )
+                    .flex_none()
                     .button_chrome()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, window, cx| {
