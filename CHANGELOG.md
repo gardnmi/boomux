@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.1](https://github.com/gardnmi/boomux/compare/v1.21.0...v1.21.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* **desktop:** bundle web gateway and runtime assets in releases ([#437](https://github.com/gardnmi/boomux/issues/437)) ([b379ce4](https://github.com/gardnmi/boomux/commit/b379ce44a2fdd5c4a6d48c2a4a8d803dcb22891a))
+
 ## [1.21.0](https://github.com/gardnmi/boomux/compare/v1.20.2...v1.21.0) (2026-09-14)
 
 
