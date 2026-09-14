@@ -462,3 +462,19 @@ works offline, remembers the choice, and leaves remote work running. Restore it
 under **Remotes → Hidden Workspaces → Show**. Deleting remote Shells still
 requires the owner to be reachable; forgetting a machine's connection removes
 all its entries instead.
+
+### Development web UI sharing
+
+The sidebar **⋯ → Open WebUI** action starts the tiling web gateway and
+opens its private HTTPS URL. While running, the sidebar footer provides Open, Copy URL, and Stop
+sharing actions. Sharing ends when Desktop closes; managed Shells keep running.
+This development feature requires the matching `webgpu_gateway` example and
+source assets; it is not included in release bundles yet. See the
+[tiling gateway build and sharing instructions](../poc/webgpu-tiling/README.md#share-the-tiling-ui-from-desktop).
+
+Desktop shows **Open WebUI** in its three-dot menu while stopped. It starts sharing
+and opens the browser; while running, the sidebar footer shows **Open WebUI**, **Copy URL**,
+**Stop sharing**, and the Desktop lifetime note. Setup failures include links to
+[Tailscale installation](https://tailscale.com/download) and its
+[private HTTPS setup guide](https://tailscale.com/docs/features/tailscale-serve).
+The sharing footer is hidden when WebUI is stopped.

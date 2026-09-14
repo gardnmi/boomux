@@ -50,6 +50,7 @@ enum ClientMessage {
 enum ServerMessage<'a> {
     Attached {
         warning: Option<&'a str>,
+        replay_bytes: usize,
         rows: u16,
         cols: u16,
     },
@@ -105,6 +106,7 @@ pub(crate) async fn run(socket: WebSocket, client: Client, grant: Grant) {
             &mut sender,
             ServerMessage::Attached {
                 warning: attachment.warning.as_deref(),
+                replay_bytes: attachment.reconstruction.len(),
                 rows: attachment
                     .profile
                     .as_ref()

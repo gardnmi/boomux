@@ -20,6 +20,7 @@ mod subprocess;
 mod terminal;
 mod theme;
 mod updates;
+mod web_share;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1555,6 +1556,9 @@ fn desktop_window_title(workspace_name: Option<&str>) -> String {
 }
 
 struct Workspace {
+    web_publisher: Option<web_share::Publisher>,
+    web_publish_busy: bool,
+    web_publish_error: Option<String>,
     layout_document: layout_state::Document,
     layout_writer: Option<async_channel::Sender<layout_state::Write>>,
     layout_save_task: Option<gpui::Task<()>>,
@@ -1880,6 +1884,9 @@ impl Workspace {
             prepared_update: None,
             onboarding_complete: saved.onboarding_complete,
             updates_status: None,
+            web_publisher: None,
+            web_publish_busy: false,
+            web_publish_error: None,
             update_task: None,
             dismissed_desktop_update: saved.dismissed_desktop_update,
             dismissed_boomux_update: saved.dismissed_boomux_update,
@@ -1908,6 +1915,12 @@ impl Workspace {
             next_id: 2,
             focus_handle,
         };
+        cx.on_app_quit(|this, _| {
+            // Closing the ownership pipe also works when the app exits abruptly.
+            this.web_publisher.take();
+            async {}
+        })
+        .detach();
         workspace.initialize_layout(window, cx);
         if workspace.layout_document.active.is_empty()
             && let Some(shell) = initial_shell
@@ -7212,6 +7225,150 @@ impl Workspace {
         )
     }
 
+    fn toggle_web_sharing(&mut self, cx: &mut Context<Self>) {
+        if self.web_publish_busy {
+            return;
+        }
+        self.web_publish_busy = true;
+        self.web_publish_error = None;
+        let publisher = self.web_publisher.take();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Some(publisher) = publisher {
+                        publisher.stop().map(|()| None)
+                    } else {
+                        web_share::Publisher::start().map(Some)
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.web_publish_busy = false;
+                match result {
+                    Ok(publisher) => {
+                        if let Some(publisher) = &publisher {
+                            cx.open_url(&publisher.url);
+                        }
+                        this.web_publisher = publisher;
+                    }
+                    Err(error) => this.web_publish_error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn web_sharing_controls(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .flex_none()
+            .when(self.web_publisher.is_some(), |section| section.p_2())
+            .child(
+                sidebar_menu_row("header-web-ui")
+                    .aria_label("Open WebUI")
+                    .when(self.web_publisher.is_some(), |button| {
+                        button
+                            .w_full()
+                            .h(px(32.0))
+                            .px_2()
+                            .justify_center()
+                            .border_1()
+                            .border_color(rgb(0x45475a))
+                            .text_sm()
+                    })
+                    .button_chrome()
+                    .child(if self.web_publish_busy {
+                        "Updating WebUI…"
+                    } else if self.web_publisher.is_some() {
+                        "Open WebUI ↗"
+                    } else {
+                        "Open WebUI"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(publisher) = &this.web_publisher {
+                            cx.open_url(&publisher.url);
+                        } else {
+                            this.toggle_web_sharing(cx);
+                        }
+                    })),
+            )
+            .when_some(self.web_publisher.as_ref(), |section, publisher| {
+                let url = publisher.url.clone();
+                section
+                    .child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                Self::settings_control("web-share-copy", "Copy URL", false, true)
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            url.clone(),
+                                        ));
+                                    })),
+                            )
+                            .child(
+                                Self::settings_control(
+                                    "web-share-stop",
+                                    "Stop sharing",
+                                    false,
+                                    true,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_web_sharing(cx);
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(0xa6adc8))
+                            .child("Private · while Desktop is open"),
+                    )
+            })
+            .when_some(self.web_publish_error.as_ref(), |section, error| {
+                section
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(0xf38ba8))
+                            .child(error.clone()),
+                    )
+                    .child(
+                        sidebar_menu_row("web-ui-install-help")
+                            .child("Install Tailscale ↗")
+                            .text_xs()
+                            .button_chrome()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(web_share::INSTALL_URL);
+                            })),
+                    )
+                    .child(
+                        sidebar_menu_row("web-ui-setup-help")
+                            .child("Set up Tailscale ↗")
+                            .text_xs()
+                            .button_chrome()
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(web_share::SETUP_URL);
+                            })),
+                    )
+            })
+            .into_any_element()
+    }
+
     fn sidebar_header_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         self.sidebar_header_menu_open.then(|| {
             div()
@@ -7229,6 +7386,12 @@ impl Workspace {
                 .border_color(rgb(0x45475a))
                 .bg(rgb(0x1e1e2e))
                 .shadow_lg()
+                .when(self.web_publisher.is_none(), |menu| {
+                    menu.child(self.web_sharing_controls(cx))
+                })
+                .when(self.web_publish_error.is_some(), |menu| {
+                    menu.child(div().mx_2().my_1().h(px(1.0)).bg(rgb(0x313244)))
+                })
                 .child(
                     sidebar_menu_row("header-menu-updates")
                         .child(if self.updates_checking {
@@ -8043,6 +8206,15 @@ impl Workspace {
                                     .children(agent_rows),
                             )
                         }),
+                )
+            })
+            .when(self.web_publisher.is_some(), |sidebar| {
+                sidebar.child(
+                    div()
+                        .flex_none()
+                        .border_t_1()
+                        .border_color(rgb(0x313244))
+                        .child(self.web_sharing_controls(cx)),
                 )
             })
             .when_some(settings_panel, |element, settings| element.child(settings))
@@ -10146,8 +10318,8 @@ impl Workspace {
                                 .child(
                                     div()
                                         .id(("rename-pane", id))
-                                        .w(px(22.0))
-                                        .h(px(22.0))
+                                        .w(px(28.0))
+                                        .h(px(26.0))
                                         .flex_none()
                                         .flex()
                                         .items_center()
@@ -10172,7 +10344,7 @@ impl Workspace {
                                                 cx,
                                             );
                                         }))
-                                        .child("✎"),
+                                        .child(buttons::pane_icon("rename")),
                                 ),
                         )
                         .child(
@@ -10237,8 +10409,6 @@ impl Workspace {
                                         .items_center()
                                         .justify_center()
                                         .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
                                         .text_color(rgb(0xa6adc8))
                                         .cursor_pointer()
                                         .hover(|button| button.bg(rgb(0x45475a)))
@@ -10251,7 +10421,11 @@ impl Workspace {
                                             this.focus_terminal_pane(id, window, cx);
                                             this.toggle_floating(&ToggleFloating, window, cx);
                                         }))
-                                        .child(if floating { "↙" } else { "↗" }),
+                                        .child(buttons::pane_icon(if floating {
+                                            "dock"
+                                        } else {
+                                            "float"
+                                        })),
                                 )
                                 .child(
                                     div()
@@ -10262,8 +10436,6 @@ impl Workspace {
                                         .items_center()
                                         .justify_center()
                                         .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
                                         .text_color(rgb(0xa6adc8))
                                         .cursor_pointer()
                                         .hover(|button| button.bg(rgb(0x45475a)))
@@ -10276,7 +10448,11 @@ impl Workspace {
                                             this.focus_terminal_pane(id, window, cx);
                                             this.toggle_fullscreen(&ToggleFullscreen, window, cx);
                                         }))
-                                        .child(if maximized { "❐" } else { "□" }),
+                                        .child(buttons::pane_icon(if maximized {
+                                            "restore"
+                                        } else {
+                                            "expand"
+                                        })),
                                 )
                                 .child(
                                     div()
@@ -10287,8 +10463,6 @@ impl Workspace {
                                         .items_center()
                                         .justify_center()
                                         .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
                                         .text_color(rgb(0xa6adc8))
                                         .cursor_pointer()
                                         .hover(|button| button.bg(rgb(0x45475a)))
@@ -10300,7 +10474,7 @@ impl Workspace {
                                             cx.stop_propagation();
                                             this.minimize_pane(id, window, cx);
                                         }))
-                                        .child("−"),
+                                        .child(buttons::pane_icon("minimize")),
                                 )
                                 .child(
                                     div()
@@ -10311,8 +10485,6 @@ impl Workspace {
                                         .items_center()
                                         .justify_center()
                                         .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
                                         .text_color(rgb(0xa6adc8))
                                         .cursor_pointer()
                                         .hover(|button| {
@@ -10331,7 +10503,7 @@ impl Workspace {
                                                 cx,
                                             );
                                         }))
-                                        .child("×"),
+                                        .child(buttons::pane_icon("close")),
                                 ),
                         ),
                 )

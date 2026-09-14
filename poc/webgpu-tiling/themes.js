@@ -71,7 +71,8 @@ export const themes=[
       "brightMagenta": "#f5c2e7",
       "cyan": "#94e2d5",
       "brightCyan": "#94e2d5"
-    }
+    },
+    "subtle": "#6c7086"
   },
   {
     "id": "catppuccin-latte",
@@ -107,7 +108,8 @@ export const themes=[
       "brightMagenta": "#ea76cb",
       "cyan": "#179299",
       "brightCyan": "#179299"
-    }
+    },
+    "subtle": "#9ca0b0"
   },
   {
     "id": "ethereal",
@@ -143,7 +145,8 @@ export const themes=[
       "brightMagenta": "#ead7e7",
       "cyan": "#a3bfd1",
       "brightCyan": "#dfeaf0"
-    }
+    },
+    "subtle": "#6d7db6"
   },
   {
     "id": "everforest",
@@ -179,7 +182,8 @@ export const themes=[
       "brightMagenta": "#d699b6",
       "cyan": "#83c092",
       "brightCyan": "#83c092"
-    }
+    },
+    "subtle": "#4f585e"
   },
   {
     "id": "flexoki-light",
@@ -215,7 +219,8 @@ export const themes=[
       "brightMagenta": "#CE5D97",
       "cyan": "#3AA99F",
       "brightCyan": "#3AA99F"
-    }
+    },
+    "subtle": "#878580"
   },
   {
     "id": "gruvbox",
@@ -251,7 +256,8 @@ export const themes=[
       "brightMagenta": "#d3869b",
       "cyan": "#89b482",
       "brightCyan": "#89b482"
-    }
+    },
+    "subtle": "#7c6f64"
   },
   {
     "id": "hackerman",
@@ -287,7 +293,8 @@ export const themes=[
       "brightMagenta": "#cddbf4",
       "cyan": "#7cf8f7",
       "brightCyan": "#d1fffe"
-    }
+    },
+    "subtle": "#6a6e95"
   },
   {
     "id": "kanagawa",
@@ -323,7 +330,8 @@ export const themes=[
       "brightMagenta": "#938aa9",
       "cyan": "#6a9589",
       "brightCyan": "#7aa89f"
-    }
+    },
+    "subtle": "#727169"
   },
   {
     "id": "last-horizon",
@@ -359,7 +367,8 @@ export const themes=[
       "brightMagenta": "#c4d8e2",
       "cyan": "#a5a0b6",
       "brightCyan": "#a5a0b6"
-    }
+    },
+    "subtle": "#584e51"
   },
   {
     "id": "lumon",
@@ -395,7 +404,8 @@ export const themes=[
       "brightMagenta": "#b1d8ee",
       "cyan": "#b4e4f6",
       "brightCyan": "#d1eef8"
-    }
+    },
+    "subtle": "#4d86b0"
   },
   {
     "id": "lupine",
@@ -431,7 +441,8 @@ export const themes=[
       "brightMagenta": "#b363ff",
       "cyan": "#0c67de",
       "brightCyan": "#3986ff"
-    }
+    },
+    "subtle": "#757575"
   },
   {
     "id": "matte-black",
@@ -467,7 +478,8 @@ export const themes=[
       "brightMagenta": "#B91C1C",
       "cyan": "#bebebe",
       "brightCyan": "#eaeaea"
-    }
+    },
+    "subtle": "#555555"
   },
   {
     "id": "miasma",
@@ -503,7 +515,8 @@ export const themes=[
       "brightMagenta": "#bb7744",
       "cyan": "#c9a554",
       "brightCyan": "#c9a554"
-    }
+    },
+    "subtle": "#555555"
   },
   {
     "id": "nord",
@@ -539,7 +552,8 @@ export const themes=[
       "brightMagenta": "#b48ead",
       "cyan": "#88c0d0",
       "brightCyan": "#8fbcbb"
-    }
+    },
+    "subtle": "#667080"
   },
   {
     "id": "osaka-jade",
@@ -575,7 +589,8 @@ export const themes=[
       "brightMagenta": "#75bbb3",
       "cyan": "#2DD5B7",
       "brightCyan": "#8CD3CB"
-    }
+    },
+    "subtle": "#81B8A8"
   },
   {
     "id": "retro-82",
@@ -611,7 +626,8 @@ export const themes=[
       "brightMagenta": "#3f8f8a",
       "cyan": "#8cbfb8",
       "brightCyan": "#8cbfb8"
-    }
+    },
+    "subtle": "#3f8f8a"
   },
   {
     "id": "ristretto",
@@ -647,7 +663,8 @@ export const themes=[
       "brightMagenta": "#bebffd",
       "cyan": "#85dacc",
       "brightCyan": "#9bf1e1"
-    }
+    },
+    "subtle": "#72696a"
   },
   {
     "id": "rose-pine",
@@ -683,7 +700,8 @@ export const themes=[
       "brightMagenta": "#907aa9",
       "cyan": "#d7827e",
       "brightCyan": "#d7827e"
-    }
+    },
+    "subtle": "#9893a5"
   },
   {
     "id": "solitude",
@@ -719,7 +737,8 @@ export const themes=[
       "brightMagenta": "#9a9a9a",
       "cyan": "#707070",
       "brightCyan": "#707070"
-    }
+    },
+    "subtle": "#4b4e55"
   },
   {
     "id": "tokyo-night",
@@ -755,7 +774,8 @@ export const themes=[
       "brightMagenta": "#bb9af7",
       "cyan": "#449dab",
       "brightCyan": "#0db9d7"
-    }
+    },
+    "subtle": "#565f89"
   },
   {
     "id": "vantablack",
@@ -791,7 +811,8 @@ export const themes=[
       "brightMagenta": "#9b9b9b",
       "cyan": "#b0b0b0",
       "brightCyan": "#b0b0b0"
-    }
+    },
+    "subtle": "#505050"
   },
   {
     "id": "white",
@@ -827,7 +848,8 @@ export const themes=[
       "brightMagenta": "#2e2e2e",
       "cyan": "#3e3e3e",
       "brightCyan": "#3e3e3e"
-    }
+    },
+    "subtle": "#c0c0c0"
   }
 ];
 const key='boomux.webgpu.theme';
@@ -840,18 +862,22 @@ function apply(theme,persist=true){
  current=theme;document.documentElement.dataset.theme=theme.id;
  document.documentElement.style.colorScheme=theme.light?'light':'dark';
  for(const k of ['bg','deep','surface','raised','border','fg','muted','accent','selection'])document.documentElement.style.setProperty(`--ui-${k}`,theme[k]);
+ // Desktop distinguishes panel, hover, selected Shell, and secondary text colors.
+ const mix=(a,b,t)=>'#'+[1,3,5].map(i=>Math.round(parseInt(a.slice(i,i+2),16)*(1-t)+parseInt(b.slice(i,i+2),16)*t).toString(16).padStart(2,'0')).join('');
+ const subtle=theme.subtle||theme.terminal.brightBlack||theme.border;
+ for(const [key,value]of Object.entries({hover:theme.raised,soft:mix(theme.bg,theme.fg,.05),'text-secondary':theme.muted,'text-subtle':subtle,'text-muted':mix(theme.muted,subtle,.5)}))document.documentElement.style.setProperty(`--ui-${key}`,value);
+ for(const color of ['green','yellow','red'])document.documentElement.style.setProperty(`--ui-${color}`,theme.terminal[color]||theme.accent);
  if(persist)try{localStorage.setItem(key,theme.id);}catch{}
  window.dispatchEvent(new Event('boomux-theme'));
 }
 apply(current,false);
 export function mountThemePicker(){
  const trigger=document.querySelector('#theme-picker'),dialog=document.querySelector('#theme-dialog');let candidate=current;
- let showcase=false,suppressCardClick=false,changing=false;
- try{showcase=localStorage.getItem('boomux.webgpu.theme-view')==='showcase';}catch{}
- const view=dialog.querySelector('#theme-view'),cards=dialog.querySelector('.showcase-cards');
+ let suppressCardClick=false,changing=false;
+ const cards=dialog.querySelector('.showcase-cards');
  const title=dialog.querySelector('#showcase-name'),position=dialog.querySelector('#showcase-position');
- const list=dialog.querySelector('.theme-list'),preview=dialog.querySelector('.theme-preview'),label=dialog.querySelector('#theme-preview-name');
- function select(t){candidate=t;renderCards();label.textContent=t.name;for(const k of ['bg','surface','fg','muted','accent','border'])preview.style.setProperty(`--preview-${k}`,t[k]);for(const b of list.children){b.setAttribute('aria-pressed',String(b.dataset.theme===t.id));} }
+ const preview=dialog.querySelector('#theme-preview-template').content.firstElementChild;
+ function select(t){candidate=t;renderCards();}
 
  // Three reusable previews: synthetic Boomux content, never live terminal data.
  for(const offset of [-1,0,1]){
@@ -867,30 +893,21 @@ export function mountThemePicker(){
    for(const k of ['bg','surface','fg','muted','accent','border'])card.style.setProperty(`--preview-${k}`,t[k]);
   }
  }
- function setView(){
-  dialog.classList.toggle('showcase',showcase);dialog.querySelector('.theme-showcase').hidden=!showcase;
-  view.textContent=showcase?'List view':'Showcase';view.setAttribute('aria-pressed',String(showcase));
-  renderCards();
- }
  function step(delta){
   select(themes[(themes.indexOf(candidate)+delta+themes.length)%themes.length]);
-  if(showcase&&!matchMedia('(prefers-reduced-motion: reduce)').matches){
+  if(!matchMedia('(prefers-reduced-motion: reduce)').matches){
    for(const animation of cards.getAnimations())animation.cancel();
    cards.animate([{translate:`${delta*55}px 0`,opacity:.45},{translate:'0 0',opacity:1}],{duration:240,easing:'ease-out'});
   }
  }
- view.onclick=()=>{showcase=!showcase;setView();try{localStorage.setItem('boomux.webgpu.theme-view',showcase?'showcase':'list');}catch{}};
+
  dialog.querySelector('#theme-previous').onclick=()=>step(-1);
  dialog.querySelector('#theme-next').onclick=()=>step(1);
  let touchStart=null;
  cards.addEventListener('pointerdown',e=>{suppressCardClick=false;if(e.pointerType==='touch')touchStart=e.clientX;});
  cards.addEventListener('pointerup',e=>{if(touchStart!==null){const dx=e.clientX-touchStart;touchStart=null;if(Math.abs(dx)>45){suppressCardClick=true;step(dx<0?1:-1);e.preventDefault();}}});
  cards.addEventListener('pointercancel',()=>{touchStart=null;});
- setView();
- for(const t of themes){const b=document.createElement('button');b.type='button';b.dataset.theme=t.id;b.className='theme-choice';b.setAttribute('aria-pressed','false');
- const swatches=document.createElement('span');swatches.className='theme-swatches';swatches.setAttribute('aria-hidden','true');for(const color of [t.bg,t.surface,t.fg,t.accent]){const dot=document.createElement('i');dot.style.background=color;swatches.append(dot);}
- b.append(swatches,document.createTextNode(t.name));b.onclick=()=>select(t);list.append(b);}
- trigger.onclick=()=>{if(changing)return;document.querySelector('#settings').open=false;select(current);dialog.showModal();(showcase?dialog.querySelector('#theme-next'):list.querySelector(`[data-theme="${current.id}"]`)).focus();};
+ trigger.onclick=()=>{if(changing)return;document.querySelector('#settings').open=false;select(current);dialog.showModal();dialog.querySelector('#theme-next').focus();};
  dialog.querySelector('#theme-apply').onclick=()=>{
   if(changing)return;
   const selected=candidate;
@@ -908,7 +925,7 @@ export function mountThemePicker(){
  };
  dialog.querySelector('#theme-cancel').onclick=()=>dialog.close();
  dialog.addEventListener('click',e=>{if(e.target===dialog){const r=dialog.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)dialog.close();}});
- dialog.addEventListener('close',()=>trigger.focus());
+ dialog.addEventListener('close',()=>document.querySelector('#settings>summary').focus());
  window.addEventListener('keydown',e=>{
   if(e.isComposing||!e.ctrlKey||!e.shiftKey||e.altKey||e.metaKey||e.code!=='KeyY')return;
   e.preventDefault();e.stopImmediatePropagation();
@@ -919,7 +936,7 @@ export function mountThemePicker(){
   if(e.key==='Enter'&&!e.ctrlKey&&!e.altKey&&!e.metaKey&&!e.shiftKey){
    e.preventDefault();e.stopPropagation();if(!e.repeat)dialog.querySelector('#theme-apply').click();return;
   }
-  if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();step(e.key==='ArrowRight'?1:-1);if(!showcase)list.querySelector(`[data-theme="${candidate.id}"]`).focus();}});
- if(new URLSearchParams(location.search).has('theme-showcase')){showcase=true;setView();trigger.click();}
+  if(['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();step(e.key==='ArrowRight'?1:-1);}});
+ if(new URLSearchParams(location.search).has('theme-showcase')){trigger.click();}
  window.addEventListener('storage',e=>{if(e.key===key){const t=themes.find(t=>t.id===e.newValue);if(t)apply(t,false);}});
 }

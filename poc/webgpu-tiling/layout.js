@@ -17,16 +17,16 @@ export function insert(node, target, id, edge) {
   if ('id' in node) return node;
   return {...node,a:insert(node.a,target,id,edge),b:insert(node.b,target,id,edge)};
 }
-export function layout(node, rect, panes = new Map(), dividers = []) {
+export function layout(node, rect, panes = new Map(), dividers = [], gap = 8) {
   if (!node) return {panes,dividers};
   if ('id' in node) {panes.set(node.id,rect);return {panes,dividers};}
   const horizontal = node.axis === 'x', size = horizontal ? rect.w : rect.h;
-  const cut = (size - 8) * node.ratio;
+  const cut = (size - gap) * node.ratio;
   const first = {...rect}, second = {...rect};
-  if (horizontal) {first.w=cut;second.x+=cut+8;second.w=size-cut-8;}
-  else {first.h=cut;second.y+=cut+8;second.h=size-cut-8;}
-  dividers.push({node,rect:{x:horizontal?rect.x+cut:rect.x,y:horizontal?rect.y:rect.y+cut,w:horizontal?8:rect.w,h:horizontal?rect.h:8},parent:rect});
-  layout(node.a,first,panes,dividers);layout(node.b,second,panes,dividers);
+  if (horizontal) {first.w=cut;second.x+=cut+gap;second.w=size-cut-gap;}
+  else {first.h=cut;second.y+=cut+gap;second.h=size-cut-gap;}
+  dividers.push({node,rect:{x:horizontal?rect.x+cut:rect.x,y:horizontal?rect.y:rect.y+cut,w:horizontal?gap:rect.w,h:horizontal?rect.h:gap},parent:rect});
+  layout(node.a,first,panes,dividers,gap);layout(node.b,second,panes,dividers,gap);
   return {panes,dividers};
 }
 export function dropAt(rects,x,y) {

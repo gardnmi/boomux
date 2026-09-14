@@ -51,11 +51,11 @@ try{
   await eventually(()=>streams.some(s=>s.output.includes(`\r\n${rows} ${cols}\r\n`)),'browser controls PTY size');
   const peer=await context.newPage();await peer.goto(base);await peer.waitForSelector('.attachment-error');
   assert.equal(await peer.getByRole('button',{name:'Take control',exact:true}).count(),2);
-  peer.once('dialog',dialog=>dialog.accept());await peer.getByRole('button',{name:'Take control',exact:true}).first().click();
+  await peer.getByRole('button',{name:'Take control',exact:true}).first().click();await peer.locator('.resource-dialog').getByRole('button',{name:'Take control',exact:true}).click();
   await peer.waitForSelector('.pane-body[data-connected="true"]');
   await eventually(()=>page.locator('.pane-body').first().getAttribute('data-connected').then(v=>v==='false'),'explicit takeover detaches previous controller');
   await page.locator('.pane').first().getByRole('button',{name:'Take control',exact:true}).waitFor();
-  page.once('dialog',dialog=>dialog.accept());await page.locator('.pane').first().getByRole('button',{name:'Take control',exact:true}).click();
+  await page.locator('.pane').first().getByRole('button',{name:'Take control',exact:true}).click();await page.locator('.resource-dialog').getByRole('button',{name:'Take control',exact:true}).click();
   await peer.locator('.pane').first().getByRole('button',{name:'Take control',exact:true}).waitFor();
   await peer.close();await page.waitForFunction(()=>document.querySelectorAll('.pane-body[data-connected="true"]').length===2);
   if(process.env.POC_RESTART==='1'){

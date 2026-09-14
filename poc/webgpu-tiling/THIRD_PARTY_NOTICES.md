@@ -29,3 +29,11 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Bundled terminal font
+
+`fonts/jetbrains-mono-nerd.woff2` is JetBrainsMono Nerd Font Regular from
+`ttf-jetbrains-mono-nerd-basic` 3.5.1-1, converted losslessly from the installed
+TTF to WOFF2 with `woff2_compress`. Copyright 2020 The JetBrains Mono Project
+Authors. Distributed under SIL Open Font License 1.1; see `fonts/OFL.txt`.
+The font is loaded as “Boomux Terminal” in CSS to avoid local-font ambiguity.

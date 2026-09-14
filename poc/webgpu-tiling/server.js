@@ -7,10 +7,11 @@ const port=Number(process.env.POC_PORT||4387);
 const host=`127.0.0.1:${port}`,origin=`http://${host}`;
 const sessions=new Set();
 const maxSessions=48,maxPending=1024*1024;
-const routes=new Map(['index.html','app.js','style.css','layout.js','renderer.js','terminal.js','themes.js'].map(name=>['/'+name,resolve(root,name)]));
+const routes=new Map(['index.html','app.js','desktop-panels.js','style.css','layout.js','renderer.js','terminal.js','themes.js'].map(name=>['/'+name,resolve(root,name)]));
 routes.set('/',resolve(root,'index.html'));
 routes.set('/vendor/ghostty-web.js',resolve(repo,'node_modules/ghostty-web/dist/ghostty-web.js'));
 routes.set('/vendor/ghostty-vt.wasm',resolve(repo,'node_modules/ghostty-web/ghostty-vt.wasm'));
+routes.set('/vendor/jetbrains-mono-nerd.woff2',resolve(repo,'poc/webgpu-tiling/fonts/jetbrains-mono-nerd.woff2'));
 routes.set('/vendor/jetbrains-mono.woff2',resolve(repo,'node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2'));
 const dimension=(n,min,max)=>Number.isInteger(n)&&n>=min&&n<=max;
 function cleanup(ws){

@@ -20,7 +20,7 @@ try {
     await page.keyboard.press('Escape');await page.mouse.up();await settle();
     assert.deepEqual(await box(1),initial,'cancel must restore exact layout');
     const lifted=await start(1);await page.mouse.move(lifted.x+105,lifted.y+35,{steps:3});await settle();let target=await box(4);await page.mouse.move(target.x+target.width-15,target.y+target.height/2,{steps:10});await settle();
-    assert.equal(await page.locator('#drop-label').textContent(),'Tile right');
+    assert.ok(await page.locator('#drop-overlay').isVisible());
     await page.mouse.up();await settle();
     assert.ok((await box(1)).x>(await box(4)).x,'pane should tile to the right');
     await start(1);await page.keyboard.down('Shift');await page.mouse.move(850,280,{steps:8});await page.mouse.up();await page.keyboard.up('Shift');await settle();

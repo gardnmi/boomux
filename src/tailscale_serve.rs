@@ -37,6 +37,7 @@ pub(crate) struct Exposure {
     record_path: PathBuf,
     record: OwnershipRecord,
     active: bool,
+    dashboard_https_port: u16,
 }
 
 impl Exposure {
@@ -51,6 +52,21 @@ impl Exposure {
             record_path,
             dashboard_port,
             opencode_port,
+            &[443],
+        )
+    }
+
+    // The tiling UI coexists with the older dashboard and other Serve applications.
+    #[allow(dead_code)]
+    pub(crate) fn enable_tiling(dashboard_port: u16) -> Result<Self, Box<dyn Error>> {
+        let record_path = ownership_path(dashboard_port)?;
+        cleanup_record_if_present(OsStr::new("tailscale"), &record_path)?;
+        Self::enable_with(
+            OsStr::new("tailscale"),
+            record_path,
+            dashboard_port,
+            None,
+            &[443, 8443, 10000],
         )
     }
 
@@ -59,13 +75,18 @@ impl Exposure {
         record_path: PathBuf,
         dashboard_port: u16,
         opencode_port: Option<u16>,
+        https_ports: &[u16],
     ) -> Result<Self, Box<dyn Error>> {
         let tailnet = tailnet_status(executable)?;
         let serve_status = serve_status(executable)?;
-        let mut desired = vec![OwnedRoute {
-            https_port: 443,
-            target: format!("http://127.0.0.1:{dashboard_port}"),
-        }];
+        let dashboard_route = select_dashboard_route(
+            &serve_status,
+            &tailnet.dns_name,
+            dashboard_port,
+            https_ports,
+        )?;
+        let dashboard_https_port = dashboard_route.https_port;
+        let mut desired = vec![dashboard_route];
         if let Some(port) = opencode_port {
             desired.push(OwnedRoute {
                 https_port: port,
@@ -100,6 +121,7 @@ impl Exposure {
                 routes: Vec::new(),
             },
             active: true,
+            dashboard_https_port,
         };
         for route in missing {
             exposure.record.routes.push(route.clone());
@@ -116,7 +138,14 @@ impl Exposure {
     }
 
     pub(crate) fn dashboard_url(&self) -> String {
-        format!("https://{}", self.record.dns_name)
+        if self.dashboard_https_port == 443 {
+            format!("https://{}", self.record.dns_name)
+        } else {
+            format!(
+                "https://{}:{}",
+                self.record.dns_name, self.dashboard_https_port
+            )
+        }
     }
 
     pub(crate) fn opencode_url(&self, port: u16) -> String {
@@ -127,7 +156,7 @@ impl Exposure {
         write_record(&self.record_path, &self.record)
     }
 
-    fn cleanup(&mut self) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn cleanup(&mut self) -> Result<(), Box<dyn Error>> {
         if !self.active {
             return Ok(());
         }
@@ -252,17 +281,41 @@ enum RouteState {
     Conflict,
 }
 
+fn select_dashboard_route(
+    status: &Value,
+    dns_name: &str,
+    dashboard_port: u16,
+    ports: &[u16],
+) -> io::Result<OwnedRoute> {
+    ports.iter().copied().map(|https_port| OwnedRoute {
+        https_port,
+        target: format!("http://127.0.0.1:{dashboard_port}"),
+    }).find(|route| route_state(status, dns_name, route) != RouteState::Conflict)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, format!("Tailscale Serve HTTPS ports {ports:?} are already in use; existing services were preserved")))
+}
+
 fn route_state(status: &Value, dns_name: &str, route: &OwnedRoute) -> RouteState {
     let web_key = format!("{dns_name}:{}", route.https_port);
-    let proxy = status
+    // Never adopt a publicly exposed Funnel listener as private tailnet sharing.
+    if status
+        .get("AllowFunnel")
+        .and_then(|ports| ports.get(&web_key))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return RouteState::Conflict;
+    }
+    let handler = status
         .get("Web")
         .and_then(|web| web.get(&web_key))
-        .and_then(|web| web.pointer("/Handlers/~1/Proxy"))
+        .and_then(|web| web.pointer("/Handlers/~1"));
+    let proxy = handler
+        .and_then(|handler| handler.get("Proxy"))
         .and_then(Value::as_str);
     if proxy == Some(route.target.as_str()) {
         return RouteState::Compatible;
     }
-    if proxy.is_some() {
+    if handler.is_some() {
         return RouteState::Conflict;
     }
     let port = route.https_port.to_string();
@@ -394,6 +447,56 @@ mod tests {
     }
 
     #[test]
+    fn tiling_selects_an_available_https_port_without_replacing_services() {
+        let mut occupied = status(Some("http://127.0.0.1:3737"));
+        let ports = &[443, 8443, 10000];
+        assert_eq!(
+            select_dashboard_route(&status(None), "host.example.ts.net", 4391, ports)
+                .unwrap()
+                .https_port,
+            443
+        );
+        assert_eq!(
+            select_dashboard_route(&occupied, "host.example.ts.net", 4391, ports)
+                .unwrap()
+                .https_port,
+            8443
+        );
+        occupied["AllowFunnel"] = serde_json::json!({"host.example.ts.net:8443":true});
+        assert_eq!(
+            select_dashboard_route(&occupied, "host.example.ts.net", 4391, ports)
+                .unwrap()
+                .https_port,
+            10000
+        );
+        occupied["TCP"]["10000"] = serde_json::json!({"TCPForward":"localhost:1234"});
+        assert!(select_dashboard_route(&occupied, "host.example.ts.net", 4391, ports).is_err());
+        // The older dashboard intentionally keeps its fixed-port contract.
+        assert!(select_dashboard_route(&occupied, "host.example.ts.net", 4391, &[443]).is_err());
+    }
+
+    #[test]
+    fn private_sharing_rejects_funnel_and_existing_file_handlers() {
+        let route = OwnedRoute {
+            https_port: 443,
+            target: "http://127.0.0.1:3737".into(),
+        };
+        let mut public = status(Some(&route.target));
+        public["AllowFunnel"] = serde_json::json!({"host.example.ts.net:443":true});
+        assert_eq!(
+            route_state(&public, "host.example.ts.net", &route),
+            RouteState::Conflict
+        );
+        let mut files = status(None);
+        files["Web"] =
+            serde_json::json!({"host.example.ts.net:443":{"Handlers":{"/":{"Path":"/srv/site"}}}});
+        assert_eq!(
+            route_state(&files, "host.example.ts.net", &route),
+            RouteState::Conflict
+        );
+    }
+
+    #[test]
     fn ownership_record_is_owner_only_and_versioned() {
         let directory =
             std::env::temp_dir().join(format!("boomux-tailscale-record-test-{}", Uuid::new_v4()));
@@ -446,9 +549,14 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let record = directory.join("ownership.json");
 
-        let exposure =
-            Exposure::enable_with(executable.as_os_str(), record.clone(), 3737, Some(4097))
-                .unwrap();
+        let exposure = Exposure::enable_with(
+            executable.as_os_str(),
+            record.clone(),
+            3737,
+            Some(4097),
+            &[443],
+        )
+        .unwrap();
         assert_eq!(exposure.dashboard_url(), "https://host.example.ts.net");
         assert!(marker.exists());
         assert!(record.exists());
@@ -495,7 +603,8 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let record = directory.join("ownership.json");
 
-        let exposure = Exposure::enable_with(executable.as_os_str(), record, 3737, None).unwrap();
+        let exposure =
+            Exposure::enable_with(executable.as_os_str(), record, 3737, None, &[443]).unwrap();
         assert_eq!(exposure.dashboard_url(), "https://host.example.ts.net");
         drop(exposure);
 

@@ -29,12 +29,12 @@ try{
   await page.waitForTimeout(120);
   const during=resizes.length-start;
   if(!process.env.POC_APP_SOURCE)assert.equal(during,0,'no scrollback reflow/PTY resize during drag');
-  await page.mouse.up();await page.waitForTimeout(450);
+  await page.mouse.up();await page.waitForTimeout(600);
   const after=resizes.length-start;
   if(!process.env.POC_APP_SOURCE)assert.ok(after>0&&after<=4,'one final grid update per affected terminal');
   // Cancellation restores geometry and must not resize the terminal grid.
   const settled=await divider.boundingBox(),cancelStart=resizes.length;
-  await page.mouse.move(settled.x+4,settled.y+65);await page.mouse.down();await page.mouse.move(settled.x-80,settled.y+65);await page.keyboard.press('Escape');await page.mouse.up();await page.waitForTimeout(450);
+  await page.mouse.move(settled.x+4,settled.y+65);await page.mouse.down();await page.mouse.move(settled.x-80,settled.y+65);await page.keyboard.press('Escape');await page.mouse.up();await page.waitForTimeout(600);
   if(!process.env.POC_APP_SOURCE){assert.ok(Math.abs((await divider.boundingBox()).x-settled.x)<1);assert.equal(resizes.length,cancelStart);}
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({resizeMessagesDuringDrag:during,resizeMessagesIncludingCommit:after,elapsedMs:Math.round(performance.now()-began),longTasks:await page.evaluate(()=>window.resizeLongTasks)}));

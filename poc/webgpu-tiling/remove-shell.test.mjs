@@ -18,16 +18,16 @@ try{
   });
   await page.goto((process.env.POC_URL||'http://127.0.0.1:4389')+'/?fallback');
   await page.waitForSelector('.pane-body[data-connected="true"]');
-  page.once('dialog',d=>d.dismiss());await page.getByRole('button',{name:'Remove Shell',exact:true}).click();
+  await page.getByRole('button',{name:'Remove Shell',exact:true}).click();await page.locator('.resource-dialog').getByRole('button',{name:'Cancel',exact:true}).click();
   assert.equal(requests.length,0,'cancel makes no removal request');assert.equal(await page.locator('.pane').count(),1);
-  page.once('dialog',d=>d.accept());await page.getByRole('button',{name:'Remove Shell',exact:true}).click();
+  await page.getByRole('button',{name:'Remove Shell',exact:true}).click();await page.locator('.resource-dialog').getByRole('button',{name:'Remove Shell',exact:true}).click();
   await page.getByText('ShellRun changed; refresh and confirm removal again',{exact:true}).waitFor();
   assert.equal(await page.locator('.pane').count(),1,'failure retains the pane');
   assert.deepEqual(requests[0],{node_id:'local',shell_id:shell.id,run_id:'run'});
-  await page.getByRole('button',{name:'Minimize pane',exact:true}).click();assert.equal(await page.locator('.pane').count(),0);
+  await page.getByRole('button',{name:'Minimize pane',exact:true}).click();await page.waitForFunction(()=>document.querySelectorAll('#panes .pane').length===0);assert.equal(await page.locator('.pane').count(),0);
   assert.equal(requests.length,1,'minimize never removes the Shell');
   await page.locator('.shell-button').click();await page.waitForSelector('.pane-body[data-connected="true"]');
-  reject=false;page.once('dialog',d=>d.accept());await page.getByRole('button',{name:'Remove Shell',exact:true}).click();
+  reject=false;await page.getByRole('button',{name:'Remove Shell',exact:true}).click();await page.locator('.resource-dialog').getByRole('button',{name:'Remove Shell',exact:true}).click();
   await page.waitForFunction(()=>document.querySelectorAll('.pane').length===0&&document.querySelectorAll('.shell-button').length===0);
   assert.equal(requests.length,2);assert.deepEqual(errors,[]);await page.close();
  }
