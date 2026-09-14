@@ -6365,7 +6365,10 @@ impl Workspace {
                         };
                         let next_revision = terminal.revision();
                         if next_revision != revision {
-                            pane.screen = Some(terminal.screen());
+                            // Control-loss chrome must not wait for the emulator's final screen.
+                            if !terminal.is_detached() {
+                                pane.screen = Some(terminal.screen());
+                            }
                             if let Some(drag) = this
                                 .selection_autoscroll
                                 .filter(|drag| drag.pane_id == pane_id)
@@ -9992,6 +9995,59 @@ impl Workspace {
 
     fn boomux_body(&self, pane_id: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let pane = self.terminals.get(&pane_id);
+        let control_lost = pane
+            .and_then(|pane| pane.session.as_ref())
+            .is_some_and(TerminalSession::is_detached);
+        let control_busy = pane
+            .and_then(|pane| pane.error.as_deref())
+            .is_some_and(|error| {
+                error.contains("active controller") || error.contains("use takeover")
+            });
+        if control_lost || control_busy {
+            let attaching = pane.is_some_and(|pane| pane.attaching);
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .overflow_hidden()
+                .child(
+                    div().flex_none().text_xs().text_color(rgb(0xa6adc8)).child(
+                        "Another terminal controls this Shell. Take control to use it here.",
+                    ),
+                )
+                .child(
+                    Self::settings_control(
+                        ("take-control-body", pane_id),
+                        if attaching {
+                            "Taking control…"
+                        } else {
+                            "Take control"
+                        },
+                        false,
+                        !attaching,
+                    )
+                    .w_full()
+                    .min_h_0()
+                    .button_chrome()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        let Some(shell) = this
+                            .terminals
+                            .get(&pane_id)
+                            .filter(|pane| !pane.attaching)
+                            .and_then(|pane| pane.shell.clone())
+                        else {
+                            return;
+                        };
+                        let size = this.terminal_grid_size(pane_id, window);
+                        this.start_terminal_attachment(pane_id, shell, size, cx);
+                    })),
+                )
+                .into_any_element();
+        }
         if pane.and_then(|pane| pane.session.as_ref()).is_some()
             && let Some(screen) = pane.and_then(|pane| pane.screen.as_ref())
         {
@@ -10431,44 +10487,6 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .when(
-                                    status_message.as_deref() == Some("detached")
-                                        && !pane.is_some_and(|pane| pane.attaching),
-                                    |controls| {
-                                        controls.child(
-                                            div()
-                                                .id(("take-control", id))
-                                                .px_2()
-                                                .py_1()
-                                                .rounded_md()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .bg(rgb(0x45475a))
-                                                .child("Take control")
-                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                    cx.stop_propagation();
-                                                })
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        cx.stop_propagation();
-                                                        let Some(shell) = this
-                                                            .terminals
-                                                            .get(&id)
-                                                            .filter(|pane| !pane.attaching)
-                                                            .and_then(|pane| pane.shell.clone())
-                                                        else {
-                                                            return;
-                                                        };
-                                                        let size =
-                                                            this.terminal_grid_size(id, window);
-                                                        this.start_terminal_attachment(
-                                                            id, shell, size, cx,
-                                                        );
-                                                    },
-                                                )),
-                                        )
-                                    },
-                                )
                                 .when_some(status_message, |controls, status| {
                                     controls.child(
                                         div()
