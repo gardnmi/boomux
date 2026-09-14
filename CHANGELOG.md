@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.3](https://github.com/gardnmi/boomux/compare/v1.21.2...v1.21.3) (2026-09-14)
+
+
+### Bug Fixes
+
+* **web:** use shared generated shell and workspace names ([#442](https://github.com/gardnmi/boomux/issues/442)) ([a8546e3](https://github.com/gardnmi/boomux/commit/a8546e3bdf96033d5a89054e290e2ae8169027a5))
+
 ## [1.21.2](https://github.com/gardnmi/boomux/compare/v1.21.1...v1.21.2) (2026-09-14)
 
 
