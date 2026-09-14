@@ -28,7 +28,7 @@ try{
  await page.goto(process.env.POC_URL||'http://127.0.0.1:4387');await page.waitForSelector('.workspace-button');
  async function start(){await page.locator('#header-new summary').click();await page.locator('#header-connect').click();await page.getByRole('dialog').getByRole('button',{name:'Connect another machine…'}).click();await page.waitForFunction(()=>document.querySelector('.workspace-group.current')?.textContent.includes('Setup'));await page.getByRole('button',{name:'Take control',exact:true}).first().waitFor();}
  async function refresh(){await page.locator('#header-more summary').click();await page.locator('#header-refresh').click();}
- await start();setup.shells=[];await refresh();await page.waitForFunction(()=>document.querySelector('.workspace-group.current')?.textContent.includes('Remote 1'));
+ await start();await page.reload();await page.waitForSelector('.workspace-button');setup.shells[0].status={exited:{code:0}};await refresh();await page.waitForFunction(()=>document.querySelector('.workspace-group.current')?.textContent.includes('Remote 1'));
  assert.equal(ops.filter(op=>op.action==='finish_setup').length,1);
  await start();await page.locator('.workspace-button').filter({hasText:'Home'}).click();setup.shells=[];await refresh();
  await page.waitForFunction(()=>[...document.querySelectorAll('.workspace-button')].some(el=>el.textContent.includes('Remote 2')));

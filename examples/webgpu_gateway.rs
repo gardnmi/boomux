@@ -58,7 +58,18 @@ struct SetupLaunch {
     workspace: String,
     shell: String,
     empty_revision: u64,
+    run_id: Option<String>,
     receiver: Option<boomux::desktop_connect::ConnectResultReceiver>,
+}
+fn setup_run_finished(launch: &SetupLaunch, shell: &boomux::protocol::ShellSnapshot) -> bool {
+    shell.id == launch.shell
+        && shell.workspace_id == launch.workspace
+        && matches!(
+            shell.status,
+            boomux::protocol::ShellStatus::Exited { code: Some(0) }
+        )
+        && launch.run_id.is_some()
+        && shell.run.as_ref().map(|run| &run.id) == launch.run_id.as_ref()
 }
 fn setup_cleanup_request(
     launch: &SetupLaunch,
@@ -389,7 +400,21 @@ async fn resource_action(
                         .clone()
                 };
                 match app.client.get_shell(&shell_id) {
-                    Ok(_) => return Ok(json!({"pending":true})),
+                    Ok(shell) => {
+                        let mut setups = app.setups.lock().map_err(|_| "Setup state unavailable")?;
+                        let launch = setups.get(&token).ok_or("Setup already consumed")?;
+                        if !matches!(shell.status, boomux::protocol::ShellStatus::Exited { code: Some(0) }) {
+                            return Ok(json!({"pending":true}));
+                        }
+                        let workspace = app.client.get_workspace(&launch.workspace).map_err(|e| e.to_string())?;
+                        if !setup_run_finished(launch, &shell)
+                            || workspace.revision.checked_add(1) != Some(launch.empty_revision)
+                            || workspace.shells.len() != 1 || !workspace.agents.is_empty() || !workspace.launchers.is_empty() {
+                            setups.remove(&token);
+                            return Ok(json!({"pending":false,"warning":"Setup Workspace changed; kept it for review."}));
+                        }
+                        app.client.request(DaemonRequest::GuardedCloseShell { shell_id: shell.id, expected_revision: shell.revision }).map_err(|e| e.to_string())?;
+                    },
                     Err(client::ClientError::Remote(error))
                         if error.code == Some(boomux::protocol::ErrorCode::NotFound) => {}
                     Err(error) => return Err(error.to_string()),
@@ -487,17 +512,10 @@ async fn resource_action(
                         .node_registration(owner)
                         .map_err(|e| e.to_string())?;
                 }
-                let temporary = matches!(
-                    workflow,
-                    GuidedWorkflow::Connect
-                        | GuidedWorkflow::Upgrade
-                        | GuidedWorkflow::Uninstall
-                        | GuidedWorkflow::Reauthenticate
-                );
                 // Hold the short creation reservation so concurrent requests cannot exceed the cap.
                 let mut setups = app.setups.lock().map_err(|_| "Setup state unavailable")?;
                 setups.retain(|_, launch| launch.created.elapsed() < Duration::from_secs(7200));
-                if temporary && setups.len() >= 8 {
+                if setups.len() >= 8 {
                     return Err("Finish an existing remote setup before opening another".into());
                 }
                 let receiver = if matches!(workflow, GuidedWorkflow::Connect) {
@@ -557,7 +575,7 @@ async fn resource_action(
                     .into_iter()
                     .next()
                     .ok_or("Setup Shell missing")?;
-                let token = if temporary {
+                let token = {
                     let token = uuid::Uuid::new_v4().to_string();
                     setups.insert(
                         token.clone(),
@@ -566,12 +584,11 @@ async fn resource_action(
                             workspace: workspace.id.clone(),
                             shell: shell.id.clone(),
                             empty_revision,
+                            run_id: None,
                             receiver,
                         },
                     );
-                    Some(token)
-                } else {
-                    None
+                    token
                 };
                 Ok(json!({"shell":shell,"workspace_id":workspace.id,"setup_token":token}))
             }
@@ -687,6 +704,9 @@ async fn resource_action(
                 let mut shell = remote::shell(&app.client, &id).map_err(|e| e.to_string())?;
                 if let Some(identity) = remote::identity(&id) {
                     remote::qualify_shell(&identity.node_id, &mut shell);
+                }
+                for launch in app.setups.lock().map_err(|_| "Setup state unavailable")?.values_mut() {
+                    if launch.shell == id && launch.run_id.is_none() { launch.run_id = shell.run.as_ref().map(|run| run.id.clone()); }
                 }
                 Ok(json!({"shell":shell}))
             }
@@ -1138,6 +1158,7 @@ mod tests {
             workspace: "setup".into(),
             shell: "shell".into(),
             empty_revision: 2,
+            run_id: None,
             receiver: None,
         };
         let mut workspace: boomux::protocol::WorkspaceSnapshot = serde_json::from_value(
@@ -1159,6 +1180,27 @@ mod tests {
         workspace.id = "setup".into();
         workspace.shells.push(serde_json::from_value(json!({"id":"new-shell","workspace_id":"setup","name":"added work","command":["bash"],"cwd":"/tmp","status":"pending"})).unwrap());
         assert!(setup_cleanup_request(&launch, &workspace).is_none());
+    }
+
+    #[test]
+    fn setup_run_cleanup_requires_exact_successful_run() {
+        let launch = SetupLaunch {
+            created: Instant::now(),
+            workspace: "setup".into(),
+            shell: "shell".into(),
+            empty_revision: 2,
+            run_id: Some("original".into()),
+            receiver: None,
+        };
+        let mut shell: boomux::protocol::ShellSnapshot = serde_json::from_value(json!({"id":"shell","workspace_id":"setup","name":"Setup","cwd":"/tmp","status":{"exited":{"code":0}},"run":{"id":"original","generation":1,"started_at_ms":0,"ended_at_ms":1,"output_revision":0,"environment_has_run_id":true}})).unwrap();
+        assert!(setup_run_finished(&launch, &shell));
+        shell.status = boomux::protocol::ShellStatus::Running;
+        assert!(!setup_run_finished(&launch, &shell));
+        shell.status = boomux::protocol::ShellStatus::Exited { code: Some(1) };
+        assert!(!setup_run_finished(&launch, &shell));
+        shell.status = boomux::protocol::ShellStatus::Exited { code: Some(0) };
+        shell.run.as_mut().unwrap().id = "restarted".into();
+        assert!(!setup_run_finished(&launch, &shell));
     }
 
     #[test]
