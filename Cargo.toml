@@ -1,6 +1,6 @@
 [package]
 name = "boomux"
-version = "1.20.1"
+version = "1.20.2"
 edition = "2024"
 license = "MIT"
 
@@ -8,9 +8,10 @@ license = "MIT"
 members = ["desktop"]
 default-members = ["."]
 resolver = "3"
-exclude = ["vendor/libghostty-vt-sys"]
+exclude = ["vendor/libghostty-vt-sys", "vendor/gpui-ce"]
 
 [patch.crates-io]
+gpui-ce = { path = "vendor/gpui-ce" }
 libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
 
 [features]

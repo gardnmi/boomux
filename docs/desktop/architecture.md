@@ -143,6 +143,8 @@ and history but does not remove project shortcuts or filesystem contents.
 - `src/layout_badge.rs`: shared animated Layout-mode icons and pane overlays.
 - `src/theme.rs`: bounded Omarchy palette loading, semantic application and
   terminal colors, built-in fallback, and the current-theme filesystem watcher.
+- `src/theme_picker.rs`: bundled palettes, System/preset selection, and an isolated
+  preview dialog; palette data and attribution live in `desktop/assets/`.
 
 ## Threading And Backpressure
 
@@ -194,6 +196,29 @@ a bounded `colors.toml` read runs on the background executor. GPUI installs the
 result through atomic semantic color slots and notifies once. Each terminal
 worker receives only its latest pending palette through its existing bounded
 command path and republishes a screen without reconnecting the Boomux Shell.
+
+Desktop stores a stable `color_theme` ID in its local preferences, defaulting to
+`system`. System uses the latest valid Omarchy palette, with an OS light/dark
+fallback when unavailable. A preset overrides System; watcher results still
+refresh the cached System palette without applying it. Returning to System uses
+that cache immediately. A failed reload retains the last valid palette. The
+picker keeps its candidate separate from the applied preference, so preview and
+Cancel never reconfigure terminals. Apply uses the same bounded terminal update
+path as a System theme change. The carousel renders only three synthetic previews
+and wraps through System and the bundled catalog. Applying a palette commits
+once before animation and uses a bounded center-out paint mask over the stationary previous view. The old view holds shared references
+to existing terminal paint caches, without copying transcripts or reconfiguring
+workers on each frame. Both layers share unchanged layout geometry; only the
+mask expands. The frozen render skips terminal resize and cache refresh, and
+has no keyboard focus. The previous palette/cache references are released at
+completion. Instant motion skips the extra layer. The vendored GPUI extension clips only preview cards to shallow parallelograms
+without moving text or changing GPU shaders. Only primitives crossing an angled
+edge are sliced into rectangular masks, bounded to 512 bands per primitive;
+interior/exterior primitives use a constant-time path. See
+`vendor/gpui-ce/BOOMUX_PATCH.md` for provenance and focused validation. The
+whole-window wipe uses the native rectangular mask; slicing a terminal-heavy
+window along angled edges caused visible animation regressions. Preview-card
+clipping is limited to three synthetic cards with a 4% lean.
 
 ## Rendering
 

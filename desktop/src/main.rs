@@ -19,6 +19,7 @@ mod settings;
 mod subprocess;
 mod terminal;
 mod theme;
+mod theme_picker;
 mod updates;
 mod web_share;
 
@@ -1644,6 +1645,17 @@ struct Workspace {
     minimized_shells: HashSet<String>,
     confirm_destructive_actions: bool,
     theme: AppTheme,
+    color_theme: String,
+    theme_candidate: Option<usize>,
+    theme_carousel: bool,
+    theme_carousel_generation: u64,
+    theme_carousel_direction: f32,
+    theme_wheel_at: Option<Instant>,
+    theme_reveal: Option<theme_picker::Reveal>,
+    theme_scroll_handle: ScrollHandle,
+    theme_scroll_anchor: ScrollAnchor,
+    system_theme: Option<AppTheme>,
+    system_light: bool,
     theme_watcher: Option<ThemeWatcher>,
     theme_load_generation: u64,
     theme_error: Option<String>,
@@ -1778,6 +1790,8 @@ impl Workspace {
             .as_ref()
             .map(|shell| HashSet::from([shell.workspace_id.clone()]))
             .unwrap_or_default();
+        let theme_scroll_handle = ScrollHandle::new();
+        let theme_scroll_anchor = ScrollAnchor::for_handle(theme_scroll_handle.clone());
         let sidebar_scroll_handle = ScrollHandle::new();
         let sidebar_scroll_anchor = ScrollAnchor::for_handle(sidebar_scroll_handle.clone());
         let sidebar_agent_scroll_handle = ScrollHandle::new();
@@ -1875,6 +1889,17 @@ impl Workspace {
             minimized_shells: HashSet::new(),
             confirm_destructive_actions: saved.confirm_destructive_actions,
             theme: AppTheme::default(),
+            color_theme: saved.color_theme.clone(),
+            theme_candidate: None,
+            theme_carousel: true,
+            theme_carousel_generation: 0,
+            theme_carousel_direction: 1.0,
+            theme_wheel_at: None,
+            theme_reveal: None,
+            theme_scroll_handle,
+            theme_scroll_anchor,
+            system_theme: None,
+            system_light: false,
             theme_watcher: None,
             theme_load_generation: 0,
             theme_error: None,
@@ -1978,6 +2003,21 @@ impl Workspace {
             cx.notify();
         })
         .detach();
+        workspace.system_light = matches!(
+            window.appearance(),
+            gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight
+        );
+        workspace.apply_selected_theme(cx);
+        cx.observe_window_appearance(window, |this, window, cx| {
+            this.system_light = matches!(
+                window.appearance(),
+                gpui::WindowAppearance::Light | gpui::WindowAppearance::VibrantLight
+            );
+            if this.color_theme == "system" {
+                this.apply_selected_theme(cx);
+            }
+        })
+        .detach();
         workspace.watch_omarchy_theme(cx);
         workspace.watch_boomux_overview(window, cx);
         if saved.sidebar_git_tab {
@@ -1997,6 +2037,7 @@ impl Workspace {
                 pane_corner_style: self.pane_corner_style,
                 pane_gap: self.pane_gap,
                 focus_highlight_strength: self.focus_highlight_strength,
+                color_theme: self.color_theme.clone(),
                 motion_speed: self.motion_speed,
                 button_hover_animations: self.button_hover_animations,
                 layout_overlay_visible: self.layout_overlay_visible,
@@ -2325,13 +2366,10 @@ impl Workspace {
                 }
                 match result {
                     Ok(theme) => {
-                        this.theme = theme;
-                        theme::install(theme);
-                        this.theme_error = this.terminals.values().find_map(|pane| {
-                            pane.session
-                                .as_ref()
-                                .and_then(|session| session.set_theme(theme.terminal).err())
-                        });
+                        this.system_theme = Some(theme);
+                        if this.color_theme == "system" {
+                            this.apply_selected_theme(cx);
+                        }
                     }
                     Err(error) => this.theme_error = Some(error),
                 }
@@ -5050,6 +5088,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.theme_candidate.is_some() {
+            self.theme_picker_key_down(event, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+
         let input_target = self.keyboard_input_target();
         if input_target == InputTarget::ResourceDialog {
             self.resource_dialog_key_down(event, window, cx);
@@ -9118,6 +9162,26 @@ impl Workspace {
                         )),
                 );
             let appearance = Self::settings_group()
+                .child(
+                    Self::settings_field(
+                        "Color theme",
+                        "System follows Omarchy or your desktop’s light/dark appearance.",
+                    )
+                    .child(
+                        Self::settings_option(
+                            "choose-color-theme",
+                            format!("{} · Choose theme…", self.selected_theme_label()),
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.theme_candidate =
+                                Some(theme_picker::selection_index(&this.color_theme));
+                            window.focus(&this.focus_handle, cx);
+                            this.theme_scroll_anchor.scroll_to(window, cx);
+                            cx.notify();
+                        })),
+                    ),
+                )
                 .child(Self::settings_toggle_row(
                     "Window headings",
                     "Show a heading above each pane.",
@@ -10207,8 +10271,9 @@ impl Workspace {
         })
     }
 
-    fn pane(&self, id: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn pane(&self, id: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.pane_with_heading(id, self.pane_headings_visible, cx)
+            .into_any_element()
     }
 
     fn pane_with_heading(
@@ -10770,6 +10835,17 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_theme_transition(window, cx)
+    }
+}
+
+impl Workspace {
+    fn render_frame(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        frozen: bool,
+    ) -> gpui::AnyElement {
         cx.set_global(buttons::Motion(
             self.motion_speed
                 .duration()
@@ -10792,27 +10868,30 @@ impl Render for Workspace {
         if window.window_title() != desktop_title {
             window.set_window_title(&desktop_title);
         }
-        for (&id, pane) in &self.terminals {
-            if self
-                .minimizing_panes
-                .iter()
-                .any(|animation| animation.pane_id == id)
-                || self
-                    .workspace_transition
-                    .as_ref()
-                    .is_some_and(|transition| {
-                        transition.outgoing.iter().any(|outgoing| outgoing.id == id)
-                    })
-            {
-                continue;
+        if !frozen {
+            for (&id, pane) in &self.terminals {
+                if self
+                    .minimizing_panes
+                    .iter()
+                    .any(|animation| animation.pane_id == id)
+                    || self
+                        .workspace_transition
+                        .as_ref()
+                        .is_some_and(|transition| {
+                            transition.outgoing.iter().any(|outgoing| outgoing.id == id)
+                        })
+                {
+                    continue;
+                }
+                if let Some(terminal) = pane.session.as_ref() {
+                    let (rows, cols, pixel_width, pixel_height) =
+                        self.terminal_grid_size(id, window);
+                    terminal.resize(rows, cols, pixel_width, pixel_height);
+                }
             }
-            if let Some(terminal) = pane.session.as_ref() {
-                let (rows, cols, pixel_width, pixel_height) = self.terminal_grid_size(id, window);
-                terminal.resize(rows, cols, pixel_width, pixel_height);
-            }
+            self.refresh_terminal_images(window);
+            self.refresh_terminal_paint_caches(window);
         }
-        self.refresh_terminal_images(window);
-        self.refresh_terminal_paint_caches(window);
         let tiled = if let Some(layout) = &self.layout {
             self.render_layout(layout, cx)
         } else if self.boomux_overview.workspaces.is_empty() && self.terminals.is_empty() {
@@ -11187,6 +11266,7 @@ impl Render for Workspace {
             .into_any_element();
         let sidebar_menu = self.sidebar_menu_overlay(cx);
         let resource_dialog = self.resource_dialog_overlay(cx);
+        let theme_dialog = self.theme_picker_overlay(cx);
         let settings_restart = self.settings_restart_overlay(cx);
         let help = self.help_overlay(cx);
 
@@ -11204,15 +11284,17 @@ impl Render for Workspace {
                         .child(format!("Layout not saved: {error}")),
                 )
             })
-            .track_focus(&self.focus_handle)
-            .key_context(
+            .when(!frozen, |element| element.track_focus(&self.focus_handle))
+            .key_context(if self.theme_candidate.is_some() {
+                "ThemePicker"
+            } else {
                 self.keyboard_input_target()
                     .key_context(workspace_key_context(
                         self.help_open,
                         self.navigation_region,
                         self.layout_mode,
-                    )),
-            )
+                    ))
+            })
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
             .on_action(cx.listener(Self::focus_up))
@@ -11295,6 +11377,8 @@ impl Render for Workspace {
             .when_some(settings_restart, |element, dialog| element.child(dialog))
             .when_some(help, |element, help| element.child(help))
             .when_some(resource_dialog, |element, dialog| element.child(dialog))
+            .when_some(theme_dialog, |element, dialog| element.child(dialog))
+            .into_any_element()
     }
 }
 

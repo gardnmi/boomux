@@ -15,6 +15,39 @@ use crate::support::{
 };
 
 #[test]
+fn closing_pty_before_process_exit_preserves_final_exit_code() {
+    let mut daemon = TestDaemon::start();
+    let workspace = daemon
+        .client
+        .create_workspace(
+            "early-pty-close",
+            vec![ShellSpec {
+                name: "shell".into(),
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "exec </dev/null >/dev/null 2>&1; sleep 1; exit 7".into(),
+                ],
+                cwd: daemon.runtime_dir.clone(),
+            }],
+        )
+        .unwrap();
+    let shell_id = &workspace.shells[0].id;
+    let attachment = daemon.client.attach(shell_id, false, profile()).unwrap();
+    wait_until(
+        || {
+            matches!(
+                daemon.client.get_shell(shell_id).unwrap().status,
+                ShellStatus::Exited { code: Some(7) }
+            )
+        },
+        "PTY EOF lost final process exit code",
+    );
+    drop(attachment);
+    daemon.stop_with_cli();
+}
+
+#[test]
 #[ignore = "explicit startup timing diagnostic; optionally set BOOMUX_TIMING_STATE_ROOT"]
 fn shell_startup_phase_timings() {
     use std::time::Instant;
