@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.21.0](https://github.com/gardnmi/boomux/compare/v1.20.2...v1.21.0) (2026-09-14)
+
+
+### Features
+
+* **desktop:** add palette picker with system theme support ([#435](https://github.com/gardnmi/boomux/issues/435)) ([6ce72f7](https://github.com/gardnmi/boomux/commit/6ce72f7dec084b336368b824f832f5b1e040c179))
+* **web:** add desktop-aligned terminal ui and private sharing ([c56ccd9](https://github.com/gardnmi/boomux/commit/c56ccd966d41aa8c64b43fd37abf750cfed0930f))
+
+
+### Bug Fixes
+
+* **daemon:** preserve exit status when pty closes early ([#433](https://github.com/gardnmi/boomux/issues/433)) ([d748ba0](https://github.com/gardnmi/boomux/commit/d748ba01af10c4c9e7799feed1d83b8d0bfaf4b9))
+
 ## [1.20.2](https://github.com/gardnmi/boomux/compare/v1.20.1...v1.20.2) (2026-09-13)
 
 
