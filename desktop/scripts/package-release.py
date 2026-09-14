@@ -3,6 +3,7 @@
 import hashlib
 from pathlib import Path
 import platform
+import runpy
 import shutil
 import subprocess
 import sys
@@ -56,6 +57,9 @@ def package(archive, root=ROOT):
         shutil.copy2(desktop / "packaging/boomux-desktop", bundle / "bin/boomux-desktop")
         (bundle / "bin/boomux-desktop").chmod(0o755)
         shutil.copytree(desktop / "packaging/share", bundle / "share")
+        stage_webui = runpy.run_path(str(Path(__file__).with_name("package-webui.py")))["stage_webui"]
+        stage_webui(root, binary.parent / "examples/webgpu_gateway", bundle / "libexec", bundle / "share/boomux/webui")
+        subprocess.run([str(bundle / "libexec/webgpu_gateway"), "--check-assets"], cwd=stage, check=True)
         shutil.copy2(desktop / "LICENSE", bundle / "LICENSE")
         shutil.copy2(root / "LICENSE", bundle / "LICENSE.boomux")
         shutil.copy2(root / "THIRD_PARTY_NOTICES.md", bundle / "THIRD_PARTY_NOTICES.md")

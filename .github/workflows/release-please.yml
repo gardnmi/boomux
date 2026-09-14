@@ -270,10 +270,16 @@ jobs:
         with:
           key: macos-preview-release-v1
           save-if: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Install web UI runtime assets
+        run: bun install --frozen-lockfile
       - name: Build and smoke test macOS recovery bundle
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           cargo +stable build --release --locked -p boomux -p boomux-desktop
+          cargo +stable build --release --locked --example webgpu_gateway
           python3 desktop/scripts/package-macos.py
           python3 desktop/scripts/smoke-macos.py
           sh desktop/scripts/test-macos-install.sh

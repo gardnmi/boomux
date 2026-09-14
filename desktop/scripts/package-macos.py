@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import platform
+import runpy
 import plistlib
 import shutil
 import subprocess
@@ -40,6 +41,9 @@ def main():
             if not library.startswith(("/System/Library/", "/usr/lib/")):
                 raise RuntimeError(f"Unbundled runtime dependency in {name}: {library}")
         shutil.copy2(source, binaries / name)
+    runpy.run_path(str(Path(__file__).with_name("package-webui.py")))["stage_webui"](
+        ROOT, ROOT / "target/release/examples/webgpu_gateway", binaries, resources / "webui")
+    subprocess.run([str(binaries / "webgpu_gateway"), "--check-assets"], cwd=stage, check=True)
     shutil.copy2(ROOT / "desktop/packaging/macos/boomux-launcher", binaries / "boomux-launcher")
     (binaries / "boomux-launcher").chmod(0o755)
     (contents / "Info.plist").write_bytes(plistlib.dumps({
@@ -60,7 +64,7 @@ def main():
     shutil.copy2(ROOT / "docs/platforms/macos-testing.md", stage / "READ ME FIRST.md")
     metadata = {"source": sha, "version": version, "target": f"{arch}-apple-darwin", "distribution": "testing-preview", "notarized": False}
     (stage / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    for name in ["boomux", "boomux-desktop"]:
+    for name in ["boomux", "boomux-desktop", "webgpu_gateway"]:
         subprocess.run(["codesign", "--force", "--sign", "-", str(binaries / name)], check=True)
     subprocess.run(["codesign", "--force", "--sign", "-", str(contents.parent)], check=True)
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(contents.parent)], check=True)

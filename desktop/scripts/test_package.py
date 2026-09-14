@@ -30,6 +30,9 @@ class PackageTests(unittest.TestCase):
         self.write("desktop/packaging/boomux-desktop", "#!/bin/sh\n")
         self.write(f"target/{TARGET}/release/boomux-desktop",
                    "#!/bin/sh\nprintf 'boomux-desktop 1.2.3\\n'\n", executable=True)
+        self.write(f"target/{TARGET}/release/examples/webgpu_gateway", "#!/bin/sh\nexit 0\n", executable=True)
+        for asset in runpy.run_path(str(Path(__file__).with_name("package-webui.py")))["ASSETS"]:
+            self.write(asset, "bundled fixture")
         subprocess.run(["git", "-C", self.root, "add", "."], check=True)
         subprocess.run(["git", "-C", self.root, "-c", "user.name=Fixture", "-c",
                         "user.email=fixture@example.invalid", "commit", "-qm", "fixture"], check=True)
@@ -59,6 +62,19 @@ class PackageTests(unittest.TestCase):
             source = subprocess.check_output(["git", "-C", self.root, "rev-parse", "HEAD"], text=True).strip()
             self.assertIn(f"source {source}\n", tar.extractfile("release.txt").read().decode())
             self.assertIn("THIRD_PARTY_NOTICES.md", tar.getnames())
+            self.assertTrue(tar.getmember("libexec/webgpu_gateway").mode & 0o111)
+            for asset in runpy.run_path(str(Path(__file__).with_name("package-webui.py")))["ASSETS"]:
+                self.assertEqual(tar.extractfile("share/boomux/webui/" + asset).read(), b"bundled fixture")
+
+    def test_missing_gateway_rejects_bundle(self):
+        (self.root / f"target/{TARGET}/release/examples/webgpu_gateway").unlink()
+        with self.assertRaisesRegex(ValueError, "Missing web gateway"):
+            PACKAGE["package"](self.archive, self.root)
+
+    def test_missing_web_asset_rejects_bundle(self):
+        (self.root / "node_modules/ghostty-web/ghostty-vt.wasm").unlink()
+        with self.assertRaisesRegex(ValueError, "Missing web UI asset"):
+            PACKAGE["package"](self.archive, self.root)
 
     def test_mismatched_manifest_rejects_bundle(self):
         self.write("desktop/Cargo.toml", '[package]\nversion = "1.2.4"\n')
