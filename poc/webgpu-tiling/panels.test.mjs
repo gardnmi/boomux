@@ -19,8 +19,10 @@ try{
  }
 
  assert.equal(await page.locator('.attachment-error p').textContent(),'Another terminal controls this Shell. Take control to use it here.');
+ const takeoverRequest=page.waitForRequest(request=>request.url().endsWith('/api/attach')&&request.postDataJSON()?.takeover===true);
  await page.getByRole('button',{name:'Take control',exact:true}).click();
- await page.getByRole('button',{name:'Cancel',exact:true}).click();
+ await takeoverRequest;
+ assert.equal(await page.locator('.resource-dialog').count(),0,'Take control attaches immediately without confirmation');
  assert.ok((await page.locator('#stage').boundingBox()).y<15,'canvas starts at the top');
  assert.equal(await page.locator('header,.toolbar').count(),0);
  assert.equal(await page.locator('.brand-copy strong').textContent(),'BOOMUX');
