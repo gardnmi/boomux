@@ -565,6 +565,10 @@ impl TerminalSession {
         self.shared.set_theme(theme)
     }
 
+    pub fn is_detached(&self) -> bool {
+        self.shared.status.lock().unwrap().as_str() == "detached"
+    }
+
     pub fn status_message(&self) -> Option<String> {
         let status = self.shared.status.lock().unwrap();
         match status.as_str() {
