@@ -10009,13 +10009,14 @@ impl Workspace {
                 .size_full()
                 .flex()
                 .flex_col()
-                .items_start()
-                .gap_3()
-                .p_6()
-                .bg(rgb(0x1e1e2e))
-                .text_sm()
-                .text_color(rgb(0xa6adc8))
-                .child("Another terminal controls this Shell. Take control to use it here.")
+                .gap_2()
+                .p_3()
+                .overflow_hidden()
+                .child(
+                    div().flex_none().text_xs().text_color(rgb(0xa6adc8)).child(
+                        "Another terminal controls this Shell. Take control to use it here.",
+                    ),
+                )
                 .child(
                     Self::settings_control(
                         ("take-control-body", pane_id),
@@ -10027,7 +10028,8 @@ impl Workspace {
                         false,
                         !attaching,
                     )
-                    .flex_none()
+                    .w_full()
+                    .min_h_0()
                     .button_chrome()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, window, cx| {

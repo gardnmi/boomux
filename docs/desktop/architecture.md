@@ -30,7 +30,7 @@ encoding and forwarding them; this keeps Kitty keyboard, modifyOtherKeys,
 cursor, keypad, and backarrow negotiation ordered with terminal output.
 Detaching a pane never implies closing its Boomux Shell.
 When another client takes control, Desktop publishes the detached status before
-draining the terminal worker and shows **Take control** in the pane heading.
+draining the terminal worker and replaces the terminal body with a centered **Take control** action.
 That action attaches to the same ShellRun; workspace switching is not required.
 Layout capture and restore discard unbound placeholders that have no Shell identity,
 collapsing their splits. Saved references to unavailable Shells remain reconnectable.
