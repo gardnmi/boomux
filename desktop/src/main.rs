@@ -7435,6 +7435,12 @@ impl Workspace {
                 .id("sidebar-header-menu")
                 .role(gpui::Role::Menu)
                 .aria_label("More actions")
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    // Consume the dismissing press so the trigger cannot reopen the menu.
+                    cx.stop_propagation();
+                    this.sidebar_header_menu_open = false;
+                    cx.notify();
+                }))
                 .absolute()
                 .occlude()
                 .top(px(54.0))
