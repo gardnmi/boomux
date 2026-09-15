@@ -472,11 +472,14 @@ impl Workspace {
         size: (u16, u16, u16, u16),
         cx: &mut Context<Self>,
     ) {
-        if let Some(pane) = self.terminals.get_mut(&id) {
-            pane.attaching = true;
-            pane.restore_attempt = shell.run_id.clone();
-            pane.error = None;
+        if self.layout_frozen || self.layout_closing {
+            return;
         }
+        let Some(pane) = self.terminals.get_mut(&id) else {
+            return;
+        };
+        pane.recovery.begin(shell.run_id.as_deref());
+        let generation = pane.begin_attachment();
         cx.spawn(async move |this, cx| {
             let attached = shell.clone();
             let result = cx
@@ -489,27 +492,33 @@ impl Workspace {
                     return;
                 };
                 // The user may have explicitly attached something else while restoring.
-                if pane.session.is_some() || pane.shell.as_ref().is_none_or(|s| s.id != attached.id)
+                if pane
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| !session.is_closed())
+                    || !pane.accepts_attachment(generation, &attached.id)
                 {
                     return;
                 }
                 pane.attaching = false;
+                if this.layout_frozen || this.layout_closing {
+                    return;
+                }
                 match result {
                     Ok(session) => {
+                        let mut current = attached.clone();
+                        current.run_id = session.run_id.clone();
+                        current.status = boomux::protocol::ShellStatus::Running;
+                        pane.recovery.succeeded(current.run_id.as_deref());
                         pane.screen = Some(session.screen());
                         pane.session = Some(session);
-                        pane.shell = Some(attached.clone());
+                        pane.shell = Some(current);
                         this.watch_terminal(id, attached.id, cx);
                     }
                     Err(error) => {
+                        pane.recovery
+                            .failed(terminal::automatic_restore_paused(&error), Instant::now());
                         pane.error = Some(error);
-                        pane.restore_failures = pane.restore_failures.saturating_add(1);
-                        pane.restore_retry_after = Some(
-                            Instant::now()
-                                + Duration::from_secs(
-                                    (1u64 << pane.restore_failures.min(5)).min(30),
-                                ),
-                        );
                     }
                 }
                 cx.notify();
@@ -545,49 +554,61 @@ impl Workspace {
     }
 
     pub(super) fn reconnect_saved_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let available = 4usize.saturating_sub(
+        if self.layout_frozen || self.layout_closing {
+            return;
+        }
+        let available = recovery::MAX_CONCURRENT.saturating_sub(
             self.terminals
                 .values()
-                .filter(|p| p.restored.is_some() && p.attaching)
+                .filter(|pane| pane.attaching)
                 .count(),
         );
-        let mut pending = Vec::new();
-        for (id, pane) in &mut self.terminals {
-            if pane.session.is_some() || pane.attaching {
-                continue;
+        let outgoing: HashSet<_> = self
+            .workspace_transition
+            .as_ref()
+            .map(|transition| transition.outgoing.iter().map(|pane| pane.id).collect())
+            .unwrap_or_default();
+        let candidates = self.terminals.iter().filter_map(|(id, pane)| {
+            if pane.attaching
+                || outgoing.contains(id)
+                || pane
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| !session.is_closed())
+            {
+                return None;
             }
-            let Some(key) = pane.restored.as_ref().and_then(|p| p.shell.as_ref()) else {
-                continue;
-            };
+            let key = pane
+                .shell
+                .as_ref()
+                .map(|shell| &shell.id)
+                .or_else(|| pane.restored.as_ref().and_then(|pane| pane.shell.as_ref()))?;
             if let Some(remote) = remote::identity(key)
                 && !self
                     .node_views
                     .iter()
-                    .any(|n| n.id == remote.node_id && n.connected())
+                    .any(|node| node.id == remote.node_id && node.connected())
             {
-                pane.restore_attempt = None;
-                continue;
+                return None;
             }
-            let Some(shell) = self.boomux_shells.iter().find(|s| &s.id == key) else {
-                continue;
-            };
-            let Some(run) = &shell.run_id else {
-                continue;
-            };
-            let retry_due = pane
-                .restore_retry_after
-                .is_some_and(|deadline| Instant::now() >= deadline);
-            if pending.len() < available
-                && matches!(shell.status, boomux::protocol::ShellStatus::Running)
-                && (pane.restore_attempt.as_ref() != Some(run) || retry_due)
-            {
-                pane.restore_attempt = Some(run.clone());
-                pane.restore_retry_after = None;
+            Some(recovery::Candidate {
+                pane: *id,
+                shell: key,
+                retry: &pane.recovery,
+            })
+        });
+        let shells = self.boomux_shells.iter().map(|shell| recovery::Shell {
+            id: &shell.id,
+            run: shell.run_id.as_deref(),
+            eligible: !matches!(shell.status, boomux::protocol::ShellStatus::Exited { .. })
+                && !shell.desktop_setup,
+        });
+        let pending = recovery::plan(candidates, shells, available, Instant::now());
+        for (id, index) in pending {
+            let shell = self.boomux_shells[index].clone();
+            if let Some(pane) = self.terminals.get_mut(&id) {
                 pane.shell = Some(shell.clone());
-                pending.push((*id, shell.clone()));
             }
-        }
-        for (id, shell) in pending {
             let size = self.terminal_grid_size(id, window);
             self.start_restored_attachment(id, shell, size, cx);
         }
