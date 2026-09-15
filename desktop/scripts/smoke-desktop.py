@@ -331,7 +331,7 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
                 raise RuntimeError("exiting Desktop did not preserve the exact ShellRun")
             layout_path = Path(env["XDG_STATE_HOME"]) / "boomux-desktop/layout-state.json"
             saved_layout = json.loads(layout_path.read_text())
-            pending_id = created_id(cli("shell", "create", workspace_id, "--name", "restore-must-not-start",
+            pending_id = created_id(cli("shell", "create", workspace_id, "--name", "restore-once",
                                         "--cwd", str(root), "--", "/bin/sh", "-c", "exit 99"))
             key = "workspace:" + workspace_id
             saved_layout["active"] = key
@@ -353,9 +353,28 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
                         and restored_layout_matches(document, shell_id, pending_id))
             wait_for("internal layout restoration and durable recapture", layout_restored, [*servers, app])
             (output / "restored-layout.json").write_text(layout_path.read_text())
-            pending_shell = json.loads(cli("--json", "shell", "inspect", pending_id))["data"]["shell"]
-            if pending_shell["status"] != "pending":
-                raise RuntimeError("layout restoration started a pending Shell")
+            def restored_shell():
+                return json.loads(cli("--json", "shell", "inspect", pending_id))["data"]["shell"]
+
+            # A new pending Shell starts automatically, then its normal exit must
+            # remain final across another Desktop restart.
+            wait_for("automatic pending Shell start and completion",
+                     lambda: restored_shell()["status"] == {"exited": {"code": 99}},
+                     [*servers, app])
+            finished_run_id = restored_shell()["run"]["id"]
+            stop(app)
+            app = launch("finished-shell-restore")
+            deadline = time.monotonic() + 3
+
+            def finished_shell_stays_stopped():
+                finished = restored_shell()
+                if (finished["status"] != {"exited": {"code": 99}}
+                        or finished["run"]["id"] != finished_run_id):
+                    raise RuntimeError("layout restoration restarted a normally finished Shell")
+                return time.monotonic() >= deadline
+
+            wait_for("finished Shell remains stopped", finished_shell_stays_stopped,
+                     [*servers, app], seconds=10)
             after = inspect()
             if after["status"] != "running" or after["run"]["id"] != run_id:
                 raise RuntimeError("reopening Desktop changed the ShellRun")
@@ -365,7 +384,7 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
             if json.loads(cli("--json", "daemon", "status"))["data"]["pid"] != daemon_pid:
                 raise RuntimeError("reopening Desktop replaced the daemon")
             (output / "result.json").write_text(json.dumps(
-                dict(backend=backend, cpu_model=cpu_model, emulated_components=["desktop", "daemon", "cli"] if cpu_model else [], shell_id=shell_id, run_id=run_id, status="passed", layout_restored=True,
+                dict(backend=backend, cpu_model=cpu_model, emulated_components=["desktop", "daemon", "cli"] if cpu_model else [], shell_id=shell_id, run_id=run_id, status="passed", layout_restored=True, pending_shell_started=True, finished_shell_preserved=True,
                      archive_sha256=actual, boomux_version=cli("--version").strip()), indent=2))
             print(f"PASS: {backend} bundle startup, attachment, and ShellRun survival", flush=True)
         finally:
