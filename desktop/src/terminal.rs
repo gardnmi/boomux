@@ -579,6 +579,17 @@ impl TerminalSession {
         let client = client::connect_if_running()
             .map_err(|e| e.to_string())?
             .ok_or("Boomux is not running")?;
+        Self::restore_with_client(client, shell, rows, cols, pixel_width, pixel_height)
+    }
+
+    fn restore_with_client(
+        client: Client,
+        shell: ShellChoice,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<Self, String> {
         // Pending after cold recovery may mean interrupted OR intentionally ended.
         // Ask the owner before starting it; never relaunch a normally finished command.
         let shell = if matches!(shell.status, ShellStatus::Pending) {
@@ -3178,23 +3189,152 @@ mod tests {
     }
 
     #[test]
-    fn layout_restore_never_starts_pending_or_exited_shells() {
-        use boomux::protocol::ShellStatus;
-        for status in [ShellStatus::Pending, ShellStatus::Exited { code: Some(0) }] {
+    fn layout_restore_checks_owner_before_starting_pending_shells() {
+        use boomux::protocol::{self, Envelope, Request, Response, ShellSnapshot, ShellStatus};
+        use std::os::unix::net::UnixListener;
+
+        for (reason, allowed) in [
+            (Some(serde_json::json!({"reason": "interrupted"})), true),
+            (None, true),
+            (
+                Some(serde_json::json!({"reason": "exited", "code": 0})),
+                false,
+            ),
+            (Some(serde_json::json!({"reason": "terminated"})), false),
+        ] {
+            let directory = std::env::temp_dir().join(format!("lr-{:016x}", fastrand::u64(..)));
+            std::fs::create_dir(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let envelope: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert!(
+                    matches!(envelope.message, Request::GetShell { ref shell_id } if shell_id == "saved")
+                );
+                let run = reason.map(|reason| {
+                    serde_json::json!({
+                        "id": "old-run", "generation": 1, "started_at_ms": 1, "ended_at_ms": 2,
+                        "exit_reason": reason, "output_revision": 0, "environment_has_run_id": true
+                    })
+                });
+                let snapshot: ShellSnapshot = serde_json::from_value(serde_json::json!({
+                    "id": "saved", "workspace_id": "workspace", "name": "saved", "cwd": "/tmp",
+                    "status": "pending", "run": run
+                }))
+                .unwrap();
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::with_version(envelope.version, Response::Shell { shell: snapshot }),
+                )
+                .unwrap();
+                if allowed {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let envelope: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                    let Request::Attach {
+                        shell_id,
+                        expected_run_id,
+                        takeover,
+                        restart_exited,
+                        ..
+                    } = envelope.message
+                    else {
+                        panic!("expected recovered attachment")
+                    };
+                    assert_eq!(shell_id, "saved");
+                    assert_eq!(expected_run_id, None);
+                    assert!(!takeover && !restart_exited);
+                    protocol::write_message(
+                        &mut stream,
+                        &Envelope::with_version(
+                            envelope.version,
+                            Response::Error {
+                                code: None,
+                                message: "attachment reached".into(),
+                            },
+                        ),
+                    )
+                    .unwrap();
+                }
+                listener
+            });
             let shell = super::ShellChoice {
                 id: "saved".into(),
                 name: "saved".into(),
                 workspace_id: "workspace".into(),
-                cwd: std::path::PathBuf::new(),
-                status,
-                run_id: None,
+                cwd: directory.clone(),
+                status: ShellStatus::Pending,
+                run_id: Some("stale-overview-run".into()),
                 desktop_setup: false,
             };
-            let error = super::TerminalSession::restore(shell, 24, 80, 800, 480)
-                .err()
-                .unwrap();
-            assert!(error.contains("start it explicitly"));
+            let error = super::TerminalSession::restore_with_client(
+                boomux::client::Client::from_socket_path(socket),
+                shell,
+                24,
+                80,
+                800,
+                480,
+            )
+            .err()
+            .unwrap();
+            assert!(
+                error.contains(if allowed {
+                    "attachment reached"
+                } else {
+                    "start it explicitly"
+                }),
+                "{error}"
+            );
+            let listener = server.join().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(listener);
+            std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn layout_restore_never_starts_exited_shells() {
+        let directory = std::env::temp_dir().join(format!("le-{:016x}", fastrand::u64(..)));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let shell = super::ShellChoice {
+            id: "saved".into(),
+            name: "saved".into(),
+            workspace_id: "workspace".into(),
+            cwd: directory.clone(),
+            status: boomux::protocol::ShellStatus::Exited { code: Some(0) },
+            run_id: None,
+            desktop_setup: false,
+        };
+        let error = super::TerminalSession::restore_with_client(
+            boomux::client::Client::from_socket_path(socket),
+            shell,
+            24,
+            80,
+            800,
+            480,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("start it explicitly"), "{error}");
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

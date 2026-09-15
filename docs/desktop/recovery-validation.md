@@ -29,7 +29,7 @@ existing daemon recovery contracts.
 
 | Behavior | Focused coverage |
 | --- | --- |
-| Interrupted versus normally ended Shells | `automatic_attachment_recovery_starts_only_interrupted_or_new_shells` |
+| Interrupted versus normally ended Shells | `automatic_attachment_recovery_starts_only_interrupted_or_new_shells`, isolated owner/attachment fixtures in `layout_restore_checks_owner_before_starting_pending_shells` and `layout_restore_never_starts_exited_shells` |
 | Exact supported conversation after reboot | Native `cold_recovery_resumes_exact_codex_thread_with_run_scoped_hooks` (passed during implementation) |
 | Stale run cannot replace a newer controller | Native `exact_run_attach_rejects_a_run_changed_after_validation_without_takeover` |
 | Graceful daemon restart reconnects an attachment | Native `attachment_client_reconnects_across_daemon_restart` |
