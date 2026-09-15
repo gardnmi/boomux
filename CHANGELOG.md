@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.6](https://github.com/gardnmi/boomux/compare/v1.21.5...v1.21.6) (2026-09-15)
+
+
+### Bug Fixes
+
+* **desktop:** dismiss sidebar menu on outside click ([#448](https://github.com/gardnmi/boomux/issues/448)) ([b7f8b5b](https://github.com/gardnmi/boomux/commit/b7f8b5b84bbd931ba6f7f52e4950ad54f3c59874))
+
 ## [1.21.5](https://github.com/gardnmi/boomux/compare/v1.21.4...v1.21.5) (2026-09-14)
 
 
