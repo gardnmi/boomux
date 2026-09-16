@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.7](https://github.com/gardnmi/boomux/compare/v1.21.6...v1.21.7) (2026-09-16)
+
+
+### Bug Fixes
+
+* **desktop:** recover terminal attachments automatically ([#450](https://github.com/gardnmi/boomux/issues/450)) ([8a14721](https://github.com/gardnmi/boomux/commit/8a147215947286c7d11501dcf874846eb6e4dee3))
+
 ## [1.21.6](https://github.com/gardnmi/boomux/compare/v1.21.5...v1.21.6) (2026-09-15)
 
 
