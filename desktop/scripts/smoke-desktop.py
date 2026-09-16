@@ -28,6 +28,10 @@ def wait_for(description, predicate, processes, seconds=30):
     raise RuntimeError(f"timed out waiting for {description}")
 
 
+def shell_finished(shell, code):
+    return shell.get("status") == "exited" and shell.get("exit_code") == code
+
+
 def wayland_frame_presented(log):
     if 'set_app_id("org.omarchy.boomux-desktop")' not in log:
         return False
@@ -359,7 +363,7 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
             # A new pending Shell starts automatically, then its normal exit must
             # remain final across another Desktop restart.
             wait_for("automatic pending Shell start and completion",
-                     lambda: restored_shell()["status"] == {"exited": {"code": 99}},
+                     lambda: shell_finished(restored_shell(), 99),
                      [*servers, app])
             finished_run_id = restored_shell()["run"]["id"]
             stop(app)
@@ -368,7 +372,7 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
 
             def finished_shell_stays_stopped():
                 finished = restored_shell()
-                if (finished["status"] != {"exited": {"code": 99}}
+                if (not shell_finished(finished, 99)
                         or finished["run"]["id"] != finished_run_id):
                     raise RuntimeError("layout restoration restarted a normally finished Shell")
                 return time.monotonic() >= deadline
