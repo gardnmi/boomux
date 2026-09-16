@@ -63,6 +63,63 @@ impl ShellChoice {
     }
 }
 
+/// A detach frame has no reason: only an explicit owner conflict proves takeover is needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryAction {
+    Start,
+    Reconnect,
+    TakeControl,
+}
+
+impl RecoveryAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start Shell",
+            Self::Reconnect => "Reconnect",
+            Self::TakeControl => "Take control",
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Start => "This Shell is stopped. Start it to open a new run.",
+            Self::Reconnect => "The connection to this Shell ended. Reconnect to use it here.",
+            Self::TakeControl => {
+                "Another terminal controls this Shell. Take control to use it here."
+            }
+        }
+    }
+}
+
+pub fn automatic_restore_paused(error: &str) -> bool {
+    error == "Shell ended normally; start it explicitly"
+}
+
+fn automatic_restore_allowed(shell: &ShellSnapshot) -> bool {
+    match shell.status {
+        ShellStatus::Running => true,
+        ShellStatus::Exited { .. } => false,
+        ShellStatus::Pending => shell.run.as_ref().is_none_or(|run| {
+            matches!(
+                run.exit_reason,
+                Some(boomux::protocol::ShellRunExitReason::Interrupted)
+            )
+        }),
+    }
+}
+
+pub fn recovery_action(status: &ShellStatus, error: Option<&str>) -> RecoveryAction {
+    if !matches!(status, ShellStatus::Running) {
+        RecoveryAction::Start
+    } else if error
+        .is_some_and(|error| error.contains("active controller") || error.contains("use takeover"))
+    {
+        RecoveryAction::TakeControl
+    } else {
+        RecoveryAction::Reconnect
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceChoice {
     pub id: String,
@@ -162,6 +219,7 @@ pub struct TerminalImagePlacement {
 }
 
 struct SharedTerminal {
+    diagnostic_identity: std::sync::OnceLock<(String, Option<String>)>,
     screen: Mutex<Arc<TerminalScreen>>,
     updates: async_channel::Sender<()>,
     update_events: async_channel::Receiver<()>,
@@ -182,10 +240,18 @@ struct SharedTerminal {
 }
 
 impl SharedTerminal {
+    fn try_screen(&self) -> Option<Arc<TerminalScreen>> {
+        self.screen
+            .try_lock()
+            .ok()
+            .map(|screen| Arc::clone(&screen))
+    }
+
     fn new(profile: TerminalProfile) -> Self {
         let theme = crate::theme::current_terminal();
         let (updates, update_events) = async_channel::bounded(1);
         Self {
+            diagnostic_identity: std::sync::OnceLock::new(),
             screen: Mutex::new(Arc::new(blank_screen(profile.rows, profile.cols))),
             updates,
             update_events,
@@ -414,6 +480,15 @@ impl SharedTerminal {
         }
         *self.writer.lock().unwrap() = None;
         // Publish control loss before the worker finishes draining queued output.
+        let status = status.into();
+        if let Some((shell, run)) = self.diagnostic_identity.get() {
+            let event = match status.as_str() {
+                "detached" => "detached_reason_unknown",
+                "connection closed" => "connection_closed",
+                _ => "attachment_failed",
+            };
+            crate::attachment_diagnostics::record(event, shell, run.as_deref());
+        }
         self.replace_status(status);
         // Dropping the sender preserves queued output without requiring capacity.
         self.emulator.lock().unwrap().take();
@@ -476,6 +551,19 @@ impl TerminalSession {
         Self::attach_with_client(client, shell, rows, cols, pixel_width, pixel_height)
     }
 
+    pub fn attach_without_takeover(
+        shell: ShellChoice,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<Self, String> {
+        let client = client::connect_if_running()
+            .map_err(|e| e.to_string())?
+            .ok_or("Boomux is not running")?;
+        Self::attach_with_policy(client, shell, rows, cols, pixel_width, pixel_height, false)
+    }
+
     pub fn restore(
         shell: ShellChoice,
         rows: u16,
@@ -483,12 +571,42 @@ impl TerminalSession {
         pixel_width: u16,
         pixel_height: u16,
     ) -> Result<Self, String> {
-        if !matches!(shell.status, ShellStatus::Running) || shell.run_id.is_none() {
-            return Err("Saved Shell is stopped; start it explicitly".into());
-        }
+        crate::attachment_diagnostics::record(
+            "automatic_restore_requested",
+            &shell.id,
+            shell.run_id.as_deref(),
+        );
         let client = client::connect_if_running()
             .map_err(|e| e.to_string())?
             .ok_or("Boomux is not running")?;
+        Self::restore_with_client(client, shell, rows, cols, pixel_width, pixel_height)
+    }
+
+    fn restore_with_client(
+        client: Client,
+        shell: ShellChoice,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<Self, String> {
+        // Pending after cold recovery may mean interrupted OR intentionally ended.
+        // Ask the owner before starting it; never relaunch a normally finished command.
+        let shell = if matches!(shell.status, ShellStatus::Pending) {
+            let snapshot = crate::remote::shell(&client, &shell.id).map_err(|e| e.to_string())?;
+            if !automatic_restore_allowed(&snapshot) {
+                return Err("Shell ended normally; start it explicitly".into());
+            }
+            let mut current = shell_choice(snapshot);
+            current.id = shell.id;
+            current.workspace_id = shell.workspace_id;
+            current
+        } else {
+            shell
+        };
+        if matches!(shell.status, ShellStatus::Exited { .. }) {
+            return Err("Shell ended normally; start it explicitly".into());
+        }
         Self::attach_with_policy(client, shell, rows, cols, pixel_width, pixel_height, false)
     }
 
@@ -514,7 +632,27 @@ impl TerminalSession {
         takeover: bool,
     ) -> Result<Self, String> {
         let profile = terminal_profile(rows, cols, pixel_width, pixel_height);
-        let attachment = attach_shell(&client, &shell, profile.clone(), takeover)?;
+        crate::attachment_diagnostics::record(
+            if takeover {
+                "attach_takeover_requested"
+            } else {
+                "attach_requested"
+            },
+            &shell.id,
+            shell.run_id.as_deref(),
+        );
+        let attachment =
+            attach_shell(&client, &shell, profile.clone(), takeover).inspect_err(|error| {
+                crate::attachment_diagnostics::record(
+                    if error.contains("active controller") || error.contains("use takeover") {
+                        "controller_conflict"
+                    } else {
+                        "attach_failed"
+                    },
+                    &shell.id,
+                    shell.run_id.as_deref(),
+                );
+            })?;
         let shared = Arc::new(SharedTerminal::new(profile));
         let stream = attachment.stream;
         shared.install_writer(&stream)?;
@@ -531,6 +669,10 @@ impl TerminalSession {
                     .ok()
                     .and_then(|snapshot| snapshot.run.map(|run| run.id))
             };
+        let _ = shared
+            .diagnostic_identity
+            .set((shell.id.clone(), expected_run_id.clone()));
+        crate::attachment_diagnostics::record("attached", &shell.id, expected_run_id.as_deref());
         spawn_reader(
             client,
             shell.id.clone(),
@@ -565,8 +707,8 @@ impl TerminalSession {
         self.shared.set_theme(theme)
     }
 
-    pub fn is_detached(&self) -> bool {
-        self.shared.status.lock().unwrap().as_str() == "detached"
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
     }
 
     pub fn status_message(&self) -> Option<String> {
@@ -582,8 +724,16 @@ impl TerminalSession {
         }
     }
 
+    pub fn try_screen(&self) -> Option<Arc<TerminalScreen>> {
+        self.shared.try_screen()
+    }
+
     pub fn screen(&self) -> Arc<TerminalScreen> {
         Arc::clone(&self.shared.screen.lock().unwrap())
+    }
+
+    pub fn observes(&self, events: &async_channel::Receiver<()>) -> bool {
+        self.shared.update_events.same_channel(events)
     }
 
     pub fn update_events(&self) -> async_channel::Receiver<()> {
@@ -725,6 +875,11 @@ fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        crate::attachment_diagnostics::record(
+            "pane_detached",
+            &self.shell_id,
+            self.run_id.as_deref(),
+        );
         let _ = self.shared.send(AttachFrame::Detached);
         self.shared.closed.store(true, Ordering::Release);
         self.shared.cancel_emulator();
@@ -1479,7 +1634,7 @@ fn attach_shell(
                 identity,
                 takeover,
                 matches!(shell.status, ShellStatus::Exited { .. }),
-                shell.run_id.clone(),
+                matches!(shell.status, ShellStatus::Running).then(|| shell.run_id.clone()).flatten(),
                 profile,
             )
             .map_err(|error| match &error {
@@ -2264,6 +2419,11 @@ fn spawn_reader(
                         shared.bump_revision();
                     }
                     Ok(AttachFrame::Reconnect) => {
+                        crate::attachment_diagnostics::record(
+                            "handoff_reconnect",
+                            &shell_id,
+                            expected_run_id.as_deref(),
+                        );
                         let _ = AttachFrame::ReconnectAck.write_to(&mut stream);
                         shared.set_status("reconnecting");
                         let profile = shared.profile.lock().unwrap().clone();
@@ -2277,6 +2437,11 @@ fn spawn_reader(
                                 shared.process(attachment.reconstruction);
                                 refresh_attachment = true;
                                 shared.set_status("attached");
+                                crate::attachment_diagnostics::record(
+                                    "handoff_reconnected",
+                                    &shell_id,
+                                    expected_run_id.as_deref(),
+                                );
                             }
                             Err(error) => {
                                 shared.close(error);
@@ -2617,6 +2782,120 @@ fn indexed_color_with_palette(index: u8, ansi: &[u32; 16]) -> u32 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn attachment_replacement_releases_shared_state_and_closes_observers() {
+        for _ in 0..100 {
+            let shared = Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480)));
+            let weak = Arc::downgrade(&shared);
+            shared
+                .diagnostic_identity
+                .set(("shell".into(), Some("run".into())))
+                .unwrap();
+            let events = shared.update_events.clone();
+            let session = super::TerminalSession {
+                shell_id: "shell".into(),
+                run_id: Some("run".into()),
+                shell_name: "test".into(),
+                setup_workspace_cleanup: None,
+                connect_result: None,
+                shared,
+                last_size: std::sync::Mutex::new((24, 80)),
+            };
+            drop(session);
+            assert!(weak.upgrade().is_none());
+            assert!(events.is_closed());
+        }
+    }
+
+    #[test]
+    fn attachment_observers_follow_the_connection_not_just_the_shell() {
+        let make_session = || super::TerminalSession {
+            shell_id: "same-shell".into(),
+            run_id: Some("same-run".into()),
+            shell_name: "test".into(),
+            setup_workspace_cleanup: None,
+            connect_result: None,
+            shared: Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480))),
+            last_size: std::sync::Mutex::new((24, 80)),
+        };
+        let old = make_session();
+        let events = old.update_events();
+        let replacement = make_session();
+        assert!(old.observes(&events));
+        assert!(!replacement.observes(&events));
+        let guard = old.shared.screen.lock().unwrap();
+        assert!(
+            old.try_screen().is_none(),
+            "UI must not wait for a screen lock"
+        );
+        drop(guard);
+        old.shared.close("connection closed");
+        assert!(old.try_screen().is_some(), "closed output stays readable");
+    }
+
+    #[test]
+    fn automatic_attachment_recovery_starts_only_interrupted_or_new_shells() {
+        use super::{automatic_restore_allowed, automatic_restore_paused};
+        use boomux::protocol::{ShellRunExitReason, ShellSnapshot, ShellStatus};
+        let mut shell: ShellSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "s", "workspace_id": "w", "name": "test", "cwd": "/tmp", "status": "pending",
+            "run": {"id": "old", "generation": 1, "started_at_ms": 1, "ended_at_ms": 2,
+                "exit_reason": {"reason": "interrupted"}, "output_revision": 0,
+                "environment_has_run_id": true}
+        }))
+        .unwrap();
+        assert!(automatic_restore_allowed(&shell));
+        for reason in [
+            ShellRunExitReason::Exited { code: Some(0) },
+            ShellRunExitReason::Terminated,
+        ] {
+            shell.run.as_mut().unwrap().exit_reason = Some(reason);
+            assert!(!automatic_restore_allowed(&shell));
+        }
+        shell.run = None;
+        assert!(automatic_restore_allowed(&shell));
+        shell.status = ShellStatus::Exited { code: Some(0) };
+        assert!(!automatic_restore_allowed(&shell));
+        assert!(!automatic_restore_paused(
+            "shell already has an active controller; use takeover"
+        ));
+        assert!(!automatic_restore_paused("connection closed"));
+    }
+
+    #[test]
+    fn attachment_recovery_does_not_infer_takeover_from_detach_or_reboot() {
+        use super::{RecoveryAction, ShellStatus, recovery_action};
+        assert_eq!(
+            recovery_action(&ShellStatus::Running, None),
+            RecoveryAction::Reconnect
+        );
+        for error in ["detached", "connection closed", "terminal read failed"] {
+            assert_eq!(
+                recovery_action(&ShellStatus::Running, Some(error)),
+                RecoveryAction::Reconnect
+            );
+        }
+        assert_eq!(
+            recovery_action(
+                &ShellStatus::Running,
+                Some("shell already has an active controller; use takeover")
+            ),
+            RecoveryAction::TakeControl
+        );
+        assert_eq!(
+            recovery_action(&ShellStatus::Pending, None),
+            RecoveryAction::Start
+        );
+        assert_eq!(
+            recovery_action(&ShellStatus::Exited { code: Some(0) }, None),
+            RecoveryAction::Start
+        );
+        assert_eq!(
+            recovery_action(&ShellStatus::Pending, Some("active controller")),
+            RecoveryAction::Start
+        );
+    }
+
+    #[test]
     #[ignore = "requires the matching CLI in BOOMUX_TEST_CLI; runs only an isolated fixture daemon"]
     fn setup_workspace_real_lifecycle_cleans_only_unused_creation() {
         use boomux::protocol::{Request, ShellSpec};
@@ -2910,23 +3189,152 @@ mod tests {
     }
 
     #[test]
-    fn layout_restore_never_starts_pending_or_exited_shells() {
-        use boomux::protocol::ShellStatus;
-        for status in [ShellStatus::Pending, ShellStatus::Exited { code: Some(0) }] {
+    fn layout_restore_checks_owner_before_starting_pending_shells() {
+        use boomux::protocol::{self, Envelope, Request, Response, ShellSnapshot, ShellStatus};
+        use std::os::unix::net::UnixListener;
+
+        for (reason, allowed) in [
+            (Some(serde_json::json!({"reason": "interrupted"})), true),
+            (None, true),
+            (
+                Some(serde_json::json!({"reason": "exited", "code": 0})),
+                false,
+            ),
+            (Some(serde_json::json!({"reason": "terminated"})), false),
+        ] {
+            let directory = std::env::temp_dir().join(format!("lr-{:016x}", fastrand::u64(..)));
+            std::fs::create_dir(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let envelope: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                assert!(
+                    matches!(envelope.message, Request::GetShell { ref shell_id } if shell_id == "saved")
+                );
+                let run = reason.map(|reason| {
+                    serde_json::json!({
+                        "id": "old-run", "generation": 1, "started_at_ms": 1, "ended_at_ms": 2,
+                        "exit_reason": reason, "output_revision": 0, "environment_has_run_id": true
+                    })
+                });
+                let snapshot: ShellSnapshot = serde_json::from_value(serde_json::json!({
+                    "id": "saved", "workspace_id": "workspace", "name": "saved", "cwd": "/tmp",
+                    "status": "pending", "run": run
+                }))
+                .unwrap();
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::with_version(envelope.version, Response::Shell { shell: snapshot }),
+                )
+                .unwrap();
+                if allowed {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let envelope: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                    let Request::Attach {
+                        shell_id,
+                        expected_run_id,
+                        takeover,
+                        restart_exited,
+                        ..
+                    } = envelope.message
+                    else {
+                        panic!("expected recovered attachment")
+                    };
+                    assert_eq!(shell_id, "saved");
+                    assert_eq!(expected_run_id, None);
+                    assert!(!takeover && !restart_exited);
+                    protocol::write_message(
+                        &mut stream,
+                        &Envelope::with_version(
+                            envelope.version,
+                            Response::Error {
+                                code: None,
+                                message: "attachment reached".into(),
+                            },
+                        ),
+                    )
+                    .unwrap();
+                }
+                listener
+            });
             let shell = super::ShellChoice {
                 id: "saved".into(),
                 name: "saved".into(),
                 workspace_id: "workspace".into(),
-                cwd: std::path::PathBuf::new(),
-                status,
-                run_id: None,
+                cwd: directory.clone(),
+                status: ShellStatus::Pending,
+                run_id: Some("stale-overview-run".into()),
                 desktop_setup: false,
             };
-            let error = super::TerminalSession::restore(shell, 24, 80, 800, 480)
-                .err()
-                .unwrap();
-            assert!(error.contains("start it explicitly"));
+            let error = super::TerminalSession::restore_with_client(
+                boomux::client::Client::from_socket_path(socket),
+                shell,
+                24,
+                80,
+                800,
+                480,
+            )
+            .err()
+            .unwrap();
+            assert!(
+                error.contains(if allowed {
+                    "attachment reached"
+                } else {
+                    "start it explicitly"
+                }),
+                "{error}"
+            );
+            let listener = server.join().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(listener);
+            std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn layout_restore_never_starts_exited_shells() {
+        let directory = std::env::temp_dir().join(format!("le-{:016x}", fastrand::u64(..)));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let shell = super::ShellChoice {
+            id: "saved".into(),
+            name: "saved".into(),
+            workspace_id: "workspace".into(),
+            cwd: directory.clone(),
+            status: boomux::protocol::ShellStatus::Exited { code: Some(0) },
+            run_id: None,
+            desktop_setup: false,
+        };
+        let error = super::TerminalSession::restore_with_client(
+            boomux::client::Client::from_socket_path(socket),
+            shell,
+            24,
+            80,
+            800,
+            480,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("start it explicitly"), "{error}");
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2938,7 +3346,12 @@ mod tests {
         let socket = directory.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
-            for takeover in [true, false] {
+            for (takeover, restart, run) in [
+                (true, false, Some("run")),
+                (false, false, Some("run")),
+                (false, false, None),
+                (true, true, None),
+            ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
                 let Request::AttachNode {
@@ -2954,8 +3367,8 @@ mod tests {
                 assert_eq!(identity.node_id, "owner");
                 assert_eq!(identity.inner_id, "shell");
                 assert_eq!(actual, takeover);
-                assert!(!restart_exited);
-                assert_eq!(expected_run_id.as_deref(), Some("run"));
+                assert_eq!(restart_exited, restart);
+                assert_eq!(expected_run_id.as_deref(), run);
                 protocol::write_message(
                     &mut stream,
                     &Envelope::with_version(
@@ -2984,6 +3397,11 @@ mod tests {
         let profile = terminal_profile(24, 80, 800, 480);
         super::attach_shell(&client, &shell, profile.clone(), true).unwrap();
         super::reconnect(&client, &shell.id, Some("run"), &profile).unwrap();
+        let mut recovered = shell.clone();
+        recovered.status = boomux::protocol::ShellStatus::Pending;
+        super::attach_shell(&client, &recovered, profile.clone(), false).unwrap();
+        recovered.status = boomux::protocol::ShellStatus::Exited { code: Some(0) };
+        super::attach_shell(&client, &recovered, profile, true).unwrap();
         server.join().unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -4389,7 +4807,9 @@ mod tests {
 
                 run_emulator(&mut core, &shared, receiver);
 
-                let screen = shared.screen.lock().unwrap();
+                let screen = shared
+                    .try_screen()
+                    .expect("final screen remains visible after close");
                 let text: String = screen.cells.iter().map(|cell| cell.text.as_str()).collect();
                 assert!(text.contains(receipt), "{text}");
                 assert!(text.contains("Press Ctrl+W to close this pane."), "{text}");

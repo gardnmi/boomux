@@ -494,3 +494,23 @@ and opens the browser; while running, the sidebar footer shows **Open WebUI**, *
 [Tailscale installation](https://tailscale.com/download) and its
 [private HTTPS setup guide](https://tailscale.com/docs/features/tailscale-serve).
 The sharing footer is hidden when WebUI is stopped.
+
+## Attachment Troubleshooting
+
+Desktop reconnects automatically after brief interruptions, keeping the terminal
+view in place. After a computer reboot, it opens interrupted saved Shells and uses
+the daemon's existing agent recovery setting to resume exact supported conversations.
+The layout and focus are restored; arbitrary process memory does not survive reboot.
+Normally finished commands remain stopped.
+
+**Reconnect** appears only after repeated recovery failures. If another terminal
+controls the Shell, automatic attempts pause and **Take control** is offered.
+A generic detach notification alone does not prove another terminal took control.
+
+Attachment diagnostics are stored in
+`~/.local/state/boomux-desktop/attachments.jsonl` and
+`attachments.previous.jsonl` (or the configured Boomux/XDG state directory).
+They record timestamps, process/version and Shell/run IDs, and attachment events,
+without terminal contents. The two files are capped at 512 KiB each. Logging is
+best-effort; a crash or full queue can leave gaps. Include both files when
+investigating unexpected control loss or reconnect failures.

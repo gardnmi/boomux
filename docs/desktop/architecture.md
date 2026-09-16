@@ -29,9 +29,9 @@ where Ghostty's reusable key encoder reads the current terminal modes before
 encoding and forwarding them; this keeps Kitty keyboard, modifyOtherKeys,
 cursor, keypad, and backarrow negotiation ordered with terminal output.
 Detaching a pane never implies closing its Boomux Shell.
-When another client takes control, Desktop publishes the detached status before
-draining the terminal worker and replaces the terminal body with a centered **Take control** action.
-That action attaches to the same ShellRun; workspace switching is not required.
+When an attachment ends, Desktop publishes its status before draining the terminal
+worker and offers the recovery action described below. Workspace switching is not
+required to reconnect.
 Layout capture and restore discard unbound placeholders that have no Shell identity,
 collapsing their splits. Saved references to unavailable Shells remain reconnectable.
 
@@ -43,6 +43,52 @@ Older owners fall back to pending creation followed by attachment; remote and
 new-Workspace creation retain their existing paths. Reattachment
 to a running Shell retains the exact run already validated by attach, without a
 second owner lookup. Newly started/restarted Shells still resolve their new run.
+
+### Attachment Recovery And Diagnostics
+
+A protocol `Detached` frame does not identify why the attachment ended. Desktop
+must not interpret it as proof of a competing controller. A closed connection
+reconnects automatically to the exact current running ShellRun without takeover.
+Brief interruptions retain the existing terminal screen. Recovery controls overlay
+retained output rather than replacing it, and final drained output remains visible.
+Each attempt has a pane-local generation so late results cannot overwrite a newer
+user attachment. Observers are bound to their connection's event channel, keeping
+the existing view live until a replacement succeeds and ignoring old connections
+after replacement. After repeated failures,
+Desktop offers Reconnect, or Take control for an explicit owner controller conflict.
+Controller conflicts remain eligible for bounded non-takeover retries, allowing
+an update's old window time to release its attachment without requiring a click.
+`desktop/src/recovery.rs` owns retry state and planning. Waiting panes skip Shell
+lookups; batches use up to four direct lookups before a temporary borrowed index
+bounds the cost of many rejected candidates. No index is retained between refreshes.
+Backoff also applies when the observed run changes, for at most 30 seconds. Successful
+recovery resets it. Closing/frozen windows and outgoing animation panes do not start
+recovery work; late automatic results are discarded while the window is frozen. Recovery uses the existing overview
+loop with four concurrent attempts and exponential backoff capped at 30 seconds.
+
+Pending saved Shells are checked against an owner-authoritative snapshot. An
+interrupted run (or a Shell never yet started) starts automatically. The daemon's
+existing `recovery.resume_agents` policy resumes a uniquely identified supported
+agent conversation; Desktop does not infer a conversation from terminal output.
+Normally ended and explicitly terminated commands remain stopped. Temporary setup
+Shells are excluded from automatic recovery. Cold recovery creates a new process
+and ShellRun; it cannot preserve arbitrary process memory or unsaved terminal state.
+
+`desktop/src/attachment_diagnostics.rs` records attachment requests, successful
+attachments, conflicts, ambiguous detachments, connection closure, graceful
+handoff reconnects, and pane disposal. Records contain epoch milliseconds, PID,
+Desktop version, Node-qualified Shell identity (for remotes), and run identity.
+No terminal bytes, commands, environment, paths, or free-form error text are logged.
+The event name `detached_reason_unknown` deliberately makes no takeover claim.
+
+One lazy process-wide worker drains a 128-record queue; producers never wait on
+filesystem I/O. Queue overflow and failed writes drop records and are counted in
+the next written record. The worker blocks when idle. Owner-validated, no-follow,
+mode-0600 files and a nonblocking advisory lock coordinate multiple Desktops.
+`attachments.jsonl` and `attachments.previous.jsonl` each retain at most 512 KiB
+under the Desktop state directory, respecting `BOOMUX_STATE_HOME` and
+`XDG_STATE_HOME`. Diagnostics are best-effort, not a durable lifecycle journal;
+abrupt shutdown can lose queued records. They do not change daemon or Agent state.
 
 ### Terminal Selection And Clipboard
 
@@ -132,10 +178,13 @@ and history but does not remove project shortcuts or filesystem contents.
   from the daemon's combined snapshot.
 - `src/boomux_settings.rs`: active-layer settings editor and bounded CLI bridge;
   Boomux retains configuration validation and commit authority.
+- `src/recovery.rs`: pure retry state, backoff, and bounded recovery selection.
+- `src/attachment_diagnostics.rs`: bounded asynchronous attachment-event logging;
+  see [recovery validation](recovery-validation.md) for coverage and measurements.
 - `src/layout_state.rs`: versioned, bounded Desktop arrangement storage with atomic
   background writes and revision checks preventing stale-instance overwrites.
 - `src/layout_persistence.rs`: pane-ID remapping, per-Workspace/Mixed arrangement
-  capture/restore, debounced saves, and deferred exact-run attachments. Local
+  capture/restore, debounced saves, and automatic attachment/recovery orchestration. Local
   references are scoped to the verified coordinator Node; remote keys retain
   owner and resource identity. No terminal data or attachment environment is saved.
 - `src/settings.rs`: bounded preference loading, validation, and atomic background
@@ -566,12 +615,12 @@ inactive arrangements retain metadata only, not sessions or emulator state.
 Files cap at 2 MiB, 256 arrangements, 4096 total panes and depth 64. Invalid or
 unsupported files remain untouched and disable writes with a visible notice.
 
-Desktop startup restores the tree and floating geometry before exact-running
-attachments. Stopped Shells require explicit user action. Deferred attachments reuse the
-existing overview refresh, attempt at most four panes per refresh, and back off
-failed attempts up to 30 seconds without per-pane timers. This also allows an
-update replacement to attach after the old window releases its terminals. Restoration never authorizes
-Shell creation, restart, or attachment takeover. Updates freeze saving and await
+Desktop startup restores the tree and floating geometry before attaching running
+Shells or starting interrupted saved Shells through the owner recovery policy.
+Normally finished commands require explicit user action. Deferred attachments reuse
+the existing overview refresh, allow at most four concurrent attempts, and back off
+failures up to 30 seconds without per-pane timers. Restoration does not create
+Shell identities or take over another controller. Updates freeze saving and await
 the durable snapshot before launching the replacement; failure permits retry.
 A per-file lock plus revision comparison prevents stale windows from replacing
 newer state. Outer OS window placement remains outside this feature.

@@ -17,6 +17,15 @@ wl_callback#23.done(12345)
 
 
 class SmokeEvidenceTests(unittest.TestCase):
+    def test_finished_shell_uses_cli_status_and_exact_exit_code(self):
+        self.assertTrue(SMOKE["shell_finished"]({"status": "exited", "exit_code": 99}, 99))
+        for shell in [{"status": "pending"}, {"status": "running"},
+                      {"status": "exited", "exit_code": 0},
+                      {"status": "exited", "exit_code": None},
+                      {"status": {"exited": {"code": 99}}}]:
+            with self.subTest(shell=shell):
+                self.assertFalse(SMOKE["shell_finished"](shell, 99))
+
     def test_layout_evidence_requires_restored_geometry_identity_and_state(self):
         document = {"active": "workspace:w", "minimized": ["minimized-missing"], "arrangements": {
             "workspace:w": {"tree": {"Split": {"ratio": 0.31, "horizontal": True, "first": {"Pane": 101}, "second": {"Pane": 202}}},

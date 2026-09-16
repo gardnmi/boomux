@@ -148,6 +148,8 @@ python3 desktop/scripts/smoke-desktop.py --backend wayland \
 The harness creates private XDG directories, an isolated display and D-Bus, and
 uses Mesa software rendering. It checks mapped/committed frames, pending Shell
 attachment and PTY output, then close/reopen with the same daemon and ShellRun.
+It also restores a new pending Shell automatically and checks that its completed
+run stays stopped when Desktop reopens again.
 The X11 path emulates the foreground daemon and CLI as well as Desktop, asserting
 that daemon/Desktop process identities remain QEMU. Desktop's CLI helpers use
 the same QEMU wrapper through PATH. It does not exercise daemon

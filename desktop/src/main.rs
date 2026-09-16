@@ -1,3 +1,4 @@
+mod attachment_diagnostics;
 mod boomux_settings;
 mod buttons;
 use buttons::ButtonChrome;
@@ -12,6 +13,7 @@ mod layout_badge;
 mod layout_persistence;
 mod layout_state;
 mod nodes;
+mod recovery;
 mod remote;
 mod remote_visibility;
 mod runtime;
@@ -1699,12 +1701,11 @@ struct TerminalPane {
     temporary_setup: bool,
     shell: Option<ShellChoice>,
     restored: Option<layout_state::Pane>,
-    restore_attempt: Option<String>,
-    restore_retry_after: Option<Instant>,
-    restore_failures: u8,
+    recovery: recovery::Retry,
     session: Option<TerminalSession>,
     screen: Option<Arc<TerminalScreen>>,
     attaching: bool,
+    attachment_generation: u64,
     error: Option<String>,
     scroll_remainder: f32,
     scrollbar_hovered: bool,
@@ -1714,6 +1715,23 @@ struct TerminalPane {
     render_images: HashMap<u64, Arc<RenderImage>>,
     render_image_screen: Option<Arc<TerminalScreen>>,
     paint_cache: Option<Arc<TerminalPaintCache>>,
+}
+
+impl TerminalPane {
+    fn begin_attachment(&mut self) -> u64 {
+        self.attachment_generation = self.attachment_generation.wrapping_add(1);
+        self.attaching = true;
+        self.error = None;
+        self.attachment_generation
+    }
+
+    fn accepts_attachment(&self, generation: u64, shell_id: &str) -> bool {
+        self.attachment_generation == generation
+            && self
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.id == shell_id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5439,12 +5457,28 @@ impl Workspace {
         (rows, cols, pixel_width, pixel_height): (u16, u16, u16, u16),
         cx: &mut Context<Self>,
     ) {
+        self.start_terminal_attachment_with_policy(
+            pane_id,
+            shell,
+            (rows, cols, pixel_width, pixel_height),
+            true,
+            cx,
+        );
+    }
+
+    fn start_terminal_attachment_with_policy(
+        &mut self,
+        pane_id: usize,
+        shell: ShellChoice,
+        (rows, cols, pixel_width, pixel_height): (u16, u16, u16, u16),
+        takeover: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(pane) = self.terminals.get_mut(&pane_id) else {
             return;
         };
         pane.shell = Some(shell.clone());
-        pane.attaching = true;
-        pane.error = None;
+        let generation = pane.begin_attachment();
         self.layout_changed(cx);
         cx.notify();
 
@@ -5452,17 +5486,31 @@ impl Workspace {
             let mut attached_shell = shell.clone();
             let result = cx
                 .background_spawn(async move {
-                    TerminalSession::attach(shell, rows, cols, pixel_width, pixel_height)
+                    if takeover {
+                        TerminalSession::attach(shell, rows, cols, pixel_width, pixel_height)
+                    } else {
+                        TerminalSession::attach_without_takeover(
+                            shell,
+                            rows,
+                            cols,
+                            pixel_width,
+                            pixel_height,
+                        )
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 let Some(pane) = this.terminals.get_mut(&pane_id) else {
                     return;
                 };
+                if !pane.accepts_attachment(generation, &attached_shell.id) {
+                    return;
+                }
                 pane.attaching = false;
                 match result {
                     Ok(terminal) => {
                         attached_shell.run_id = terminal.run_id.clone();
+                        pane.recovery.succeeded(attached_shell.run_id.as_deref());
                         let shell_id = terminal.shell_id.clone();
                         pane.screen = Some(terminal.screen());
                         pane.shell = Some(attached_shell);
@@ -6356,18 +6404,16 @@ impl Workspace {
                         let Some(pane) = this.terminals.get_mut(&pane_id) else {
                             return false;
                         };
-                        let Some(terminal) = pane
-                            .session
-                            .as_ref()
-                            .filter(|terminal| terminal.shell_id == shell_id)
-                        else {
+                        let Some(terminal) = pane.session.as_ref().filter(|terminal| {
+                            terminal.shell_id == shell_id && terminal.observes(&update_events)
+                        }) else {
                             return false;
                         };
                         let next_revision = terminal.revision();
                         if next_revision != revision {
-                            // Control-loss chrome must not wait for the emulator's final screen.
-                            if !terminal.is_detached() {
-                                pane.screen = Some(terminal.screen());
+                            // Drain final output too, without waiting on the emulator's screen lock.
+                            if let Some(screen) = terminal.try_screen() {
+                                pane.screen = Some(screen);
                             }
                             if let Some(drag) = this
                                 .selection_autoscroll
@@ -10001,59 +10047,83 @@ impl Workspace {
 
     fn boomux_body(&self, pane_id: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let pane = self.terminals.get(&pane_id);
-        let control_lost = pane
-            .and_then(|pane| pane.session.as_ref())
-            .is_some_and(TerminalSession::is_detached);
-        let control_busy = pane
-            .and_then(|pane| pane.error.as_deref())
-            .is_some_and(|error| {
-                error.contains("active controller") || error.contains("use takeover")
+        // Live panes do not scan the resource list on each terminal repaint.
+        let recovery_shell = pane
+            .filter(|pane| pane.session.as_ref().is_none_or(TerminalSession::is_closed))
+            .and_then(|pane| pane.shell.as_ref())
+            .and_then(|saved| self.boomux_shells.iter().find(|shell| shell.id == saved.id));
+        let recovery_needs_attention = recovery_shell.is_none()
+            || pane.is_some_and(|pane| {
+                pane.recovery.needs_attention()
+                    || pane
+                        .error
+                        .as_deref()
+                        .is_some_and(terminal::automatic_restore_paused)
+            })
+            || recovery_shell.is_some_and(|shell| {
+                shell.desktop_setup
+                    || matches!(shell.status, boomux::protocol::ShellStatus::Exited { .. })
             });
-        if control_lost || control_busy {
-            let attaching = pane.is_some_and(|pane| pane.attaching);
-            return div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .p_3()
-                .overflow_hidden()
-                .child(
-                    div().flex_none().text_xs().text_color(rgb(0xa6adc8)).child(
-                        "Another terminal controls this Shell. Take control to use it here.",
-                    ),
-                )
-                .child(
-                    Self::settings_control(
-                        ("take-control-body", pane_id),
-                        if attaching {
-                            "Taking control…"
-                        } else {
-                            "Take control"
-                        },
-                        false,
-                        !attaching,
-                    )
+        let recovery_controls = recovery_shell
+            .filter(|_| recovery_needs_attention)
+            .map(|shell| {
+                let action =
+                    terminal::recovery_action(&shell.status, pane.and_then(|p| p.error.as_deref()));
+                let recovery_shell = shell.clone();
+                let attaching = pane.is_some_and(|pane| pane.attaching);
+                div()
                     .w_full()
-                    .min_h_0()
-                    .button_chrome()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        let Some(shell) = this
-                            .terminals
-                            .get(&pane_id)
-                            .filter(|pane| !pane.attaching)
-                            .and_then(|pane| pane.shell.clone())
-                        else {
-                            return;
-                        };
-                        let size = this.terminal_grid_size(pane_id, window);
-                        this.start_terminal_attachment(pane_id, shell, size, cx);
-                    })),
-                )
-                .into_any_element();
-        }
+                    .bg(rgb(0x1e1e2e))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(0xa6adc8))
+                            .child(action.message()),
+                    )
+                    .child(
+                        Self::settings_control(
+                            ("take-control-body", pane_id),
+                            if attaching {
+                                "Connecting…"
+                            } else {
+                                action.label()
+                            },
+                            false,
+                            !attaching,
+                        )
+                        .w_full()
+                        .min_h_0()
+                        .button_chrome()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if this
+                                    .terminals
+                                    .get(&pane_id)
+                                    .is_none_or(|pane| pane.attaching)
+                                {
+                                    return;
+                                }
+                                let size = this.terminal_grid_size(pane_id, window);
+                                this.start_terminal_attachment_with_policy(
+                                    pane_id,
+                                    recovery_shell.clone(),
+                                    size,
+                                    action == terminal::RecoveryAction::TakeControl,
+                                    cx,
+                                );
+                            },
+                        )),
+                    )
+                    .into_any_element()
+            });
         if pane.and_then(|pane| pane.session.as_ref()).is_some()
             && let Some(screen) = pane.and_then(|pane| pane.screen.as_ref())
         {
@@ -10150,9 +10220,23 @@ impl Workspace {
                         .collect(),
                 ))
                 .child(scrollbar)
+                .when_some(recovery_controls, |element, controls| {
+                    element.child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .occlude()
+                            .child(controls),
+                    )
+                })
                 .into_any_element();
         }
 
+        if let Some(controls) = recovery_controls {
+            return controls;
+        }
         div()
             .size_full()
             .flex()
@@ -10163,6 +10247,8 @@ impl Workspace {
             .child(div().text_xs().text_color(rgb(0xa6adc8)).child(
                 if pane.is_some_and(|pane| pane.attaching) {
                     "Opening terminal…"
+                } else if recovery_shell.is_some() {
+                    "Restoring terminal…"
                 } else {
                     "No Boomux terminal is available."
                 },
@@ -10174,6 +10260,7 @@ impl Workspace {
                         .is_some_and(|saved| saved.shell.is_some())
                         && !pane.attaching
                         && pane.session.is_none()
+                        && recovery_needs_attention
                 }),
                 |element| {
                     element.child(
@@ -10192,7 +10279,8 @@ impl Workspace {
                 },
             )
             .when_some(
-                pane.and_then(|pane| pane.error.clone())
+                pane.filter(|_| recovery_needs_attention)
+                    .and_then(|pane| pane.error.clone())
                     .or_else(|| self.boomux_error.clone()),
                 |element, error| {
                     element.child(div().text_xs().text_color(rgb(0xf38ba8)).child(error))
@@ -12066,6 +12154,31 @@ fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: 
 #[cfg(test)]
 mod pointer_tests {
     use super::*;
+
+    #[test]
+    fn attachment_generation_rejects_late_reconnect_results() {
+        let shell = ShellChoice {
+            id: "shell".into(),
+            workspace_id: "workspace".into(),
+            name: "test".into(),
+            cwd: "/tmp".into(),
+            status: ShellStatus::Running,
+            run_id: Some("run".into()),
+            desktop_setup: false,
+        };
+        let mut pane = TerminalPane {
+            shell: Some(shell),
+            ..Default::default()
+        };
+        let recovery = pane.begin_attachment();
+        assert!(pane.accepts_attachment(recovery, "shell"));
+        // A user reconnects the same Shell before the background attempt completes.
+        let manual = pane.begin_attachment();
+        assert!(!pane.accepts_attachment(recovery, "shell"));
+        assert!(pane.accepts_attachment(manual, "shell"));
+        pane.shell.as_mut().unwrap().id = "other-shell".into();
+        assert!(!pane.accepts_attachment(manual, "shell"));
+    }
 
     #[test]
     fn sidebar_brand_collapses_before_title_or_controls_wrap() {
