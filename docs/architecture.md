@@ -1128,8 +1128,11 @@ run and owner-selected Agent ID only when the owning daemon's startup
 configuration and durable state prove one unambiguous lifecycle-authoritative
 resumable Agent. The dashboard keeps that exact row's `agent` kind but presents
 it as `inactive` until opening starts a new run.
-Fresh or ineligible pending Shells have no run marker and remain ordinary Shell
-rows.
+Pending Shell snapshots also expose their historical last run without an eligible
+Agent, so clients distinguish interrupted, terminated, and normally finished runs.
+Fresh Shells alone have no run marker. Agent presentation still requires the
+separate owner-selected Agent ID. Protocol-39 filtering continues to hide pending
+run metadata; no wire field or persistence schema changes are required.
 
 ### Agent Skill
 
@@ -1777,8 +1780,12 @@ its identity and outcome. Recovered shells are pending: Boomux does not claim
 that arbitrary processes, mutated environments, or PTYs survive daemon restart
 or crash. When enabled, cold recovery substitutes an integration-native resume
 command for a uniquely identified, lifecycle-authoritative OpenCode, Pi, Claude,
-or Codex Agent from an interrupted run. Ambiguous or invalid candidates use the
-shell's normal command instead. OpenCode recovery routes the exact Session
+or Codex Agent from an interrupted run. If any eligible candidates are active,
+inactive session history is excluded before checking uniqueness. A sole inactive
+candidate remains resumable when there are no active candidates. Multiple active
+candidates, multiple inactive-only candidates, or invalid candidates use the
+shell's normal command instead. Cross-Shell duplicate-identity protection still
+applies, including inactive records. OpenCode recovery routes the exact Session
 through the Shared Harness Runtime so its replacement ShellRun can establish a
 fresh claim; shared-launch preparation failure retains the standalone native
 resume fallback.

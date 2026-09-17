@@ -683,3 +683,15 @@ State is owned by the visible element and reclaimed when it disappears. Switches
 and text fields keep their distinct input shapes; disabled controls do not animate.
 The Agents/Git/Remotes tabs divide their row equally, with selected backgrounds and
 underlines. Git toolbar actions occupy a separate row to preserve tab widths.
+
+### Daemon Crash Recovery
+
+The existing background overview watcher starts a missing local daemon through
+`boomux daemon start` using the launcher's CLI PATH. It only attempts startup
+after discovery fails and a passive probe confirms the daemon is unreachable;
+protocol/configuration failures never trigger replacement. One retry state per
+window bounds failed starts to exponential backoff (2–30 seconds), with a
+10-second subprocess deadline. Compatible concurrent startup is serialized by
+the CLI's existing daemon lock. Normal successful polling adds no probe or task.
+Once the daemon returns, its authoritative snapshot drives ordinary saved-pane
+recovery, preserving the rule against restarting normally finished commands.

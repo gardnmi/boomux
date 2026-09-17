@@ -387,8 +387,28 @@ def smoke(backend, archive, output, software_driver=None, cpu_model=None):
                 assert_emulated(app.pid)
             if json.loads(cli("--json", "daemon", "status"))["data"]["pid"] != daemon_pid:
                 raise RuntimeError("reopening Desktop replaced the daemon")
+            daemon_recovered = False
+            if not cpu_model:
+                # Crash only this harness's private daemon. Status is passive:
+                # no CLI inspection may accidentally start the replacement.
+                os.kill(daemon_pid, signal.SIGKILL)
+
+                def desktop_restarted_daemon():
+                    current = json.loads(cli("--json", "daemon", "status"))["data"]
+                    return current["status"] == "running" and current["pid"] != daemon_pid
+
+                wait_for("Desktop restarts missing daemon", desktop_restarted_daemon,
+                         [*servers, app])
+                wait_for("Desktop restores interrupted Shell after daemon crash",
+                         lambda: inspect()["status"] == "running"
+                         and inspect()["run"]["id"] != run_id
+                         and inspect()["run"]["output_revision"] > 0,
+                         [*servers, app])
+                if restored_shell()["run"]["id"] != finished_run_id:
+                    raise RuntimeError("daemon crash recovery restarted a finished Shell")
+                daemon_recovered = True
             (output / "result.json").write_text(json.dumps(
-                dict(backend=backend, cpu_model=cpu_model, emulated_components=["desktop", "daemon", "cli"] if cpu_model else [], shell_id=shell_id, run_id=run_id, status="passed", layout_restored=True, pending_shell_started=True, finished_shell_preserved=True,
+                dict(backend=backend, cpu_model=cpu_model, emulated_components=["desktop", "daemon", "cli"] if cpu_model else [], shell_id=shell_id, run_id=run_id, status="passed", layout_restored=True, pending_shell_started=True, finished_shell_preserved=True, daemon_recovered=daemon_recovered,
                      archive_sha256=actual, boomux_version=cli("--version").strip()), indent=2))
             print(f"PASS: {backend} bundle startup, attachment, and ShellRun survival", flush=True)
         finally:

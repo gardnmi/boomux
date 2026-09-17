@@ -200,7 +200,11 @@ fn create_started_shell_persists_one_run_and_attaches_without_restarting() {
     daemon.restart();
     let recovered = daemon.client.get_shell(&shell.id).unwrap();
     assert_eq!(recovered.status, ShellStatus::Pending);
-    assert!(recovered.run.is_none());
+    assert_eq!(recovered.run.as_ref().unwrap().id, run.id);
+    assert_eq!(
+        recovered.run.as_ref().unwrap().exit_reason,
+        Some(ShellRunExitReason::Interrupted)
+    );
     let persisted: serde_json::Value = serde_json::from_slice(
         &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
     )
@@ -864,7 +868,7 @@ fn native_daemon_recovers_reproducible_metadata_after_restart() {
     assert_eq!(restored.shells[0].id, shell_id);
     assert_eq!(restored.shells[0].name, "restored-renamed");
     assert_eq!(restored.shells[0].status, ShellStatus::Pending);
-    assert!(restored.shells[0].run.is_none());
+    assert_eq!(restored.shells[0].run.as_ref().unwrap().id, first_run.id);
     let mut second = daemon.client.attach(&shell_id, false, profile()).unwrap();
     if !contains(&second.reconstruction, b"restored-command") {
         second
@@ -948,7 +952,7 @@ fn structured_shell_preview_preserves_color_while_plain_read_stays_plain() {
         .write_to(&mut attachment.stream)
         .unwrap();
     assert!(contains(
-        &read_until(&mut attachment.stream, b"styled-preview-marker"),
+        &read_until(&mut attachment.stream, b"\x1b[31mstyled-preview-marker"),
         b"styled-preview-marker"
     ));
 
@@ -1067,7 +1071,11 @@ fn native_daemon_marks_a_crashed_run_interrupted() {
 
     let restored = daemon.client.get_shell(&shell_id).unwrap();
     assert_eq!(restored.status, ShellStatus::Pending);
-    assert!(restored.run.is_none());
+    assert_eq!(restored.run.as_ref().unwrap().id, first_run.id);
+    assert_eq!(
+        restored.run.as_ref().unwrap().exit_reason,
+        Some(ShellRunExitReason::Interrupted)
+    );
     let persisted: serde_json::Value = serde_json::from_slice(
         &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
     )
@@ -1082,6 +1090,44 @@ fn native_daemon_marks_a_crashed_run_interrupted() {
     assert_ne!(second_run.id, first_run.id);
     assert_eq!(second_run.generation, 2);
     drop(second.stream);
+    daemon.stop_with_cli();
+}
+
+#[test]
+fn cold_recovery_exposes_normally_finished_run_without_an_agent() {
+    let mut daemon = TestDaemon::start();
+    let shell = daemon
+        .client
+        .create_shell_with_workspace(ShellSpec {
+            name: "finished".into(),
+            cwd: daemon.runtime_dir.clone(),
+            command: vec!["/bin/sh".into(), "-c".into(), "exit 99".into()],
+        })
+        .unwrap();
+    let attachment = daemon.client.attach(&shell.id, false, profile()).unwrap();
+    wait_until(
+        || {
+            matches!(
+                daemon.client.get_shell(&shell.id).unwrap().status,
+                ShellStatus::Exited { code: Some(99) }
+            )
+        },
+        "fixture command did not finish",
+    );
+    let finished = daemon.client.get_shell(&shell.id).unwrap().run.unwrap();
+    drop(attachment);
+    daemon.crash();
+    daemon.restart();
+    let recovered = daemon.client.get_shell(&shell.id).unwrap();
+    assert_eq!(recovered.status, ShellStatus::Pending);
+    assert!(recovered.recovered_agent_id.is_none());
+    let previous = recovered.run.unwrap();
+    assert_eq!(previous.id, finished.id);
+    assert_eq!(
+        previous.exit_reason,
+        Some(ShellRunExitReason::Exited { code: Some(99) })
+    );
+    assert_eq!(previous.ended_at_ms, finished.ended_at_ms);
     daemon.stop_with_cli();
 }
 
@@ -1258,7 +1304,11 @@ fn failed_close_publishes_terminated_run_after_storage_recovers() {
     drop(attachment);
     let restored = daemon.client.get_shell(&shell_id).unwrap();
     assert_eq!(restored.status, ShellStatus::Pending);
-    assert!(restored.run.is_none());
+    assert_eq!(restored.run.as_ref().unwrap().id, run_id);
+    assert_eq!(
+        restored.run.as_ref().unwrap().exit_reason,
+        Some(ShellRunExitReason::Terminated)
+    );
     assert!(
         !daemon
             .client

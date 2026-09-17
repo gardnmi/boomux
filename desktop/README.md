@@ -372,8 +372,9 @@ that file aside to reset layouts. Concurrent Desktop instances cannot overwrite
 one another's newer saved state; reopen the older instance if a conflict appears.
 
 Restoration reconnects running Shells without taking over another attachment.
-Stopped or unavailable Shells keep a placeholder with an explicit reconnect/start
-button. Restoration does not start or restart processes. Floating panes are fit
+New or interrupted Shells start automatically; normally finished commands stay
+stopped. A missing local daemon is started by the background recovery watcher.
+Repeated failures keep an explicit reconnect/start control visible. Floating panes are fit
 to the available canvas if its dimensions changed. Outer application window
 geometry, terminal selections, and in-progress drag animations are not saved.
 See [preferences](../docs/desktop/releases.md#desktop-integration-and-preferences).

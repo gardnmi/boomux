@@ -5350,11 +5350,16 @@ impl DurableRegistry {
         let mut candidates = Vec::new();
         for agent in state.agents.values() {
             if let Some(identity) = resume_identity(agent, shell, previous_run)? {
-                candidates.push((agent.id.clone(), identity.0, identity.1));
+                let inactive = lock(&agent.state)?.observation.state == AgentState::Inactive;
+                candidates.push((agent.id.clone(), identity.0, identity.1, inactive));
             }
         }
-        candidates.sort();
-        let [(agent_id, integration, external_session_id)] = candidates.as_slice() else {
+        // Ended host sessions remain resumable history, but must not obscure
+        // the one session that was still active when this ShellRun stopped.
+        if candidates.iter().any(|candidate| !candidate.3) {
+            candidates.retain(|candidate| !candidate.3);
+        }
+        let [(agent_id, integration, external_session_id, _)] = candidates.as_slice() else {
             return Ok(None);
         };
 
@@ -16047,6 +16052,21 @@ impl Shell {
             ),
             ShellLifecycle::Closed => return Err(not_found("shell", &self.id)),
         };
+        // Pending means no live process, not necessarily no previous run.
+        // Recovery clients need the last outcome even without a resumable Agent.
+        let run = if matches!(status, ShellStatus::Pending) {
+            lock(&self.last_run)?.as_ref().map(|last| ShellRunSnapshot {
+                id: last.id.clone(),
+                generation: last.generation,
+                started_at_ms: last.started_at_ms,
+                ended_at_ms: last.ended_at_ms,
+                exit_reason: last.exit_reason.clone(),
+                output_revision: last.output_revision,
+                environment_has_run_id: last.environment_has_run_id,
+            })
+        } else {
+            run
+        };
         let foreground_process = match (runtime, run.as_ref()) {
             (Some(runtime), Some(run)) => {
                 ShellRuntimeManager::foreground_process(self, &runtime, run)?
@@ -19737,6 +19757,75 @@ status=$?
     }
 
     #[test]
+    fn pending_snapshot_preserves_last_outcome_without_an_agent() {
+        let registry = DaemonService::default();
+        let (shell, run) = recovery_shell(&registry, Vec::new());
+        for reason in [
+            ShellRunExitReason::Interrupted,
+            ShellRunExitReason::Terminated,
+            ShellRunExitReason::Exited { code: Some(99) },
+        ] {
+            lock(&shell.last_run).unwrap().as_mut().unwrap().exit_reason = Some(reason.clone());
+            let snapshot = registry.snapshot().unwrap();
+            let pending = &snapshot.workspaces[0].shells[0];
+            assert_eq!(pending.status, ShellStatus::Pending);
+            assert!(pending.recovered_agent_id.is_none());
+            let previous = pending.run.as_ref().unwrap();
+            assert_eq!(previous.id, run.id);
+            assert_eq!(previous.exit_reason, Some(reason));
+        }
+    }
+
+    #[test]
+    fn recovery_prefers_unique_active_session_over_inactive_history() {
+        let registry = DaemonService::default();
+        let (shell, run) = recovery_shell(&registry, vec!["/opt/bin/codex".into()]);
+        let active = add_recovery_agent(&registry, &shell, &run.id, "codex", "active-thread");
+        let old = add_recovery_agent(&registry, &shell, &run.id, "codex", "old-thread");
+        let set_state = |id: &str, state| {
+            let durable = lock(&registry.durable.state).unwrap();
+            lock(&durable.agents[id].state).unwrap().observation.state = state;
+        };
+        set_state(&old, AgentState::Inactive);
+        for state in [AgentState::Working, AgentState::Idle, AgentState::Blocked] {
+            set_state(&active, state);
+            let recovered = registry
+                .resumable_agent(&shell, Some(&run))
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.agent_id, active);
+            assert_eq!(
+                recovered.command,
+                ["/opt/bin/codex", "resume", "active-thread"]
+            );
+        }
+        set_state(&old, AgentState::Idle);
+        assert!(
+            registry
+                .resumable_agent(&shell, Some(&run))
+                .unwrap()
+                .is_none()
+        );
+        set_state(&active, AgentState::Inactive);
+        set_state(&old, AgentState::Inactive);
+        assert!(
+            registry
+                .resumable_agent(&shell, Some(&run))
+                .unwrap()
+                .is_none()
+        );
+        set_state(&old, AgentState::Done);
+        assert_eq!(
+            registry
+                .resumable_agent(&shell, Some(&run))
+                .unwrap()
+                .unwrap()
+                .agent_id,
+            active
+        );
+    }
+
+    #[test]
     fn interrupted_kiro_agent_builds_exact_v3_resume_command() {
         let registry = DaemonService::default();
         let (shell, run) = recovery_shell(&registry, vec!["/opt/kiro/kiro-cli".into()]);
@@ -22898,8 +22987,12 @@ status=$?
                 .iter()
                 .all(|shell| shell.status == ShellStatus::Pending)
         );
-        assert!(first.snapshot().unwrap().run.is_none());
-        assert!(second.snapshot().unwrap().run.is_none());
+        for shell in [&first, &second] {
+            assert_eq!(
+                shell.snapshot().unwrap().run.unwrap().exit_reason,
+                Some(ShellRunExitReason::Terminated)
+            );
+        }
         let transitions = lock(&registry.events.transitions).unwrap();
         assert_eq!(transitions.pending_durable_events.len(), 1);
         assert_eq!(transitions.pending_durable_events[0].len(), 2);

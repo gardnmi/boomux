@@ -650,6 +650,26 @@ fn cold_recovery_resumes_exact_codex_thread_with_run_scoped_hooks() {
         )
         .unwrap();
 
+    // Completed sessions in this same run must not hide the remaining idle thread.
+    daemon
+        .client
+        .register_agent(
+            &shell_id,
+            &first_run.id,
+            AgentRegistrationSpec {
+                name: "Codex history".into(),
+                integration: "codex".into(),
+                external_session_id: Some("inactive-thread".into()),
+                report: AgentReport {
+                    state: AgentState::Inactive,
+                    authority: AgentAuthority::LifecycleIntegration,
+                    evidence: "Codex session inactive".into(),
+                    confidence: 100,
+                },
+            },
+        )
+        .unwrap();
+
     daemon.crash();
     drop(attachment.stream);
     let bin = daemon.runtime_dir.join("codex-bin");
