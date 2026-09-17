@@ -22987,8 +22987,12 @@ status=$?
                 .iter()
                 .all(|shell| shell.status == ShellStatus::Pending)
         );
-        assert!(first.snapshot().unwrap().run.is_none());
-        assert!(second.snapshot().unwrap().run.is_none());
+        for shell in [&first, &second] {
+            assert_eq!(
+                shell.snapshot().unwrap().run.unwrap().exit_reason,
+                Some(ShellRunExitReason::Terminated)
+            );
+        }
         let transitions = lock(&registry.events.transitions).unwrap();
         assert_eq!(transitions.pending_durable_events.len(), 1);
         assert_eq!(transitions.pending_durable_events[0].len(), 2);
