@@ -355,7 +355,10 @@ fn journaled_initial_shell_run_recovers_as_interrupted_after_cold_crash() {
     });
     assert_eq!(fs::metadata(&journal).unwrap().len(), 0);
     let recovered = daemon.client.get_shell(&shell_id).unwrap();
-    assert!(recovered.run.is_none());
+    assert_eq!(
+        recovered.run.as_ref().unwrap().exit_reason,
+        Some(ShellRunExitReason::Interrupted)
+    );
     let state: serde_json::Value = serde_json::from_slice(
         &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
     )

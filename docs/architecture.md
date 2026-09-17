@@ -1128,8 +1128,11 @@ run and owner-selected Agent ID only when the owning daemon's startup
 configuration and durable state prove one unambiguous lifecycle-authoritative
 resumable Agent. The dashboard keeps that exact row's `agent` kind but presents
 it as `inactive` until opening starts a new run.
-Fresh or ineligible pending Shells have no run marker and remain ordinary Shell
-rows.
+Pending Shell snapshots also expose their historical last run without an eligible
+Agent, so clients distinguish interrupted, terminated, and normally finished runs.
+Fresh Shells alone have no run marker. Agent presentation still requires the
+separate owner-selected Agent ID. Protocol-39 filtering continues to hide pending
+run metadata; no wire field or persistence schema changes are required.
 
 ### Agent Skill
 

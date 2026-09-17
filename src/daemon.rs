@@ -16052,6 +16052,21 @@ impl Shell {
             ),
             ShellLifecycle::Closed => return Err(not_found("shell", &self.id)),
         };
+        // Pending means no live process, not necessarily no previous run.
+        // Recovery clients need the last outcome even without a resumable Agent.
+        let run = if matches!(status, ShellStatus::Pending) {
+            lock(&self.last_run)?.as_ref().map(|last| ShellRunSnapshot {
+                id: last.id.clone(),
+                generation: last.generation,
+                started_at_ms: last.started_at_ms,
+                ended_at_ms: last.ended_at_ms,
+                exit_reason: last.exit_reason.clone(),
+                output_revision: last.output_revision,
+                environment_has_run_id: last.environment_has_run_id,
+            })
+        } else {
+            run
+        };
         let foreground_process = match (runtime, run.as_ref()) {
             (Some(runtime), Some(run)) => {
                 ShellRuntimeManager::foreground_process(self, &runtime, run)?
@@ -19739,6 +19754,26 @@ status=$?
             resumable.command,
             ["/opt/bin/codex", "resume", "codex-exact"]
         );
+    }
+
+    #[test]
+    fn pending_snapshot_preserves_last_outcome_without_an_agent() {
+        let registry = DaemonService::default();
+        let (shell, run) = recovery_shell(&registry, Vec::new());
+        for reason in [
+            ShellRunExitReason::Interrupted,
+            ShellRunExitReason::Terminated,
+            ShellRunExitReason::Exited { code: Some(99) },
+        ] {
+            lock(&shell.last_run).unwrap().as_mut().unwrap().exit_reason = Some(reason.clone());
+            let snapshot = registry.snapshot().unwrap();
+            let pending = &snapshot.workspaces[0].shells[0];
+            assert_eq!(pending.status, ShellStatus::Pending);
+            assert!(pending.recovered_agent_id.is_none());
+            let previous = pending.run.as_ref().unwrap();
+            assert_eq!(previous.id, run.id);
+            assert_eq!(previous.exit_reason, Some(reason));
+        }
     }
 
     #[test]

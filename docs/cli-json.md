@@ -676,12 +676,12 @@ not omitted or represented as human placeholders. `status` is `pending`,
 A run object includes `id`, `generation`, `started_at_ms`, `ended_at_ms`,
 `exit_reason`, `exit_code`, `output_revision`, and `environment_has_run_id`.
 `exit_reason` is `exited`, `terminated`, `interrupted`, or `null`.
-Under protocol 40, a `pending` Shell includes its interrupted previous `run` and
-`recovered_agent_id` only when the owning daemon has proven one exact resumable
-Agent under its startup configuration. Clients present that exact association as
-inactive. A newly created or ineligible pending Shell has `run: null` and no
-recovered Agent ID; a retained run is historical and is not live. Protocol-39
-responses remove both recovery markers, including from routed responses.
+For protocol 40 and later, a `pending` Shell retains its previous `run` when one
+exists, including its exit reason. This is historical metadata, never evidence
+of a live process. Only a newly created Shell has `run: null`. The separate
+`recovered_agent_id` is populated only when the owner proves one exact resumable
+Agent; clients present that association as inactive. Protocol-39 responses remove
+both recovery markers, including from routed responses.
 
 Launcher objects include `id`, `workspace_id`, `workspace_name`, `name`, `cwd`,
 and `command`. `command` is the exact executable-and-arguments array.
