@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.8](https://github.com/gardnmi/boomux/compare/v1.21.7...v1.21.8) (2026-09-17)
+
+
+### Bug Fixes
+
+* **recovery:** resume active sessions after daemon crashes ([#452](https://github.com/gardnmi/boomux/issues/452)) ([4060775](https://github.com/gardnmi/boomux/commit/4060775825a08a502566de1d1c0bd2d00e73b4f7))
+
 ## [1.21.7](https://github.com/gardnmi/boomux/compare/v1.21.6...v1.21.7) (2026-09-16)
 
 
