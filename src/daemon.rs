@@ -5350,11 +5350,16 @@ impl DurableRegistry {
         let mut candidates = Vec::new();
         for agent in state.agents.values() {
             if let Some(identity) = resume_identity(agent, shell, previous_run)? {
-                candidates.push((agent.id.clone(), identity.0, identity.1));
+                let inactive = lock(&agent.state)?.observation.state == AgentState::Inactive;
+                candidates.push((agent.id.clone(), identity.0, identity.1, inactive));
             }
         }
-        candidates.sort();
-        let [(agent_id, integration, external_session_id)] = candidates.as_slice() else {
+        // Ended host sessions remain resumable history, but must not obscure
+        // the one session that was still active when this ShellRun stopped.
+        if candidates.iter().any(|candidate| !candidate.3) {
+            candidates.retain(|candidate| !candidate.3);
+        }
+        let [(agent_id, integration, external_session_id, _)] = candidates.as_slice() else {
             return Ok(None);
         };
 
@@ -19733,6 +19738,55 @@ status=$?
         assert_eq!(
             resumable.command,
             ["/opt/bin/codex", "resume", "codex-exact"]
+        );
+    }
+
+    #[test]
+    fn recovery_prefers_unique_active_session_over_inactive_history() {
+        let registry = DaemonService::default();
+        let (shell, run) = recovery_shell(&registry, vec!["/opt/bin/codex".into()]);
+        let active = add_recovery_agent(&registry, &shell, &run.id, "codex", "active-thread");
+        let old = add_recovery_agent(&registry, &shell, &run.id, "codex", "old-thread");
+        let set_state = |id: &str, state| {
+            let durable = lock(&registry.durable.state).unwrap();
+            lock(&durable.agents[id].state).unwrap().observation.state = state;
+        };
+        set_state(&old, AgentState::Inactive);
+        for state in [AgentState::Working, AgentState::Idle, AgentState::Blocked] {
+            set_state(&active, state);
+            let recovered = registry
+                .resumable_agent(&shell, Some(&run))
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.agent_id, active);
+            assert_eq!(
+                recovered.command,
+                ["/opt/bin/codex", "resume", "active-thread"]
+            );
+        }
+        set_state(&old, AgentState::Idle);
+        assert!(
+            registry
+                .resumable_agent(&shell, Some(&run))
+                .unwrap()
+                .is_none()
+        );
+        set_state(&active, AgentState::Inactive);
+        set_state(&old, AgentState::Inactive);
+        assert!(
+            registry
+                .resumable_agent(&shell, Some(&run))
+                .unwrap()
+                .is_none()
+        );
+        set_state(&old, AgentState::Done);
+        assert_eq!(
+            registry
+                .resumable_agent(&shell, Some(&run))
+                .unwrap()
+                .unwrap()
+                .agent_id,
+            active
         );
     }
 

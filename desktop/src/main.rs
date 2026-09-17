@@ -6,6 +6,7 @@ mod bundle_update;
 mod conversations;
 mod project_search;
 use boomux::generated_names;
+mod daemon_recovery;
 mod git_panel;
 mod input_routing;
 mod layout;
@@ -5803,11 +5804,23 @@ impl Workspace {
     fn watch_boomux_overview(&self, window: &Window, cx: &mut Context<Self>) {
         let window_handle = window.window_handle();
         cx.spawn(async move |this, cx| {
+            let mut recovery = crate::daemon_recovery::Recovery::default();
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                let result = cx
-                    .background_spawn(async { terminal::discover_overview_and_nodes() })
+                let (next_recovery, result) = cx
+                    .background_spawn(async move {
+                        let mut result = terminal::discover_overview_and_nodes();
+                        if result.0.is_err() {
+                            result = terminal::recover_daemon(&mut recovery)
+                                .map(|()| terminal::discover_overview_and_nodes())
+                                .unwrap_or_else(|error| (Err(error.clone()), Err(error)));
+                        } else {
+                            recovery = crate::daemon_recovery::Recovery::default();
+                        }
+                        (recovery, result)
+                    })
                     .await;
+                recovery = next_recovery;
                 let mut removed_setup_shells = Vec::new();
                 let mut setup_workspace_cleanups = Vec::new();
                 let mut connect_results = Vec::new();

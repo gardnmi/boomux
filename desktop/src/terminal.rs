@@ -886,6 +886,34 @@ impl Drop for TerminalSession {
     }
 }
 
+/// Only the background overview watcher owns daemon startup, never each pane.
+pub fn recover_daemon(recovery: &mut crate::daemon_recovery::Recovery) -> Result<(), String> {
+    recovery.ensure(
+        || {
+            client::connect_if_running()
+                .map(|client| client.is_some())
+                .map_err(|e| e.to_string())
+        },
+        || {
+            use std::process::Stdio;
+            // Invoke the CLI from the launcher's PATH, not the Desktop executable.
+            // Its daemon lock handles concurrent CLI/Desktop startup safely.
+            let status = crate::subprocess::command(10, "boomux")
+                .args(["daemon", "start"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|e| format!("Could not start Boomux: {e}"))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("Boomux daemon startup failed: {status}"))
+            }
+        },
+    )
+}
+
 pub fn discover_overview() -> Result<BoomuxOverview, String> {
     discover_overview_and_nodes().0
 }
