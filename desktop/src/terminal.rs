@@ -987,11 +987,21 @@ fn append_remote_workspaces(
                 .or_default()
                 .push(shell);
         }
-        let mut agent_counts = HashMap::<&str, usize>::new();
-        for agent in &projection.agents {
+        let current_agents = newest_agents_by_run(projection.agents.iter().filter_map(|agent| {
             let current = shell_index
                 .get(agent.shell_id.as_str())
                 .is_some_and(|shell| shell.run_id.as_ref() == Some(&agent.run_id));
+            agent_is_visible(agent.state, false, current).then_some((
+                agent.shell_id.as_str(),
+                agent.run_id.as_str(),
+                agent.observed_at_ms,
+                agent.started_at_ms,
+                agent.id.as_str(),
+            ))
+        }));
+        let mut agent_counts = HashMap::<&str, usize>::new();
+        for agent in &projection.agents {
+            let current = current_agents.contains(agent.id.as_str());
             if agent_is_visible(agent.state, agent.attention.is_some(), current) {
                 *agent_counts.entry(&agent.workspace_id).or_default() += 1;
             }
@@ -1022,9 +1032,7 @@ fn append_remote_workspaces(
             });
         }
         for agent in &projection.agents {
-            let current = shell_index
-                .get(agent.shell_id.as_str())
-                .is_some_and(|s| s.run_id.as_ref() == Some(&agent.run_id));
+            let current = current_agents.contains(agent.id.as_str());
             if !agent_is_visible(agent.state, agent.attention.is_some(), current) {
                 continue;
             }
@@ -1070,15 +1078,28 @@ fn overview_from_snapshot(snapshot: boomux::protocol::Snapshot) -> BoomuxOvervie
             .cloned()
             .map(shell_choice)
             .collect::<Vec<_>>();
+        let shell_index = workspace
+            .shells
+            .iter()
+            .map(|shell| (shell.id.as_str(), shell))
+            .collect::<HashMap<_, _>>();
+        let current_agents = newest_agents_by_run(workspace.agents.iter().filter_map(|agent| {
+            let current = shell_index
+                .get(agent.shell_id.as_str())
+                .is_some_and(|shell| shell.run.as_ref().is_some_and(|run| run.id == agent.run_id));
+            agent_is_visible(agent.observation.state, false, current).then_some((
+                agent.shell_id.as_str(),
+                agent.run_id.as_str(),
+                agent.observation.observed_at_ms,
+                agent.started_at_ms,
+                agent.id.as_str(),
+            ))
+        }));
         let visible_agents = workspace.agents.iter().filter(|agent| {
-            let attached_to_current_run = workspace.shells.iter().any(|shell| {
-                shell.id == agent.shell_id
-                    && shell.run.as_ref().is_some_and(|run| run.id == agent.run_id)
-            });
             agent_is_visible(
                 agent.observation.state,
                 agent.attention.is_some(),
-                attached_to_current_run,
+                current_agents.contains(agent.id.as_str()),
             )
         });
         let agent_count = visible_agents.clone().count();
@@ -1098,10 +1119,8 @@ fn overview_from_snapshot(snapshot: boomux::protocol::Snapshot) -> BoomuxOvervie
             AgentChoice {
                 id: agent.id.clone(),
                 run_id: agent.run_id.clone(),
-                shell_name: workspace
-                    .shells
-                    .iter()
-                    .find(|shell| shell.id == agent.shell_id)
+                shell_name: shell_index
+                    .get(agent.shell_id.as_str())
                     .map(|shell| shell.name.clone())
                     .unwrap_or_else(|| agent.name.clone()),
                 display_name: String::new(),
@@ -1206,6 +1225,20 @@ pub fn acknowledge_agent_attention(
         .acknowledge_agent_attention(agent_id, observation_revision)
         .map(|_| ())
         .map_err(|error| format!("could not acknowledge Agent notification: {error}"))
+}
+
+// Presentation only: choose the latest active observation for each exact run.
+// A Node-local index keeps equal inner IDs on different Nodes independent.
+fn newest_agents_by_run<'a>(
+    candidates: impl Iterator<Item = (&'a str, &'a str, u64, u64, &'a str)>,
+) -> HashSet<&'a str> {
+    let mut newest = HashMap::new();
+    for (shell_id, run_id, observed_at_ms, started_at_ms, agent_id) in candidates {
+        let candidate = (observed_at_ms, started_at_ms, agent_id);
+        let selected = newest.entry((shell_id, run_id)).or_insert(candidate);
+        *selected = (*selected).max(candidate);
+    }
+    newest.into_values().map(|(_, _, id)| id).collect()
 }
 
 fn agent_is_visible(state: AgentState, has_attention: bool, attached_to_current_run: bool) -> bool {
@@ -3432,6 +3465,103 @@ mod tests {
         super::attach_shell(&client, &recovered, profile, true).unwrap();
         server.join().unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn overview_selects_current_agent_locally_and_per_remote_node() {
+        use serde_json::json;
+        // The older Kiro session stays idle when a new session starts in the same run.
+        // Later activity can select it again; state priority must not pin the working row.
+        for (old_time, expected) in [(10, "new"), (30, "old")] {
+            for reverse in [false, true] {
+                let specs = [
+                    ("old", "shell", "run", "idle", old_time, false),
+                    ("new", "shell", "run", "working", 20, false),
+                    ("inactive", "shell", "run", "inactive", 90, false),
+                    ("done", "shell", "run", "done", 90, false),
+                    ("past", "shell", "past-run", "working", 90, false),
+                    ("alert", "shell", "past-run", "done", 5, true),
+                    ("other", "other-shell", "run", "idle", 1, false),
+                ];
+                let mut local_agents = Vec::new();
+                let mut remote_agents = Vec::new();
+                for (id, shell, run, state, time, attention) in specs {
+                    let observation = json!({"revision": 1, "state": state,
+                        "authority": "lifecycle_integration", "evidence": "fixture",
+                        "confidence": 100, "observed_at_ms": time});
+                    local_agents.push(json!({"id": id, "workspace_id": "workspace",
+                        "shell_id": shell, "run_id": run, "name": "Kiro CLI",
+                        "integration": "kiro", "external_session_id": format!("sess-{id}"),
+                        "started_at_ms": 1, "observation": observation,
+                        "attention": attention.then(|| json!({"reason": "completed",
+                            "observation": observation}))}));
+                    remote_agents.push(json!({"id": id, "workspace_id": "workspace",
+                        "shell_id": shell, "run_id": run, "name": "Kiro CLI",
+                        "integration": "kiro", "started_at_ms": 1, "state": state,
+                        "observation_revision": 1, "observed_at_ms": time,
+                        "attention": attention.then(|| json!({"reason": "completed",
+                            "observation_revision": 1, "observed_at_ms": time}))}));
+                }
+                if reverse {
+                    local_agents.reverse();
+                    remote_agents.reverse();
+                }
+                let local_shells = ["shell", "other-shell"].map(|id| {
+                    json!({
+                        "id": id, "workspace_id": "workspace", "name": "same-name",
+                        "cwd": "/tmp", "status": "running", "command": [],
+                        "run": {"id": "run", "generation": 1, "started_at_ms": 1,
+                            "environment_has_run_id": true, "output_revision": 0}
+                    })
+                });
+                let snapshot = serde_json::from_value(json!({"workspaces": [{
+                    "id": "workspace", "name": "work", "shells": local_shells,
+                    "agents": local_agents
+                }]}))
+                .unwrap();
+                let mut overview = super::overview_from_snapshot(snapshot);
+                let remote_shells = ["shell", "other-shell"].map(|id| {
+                    json!({
+                        "id": id, "workspace_id": "workspace", "name": "same-name",
+                        "status": "running", "run_id": "run"
+                    })
+                });
+                let nodes = ["first", "second"].map(|owner| {
+                    json!({
+                        "node_id": owner, "alias": "remote", "local": false,
+                        "health": "unreachable", "current": false, "stale": true,
+                        "observed_at_ms": 1, "remote_projection": {"node_id": owner,
+                            "workspaces": [{"id": "workspace", "name": "work",
+                                "item_count": 2, "attention_count": 1}],
+                            "shells": remote_shells, "agents": remote_agents, "launchers": []}
+                    })
+                });
+                let combined = serde_json::from_value(json!({"nodes": nodes})).unwrap();
+                super::append_remote_workspaces(&mut overview, &combined);
+                assert_eq!(overview.agents.len(), 9);
+                assert!(overview.workspaces.iter().all(|w| w.agent_count == 3));
+                for owner in [None, Some("first"), Some("second")] {
+                    for id in [expected, "other", "alert"] {
+                        let qualified = owner
+                            .map_or_else(|| id.to_owned(), |node| crate::remote::key(node, id));
+                        let row = overview.agents.iter().find(|a| a.id == qualified).unwrap();
+                        assert_eq!(row.completed_attention, id == "alert");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_agent_timestamp_ties_are_stable_and_use_start_time_then_id() {
+        let candidates = [
+            ("shell", "run", 10, 1, "z"),
+            ("shell", "run", 10, 2, "a"),
+            ("shell", "run", 10, 2, "b"),
+        ];
+        for input in [candidates.to_vec(), candidates.into_iter().rev().collect()] {
+            assert_eq!(super::newest_agents_by_run(input.into_iter()), ["b"].into());
+        }
     }
 
     #[test]
