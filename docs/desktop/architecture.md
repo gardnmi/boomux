@@ -324,8 +324,11 @@ membership from an existing Workspace's equal name or launch commands from files
 
 ### Agent Projection
 
-The sidebar is a bounded, read-only Boomux snapshot. Active Agent rows require an
-exact current ShellRun. Historical records appear only through explicit Boomux
+The sidebar is a bounded, read-only Boomux snapshot. For each exact Node, Shell,
+and current run, it shows the newest non-inactive, non-done Agent observation
+(with start time and Agent ID breaking observation timestamp ties), matching the
+web dashboard. This is presentation only: older session records retain their
+lifecycle state and history. Active Agent rows require an exact current ShellRun. Historical records appear only through explicit Boomux
 attention/history semantics; durable records are not assumed to be active.
 When multiple visible Agents share a Shell, each row includes a distinguishing
 prefix of its exact Boomux Agent ID. Labels do not infer which host thread is
