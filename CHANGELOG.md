@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.9](https://github.com/gardnmi/boomux/compare/v1.21.8...v1.21.9) (2026-09-24)
+
+
+### Bug Fixes
+
+* **desktop:** show one current agent per shell run ([#454](https://github.com/gardnmi/boomux/issues/454)) ([3a8d0c5](https://github.com/gardnmi/boomux/commit/3a8d0c5bd886fc26f826bb3bc7c1f022d2d3cfe7))
+
 ## [1.21.8](https://github.com/gardnmi/boomux/compare/v1.21.7...v1.21.8) (2026-09-17)
 
 
