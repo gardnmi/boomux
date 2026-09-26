@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.10](https://github.com/gardnmi/boomux/compare/v1.21.9...v1.21.10) (2026-09-26)
+
+
+### Bug Fixes
+
+* **codex:** track prompted local chat launches ([#456](https://github.com/gardnmi/boomux/issues/456)) ([e98fc64](https://github.com/gardnmi/boomux/commit/e98fc64d1892e8816a302a9ee6865ae66e2f7f79))
+
 ## [1.21.9](https://github.com/gardnmi/boomux/compare/v1.21.8...v1.21.9) (2026-09-24)
 
 
