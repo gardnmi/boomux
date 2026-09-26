@@ -10259,10 +10259,7 @@ fn codex_hook_command() -> Result<(), Box<dyn Error>> {
 
 fn launch_codex(arguments: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     let executable = resolve_real_codex()?;
-    let managed_chat = arguments.is_empty()
-        || arguments
-            .first()
-            .is_some_and(|argument| argument == "resume" || argument == "exec");
+    let managed_chat = boomux::codex_launch::is_local_chat(&arguments);
     let environment = integration_management::Environment::from_process();
     let hooks_current = integration_management::inspect_without_host_probe(
         integration_management::IntegrationId::CODEX,

@@ -836,6 +836,24 @@ fn codex_hidden_launcher_scopes_chat_hooks_and_passes_service_commands_through()
         )
     };
 
+    for arguments in [
+        vec![],
+        vec!["."],
+        vec!["explain $(literal); do not execute"],
+        vec!["--model", "model-name", "."],
+        vec!["--config=key='literal value'", "--", "help"],
+        vec!["fork", "--last"],
+    ] {
+        let (argv, marker) = run(&arguments, "prompt");
+        let expected = ["--enable", "hooks"]
+            .into_iter()
+            .chain(arguments.iter().copied())
+            .flat_map(|argument| argument.bytes().chain([0]))
+            .collect::<Vec<_>>();
+        assert_eq!(argv, expected);
+        assert_eq!(marker, "1", "{arguments:?}");
+    }
+
     let (argv, marker) = run(&["resume", "thread; literal"], "resume");
     assert_eq!(argv, b"--enable\0hooks\0resume\0thread; literal\0");
     assert_eq!(marker, "1");

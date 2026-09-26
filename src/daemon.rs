@@ -1345,10 +1345,7 @@ fn codex_launch_eligible(_shell: &Shell, effective_command: &[String]) -> bool {
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             == Some("codex")
-    }) && (effective_command.len() == 1
-        || effective_command
-            .get(1)
-            .is_some_and(|argument| matches!(argument.as_str(), "resume" | "exec")))
+    }) && crate::codex_launch::is_local_chat(&effective_command[1..])
 }
 
 fn kiro_launch_eligible(_shell: &Shell, effective_command: &[String]) -> bool {

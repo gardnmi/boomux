@@ -1257,12 +1257,15 @@ removes only Boomux handlers and deletes the file only when no unrelated content
 remains. Codex must be restarted and the hook reviewed and trusted with `/hooks`.
 
 Eligible managed Codex invocations pass through a Shell-scoped executable shim
-and hidden launcher. Bare chat, `resume`, and `exec` are considered managed chat;
-when the installed handlers are current, the launcher prepends `--enable hooks`
-and exports `BOOMUX_CODEX_RUN_SCOPED=1`. Option-led invocations including
-explicit `--remote`, other Codex subcommands, an absent or modified installation,
-and use outside Boomux remain untracked. An exact configured primary executable
-is forwarded through `BOOMUX_REAL_CODEX`; typing an absolute path in a login
+and hidden launcher. Interactive chat with or without a prompt (including `codex .`),
+known local chat options, `resume`, `fork`, `review`, and `exec` (alias `e`) are
+considered managed chat. The primary-command adapter and hidden launcher share
+one argument classifier. Option values and literal prompts after `--` are not
+mistaken for subcommands; unknown options pass through untracked.
+When the installed handlers are current, the launcher prepends `--enable hooks`
+and exports `BOOMUX_CODEX_RUN_SCOPED=1`. Explicit remote connections, utility or
+service subcommands, an absent or modified installation, and use outside Boomux
+remain untracked. An exact configured primary executable is forwarded through `BOOMUX_REAL_CODEX`; typing an absolute path in a login
 Shell bypasses the scoped shim. Bash startup clears cached executable paths after
 reasserting the shim-first `PATH`, so a prior direct Codex resolution cannot bypass
 the scoped launcher. Hooks silently do nothing unless the run-scoped marker and

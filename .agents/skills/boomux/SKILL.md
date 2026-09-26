@@ -894,13 +894,14 @@ preserve unrelated JSON and hooks. Modified Boomux handlers require explicitly
 authorized `--force`; never replace the whole file. Restart Codex after a change,
 then review and trust the Boomux hook with `/hooks`.
 
-In a managed ShellRun, bare Codex chat, `codex resume`, and `codex exec` are
+In a managed ShellRun, Codex chat with an optional prompt and known local options,
+`codex resume`, `codex fork`, `codex review`, and `codex exec` (alias `e`) are
 routed through an internal launcher that enables hooks only while the installed
 handlers are current. The hook's `session_id` is the canonical thread identity.
 Prompt, tool, compaction, and subagent activity report `working`; permission
 waits report `blocked`; Stop reports `idle`; SessionEnd reports `inactive`; no
-Codex hook reports `done`. Other subcommands and unscoped processes remain
-untracked rather than guessing ownership.
+Codex hook reports `done`. Remote connections, utility/service subcommands, unknown
+options, and unscoped processes remain untracked rather than guessing ownership.
 
 Codex catalog discovery may execute the experimental PATH-resolved `codex
 app-server --stdio` interface in workspace-derived directories. It is bounded,

@@ -325,7 +325,7 @@ fn bare_claude_command_uses_owner_remote_control_policy_without_rewriting_stored
 }
 
 #[test]
-fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
+fn prompted_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
     let mut daemon = TestDaemon::start_with(|command, runtime_dir| {
         let bin = runtime_dir.join("codex-bin");
         let codex_home = runtime_dir.join("codex-home");
@@ -361,7 +361,7 @@ fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
             "codex",
             vec![ShellSpec {
                 name: "codex".into(),
-                command: vec![codex.display().to_string()],
+                command: vec![codex.display().to_string(), ".".into()],
                 cwd: daemon.runtime_dir.clone(),
             }],
         )
@@ -376,7 +376,7 @@ fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
     let codex_home = fs::read_to_string(daemon.runtime_dir.join("codex-home-value")).unwrap();
     assert_eq!(
         fs::read(daemon.runtime_dir.join("codex-argv")).unwrap(),
-        b"--enable\0hooks\0",
+        b"--enable\0hooks\0.\0",
         "marker={marker} CODEX_HOME={codex_home}"
     );
     assert_eq!(marker, "1");
@@ -388,7 +388,7 @@ fn bare_codex_command_uses_run_scoped_hooks_without_rewriting_stored_argv() {
     );
     assert_eq!(
         daemon.client.get_shell(shell_id).unwrap().command,
-        [codex.display().to_string()]
+        [codex.display().to_string(), ".".into()]
     );
     drop(attachment);
     daemon.stop_with_cli();
@@ -531,7 +531,7 @@ fn claude_typed_in_managed_login_shell_preserves_dispatch_shim_and_arguments() {
 }
 
 #[test]
-fn bare_codex_typed_in_managed_login_shell_uses_run_scoped_hooks() {
+fn prompted_codex_typed_in_managed_login_shell_uses_run_scoped_hooks() {
     let mut daemon = TestDaemon::start();
     let bin = daemon.runtime_dir.join("codex-login-bin");
     let home = daemon.runtime_dir.join("codex-login-home");
@@ -591,14 +591,14 @@ fn bare_codex_typed_in_managed_login_shell_uses_run_scoped_hooks() {
     };
     let mut attachment =
         attach_with_environment(&daemon.client, &workspace.shells[0].id, false, environment);
-    AttachFrame::Input(b"codex\n".to_vec())
+    AttachFrame::Input(b"codex .\n".to_vec())
         .write_to(&mut attachment.stream)
         .unwrap();
     wait_until(
         || fs::read(&marker_output).is_ok(),
         "typed Codex command did not capture its launch",
     );
-    assert_eq!(fs::read(argv_output).unwrap(), b"--enable\0hooks\0");
+    assert_eq!(fs::read(argv_output).unwrap(), b"--enable\0hooks\0.\0");
     assert_eq!(fs::read_to_string(marker_output).unwrap(), "1");
     AttachFrame::Input(b"exit\n".to_vec())
         .write_to(&mut attachment.stream)
