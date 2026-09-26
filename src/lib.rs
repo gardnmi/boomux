@@ -5,6 +5,8 @@ pub mod attach;
 #[doc(hidden)]
 pub mod benchmark_support;
 pub mod client;
+#[doc(hidden)]
+pub mod codex_launch;
 pub mod conversations;
 pub mod daemon;
 #[doc(hidden)]
