@@ -1,6 +1,6 @@
 [package]
 name = "boomux"
-version = "1.21.9"
+version = "1.21.10"
 edition = "2024"
 license = "MIT"
 
