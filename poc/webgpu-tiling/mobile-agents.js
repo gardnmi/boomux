@@ -169,8 +169,17 @@ async function openDetail(row){
   const view=active;
   try{
     const ghostty=await loadGhostty();if(active!==view)return;
-    const terminal=new Terminal({ghostty,fontFamily:'monospace',fontSize:13,cursorBlink:false,scrollback:2000,theme:terminalTheme(getTheme())});
+    const terminal=new Terminal({ghostty,fontFamily:'monospace',fontSize:13,cursorBlink:false,scrollback:2000,
+      disableStdin:true,theme:terminalTheme(getTheme())});
+    // Ghostty calls focus() during open(), including a deferred second focus.
+    // This view uses the visible composer for input, so opening output must
+    // never focus Ghostty's contenteditable element on a phone.
+    terminal.focus=()=>{};
     view.terminal=terminal;terminal.open($('#phone-output'));
+    $('#phone-output').setAttribute('contenteditable','false');
+    $('#phone-output').setAttribute('tabindex','-1');
+    $('#phone-output').setAttribute('role','log');
+    $('#phone-output').setAttribute('aria-label','Agent terminal output');
     terminal.textarea?.setAttribute('readonly','');
     terminal.textarea?.setAttribute('tabindex','-1');
     terminal.attachCustomKeyEventHandler(()=>true);

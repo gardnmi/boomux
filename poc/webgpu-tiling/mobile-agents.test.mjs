@@ -52,6 +52,13 @@ try{
   await page.goto(`http://127.0.0.1:${server.address().port}/agents`);
   await page.locator('.phone-agent-card').click();
   await page.getByText('Live terminal').waitFor();
+  await page.waitForTimeout(100);
+  assert.equal(await page.evaluate(()=>{
+    const focused=document.activeElement;
+    return focused===document.querySelector('#phone-output')||
+      focused===document.querySelector('#phone-output textarea')||
+      focused===document.querySelector('#phone-prompt');
+  }),false,'opening an Agent does not focus terminal input or open the phone keyboard');
   await page.locator('#phone-prompt').fill('editable draft');
   assert.deepEqual(await page.evaluate(()=>window.sentTerminalInput),[]);
   await page.locator('#phone-prompt').fill('hello from phone');
