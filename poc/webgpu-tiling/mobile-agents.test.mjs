@@ -14,6 +14,7 @@ const assets={
   '/agents':['poc/webgpu-tiling/index.html','text/html'],
   '/entry.js':['poc/webgpu-tiling/entry.js','text/javascript'],
   '/mobile-agents.js':['poc/webgpu-tiling/mobile-agents.js','text/javascript'],
+  '/themes.js':['poc/webgpu-tiling/themes.js','text/javascript'],
   '/mobile-agents.css':['poc/webgpu-tiling/mobile-agents.css','text/css'],
   '/style.css':['poc/webgpu-tiling/style.css','text/css'],
   '/vendor/ghostty-web.js':['node_modules/ghostty-web/dist/ghostty-web.js','text/javascript'],
@@ -82,5 +83,10 @@ try{
   assert.ok(await page.locator('#phone-latest').isVisible(),'new output preserves the history position');
   await page.locator('#phone-latest').click();
   assert.ok(await page.locator('#phone-latest').isHidden(),'Latest returns to live output');
+  await page.locator('#phone-prompt').fill(Array.from({length:8},(_,index)=>`draft line ${index}`).join('\n'));
+  const expanded=await page.locator('#phone-prompt').boundingBox();
+  assert.ok(expanded && expanded.height>box.height && expanded.height<=150 && expanded.y+expanded.height<=844,
+    'a multiline draft grows within the phone viewport');
+  assert.ok(await page.locator('.phone-keys').isHidden(),'editing makes room for the phone keyboard');
   console.log('Mobile Agent draft input and touch scrollback behave as expected');
 }finally{await browser.close();server.close();}

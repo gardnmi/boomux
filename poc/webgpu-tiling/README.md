@@ -469,7 +469,9 @@ terminal input frames, like distinct paste and submission actions.
 terminal actions without relying on a phone
 keyboard. Swipe vertically on the terminal to browse scrollback; **Latest**
 returns to live output. The prompt stays local while editing and remains
-available if a send fails. The browser attaches collaboratively to the exact
+available if a send fails. The phone view follows the saved WebUI palette and
+expands the draft as it grows; terminal keys move out of the way while the
+draft has focus. The browser attaches collaboratively to the exact
 current ShellRun, so the Desktop terminal remains connected and owns its size.
 Remote and historical Agent cards are visible but cannot be opened in this
 first version. The view is also available at `/agents` on larger screens.

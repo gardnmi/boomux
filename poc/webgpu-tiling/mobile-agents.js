@@ -1,26 +1,27 @@
 import {Ghostty, Terminal} from '/vendor/ghostty-web.js';
+import {getTheme,terminalTheme} from './themes.js';
 
 const root=document.querySelector('#phone-app');
 root.innerHTML=`
-  <header class="phone-header"><strong>Boomux Agents</strong><button id="phone-workspace" type="button">Full workspace</button></header>
-  <main id="phone-list" class="phone-list"><p id="phone-list-status" role="status">Loading Agents…</p><div id="phone-cards"></div></main>
+  <header class="phone-header"><div class="phone-brand"><span class="phone-brand-mark" aria-hidden="true">›_</span><strong>boomux</strong></div><button id="phone-workspace" type="button">Full workspace ↗</button></header>
+  <main id="phone-list" class="phone-list"><div class="phone-list-heading"><div><span class="phone-eyebrow">YOUR SESSIONS</span><h1>Agents</h1></div><span id="phone-agent-count"></span></div><p id="phone-list-status" role="status">Loading Agents…</p><div id="phone-cards"></div></main>
   <section id="phone-detail" class="phone-detail" aria-label="Agent terminal" hidden>
-    <header class="phone-detail-header"><button id="phone-back" type="button" aria-label="Back to Agents">← Agents</button><strong id="phone-title"></strong><span id="phone-state"></span></header>
-    <div class="phone-status-row"><p id="phone-terminal-status" class="phone-status" role="status">Connecting…</p><button id="phone-latest" type="button" hidden>Latest ↓</button></div>
+    <header class="phone-detail-header"><button id="phone-back" type="button" aria-label="Back to Agents">←</button><div class="phone-title-group"><strong id="phone-title"></strong><small id="phone-context"></small></div><span id="phone-state"></span></header>
+    <div class="phone-status-row"><p id="phone-terminal-status" class="phone-status" role="status">Connecting…</p><span id="phone-pan-hint">Swipe ↑ history · ↔ lines</span><button id="phone-latest" type="button" hidden>Latest ↓</button></div>
     <div id="phone-output-scroll" class="phone-output-scroll"><div id="phone-output"></div></div>
     <div class="phone-input-area">
       <div class="phone-keys" aria-label="Terminal keys">
         <button type="button" data-key="escape">Esc</button><button type="button" data-key="interrupt">Ctrl+C</button>
-        <button type="button" data-key="tab">Tab</button><button type="button" data-key="up" aria-label="Up arrow">↑</button>
-        <button type="button" data-key="down" aria-label="Down arrow">↓</button>
-        <button type="button" data-key="enter">Enter</button>
+        <button type="button" data-key="enter">Enter</button><button type="button" data-key="tab">Tab</button>
+        <button type="button" data-key="up" aria-label="Up arrow">↑</button><button type="button" data-key="down" aria-label="Down arrow">↓</button>
       </div>
-      <div class="phone-compose"><textarea id="phone-prompt" rows="2" maxlength="8192" aria-label="Prompt or response" placeholder="Edit here until ready to send"></textarea><button id="phone-send" type="button" disabled>Send ↵</button></div>
+      <div class="phone-compose-heading"><label for="phone-prompt">DRAFT</label><span>Edit here, then send</span></div>
+      <div class="phone-compose"><textarea id="phone-prompt" rows="2" maxlength="8192" aria-label="Prompt or response" placeholder="Ask your Agent…"></textarea><button id="phone-send" type="button" disabled>Send ↵</button></div>
     </div>
   </section>`;
 const $=selector=>root.querySelector(selector);
-const list=$('#phone-list'),detail=$('#phone-detail'),cards=$('#phone-cards'),listStatus=$('#phone-list-status');
-const prompt=$('#phone-prompt'),send=$('#phone-send'),status=$('#phone-terminal-status'),latest=$('#phone-latest');
+const list=$('#phone-list'),detail=$('#phone-detail'),cards=$('#phone-cards'),listStatus=$('#phone-list-status'),agentCount=$('#phone-agent-count');
+const prompt=$('#phone-prompt'),send=$('#phone-send'),status=$('#phone-terminal-status'),latest=$('#phone-latest'),panHint=$('#phone-pan-hint');
 const encoder=new TextEncoder();
 let snapshot=null,active=null,changesCursor=null,changesAbort=null,watchTimer=null;
 let ghosttyPromise=null;
@@ -75,21 +76,24 @@ function canOpen(row){return row.shell&&!row.workspace.remote;}
 function renderList(){
   const items=snapshot?rows(snapshot):[];
   cards.replaceChildren();
+  agentCount.textContent=snapshot?`${items.length} ${items.length===1?'Agent':'Agents'}`:'';
   listStatus.textContent=snapshot?(items.length?'':'No current Agents or attention to review.'):'Connecting to Boomux…';
   for(const row of items){
     const button=document.createElement('button');button.type='button';button.className='phone-agent-card';
+    button.dataset.priority=String(priority(row));
     const title=document.createElement('strong');title.textContent=row.shell?.name||row.agent.name||row.agent.integration;
     const state=document.createElement('span');state.textContent=label(row);state.className='phone-agent-state';
     const meta=document.createElement('small');meta.textContent=`${row.workspace.name} · ${row.workspace.remote?.alias||'This machine'} · ${row.agent.integration}`;
+    const chevron=document.createElement('span');chevron.className='phone-agent-chevron';chevron.textContent='›';chevron.setAttribute('aria-hidden','true');
     button.append(title,state,meta);
-    if(canOpen(row))button.addEventListener('click',()=>openDetail(row));
+    if(canOpen(row)){button.append(chevron);button.addEventListener('click',()=>openDetail(row));}
     else{button.disabled=true;button.title='Only current local Agents can be opened on a phone';}
     cards.append(button);
   }
   if(active){
     const current=items.find(row=>row.key===active.row.key&&canOpen(row));
     if(!current){disconnect('This Agent run changed. Return to Agents to choose the current run.');}
-    else{$('#phone-state').textContent=label(current);active.row=current;}
+    else{$('#phone-state').textContent=label(current);$('#phone-state').dataset.priority=String(priority(current));active.row=current;}
   }
 }
 async function refresh(){
@@ -112,7 +116,8 @@ function updateSend(){
   send.disabled=!connected||!prompt.value.trim();
   for(const button of root.querySelectorAll('.phone-keys button'))button.disabled=!connected;
 }
-function updateHistory(){latest.hidden=!active?.terminal?.viewportY;}
+function resizePrompt(){prompt.style.height='auto';prompt.style.height=`${Math.min(150,Math.max(68,prompt.scrollHeight))}px`;}
+function updateHistory(){latest.hidden=!active?.terminal?.viewportY;panHint.hidden=!latest.hidden;}
 const outputScroll=$('#phone-output-scroll');
 let touchId=null,touchStartX=0,touchStartY=0,touchY=0,touchRemainder=0,touchAxis=null;
 outputScroll.addEventListener('touchstart',event=>{
@@ -145,23 +150,26 @@ latest.onclick=()=>{active?.terminal?.scrollToBottom();updateHistory();};
 function disconnect(message){
   if(!active)return;
   active.connected=false;active.socket?.close(1000,'Agent view closed');active.socket=null;
-  status.textContent=message;updateSend();
+  status.textContent=message;delete status.dataset.connected;updateSend();
 }
 function closeDetail(){
   if(active){disconnect('Disconnected');active.dataListener?.dispose();active.scrollListener?.dispose();active.terminal?.dispose();active=null;}
-  $('#phone-output').replaceChildren();detail.hidden=true;list.hidden=false;prompt.value='';updateSend();updateHistory();
+  root.classList.remove('phone-detail-open');
+  $('#phone-output').replaceChildren();detail.hidden=true;list.hidden=false;prompt.value='';resizePrompt();updateSend();updateHistory();
 }
 async function openDetail(row){
   closeDetail();
+  root.classList.add('phone-detail-open');
   list.hidden=true;detail.hidden=false;
   $('#phone-title').textContent=row.shell?.name||row.agent.name;
-  $('#phone-state').textContent=label(row);
+  $('#phone-context').textContent=`${row.workspace.name} · ${row.agent.integration}`;
+  $('#phone-state').textContent=label(row);$('#phone-state').dataset.priority=String(priority(row));
   status.textContent='Connecting to this Agent’s current terminal…';
   prompt.value='';active={row,connected:false,socket:null,terminal:null,dataListener:null,scrollListener:null};updateSend();updateHistory();
   const view=active;
   try{
     const ghostty=await loadGhostty();if(active!==view)return;
-    const terminal=new Terminal({ghostty,fontFamily:'monospace',fontSize:12,cursorBlink:false,scrollback:2000});
+    const terminal=new Terminal({ghostty,fontFamily:'monospace',fontSize:13,cursorBlink:false,scrollback:2000,theme:terminalTheme(getTheme())});
     view.terminal=terminal;terminal.open($('#phone-output'));
     terminal.textarea?.setAttribute('readonly','');
     terminal.textarea?.setAttribute('tabindex','-1');
@@ -188,11 +196,11 @@ async function openDetail(row){
       const message=JSON.parse(event.data);
       if(message.type==='attached'){
         terminal.resize(message.cols,message.rows);
-        view.connected=true;status.textContent='Live terminal';updateSend();
+        view.connected=true;status.textContent='Live terminal';status.dataset.connected='true';updateSend();
       }else if(message.type==='resize'){
         terminal.resize(message.cols,message.rows);
       }else if(message.type==='reconnecting'){
-        view.connected=false;status.textContent='Reconnecting to the same run…';updateSend();
+        view.connected=false;status.textContent='Reconnecting to the same run…';delete status.dataset.connected;updateSend();
       }else if(message.type==='closed'||message.type==='error')disconnect(message.message||message.reason||'Terminal connection ended');
     };
     socket.onclose=()=>{if(active===view&&view.socket===socket)disconnect('Terminal disconnected. Reopen this Agent to reconnect.');};
@@ -226,6 +234,7 @@ function sendPrompt(){
     socket.send(bytes);
     socket.send(Uint8Array.of(13));
     prompt.value='';
+    resizePrompt();
     status.textContent='Sent prompt and Enter';
     updateSend();
   }catch{status.textContent='Submission was interrupted. Check the terminal before retrying.';}
@@ -241,7 +250,9 @@ function watch(){
 }
 $('#phone-workspace').onclick=()=>{sessionStorage.setItem('boomux.web.view','desktop');location.assign('/');};
 $('#phone-back').onclick=closeDetail;
-prompt.addEventListener('input',updateSend);
+prompt.addEventListener('input',()=>{resizePrompt();updateSend();});
+prompt.addEventListener('focus',()=>root.classList.add('phone-editing'));
+prompt.addEventListener('blur',()=>root.classList.remove('phone-editing'));
 send.onclick=sendPrompt;
 root.querySelectorAll('.phone-keys button').forEach(button=>button.addEventListener('click',()=>sendBytes(terminalKeys[button.dataset.key])));
 document.addEventListener('visibilitychange',()=>{clearTimeout(watchTimer);changesAbort?.abort();if(!document.hidden)watch();});
