@@ -37,15 +37,21 @@ Waiting for input
 [The terminal stays connected on the desktop]
 
 [ Type a prompt or response...       ] [Send]
-[Esc] [Ctrl+C]                 [Open native app, if available]
+[Esc] [Ctrl+C] [Tab] [↑] [↓] [Enter]
+[Open native app, if available]
 ```
 
 **Send** types into that existing Agent's terminal. It does not start another
-Agent or send to a merely similar session. The output area is a real terminal
-screen, including prompts and tool output. It is not yet a clean chat history
-of user and assistant messages. That distinction is the key product decision:
-a chat-style transcript requires a separate, authoritative integration for
-at least one harness and cannot be inferred safely from terminal output.
+Agent or send to a merely similar session. The output area is the real terminal
+screen, including prompts and tool output. Terminal output is acceptable for this feature; the phone keyboard and input
+flow are the priority.
+
+The terminal itself should not receive phone keyboard edits. Tapping output
+scrolls, selects, or copies it without summoning the keyboard. A separate,
+visible composer accepts normal phone editing, autocorrection, paste, and IME
+composition. The keyboard's Enter key inserts a newline; only the **Send**
+button submits. A small key row supplies Esc, Ctrl+C, Tab, arrows, and Enter
+for interactive TUI questions that are not ordinary prompts.
 
 ## Findings
 
@@ -96,14 +102,21 @@ at least one harness and cannot be inferred safely from terminal output.
    phone cannot become primary or resize the desktop PTY. Close the socket
    when leaving the detail view. Keep remote Agent control out of this slice;
    cached remote projections do not authorize input.
-4. Compose text locally and send only on an explicit tap. Limit prompt bytes,
-   strip terminal control characters from pasted text, and send through the
-   exact current attachment. Support a single line first. Add multiline only
-   after testing bracketed paste with each supported TUI; otherwise a newline
-   can submit multiple unintended prompts. Keep drafts in memory only, never
-   replay a send after reconnect, and disable **Send** when the run changes.
-   Put Esc and Ctrl-C behind separate, clearly labeled terminal controls.
-5. Keep the terminal rendering honest: show the authoritative grid and allow
+4. Put a visible `<textarea>` outside the terminal renderer. It owns phone
+   keyboard focus, editing, paste, autocorrection, and IME composition. The
+   terminal renderer must not forward its hidden input field on phone layouts.
+   Send only from an explicit button tap, never from Enter or an `input` event.
+   Keep the composer above the software keyboard using `VisualViewport` and
+   safe-area insets. Do not automatically refocus it after sending.
+5. Limit prompt bytes and strip pasted terminal control characters before
+   sending through the exact current attachment. For a single line, send text
+   and one terminal Enter as one bounded action. Permit multiline only when
+   that TUI has enabled bracketed paste; otherwise keep the draft and explain
+   why it cannot be sent safely. Keep drafts in memory only, never replay a
+   send after reconnect, and disable **Send** when the run changes. Add a
+   separate key row for Esc, Ctrl+C, Tab, arrows, and Enter; label these as
+   terminal keys rather than prompt actions.
+6. Keep the terminal rendering honest: show the authoritative grid and allow
    horizontal pan/zoom where needed. Do not parse VT output into conversation
    messages or claim that the screen contains full history. Where an exact
    harness-native link exists, show **Open in [harness]** for its richer
@@ -136,8 +149,9 @@ mobile viewport behavior.
   Browser queues, output reconstruction, and prompt size remain bounded.
 - Remote stale Agents and historical attention are visibly noninteractive.
 - Test narrow Chromium and WebKit viewports, keyboard open/close, orientation,
-  IME composition, copy/paste, and live Android and iOS browsers before claiming
-  phone support. Keep browser assets and terminal bytes out of persistent caches.
+  IME composition, autocorrect, paste, Enter-versus-Send behavior, the key row,
+  and live Android and iOS browsers before claiming phone support. Keep browser
+  assets and terminal bytes out of persistent caches.
 
 ## External references
 
