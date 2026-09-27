@@ -40,9 +40,10 @@ try{
     window.sentTerminalInput=[];
     window.WebSocket=class {
       static OPEN=1;
-      constructor(){this.readyState=0;this.bufferedAmount=0;setTimeout(()=>{
+      constructor(){this.readyState=0;this.bufferedAmount=0;window.fixtureSocket=this;setTimeout(()=>{
         this.readyState=1;this.onmessage?.({data:JSON.stringify({type:'attached',rows:24,cols:80})});
       },0);}
+      emitOutput(text){this.onmessage?.({data:new TextEncoder().encode(text).buffer});}
       send(bytes){window.sentTerminalInput.push(new TextDecoder().decode(bytes));}
       close(){this.readyState=3;this.onclose?.({});}
     };
@@ -58,5 +59,21 @@ try{
   assert.deepEqual(await page.evaluate(()=>window.sentTerminalInput),['hello from phone\r','\x03']);
   const box=await page.locator('#phone-prompt').boundingBox();
   assert.ok(box && box.y+box.height<=844,'composer stays inside phone viewport');
-  console.log('Mobile Agent input waits for Send and terminal keys remain available');
+  await page.evaluate(()=>window.fixtureSocket.emitOutput(
+    Array.from({length:100},(_,index)=>`history line ${index}`).join('\r\n')));
+  await page.evaluate(()=>{
+    const output=document.querySelector('#phone-output canvas');
+    const fire=(type,y)=>{
+      const touch=new Touch({identifier:1,target:output,clientX:150,clientY:y});
+      output.dispatchEvent(new TouchEvent(type,{bubbles:true,cancelable:true,
+        touches:type==='touchend'?[]:[touch],changedTouches:[touch]}));
+    };
+    fire('touchstart',120);fire('touchmove',300);fire('touchend',300);
+  });
+  await page.locator('#phone-latest').waitFor({state:'visible'});
+  await page.evaluate(()=>window.fixtureSocket.emitOutput('\r\nnew live output'));
+  assert.ok(await page.locator('#phone-latest').isVisible(),'new output preserves the history position');
+  await page.locator('#phone-latest').click();
+  assert.ok(await page.locator('#phone-latest').isHidden(),'Latest returns to live output');
+  console.log('Mobile Agent draft input and touch scrollback behave as expected');
 }finally{await browser.close();server.close();}

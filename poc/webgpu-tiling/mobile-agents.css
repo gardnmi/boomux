@@ -20,9 +20,11 @@ body.agent-phone #phone-app { position: fixed; z-index: 100; display: flex; flex
 #phone-app .phone-detail-header { justify-content: flex-start; }
 #phone-app .phone-detail-header strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #phone-app #phone-state { color: var(--ui-muted, #9298a4); font-size: 11px; }
+#phone-app .phone-status-row { display: flex; align-items: center; justify-content: space-between; padding-right: max(12px, env(safe-area-inset-right)); }
 #phone-app .phone-status { flex: none; margin: 0; padding: 5px 12px; color: var(--ui-muted, #9298a4); font-size: 11px; }
+#phone-app #phone-latest { min-height: 32px; padding: 3px 8px; font-size: 11px; }
 #phone-app .phone-output-scroll { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; background: var(--ui-bg, #161b24); }
-#phone-app #phone-output { min-height: 100%; padding: 8px; }
+#phone-app #phone-output { min-height: 100%; padding: 8px; touch-action: pan-x; }
 #phone-app #phone-output canvas { display: block; }
 #phone-app #phone-output textarea { pointer-events: none; }
 #phone-app .phone-input-area { flex: none; border-top: 1px solid var(--ui-border, #323a49); background: var(--ui-surface, #181a1e); padding: 8px max(12px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); }

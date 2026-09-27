@@ -6,7 +6,7 @@ root.innerHTML=`
   <main id="phone-list" class="phone-list"><p id="phone-list-status" role="status">Loading Agents…</p><div id="phone-cards"></div></main>
   <section id="phone-detail" class="phone-detail" aria-label="Agent terminal" hidden>
     <header class="phone-detail-header"><button id="phone-back" type="button" aria-label="Back to Agents">← Agents</button><strong id="phone-title"></strong><span id="phone-state"></span></header>
-    <p id="phone-terminal-status" class="phone-status" role="status">Connecting…</p>
+    <div class="phone-status-row"><p id="phone-terminal-status" class="phone-status" role="status">Connecting…</p><button id="phone-latest" type="button" hidden>Latest ↓</button></div>
     <div id="phone-output-scroll" class="phone-output-scroll"><div id="phone-output"></div></div>
     <div class="phone-input-area">
       <div class="phone-keys" aria-label="Terminal keys">
@@ -19,7 +19,7 @@ root.innerHTML=`
   </section>`;
 const $=selector=>root.querySelector(selector);
 const list=$('#phone-list'),detail=$('#phone-detail'),cards=$('#phone-cards'),listStatus=$('#phone-list-status');
-const prompt=$('#phone-prompt'),send=$('#phone-send'),status=$('#phone-terminal-status');
+const prompt=$('#phone-prompt'),send=$('#phone-send'),status=$('#phone-terminal-status'),latest=$('#phone-latest');
 const encoder=new TextEncoder();
 let snapshot=null,active=null,changesCursor=null,changesAbort=null,watchTimer=null;
 let ghosttyPromise=null;
@@ -111,14 +111,44 @@ function updateSend(){
   send.disabled=!connected||!prompt.value.trim();
   for(const button of root.querySelectorAll('.phone-keys button'))button.disabled=!connected;
 }
+function updateHistory(){latest.hidden=!active?.terminal?.viewportY;}
+const outputScroll=$('#phone-output-scroll');
+let touchId=null,touchStartX=0,touchStartY=0,touchY=0,touchRemainder=0,touchAxis=null;
+outputScroll.addEventListener('touchstart',event=>{
+  if(event.touches.length!==1||!active?.terminal){touchId=null;return;}
+  const touch=event.touches[0];
+  touchId=touch.identifier;touchStartX=touch.clientX;touchStartY=touch.clientY;
+  touchY=touch.clientY;touchRemainder=0;touchAxis=null;
+},{passive:true});
+outputScroll.addEventListener('touchmove',event=>{
+  if(touchId==null||!active?.terminal)return;
+  const touch=Array.from(event.touches).find(touch=>touch.identifier===touchId);
+  if(!touch)return;
+  if(!touchAxis&&Math.max(Math.abs(touch.clientX-touchStartX),Math.abs(touch.clientY-touchStartY))>6)
+    touchAxis=Math.abs(touch.clientY-touchStartY)>Math.abs(touch.clientX-touchStartX)?'vertical':'horizontal';
+  if(touchAxis!=='vertical')return;
+  event.preventDefault();
+  touchRemainder+=touchY-touch.clientY;touchY=touch.clientY;
+  const lineHeight=active.terminal.renderer?.charHeight||16;
+  const lines=Math.trunc(touchRemainder/lineHeight);
+  if(lines){active.terminal.scrollLines(lines);touchRemainder-=lines*lineHeight;}
+},{passive:false});
+outputScroll.addEventListener('touchend',event=>{
+  if(!Array.from(event.changedTouches).some(touch=>touch.identifier===touchId))return;
+  touchId=null;
+  // Ghostty's canvas otherwise focuses its hidden keyboard input on every tap.
+  event.preventDefault();event.stopPropagation();
+},{capture:true,passive:false});
+outputScroll.addEventListener('touchcancel',()=>{touchId=null;},{passive:true});
+latest.onclick=()=>{active?.terminal?.scrollToBottom();updateHistory();};
 function disconnect(message){
   if(!active)return;
   active.connected=false;active.socket?.close(1000,'Agent view closed');active.socket=null;
   status.textContent=message;updateSend();
 }
 function closeDetail(){
-  if(active){disconnect('Disconnected');active.dataListener?.dispose();active.terminal?.dispose();active=null;}
-  $('#phone-output').replaceChildren();detail.hidden=true;list.hidden=false;prompt.value='';updateSend();
+  if(active){disconnect('Disconnected');active.dataListener?.dispose();active.scrollListener?.dispose();active.terminal?.dispose();active=null;}
+  $('#phone-output').replaceChildren();detail.hidden=true;list.hidden=false;prompt.value='';updateSend();updateHistory();
 }
 async function openDetail(row){
   closeDetail();
@@ -126,7 +156,7 @@ async function openDetail(row){
   $('#phone-title').textContent=row.shell?.name||row.agent.name;
   $('#phone-state').textContent=label(row);
   status.textContent='Connecting to this Agent’s current terminal…';
-  prompt.value='';active={row,connected:false,socket:null,terminal:null,dataListener:null};updateSend();
+  prompt.value='';active={row,connected:false,socket:null,terminal:null,dataListener:null,scrollListener:null};updateSend();updateHistory();
   const view=active;
   try{
     const ghostty=await loadGhostty();if(active!==view)return;
@@ -136,6 +166,7 @@ async function openDetail(row){
     terminal.textarea?.setAttribute('tabindex','-1');
     terminal.attachCustomKeyEventHandler(()=>true);
     view.dataListener=terminal.onData(data=>sendBytes(data));
+    view.scrollListener=terminal.onScroll(updateHistory);
     const response=await fetch('/api/agent/attach',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({node_id:row.nodeId,agent_id:row.agent.id,shell_id:row.agent.shell_id,run_id:row.agent.run_id,rows:24,cols:80})});
     const result=await response.json();if(!response.ok)throw Error(result.error||'Agent attachment refused');
@@ -146,8 +177,11 @@ async function openDetail(row){
     socket.onmessage=event=>{
       if(active!==view)return;
       if(typeof event.data!=='string'){
+        const historyOffset=terminal.viewportY;
+        const previousLength=historyOffset?terminal.getScrollbackLength():0;
         terminal.write(new Uint8Array(event.data));
-        const scroll=$('#phone-output-scroll');scroll.scrollTop=scroll.scrollHeight;
+        if(historyOffset)terminal.scrollToLine(historyOffset+terminal.getScrollbackLength()-previousLength);
+        if(!historyOffset)outputScroll.scrollTop=outputScroll.scrollHeight;
         return;
       }
       const message=JSON.parse(event.data);

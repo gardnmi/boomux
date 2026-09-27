@@ -465,11 +465,13 @@ current Agents and attention across Workspaces. Open a current local Agent to
 watch its live terminal; type in the separate prompt box and tap **Send** to
 submit the whole draft followed by Enter. **Esc**, **Ctrl+C**, **Tab**, arrow,
 and **Enter** buttons cover common terminal actions without relying on a phone
-keyboard. The prompt stays local while editing and remains available if a send
-fails. The browser attaches collaboratively to the exact current ShellRun, so
-the Desktop terminal remains connected and owns its size. Remote and historical
-Agent cards are visible but cannot be opened in this first version. The view
-is also available at `/agents` on larger screens. **Full workspace** opens the
+keyboard. Swipe vertically on the terminal to browse scrollback; **Latest**
+returns to live output. The prompt stays local while editing and remains
+available if a send fails. The browser attaches collaboratively to the exact
+current ShellRun, so the Desktop terminal remains connected and owns its size.
+Remote and historical Agent cards are visible but cannot be opened in this
+first version. The view is also available at `/agents` on larger screens.
+**Full workspace** opens the
 tiling UI on a phone; its **Agents** button returns to the focused view.
 Run `PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node
 poc/webgpu-tiling/mobile-agents.test.mjs` for a focused phone-browser check of
