@@ -12,9 +12,10 @@ root.innerHTML=`
       <div class="phone-keys" aria-label="Terminal keys">
         <button type="button" data-key="escape">Esc</button><button type="button" data-key="interrupt">Ctrl+C</button>
         <button type="button" data-key="tab">Tab</button><button type="button" data-key="up" aria-label="Up arrow">↑</button>
-        <button type="button" data-key="down" aria-label="Down arrow">↓</button><button type="button" data-key="enter">Enter</button>
+        <button type="button" data-key="down" aria-label="Down arrow">↓</button>
+        <button type="button" data-key="enter">Enter</button>
       </div>
-      <div class="phone-compose"><textarea id="phone-prompt" rows="2" maxlength="8192" aria-label="Prompt or response" placeholder="Type a prompt or response"></textarea><button id="phone-send" type="button" disabled>Send</button></div>
+      <div class="phone-compose"><textarea id="phone-prompt" rows="2" maxlength="8192" aria-label="Prompt or response" placeholder="Edit here until ready to send"></textarea><button id="phone-send" type="button" disabled>Send ↵</button></div>
     </div>
   </section>`;
 const $=selector=>root.querySelector(selector);
@@ -208,11 +209,26 @@ function sendPrompt(){
   const value=prompt.value.replace(/\r\n?/g,'\n').replace(/[\x00-\x08\x0b-\x1f\x7f]/g,'').replace(/\t/g,'    ');
   if(!value.trim())return;
   const multiline=value.includes('\n');
-  if(multiline&&!active?.terminal?.hasBracketedPaste?.()){
+  const bracketed=active?.terminal?.hasBracketedPaste?.();
+  if(multiline&&!bracketed){
     status.textContent='This terminal cannot safely accept a multiline paste. Keep the draft and use one line.';return;
   }
-  const input=multiline?`\x1b[200~${value}\x1b[201~\r`:`${value}\r`;
-  if(sendBytes(input)){prompt.value='';status.textContent='Input sent to terminal';updateSend();}
+  const paste=bracketed?`\x1b[200~${value}\x1b[201~`:value;
+  const socket=active?.socket;
+  const bytes=encoder.encode(paste);
+  if(!active?.connected||socket?.readyState!==WebSocket.OPEN)return;
+  if(bytes.length>8192||socket.bufferedAmount+bytes.length+1>65536){
+    status.textContent='Input is too large or the connection is busy.';return;
+  }
+  // Keep the paste and Enter in separate terminal input frames, as keyboard
+  // editing and submission are separate actions in the Agent TUI.
+  try{
+    socket.send(bytes);
+    socket.send(Uint8Array.of(13));
+    prompt.value='';
+    status.textContent='Sent prompt and Enter';
+    updateSend();
+  }catch{status.textContent='Submission was interrupted. Check the terminal before retrying.';}
 }
 function watch(){
   if(document.hidden||!snapshot)return;

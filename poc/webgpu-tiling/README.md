@@ -462,9 +462,11 @@ removes only routes created by this publisher.
 Desktop uses the tiling gateway rather than `boomux web`'s older mobile dashboard.
 On screens up to 700 px wide, the shared URL opens an Agents view. It lists
 current Agents and attention across Workspaces. Open a current local Agent to
-watch its live terminal; type in the separate prompt box and tap **Send** to
-submit the whole draft followed by Enter. **Esc**, **Ctrl+C**, **Tab**, arrow,
-and **Enter** buttons cover common terminal actions without relying on a phone
+watch its live terminal; edit the draft in the separate prompt box until it is
+ready, then tap **Send**. The browser sends the text and Enter as separate
+terminal input frames, like distinct paste and submission actions.
+**Esc**, **Ctrl+C**, **Tab**, arrow, and **Enter** buttons cover other common
+terminal actions without relying on a phone
 keyboard. Swipe vertically on the terminal to browse scrollback; **Latest**
 returns to live output. The prompt stays local while editing and remains
 available if a send fails. The browser attaches collaboratively to the exact

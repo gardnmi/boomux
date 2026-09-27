@@ -51,12 +51,19 @@ try{
   await page.goto(`http://127.0.0.1:${server.address().port}/agents`);
   await page.locator('.phone-agent-card').click();
   await page.getByText('Live terminal').waitFor();
+  await page.locator('#phone-prompt').fill('editable draft');
+  assert.deepEqual(await page.evaluate(()=>window.sentTerminalInput),[]);
   await page.locator('#phone-prompt').fill('hello from phone');
   assert.deepEqual(await page.evaluate(()=>window.sentTerminalInput),[]);
   await page.locator('#phone-send').click();
-  assert.deepEqual(await page.evaluate(()=>window.sentTerminalInput),['hello from phone\r']);
+  assert.deepEqual(await page.evaluate(()=>window.sentTerminalInput),['hello from phone','\r']);
+  await page.evaluate(()=>window.fixtureSocket.emitOutput('\x1b[?2004h'));
+  await page.locator('#phone-prompt').fill('first line\nsecond line');
+  await page.locator('#phone-send').click();
+  assert.deepEqual((await page.evaluate(()=>window.sentTerminalInput)).slice(-2),
+    ['\x1b[200~first line\nsecond line\x1b[201~','\r']);
   await page.getByRole('button',{name:'Ctrl+C'}).click();
-  assert.deepEqual(await page.evaluate(()=>window.sentTerminalInput),['hello from phone\r','\x03']);
+  assert.equal((await page.evaluate(()=>window.sentTerminalInput)).at(-1),'\x03');
   const box=await page.locator('#phone-prompt').boundingBox();
   assert.ok(box && box.y+box.height<=844,'composer stays inside phone viewport');
   await page.evaluate(()=>window.fixtureSocket.emitOutput(
