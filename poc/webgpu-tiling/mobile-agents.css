@@ -1,0 +1,34 @@
+body.agent-phone > aside, body.agent-phone > main, body.agent-phone > #theme-dialog { display: none !important; }
+#phone-return-agents { position: fixed; z-index: 100; right: max(12px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); min-height: 44px; background: var(--ui-accent, #91b8b0); color: var(--ui-bg, #161b24); font-weight: 700; }
+body.agent-phone { display: block; overflow: hidden; background: var(--ui-deep, #101218); }
+body.agent-phone #phone-app { position: fixed; z-index: 100; display: flex; flex-direction: column; min-width: 0; overflow: hidden; background: var(--ui-deep, #101218); color: var(--ui-fg, #d4d9e3); }
+#phone-app [hidden] { display: none !important; }
+#phone-app button { min-height: 44px; touch-action: manipulation; }
+#phone-app button:disabled { opacity: .5; cursor: default; }
+#phone-app .phone-header, #phone-app .phone-detail-header { height: auto; min-height: 54px; padding: 8px max(16px, env(safe-area-inset-right)) 8px max(16px, env(safe-area-inset-left)); border-bottom: 1px solid var(--ui-border, #323a49); gap: 12px; }
+#phone-app .phone-header strong { font-size: 17px; }
+#phone-app .phone-header button { font-size: 12px; }
+#phone-app .phone-list { display: block; flex: 1; min-height: 0; overflow: auto; padding: 16px max(16px, env(safe-area-inset-right)) calc(16px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+#phone-app #phone-list-status { margin: 0 0 12px; color: var(--ui-muted, #9298a4); }
+#phone-app #phone-list-status:empty { display: none; }
+#phone-app #phone-cards { display: grid; gap: 10px; }
+#phone-app .phone-agent-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; width: 100%; min-height: 76px; padding: 12px 14px; text-align: left; gap: 5px 8px; background: var(--ui-surface, #181a1e); }
+#phone-app .phone-agent-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
+#phone-app .phone-agent-card small { grid-column: 1 / -1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ui-muted, #9298a4); font-size: 11px; }
+#phone-app .phone-agent-state { color: var(--ui-accent, #91b8b0); font-size: 12px; align-self: center; }
+#phone-app .phone-detail { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+#phone-app .phone-detail-header { justify-content: flex-start; }
+#phone-app .phone-detail-header strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#phone-app #phone-state { color: var(--ui-muted, #9298a4); font-size: 11px; }
+#phone-app .phone-status { flex: none; margin: 0; padding: 5px 12px; color: var(--ui-muted, #9298a4); font-size: 11px; }
+#phone-app .phone-output-scroll { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; background: var(--ui-bg, #161b24); }
+#phone-app #phone-output { min-height: 100%; padding: 8px; }
+#phone-app #phone-output canvas { display: block; }
+#phone-app #phone-output textarea { pointer-events: none; }
+#phone-app .phone-input-area { flex: none; border-top: 1px solid var(--ui-border, #323a49); background: var(--ui-surface, #181a1e); padding: 8px max(12px, env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); }
+#phone-app .phone-keys { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding-bottom: 8px; }
+#phone-app .phone-keys button { flex: none; min-width: 48px; padding: 7px 10px; font-size: 13px; }
+#phone-app .phone-compose { display: flex; align-items: stretch; gap: 8px; }
+#phone-app #phone-prompt { flex: 1; min-width: 0; min-height: 54px; max-height: 110px; resize: vertical; padding: 10px 12px; border: 1px solid var(--ui-border, #323a49); border-radius: 8px; background: var(--ui-bg, #161b24); color: var(--ui-fg, #d4d9e3); font: 16px/1.4 ui-sans-serif, system-ui, sans-serif; }
+#phone-app #phone-prompt:focus-visible { outline: 2px solid var(--ui-accent, #91b8b0); }
+#phone-app #phone-send { min-width: 70px; background: var(--ui-accent, #91b8b0); color: var(--ui-bg, #161b24); font-weight: 700; }

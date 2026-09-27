@@ -5,6 +5,8 @@ mod daemon_bridge;
 #[allow(dead_code)]
 #[path = "../src/tailscale_serve.rs"]
 mod tailscale_serve;
+#[path = "../src/web_terminal.rs"]
+mod web_terminal;
 // Reuse Desktop's qualified resource IDs and owner-routed operations.
 #[allow(dead_code)]
 #[path = "../desktop/src/remote.rs"]
@@ -21,8 +23,8 @@ use axum::{
 use boomux::{
     client::{self, Client},
     protocol::{
-        ProtocolFeature, Request as DaemonRequest, Response as DaemonResponse, RoutedOperation,
-        RoutedOperationResult, ShellSpec, TerminalProfile,
+        AgentState, ProtocolFeature, Request as DaemonRequest, Response as DaemonResponse,
+        RoutedOperation, RoutedOperationResult, ShellSpec, TerminalProfile,
     },
 };
 use serde::Deserialize;
@@ -47,7 +49,9 @@ struct App {
     origin: String,
     tailnet_origin: Option<String>,
     grants: Arc<Mutex<HashMap<String, (Instant, daemon_bridge::Grant)>>>,
+    agent_grants: Arc<Mutex<HashMap<String, (Instant, web_terminal::Grant)>>>,
     attachments: Arc<Semaphore>,
+    agent_attachments: Arc<Semaphore>,
     operations: Arc<Semaphore>,
     watchers: Arc<Semaphore>,
     setups: Arc<Mutex<HashMap<String, SetupLaunch>>>,
@@ -121,7 +125,7 @@ async fn guard(State(app): State<App>, req: Request, next: Next) -> Response {
     let Some(origin) = origin else {
         return fail(StatusCode::FORBIDDEN, "Invalid Host").into_response();
     };
-    if (req.method() != "GET" || req.uri().path() == "/pty")
+    if (req.method() != "GET" || matches!(req.uri().path(), "/pty" | "/agent/pty"))
         && req.headers().get("origin").and_then(|v| v.to_str().ok()) != Some(origin)
     {
         return fail(StatusCode::FORBIDDEN, "Invalid Origin").into_response();
@@ -940,9 +944,159 @@ async fn terminal(State(app): State<App>, headers: HeaderMap, ws: WebSocketUpgra
             daemon_bridge::run(socket, app.client, grant).await
         })
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentAttach {
+    node_id: String,
+    agent_id: String,
+    shell_id: String,
+    run_id: String,
+    rows: u16,
+    cols: u16,
+}
+
+fn agent_attach_target(
+    snapshot: &boomux::protocol::Snapshot,
+    request: &AgentAttach,
+) -> Result<web_terminal::Grant, String> {
+    if !(1..=200).contains(&request.rows) || !(2..=500).contains(&request.cols) {
+        return Err("Invalid grid dimensions".into());
+    }
+    for workspace in &snapshot.workspaces {
+        let Some(agent) = workspace
+            .agents
+            .iter()
+            .find(|agent| agent.id == request.agent_id)
+        else {
+            continue;
+        };
+        if agent.shell_id != request.shell_id
+            || agent.run_id != request.run_id
+            || agent.ended_at_ms.is_some()
+            || matches!(
+                agent.observation.state,
+                AgentState::Inactive | AgentState::Done
+            )
+        {
+            break;
+        }
+        let current = workspace
+            .agents
+            .iter()
+            .filter(|candidate| {
+                candidate.shell_id == request.shell_id
+                    && candidate.run_id == request.run_id
+                    && candidate.ended_at_ms.is_none()
+                    && !matches!(
+                        candidate.observation.state,
+                        AgentState::Inactive | AgentState::Done
+                    )
+            })
+            .max_by_key(|candidate| {
+                (
+                    candidate.observation.observed_at_ms,
+                    candidate.started_at_ms,
+                    &candidate.id,
+                )
+            });
+        if current.map(|candidate| candidate.id.as_str()) != Some(request.agent_id.as_str()) {
+            break;
+        }
+        let shell = workspace
+            .shells
+            .iter()
+            .find(|shell| shell.id == request.shell_id);
+        if shell
+            .and_then(|shell| shell.run.as_ref())
+            .filter(|run| run.ended_at_ms.is_none())
+            .map(|run| run.id.as_str())
+            != Some(request.run_id.as_str())
+        {
+            break;
+        }
+        return Ok(web_terminal::Grant {
+            shell_id: request.shell_id.clone(),
+            run_id: request.run_id.clone(),
+            profile: profile(request.rows, request.cols),
+        });
+    }
+    Err("Agent is no longer current on that ShellRun".into())
+}
+
+async fn authorize_agent(State(app): State<App>, Json(request): Json<AgentAttach>) -> ApiResult {
+    operation(app, move |app| {
+        if request.node_id != app.node_id {
+            return Err("Only local Agents can be controlled from this view".into());
+        }
+        let snapshot = app.client.snapshot().map_err(|e| e.to_string())?;
+        let target = agent_attach_target(&snapshot, &request)?;
+        let mut grants = app.agent_grants.lock().map_err(|_| "Grant lock failed")?;
+        grants.retain(|_, (expires, _)| *expires > Instant::now());
+        if grants.len() >= 64 {
+            return Err("Too many pending Agent attachments".into());
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        grants.insert(
+            token.clone(),
+            (Instant::now() + Duration::from_secs(30), target),
+        );
+        Ok(json!({"path":"/agent/pty","protocol":"boomux.terminal.v1","token":token}))
+    })
+    .await
+}
+
+async fn agent_terminal(
+    State(app): State<App>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let protocols = headers
+        .get("sec-websocket-protocol")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    if !protocols
+        .split(',')
+        .map(str::trim)
+        .any(|p| p == "boomux.terminal.v1")
+    {
+        return fail(StatusCode::FORBIDDEN, "Invalid Agent terminal protocol").into_response();
+    }
+    let Some(token) = protocols
+        .split(',')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("boomux.token."))
+    else {
+        return fail(StatusCode::FORBIDDEN, "Missing Agent attachment grant").into_response();
+    };
+    let grant = app
+        .agent_grants
+        .lock()
+        .ok()
+        .and_then(|mut grants| grants.remove(token))
+        .filter(|(expiry, _)| *expiry > Instant::now())
+        .map(|(_, grant)| grant);
+    let Some(grant) = grant else {
+        return fail(StatusCode::FORBIDDEN, "Expired or consumed Agent grant").into_response();
+    };
+    let Ok(permit) = app.agent_attachments.clone().try_acquire_owned() else {
+        return fail(StatusCode::TOO_MANY_REQUESTS, "Agent attachment limit").into_response();
+    };
+    ws.protocols(["boomux.terminal.v1"])
+        .max_message_size(65536)
+        .max_frame_size(65536)
+        .max_write_buffer_size(2 * 1024 * 1024)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            web_terminal::run(socket, app.client, grant).await
+        })
+}
+
 async fn asset(State(app): State<App>, uri: Uri) -> Response {
     let (path, mime) = match uri.path() {
-        "/" | "/index.html" => ("poc/webgpu-tiling/index.html", "text/html"),
+        "/" | "/index.html" | "/agents" => ("poc/webgpu-tiling/index.html", "text/html"),
+        "/entry.js" => ("poc/webgpu-tiling/entry.js", "text/javascript"),
+        "/mobile-agents.js" => ("poc/webgpu-tiling/mobile-agents.js", "text/javascript"),
+        "/mobile-agents.css" => ("poc/webgpu-tiling/mobile-agents.css", "text/css"),
         "/desktop-panels.js" => ("poc/webgpu-tiling/desktop-panels.js", "text/javascript"),
         "/app.js" => ("poc/webgpu-tiling/app.js", "text/javascript"),
         "/themes.js" => ("poc/webgpu-tiling/themes.js", "text/javascript"),
@@ -1002,6 +1156,9 @@ fn asset_root() -> PathBuf {
 fn validate_assets(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     for path in [
         "poc/webgpu-tiling/index.html",
+        "poc/webgpu-tiling/entry.js",
+        "poc/webgpu-tiling/mobile-agents.js",
+        "poc/webgpu-tiling/mobile-agents.css",
         "poc/webgpu-tiling/app.js",
         "poc/webgpu-tiling/desktop-panels.js",
         "poc/webgpu-tiling/themes.js",
@@ -1106,7 +1263,9 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
         origin: origin.clone(),
         tailnet_origin,
         grants: Arc::new(Mutex::new(HashMap::new())),
+        agent_grants: Arc::new(Mutex::new(HashMap::new())),
         attachments: Arc::new(Semaphore::new(24)),
+        agent_attachments: Arc::new(Semaphore::new(4)),
         operations: Arc::new(Semaphore::new(8)),
         watchers: Arc::new(Semaphore::new(4)),
         setups: Arc::new(Mutex::new(HashMap::new())),
@@ -1120,7 +1279,9 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/resource", post(resource_action))
         .route("/api/changes", post(changes))
         .route("/api/attach", post(grant))
+        .route("/api/agent/attach", post(authorize_agent))
         .route("/pty", get(terminal))
+        .route("/agent/pty", get(agent_terminal))
         .fallback(get(asset))
         .layer(DefaultBodyLimit::max(4096))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -1151,6 +1312,50 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mobile_agent_grant_requires_the_current_live_agent_and_run() {
+        use super::*;
+        let mut snapshot: boomux::protocol::Snapshot = serde_json::from_value(json!({
+            "workspaces":[{"id":"workspace","name":"work","shells":[{
+                "id":"shell","workspace_id":"workspace","name":"agent shell","cwd":"/tmp","status":"running",
+                "run":{"id":"run","generation":1,"started_at_ms":1,"ended_at_ms":null,"exit_reason":null,
+                    "output_revision":0,"environment_has_run_id":true}
+            }],"agents":[{
+                "id":"agent-1","workspace_id":"workspace","shell_id":"shell","run_id":"run",
+                "name":"Codex","integration":"codex","external_session_id":null,
+                "started_at_ms":1,"ended_at_ms":null,
+                "observation":{"revision":1,"state":"working","authority":"lifecycle_integration",
+                    "evidence":"fixture","confidence":100,"observed_at_ms":2}
+            }]}]
+        })).unwrap();
+        let request = AgentAttach {
+            node_id: "local".into(),
+            agent_id: "agent-1".into(),
+            shell_id: "shell".into(),
+            run_id: "run".into(),
+            rows: 24,
+            cols: 80,
+        };
+        let granted = agent_attach_target(&snapshot, &request).unwrap();
+        assert_eq!(granted.run_id, "run");
+        snapshot.workspaces[0].agents[0].ended_at_ms = Some(3);
+        assert!(agent_attach_target(&snapshot, &request).is_err());
+        snapshot.workspaces[0].agents[0].ended_at_ms = None;
+        snapshot.workspaces[0].shells[0]
+            .run
+            .as_mut()
+            .unwrap()
+            .ended_at_ms = Some(4);
+        assert!(agent_attach_target(&snapshot, &request).is_err());
+        snapshot.workspaces[0].shells[0]
+            .run
+            .as_mut()
+            .unwrap()
+            .ended_at_ms = None;
+        snapshot.workspaces[0].agents[0].observation.state = AgentState::Done;
+        assert!(agent_attach_target(&snapshot, &request).is_err());
+    }
+
     #[test]
     fn guided_workflows_preserve_exact_owner_arguments() {
         let owner = "node; $(touch /tmp/never)";

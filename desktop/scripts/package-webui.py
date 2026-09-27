@@ -4,7 +4,8 @@ import shutil
 
 ASSETS = [
     *[f"poc/webgpu-tiling/{name}" for name in (
-        "index.html", "app.js", "desktop-panels.js", "themes.js", "terminal.js",
+        "index.html", "entry.js", "mobile-agents.js", "mobile-agents.css",
+        "app.js", "desktop-panels.js", "themes.js", "terminal.js",
         "renderer.js", "layout.js", "style.css", "THIRD_PARTY_NOTICES.md",
         "fonts/jetbrains-mono-nerd.woff2", "fonts/OFL.txt")],
     "node_modules/ghostty-web/LICENSE",

@@ -460,6 +460,21 @@ ports are occupied, sharing reports an error without replacing any service. Clea
 removes only routes created by this publisher.
 
 Desktop uses the tiling gateway rather than `boomux web`'s older mobile dashboard.
+On screens up to 700 px wide, the shared URL opens an Agents view. It lists
+current Agents and attention across Workspaces. Open a current local Agent to
+watch its live terminal; type in the separate prompt box and tap **Send** to
+submit the whole draft followed by Enter. **Esc**, **Ctrl+C**, **Tab**, arrow,
+and **Enter** buttons cover common terminal actions without relying on a phone
+keyboard. The prompt stays local while editing and remains available if a send
+fails. The browser attaches collaboratively to the exact current ShellRun, so
+the Desktop terminal remains connected and owns its size. Remote and historical
+Agent cards are visible but cannot be opened in this first version. The view
+is also available at `/agents` on larger screens. **Full workspace** opens the
+tiling UI on a phone; its **Agents** button returns to the focused view.
+Run `PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node
+poc/webgpu-tiling/mobile-agents.test.mjs` for a focused phone-browser check of
+draft input, explicit Send, terminal keys, and viewport placement.
+
 Release bundles include `webgpu_gateway` beside the Desktop executable, with web
 assets under `share/boomux/webui` on Linux or `Contents/Resources/webui` on macOS.
 Installed gateways resolve assets relative to their executable and never fall back
