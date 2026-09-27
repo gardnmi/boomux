@@ -13,6 +13,40 @@ needs attention, see its live output, and send a prompt to its exact current
 run without disrupting the desktop terminal. The desktop layout remains
 available through an explicit **Full workspace** action.
 
+## What this would look like on a phone
+
+The first screen is a short Agent list, with no Workspace tiling controls:
+
+```text
+Agents                         Full workspace
+Needs you
+  Codex · boomux                 Waiting for input
+Working
+  OpenCode · edge-datapipe-cdc    Active now
+Ready
+  Pi · notes                     Idle
+```
+
+Tapping **Codex** opens one Agent detail screen:
+
+```text
+< Agents          Codex · boomux
+Waiting for input
+
+[Live output from this exact Agent terminal]
+[The terminal stays connected on the desktop]
+
+[ Type a prompt or response...       ] [Send]
+[Esc] [Ctrl+C]                 [Open native app, if available]
+```
+
+**Send** types into that existing Agent's terminal. It does not start another
+Agent or send to a merely similar session. The output area is a real terminal
+screen, including prompts and tool output. It is not yet a clean chat history
+of user and assistant messages. That distinction is the key product decision:
+a chat-style transcript requires a separate, authoritative integration for
+at least one harness and cannot be inferred safely from terminal output.
+
 ## Findings
 
 - The current `webgpu_gateway` already returns local and remote Workspaces,
