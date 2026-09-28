@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.22.1](https://github.com/gardnmi/boomux/compare/v1.22.0...v1.22.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **web:** migrate the legacy dashboard when starting desktop sharing ([#462](https://github.com/gardnmi/boomux/issues/462)) ([88804f2](https://github.com/gardnmi/boomux/commit/88804f2002f2e6b22a8be6bdcdc515a6e69c1993))
+
 ## [1.22.0](https://github.com/gardnmi/boomux/compare/v1.21.10...v1.22.0) (2026-09-28)
 
 
