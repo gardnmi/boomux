@@ -23,6 +23,47 @@ For exact protocol and persistence versions, source and compatibility tests are
 authoritative. Start a change in the owning module listed in the architecture
 module map, then read its colocated tests and the relevant contract document.
 
+## Local Build Cache
+
+- Use kache for local Rust builds. `.cargo/config.toml` selects
+  `scripts/rustc-cache.sh`, so ordinary `cargo check`, `build`, `test`, and
+  `clippy` commands use it automatically when `kache` is on PATH.
+- Manage project development tools with **mise**; keep version pins in
+  `mise.toml`. Run `mise install` when setting up a checkout. Kache **0.27.0**
+  is installed from its official GitHub release through mise, alongside Zig.
+  Do not install a separate kache binary with Cargo or a manual download.
+- Use `mise exec -- cargo ...` in agent/non-interactive shells so the pinned
+  tools are on PATH; an activated mise shell may use ordinary Cargo commands.
+  Check `mise exec -- kache --version` before the first build on a new machine.
+  If unavailable, report that caching is disabled; the wrapper permits an
+  uncached build. Do not run `kache init`:
+  project configuration already enables it without editing global Cargo/shell
+  settings or installing a login service.
+- `.kache.toml` selects local-only caching, automatic garbage collection, and a
+  **20 GiB store budget**. Adaptive/forced incremental caching is disabled to
+  avoid accumulating per-worktree incremental state. Native build-script runs
+  (including Ghostty's Zig build) remain uncached; Rust compiler outputs are
+  cached. Do not enable remote uploads or broaden native caching implicitly.
+- Keep each worktree's own `target/` directory. Kache shares reusable artifacts;
+  do not point concurrent worktrees at one Cargo target directory.
+- Inspect reuse with `kache report --last-build --root "$PWD"` and `kache stats`.
+  A Cargo-fresh build may invoke no compiler and produce no new cache events.
+  Do not claim a hit rate or speedup without checking the actual report.
+  `kache doctor` may flag our delegating wrapper because it expects a direct
+  kache wrapper; do not replace project configuration with `doctor --fix`.
+- Use `KACHE_DISABLED=1 cargo ...` for a temporary uncached comparison. CI skips
+  this wrapper's cache and retains its existing caching workflow. Preserve exact
+  compiler arguments and exit status; never retry a failed cached compile
+  automatically as an uncached build.
+- Cache GC does not cap all project disk usage: target files can retain shared
+  blocks. Inspect `kache targets` and a cleanup dry run before removing stale
+  outputs. **Never broadly clean `target/`** without preserving
+  `target/desktop-dev/`, which contains development session/configuration data.
+  Follow the existing worktree-removal rules; caches do not authorize deleting
+  worktrees or user work.
+
+See [the local build-cache guide](DEVELOPMENT.md#local-build-cache).
+
 ## Validation
 
 Use focused local checks during development. PR CI owns the complete validation

@@ -1,0 +1,8 @@
+# Local compiler-artifact sharing across Boomux worktrees.
+# This is a store budget, not a hard cap on target directories/shared blocks.
+[cache]
+local_only = true
+local_max_size = "20GiB"
+auto_gc = true
+adaptive_incremental = false
+preserve_incremental = false
