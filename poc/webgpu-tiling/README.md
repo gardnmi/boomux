@@ -18,6 +18,20 @@ launch and remembers its exact identity under `target/webgpu-poc/`. Set
 `POC_WORKSPACE_ID` to select an existing Workspace explicitly. Open
 <http://127.0.0.1:4389>; set `POC_PORT` to use another port.
 
+On a phone, `/agents` opens the Agent-focused view. When served over HTTPS,
+its web manifest lets you add **Boomux Agents** to the home screen; the installed
+app opens at `/agents`. Agent terminals still require a live Boomux connection.
+Tap **Install app** on the Agent list. Supporting browsers open their install
+prompt; other browsers show the home-screen steps for that phone.
+The suggestion disappears in the installed app or after installation. **Not now**
+dismisses it across reloads in the current browser.
+Tap **Enable** in Phone alerts to allow push notifications for local Agents that
+need attention or complete. On iPhone, install and open the Home Screen app first,
+then enable alerts. **Turn off** removes that phone's subscription. The gateway
+keeps at most eight subscriptions, sends only Agent names and lifecycle state,
+and does not include terminal output. Alerts require the gateway and Boomux
+daemon to be running; a browser or phone need not remain open.
+
 For development without touching your normal daemon, use
 `poc/webgpu-tiling/run-daemon.sh --isolated` instead. It starts a separate daemon
 with runtime, configuration, and state directories under `target/webgpu-poc/`.
@@ -460,6 +474,30 @@ ports are occupied, sharing reports an error without replacing any service. Clea
 removes only routes created by this publisher.
 
 Desktop uses the tiling gateway rather than `boomux web`'s older mobile dashboard.
+On screens up to 700 px wide, the shared URL opens an Agents view. It lists
+current Agents and attention across Workspaces. Open a current local Agent to
+watch its live terminal; edit the draft in the separate prompt box until it is
+ready, then tap **Send**. The browser sends the text and Enter as separate
+terminal input frames, like distinct paste and submission actions.
+**Esc**, **Ctrl+C**, **Tab**, arrow, and **Enter** buttons cover other common
+terminal actions without relying on a phone
+keyboard. Swipe vertically on the terminal to browse scrollback; **Latest**
+returns to live output. The prompt stays local while editing and remains
+available if a send fails. The phone view follows the saved WebUI palette and
+expands the draft as it grows; terminal keys move out of the way while the
+draft has focus. Opening an Agent leaves the phone keyboard closed until the
+draft box is tapped. When the keyboard shortens the screen, the terminal view
+keeps its latest lines visible above the draft unless the user is browsing
+scrollback. The browser attaches collaboratively to the exact
+current ShellRun, so the Desktop terminal remains connected and owns its size.
+Remote and historical Agent cards are visible but cannot be opened in this
+first version. The view is also available at `/agents` on larger screens.
+**Full workspace** opens the
+tiling UI on a phone; its **Agents** button returns to the focused view.
+Run `PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node
+poc/webgpu-tiling/mobile-agents.test.mjs` for a focused phone-browser check of
+draft input, explicit Send, terminal keys, and viewport placement.
+
 Release bundles include `webgpu_gateway` beside the Desktop executable, with web
 assets under `share/boomux/webui` on Linux or `Contents/Resources/webui` on macOS.
 Installed gateways resolve assets relative to their executable and never fall back

@@ -40,10 +40,13 @@ vt100 = "=0.16.2"
 
 [dev-dependencies]
 # The web gateway shares Desktop remote routing fixtures.
+base64 = "0.22"
 fastrand = "=2.5.0"
 criterion = "0.8.2"
 gungraun = "0.19.4"
+jwt-simple = { version = "0.12.11", default-features = false, features = ["pure-rust"] }
 tungstenite = "0.29"
+web-push = { version = "0.11.0", default-features = false, features = ["hyper-client"] }
 
 [profile.bench]
 debug = true

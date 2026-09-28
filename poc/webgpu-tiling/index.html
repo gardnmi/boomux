@@ -1,11 +1,18 @@
 <!doctype html>
 <html lang="en">
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>Boomux</title>
-<link rel="icon" href="data:,">
+<meta name="theme-color" content="#1e1e2e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="mobile-agents.css">
 <body>
+<div id="phone-app" hidden></div>
 <aside>
   <div class="desktop-sidebar-header">
     <div class="brand"><svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9"/><path d="M8 10 14 16 8 22 M17 22H24"/></svg><div class="brand-copy"><strong>BOOMUX</strong><button id="sidebar-node-status" title="Open Remotes">Connecting…</button></div></div>
@@ -60,6 +67,6 @@ Working tree clean
 
 <b>~/project</b> $ ▌</pre></div></div></template><button id="theme-apply">Apply theme</button>
 </dialog>
-<script type="module" src="app.js"></script>
+<script type="module" src="entry.js"></script>
 </body>
 </html>
