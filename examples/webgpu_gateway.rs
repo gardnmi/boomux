@@ -7,6 +7,9 @@ mod push;
 #[allow(dead_code)]
 #[path = "../src/tailscale_serve.rs"]
 mod tailscale_serve;
+#[allow(dead_code)]
+#[path = "../src/web_control.rs"]
+mod web_control;
 #[path = "../src/web_terminal.rs"]
 mod web_terminal;
 // Reuse Desktop's qualified resource IDs and owner-routed operations.

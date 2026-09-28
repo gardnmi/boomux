@@ -28,7 +28,6 @@ def request(port, host, origin=None):
 with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
     existing = {'Web': {
-        'test.tailnet.ts.net:443': {'Handlers': {'/': {'Proxy': 'http://127.0.0.1:3737'}}},
         'test.tailnet.ts.net:4097': {'Handlers': {'/': {'Proxy': 'http://127.0.0.1:4097'}}},
     }}
     (root / 'state').write_text(json.dumps(existing))
@@ -59,18 +58,18 @@ else: sys.exit(1)
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
-    env = dict(os.environ, PATH=f'{root}:{os.environ["PATH"]}', FAKE_TAILSCALE=str(root), POC_PORT=str(port))
+    env = dict(os.environ, PATH=f'{root}:{os.environ["PATH"]}', FAKE_TAILSCALE=str(root), BOOMUX_STATE_HOME=str(root / "push-state"), POC_PORT=str(port))
     process = subprocess.Popen([os.environ['BOOMUX_WEB_GATEWAY'], '--desktop', '--tailscale'],
                                env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         ready = json.loads(process.stdout.readline())
-        assert ready == {'url': 'https://test.tailnet.ts.net:8443'}, ready
+        assert ready == {'url': 'https://test.tailnet.ts.net'}, ready
         assert request(port, f'127.0.0.1:{port}') == 200
-        assert request(port, 'test.tailnet.ts.net:8443') == 200
+        assert request(port, 'test.tailnet.ts.net') == 200
         assert request(port, 'attacker.example') == 403
-        assert request(port, 'test.tailnet.ts.net:8443', 'https://attacker.example') == 403
-        assert request(port, 'test.tailnet.ts.net:8443', f'http://127.0.0.1:{port}') == 403
-        assert request(port, 'test.tailnet.ts.net:8443', 'https://test.tailnet.ts.net:8443') != 403
+        assert request(port, 'test.tailnet.ts.net', 'https://attacker.example') == 403
+        assert request(port, 'test.tailnet.ts.net', f'http://127.0.0.1:{port}') == 403
+        assert request(port, 'test.tailnet.ts.net', 'https://test.tailnet.ts.net') != 403
         # A second publisher must fail before touching the live route.
         before = (root / 'commands').read_text()
         second = subprocess.run([os.environ['BOOMUX_WEB_GATEWAY'], '--desktop', '--tailscale'],
@@ -83,6 +82,6 @@ else: sys.exit(1)
     assert process.returncode == 0
     assert json.loads((root / 'state').read_text()) == existing
     commands = [json.loads(line) for line in (root / 'commands').read_text().splitlines()]
-    assert ['serve', '--https=8443', '--set-path=/', 'off'] in commands
+    assert ['serve', '--https=443', '--set-path=/', 'off'] in commands
     assert not any('reset' in command or 'funnel' in command for command in commands)
 print('Tailscale sharing: readiness, Host/Origin, duplicate startup, and EOF cleanup passed')

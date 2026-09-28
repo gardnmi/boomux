@@ -56,13 +56,69 @@ impl Exposure {
         )
     }
 
-    // The tiling UI coexists with the older dashboard and other Serve applications.
+    // Desktop replaces the legacy dashboard at the standard HTTPS origin.
     #[allow(dead_code)]
     pub(crate) fn enable_tiling(dashboard_port: u16) -> Result<Self, Box<dyn Error>> {
-        let record_path = ownership_path(dashboard_port)?;
-        cleanup_record_if_present(OsStr::new("tailscale"), &record_path)?;
-        Self::enable_with(
+        Self::enable_tiling_with(
             OsStr::new("tailscale"),
+            ownership_path(dashboard_port)?,
+            ownership_path(3737)?,
+            crate::web_control::web_control_socket_path(3737)?,
+            dashboard_port,
+        )
+    }
+
+    fn enable_tiling_with(
+        executable: &OsStr,
+        record_path: PathBuf,
+        legacy_record_path: PathBuf,
+        legacy_control_path: PathBuf,
+        dashboard_port: u16,
+    ) -> Result<Self, Box<dyn Error>> {
+        let tailnet = tailnet_status(executable)?;
+        let status = serve_status(executable)?;
+        let legacy_route = OwnedRoute {
+            https_port: 443,
+            target: "http://127.0.0.1:3737".into(),
+        };
+        let legacy = crate::web_control::status_control_socket(&legacy_control_path)?;
+        let legacy_record = read_record(&legacy_record_path)?;
+        let legacy_running = legacy
+            .as_ref()
+            .is_some_and(|web| web.running && web.port == 3737);
+        let legacy_owned = legacy_record.as_ref().is_some_and(|record| {
+            record.dns_name == tailnet.dns_name
+                && record
+                    .routes
+                    .iter()
+                    .any(|route| route.https_port == 443 && route.target == legacy_route.target)
+        });
+        let migrate_route = (legacy_running || legacy_owned)
+            && route_state(&status, &tailnet.dns_name, &legacy_route) == RouteState::Compatible;
+        if !migrate_route {
+            // Preflight before stopping the old gateway. Unrelated services,
+            // including Funnel, keep their ports; use an available private one.
+            select_dashboard_route(
+                &status,
+                &tailnet.dns_name,
+                dashboard_port,
+                &[443, 8443, 10000],
+            )?;
+        }
+        if migrate_route && legacy_running {
+            crate::web_control::stop_control_socket(&legacy_control_path)?;
+        }
+        if migrate_route {
+            // A reused/manual route may not be in the old gateway's ownership
+            // record. Recheck after shutdown and remove only its exact target.
+            let status = serve_status(executable)?;
+            if route_state(&status, &tailnet.dns_name, &legacy_route) == RouteState::Compatible {
+                remove_route(executable, &legacy_route)?;
+            }
+        }
+        cleanup_record_if_present(executable, &record_path)?;
+        Self::enable_with(
+            executable,
             record_path,
             dashboard_port,
             None,
@@ -447,32 +503,244 @@ mod tests {
     }
 
     #[test]
-    fn tiling_selects_an_available_https_port_without_replacing_services() {
-        let mut occupied = status(Some("http://127.0.0.1:3737"));
-        let ports = &[443, 8443, 10000];
+    fn standard_origin_planning_rejects_conflicts() {
         assert_eq!(
-            select_dashboard_route(&status(None), "host.example.ts.net", 4391, ports)
+            select_dashboard_route(&status(None), "host.example.ts.net", 4391, &[443])
                 .unwrap()
                 .https_port,
             443
         );
-        assert_eq!(
-            select_dashboard_route(&occupied, "host.example.ts.net", 4391, ports)
-                .unwrap()
-                .https_port,
-            8443
+        assert!(
+            select_dashboard_route(
+                &status(Some("http://127.0.0.1:9000")),
+                "host.example.ts.net",
+                4391,
+                &[443]
+            )
+            .is_err()
         );
-        occupied["AllowFunnel"] = serde_json::json!({"host.example.ts.net:8443":true});
+    }
+
+    struct MigrationFixture {
+        root: PathBuf,
+        executable: PathBuf,
+    }
+
+    impl MigrationFixture {
+        fn new(status: Value) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("boomux-web-migration-{}", Uuid::new_v4()));
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("state"), serde_json::to_vec(&status).unwrap()).unwrap();
+            let executable = root.join("tailscale");
+            fs::write(&executable, r#"#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+root = Path(__file__).parent
+args = sys.argv[1:]
+with (root / 'commands').open('a') as log:
+    log.write(json.dumps(args) + '\n')
+if args == ['status', '--json']:
+    print(json.dumps({'BackendState':'Running','Self':{'Online':True,'DNSName':'host.example.ts.net.'}}))
+elif args == ['serve', 'status', '--json']:
+    print((root / 'state').read_text())
+else:
+    state = json.loads((root / 'state').read_text())
+    port = next(arg.split('=')[1] for arg in args if arg.startswith('--https='))
+    key = f'host.example.ts.net:{port}'
+    if args[-1] == 'off':
+        del state['Web'][key]['Handlers']['/']
+        if not state['Web'][key]['Handlers']:
+            del state['Web'][key]
+    elif '--bg' in args:
+        state['Web'].setdefault(key, {}).setdefault('Handlers', {})['/'] = {'Proxy':args[-1]}
+    else:
+        sys.exit(64)
+    (root / 'state').write_text(json.dumps(state))
+"#).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            Self { root, executable }
+        }
+
+        fn enable(&self) -> Result<Exposure, Box<dyn Error>> {
+            Exposure::enable_tiling_with(
+                self.executable.as_os_str(),
+                self.root.join("new.json"),
+                self.root.join("old.json"),
+                self.root.join("web.sock"),
+                4391,
+            )
+        }
+
+        fn legacy_record(&self) {
+            write_record(
+                &self.root.join("old.json"),
+                &OwnershipRecord {
+                    version: OWNERSHIP_VERSION,
+                    dns_name: "host.example.ts.net".into(),
+                    routes: vec![OwnedRoute {
+                        https_port: 443,
+                        target: "http://127.0.0.1:3737".into(),
+                    }],
+                },
+            )
+            .unwrap();
+        }
+
+        fn state(&self) -> Value {
+            serde_json::from_slice(&fs::read(self.root.join("state")).unwrap()).unwrap()
+        }
+    }
+
+    impl Drop for MigrationFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn tiling_migrates_live_legacy_dashboard_and_reused_route_to_standard_origin() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        for tailscale in [false, true] {
+            let mut original = status(Some("http://127.0.0.1:3737"));
+            original["Web"]["host.example.ts.net:4097"] =
+                serde_json::json!({"Handlers":{"/":{"Proxy":"http://127.0.0.1:4097"}}});
+            original["Web"]["host.example.ts.net:443"]["Handlers"]["/other"] =
+                serde_json::json!({"Proxy":"http://127.0.0.1:9000"});
+            let fixture = MigrationFixture::new(original.clone());
+            // No ownership record: the old dashboard reused an existing route.
+            let path = fixture.root.join("web.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                for expected in ["boomux-web-status-v1\n", "boomux-web-stop-v1\n"] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = String::new();
+                    BufReader::new(&stream).read_line(&mut request).unwrap();
+                    assert_eq!(request, expected);
+                    if request.contains("status") {
+                        let response = serde_json::json!({"running":true,"port":3737,"tailscale":tailscale,"dashboard_url":if tailscale { "https://host.example.ts.net" } else { "http://127.0.0.1:3737" },"opencode_port":4097,"opencode_url":null});
+                        stream
+                            .write_all(&serde_json::to_vec(&response).unwrap())
+                            .unwrap();
+                    } else {
+                        stream.write_all(crate::web_control::WEB_STOP_ACK).unwrap();
+                    }
+                }
+                drop(listener);
+                fs::remove_file(path).unwrap();
+            });
+            let exposure = fixture.enable().unwrap();
+            server.join().unwrap();
+            assert_eq!(exposure.dashboard_url(), "https://host.example.ts.net");
+            assert_eq!(
+                fixture.state()["Web"]["host.example.ts.net:443"]["Handlers"]["/"]["Proxy"],
+                "http://127.0.0.1:4391"
+            );
+            drop(exposure);
+            let state = fixture.state();
+            assert!(
+                state["Web"]["host.example.ts.net:443"]["Handlers"]
+                    .get("/")
+                    .is_none()
+            );
+            assert_eq!(
+                state["Web"]["host.example.ts.net:4097"],
+                original["Web"]["host.example.ts.net:4097"]
+            );
+            assert_eq!(
+                state["Web"]["host.example.ts.net:443"]["Handlers"]["/other"],
+                original["Web"]["host.example.ts.net:443"]["Handlers"]["/other"]
+            );
+        }
+    }
+
+    #[test]
+    fn tiling_migrates_owned_stale_route_but_never_guesses_ownership() {
+        let original = status(Some("http://127.0.0.1:3737"));
+        let fixture = MigrationFixture::new(original.clone());
+        let fallback = fixture.enable().unwrap();
+        assert_eq!(fallback.dashboard_url(), "https://host.example.ts.net:8443");
+        drop(fallback);
+        assert_eq!(fixture.state(), original);
+        fixture.legacy_record();
+        let exposure = fixture.enable().unwrap();
+        assert_eq!(exposure.dashboard_url(), "https://host.example.ts.net");
+        drop(exposure);
+    }
+
+    #[test]
+    fn tiling_preserves_other_services_and_public_routes_with_port_fallback() {
+        for public in [false, true] {
+            let mut original = status(Some(if public {
+                "http://127.0.0.1:3737"
+            } else {
+                "http://127.0.0.1:9000"
+            }));
+            if public {
+                original["AllowFunnel"] = serde_json::json!({"host.example.ts.net:443":true});
+            }
+            let fixture = MigrationFixture::new(original.clone());
+            fixture.legacy_record();
+            let exposure = fixture.enable().unwrap();
+            assert_eq!(exposure.dashboard_url(), "https://host.example.ts.net:8443");
+            assert_eq!(
+                fixture.state()["Web"]["host.example.ts.net:443"],
+                original["Web"]["host.example.ts.net:443"]
+            );
+            drop(exposure);
+            assert_eq!(fixture.state(), original);
+        }
+    }
+
+    #[test]
+    fn tiling_uses_last_fallback_and_preserves_all_occupied_ports() {
+        let mut original = status(Some("http://127.0.0.1:9000"));
+        original["Web"]["host.example.ts.net:8443"] =
+            serde_json::json!({"Handlers":{"/":{"Proxy":"http://127.0.0.1:9001"}}});
+        let fixture = MigrationFixture::new(original.clone());
+        let exposure = fixture.enable().unwrap();
         assert_eq!(
-            select_dashboard_route(&occupied, "host.example.ts.net", 4391, ports)
-                .unwrap()
-                .https_port,
-            10000
+            exposure.dashboard_url(),
+            "https://host.example.ts.net:10000"
         );
-        occupied["TCP"]["10000"] = serde_json::json!({"TCPForward":"localhost:1234"});
-        assert!(select_dashboard_route(&occupied, "host.example.ts.net", 4391, ports).is_err());
-        // The older dashboard intentionally keeps its fixed-port contract.
-        assert!(select_dashboard_route(&occupied, "host.example.ts.net", 4391, &[443]).is_err());
+        drop(exposure);
+        assert_eq!(fixture.state(), original);
+
+        original["Web"]["host.example.ts.net:10000"] =
+            serde_json::json!({"Handlers":{"/":{"Proxy":"http://127.0.0.1:9002"}}});
+        let occupied = MigrationFixture::new(original.clone());
+        assert!(occupied.enable().is_err());
+        assert_eq!(occupied.state(), original);
+    }
+
+    #[test]
+    fn tiling_migration_cleans_its_previous_alternate_port() {
+        let mut original = status(Some("http://127.0.0.1:3737"));
+        original["Web"]["host.example.ts.net:8443"] =
+            serde_json::json!({"Handlers":{"/":{"Proxy":"http://127.0.0.1:4391"}}});
+        let fixture = MigrationFixture::new(original);
+        fixture.legacy_record();
+        write_record(
+            &fixture.root.join("new.json"),
+            &OwnershipRecord {
+                version: OWNERSHIP_VERSION,
+                dns_name: "host.example.ts.net".into(),
+                routes: vec![OwnedRoute {
+                    https_port: 8443,
+                    target: "http://127.0.0.1:4391".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let exposure = fixture.enable().unwrap();
+        assert_eq!(exposure.dashboard_url(), "https://host.example.ts.net");
+        assert!(
+            fixture.state()["Web"]
+                .get("host.example.ts.net:8443")
+                .is_none()
+        );
+        drop(exposure);
     }
 
     #[test]
