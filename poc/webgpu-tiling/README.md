@@ -23,6 +23,8 @@ its web manifest lets you add **Boomux Agents** to the home screen; the installe
 app opens at `/agents`. Agent terminals still require a live Boomux connection.
 Tap **Install app** on the Agent list. Supporting browsers open their install
 prompt; other browsers show the home-screen steps for that phone.
+The suggestion disappears in the installed app or after installation. **Not now**
+dismisses it across reloads in the current browser.
 
 For development without touching your normal daemon, use
 `poc/webgpu-tiling/run-daemon.sh --isolated` instead. It starts a separate daemon

@@ -50,9 +50,10 @@ body.agent-phone #phone-app { position: fixed; z-index: 100; display: flex; flex
 #phone-app .phone-list h1 { margin: 5px 0 0; color: var(--ui-fg); font-size: 28px; font-weight: 650; letter-spacing: -.045em; line-height: 1.1; }
 #phone-app #phone-agent-count { color: var(--ui-muted); font-size: 12px; white-space: nowrap; }
 #phone-app .phone-install-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -3px 0 18px; padding: 12px; border: 1px solid var(--ui-border); border-radius: 12px; background: var(--ui-surface); }
-#phone-app .phone-install-card div { display: grid; gap: 3px; min-width: 0; }
+#phone-app .phone-install-copy { display: grid; gap: 3px; min-width: 0; }
 #phone-app .phone-install-card strong { color: var(--ui-fg); font-size: 12px; }
 #phone-app .phone-install-card span { color: var(--ui-muted); font-size: 11px; }
+#phone-app #phone-install-dismiss { justify-self: start; min-height: 44px; padding: 5px 0; border: 0; background: transparent; color: var(--ui-muted); font-size: 11px; text-decoration: underline; }
 #phone-app #phone-install { flex: none; min-height: 38px; padding: 7px 10px; border: 0; background: var(--ui-accent); color: var(--ui-deep); font-size: 12px; font-weight: 700; }
 #phone-app #phone-install-help { width: min(340px, calc(100vw - 32px)); padding: 22px; border: 1px solid var(--ui-border); border-radius: 14px; background: var(--ui-surface); color: var(--ui-fg); box-shadow: 0 16px 48px #0008; }
 #phone-app #phone-install-help::backdrop { background: #0009; }

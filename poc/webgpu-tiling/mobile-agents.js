@@ -4,7 +4,7 @@ import {getTheme,terminalTheme} from './themes.js';
 const root=document.querySelector('#phone-app');
 root.innerHTML=`
   <header class="phone-header"><div class="phone-brand"><span class="phone-brand-mark" aria-hidden="true">›_</span><strong>boomux</strong></div><button id="phone-workspace" type="button">Full workspace ↗</button></header>
-  <main id="phone-list" class="phone-list"><div class="phone-list-heading"><div><span class="phone-eyebrow">YOUR SESSIONS</span><h1>Agents</h1></div><span id="phone-agent-count"></span></div><div id="phone-install-card" class="phone-install-card"><div><strong>Keep Agents one tap away</strong><span>Add Boomux to your home screen.</span></div><button id="phone-install" type="button">Install app</button></div><p id="phone-list-status" role="status">Loading Agents…</p><div id="phone-cards"></div></main>
+  <main id="phone-list" class="phone-list"><div class="phone-list-heading"><div><span class="phone-eyebrow">YOUR SESSIONS</span><h1>Agents</h1></div><span id="phone-agent-count"></span></div><div id="phone-install-card" class="phone-install-card"><div class="phone-install-copy"><strong>Keep Agents one tap away</strong><span>Add Boomux to your home screen.</span><button id="phone-install-dismiss" type="button">Not now</button></div><button id="phone-install" type="button">Install app</button></div><p id="phone-list-status" role="status">Loading Agents…</p><div id="phone-cards"></div></main>
   <dialog id="phone-install-help" aria-labelledby="phone-install-title"><h2 id="phone-install-title">Install Boomux Agents</h2><p id="phone-install-steps"></p><button id="phone-install-close" type="button">Got it</button></dialog>
   <section id="phone-detail" class="phone-detail" aria-label="Agent terminal" hidden>
     <header class="phone-detail-header"><button id="phone-back" type="button" aria-label="Back to Agents">←</button><div class="phone-title-group"><strong id="phone-title"></strong><small id="phone-context"></small></div><span id="phone-state"></span></header>
@@ -28,9 +28,12 @@ const encoder=new TextEncoder();
 let snapshot=null,active=null,changesCursor=null,changesAbort=null,watchTimer=null;
 let ghosttyPromise=null,tailFrame=0;
 let deferredInstall=null;
+const installHiddenKey='boomux.web.agents.install.hidden';
 const terminalKeys={escape:'\x1b',interrupt:'\x03',tab:'\t',up:'\x1b[A',down:'\x1b[B',enter:'\r'};
 
 function isInstalled(){return matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;}
+function isInstallHidden(){try{return localStorage.getItem(installHiddenKey)==='1';}catch{return false;}}
+function hideInstall(){installCard.hidden=true;try{localStorage.setItem(installHiddenKey,'1');}catch{}}
 function showInstallHelp(){
   const agent=navigator.userAgent;
   $('#phone-install-steps').textContent=/iPhone|iPad|iPod/.test(agent)?
@@ -40,20 +43,21 @@ function showInstallHelp(){
       'Open your browser menu and choose Install app or Add to Home Screen.';
   installHelp.showModal();
 }
-installCard.hidden=isInstalled();
+installCard.hidden=isInstalled()||isInstallHidden();
 window.addEventListener('beforeinstallprompt',event=>{
   event.preventDefault();
   deferredInstall=event;
-  installCard.hidden=isInstalled();
+  installCard.hidden=isInstalled()||isInstallHidden();
 });
-window.addEventListener('appinstalled',()=>{deferredInstall=null;installCard.hidden=true;if(installHelp.open)installHelp.close();});
+window.addEventListener('appinstalled',()=>{deferredInstall=null;hideInstall();if(installHelp.open)installHelp.close();});
 installButton.addEventListener('click',async()=>{
   if(!deferredInstall){showInstallHelp();return;}
   const event=deferredInstall;
   deferredInstall=null;
-  try{await event.prompt();}
+  try{if((await event.prompt())?.outcome==='accepted')hideInstall();}
   catch{showInstallHelp();}
 });
+$('#phone-install-dismiss').onclick=hideInstall;
 $('#phone-install-close').onclick=()=>installHelp.close();
 installHelp.addEventListener('click',event=>{if(event.target===installHelp)installHelp.close();});
 

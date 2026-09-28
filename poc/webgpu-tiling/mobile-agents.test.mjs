@@ -76,6 +76,14 @@ try{
   assert.equal(await page.evaluate(()=>window.installPromptCalls),1,'Install app opens the browser prompt when available');
   await page.evaluate(()=>window.dispatchEvent(new Event('appinstalled')));
   assert.equal(await page.locator('#phone-install-card').isHidden(),true);
+  await page.reload();
+  assert.equal(await page.locator('#phone-install-card').isHidden(),true,'install stays hidden after reload');
+  await page.evaluate(()=>localStorage.removeItem('boomux.web.agents.install.hidden'));
+  await page.reload();
+  await page.locator('#phone-install-dismiss').click();
+  assert.equal(await page.locator('#phone-install-card').isHidden(),true);
+  await page.reload();
+  assert.equal(await page.locator('#phone-install-card').isHidden(),true,'Not now persists after reload');
   await page.locator('.phone-agent-card').click();
   await page.getByText('Live terminal').waitFor();
   await page.waitForTimeout(100);
