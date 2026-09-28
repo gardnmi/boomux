@@ -1,4 +1,12 @@
+# Optional local cache; the wrapper passes through in CI or without kache.
+[build]
+rustc-wrapper = "scripts/rustc-cache.sh"
+
 # Keep Rust debug builds debuggable without Ghostty's expensive debug page scans.
 # Set LIBGHOSTTY_VT_SYS_OPTIMIZE=Debug explicitly to debug the native terminal core.
 [env]
 LIBGHOSTTY_VT_SYS_OPTIMIZE = { value = "ReleaseFast", force = false }
+
+# Cache Rust compiler outputs, but keep running native build scripts normally.
+# Ghostty's Zig toolchain/source inputs have not been qualified for run caching.
+KACHE_BUILD_SCRIPT_CACHE = { value = "0", force = true }

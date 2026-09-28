@@ -84,6 +84,54 @@ cargo build --release --locked
 Do not replace `~/.local/bin/boomux` during ordinary development. Development
 builds are intentionally ineligible for self-update.
 
+## Local Build Cache
+
+Boomux uses [kache](https://github.com/kunobi-ninja/kache) for optional local Rust
+compiler caching. Manage project development tools with [mise](https://mise.jdx.dev/).
+`mise.toml` pins Zig and kache; kache 0.27.0 comes from the official GitHub release.
+From the repository root:
+
+```console
+mise install
+mise exec -- kache --version
+mise exec -- cargo check --locked
+```
+
+Use `mise exec --` for build commands in non-interactive shells, or activate mise
+in your interactive shell. Do not install a separate kache binary with Cargo or
+a manual download, and do not run `kache init` for this repository.
+Our Cargo wrapper enables it only for local builds when installed; it preserves
+normal builds when absent and bypasses caching in CI. Existing `RUSTC_WRAPPER`
+environment overrides still take precedence over Cargo configuration.
+
+Continue using the build commands above. `.kache.toml` uses a shared local store
+with a 20 GiB budget and automatic GC; it configures no remote service. Worktrees
+keep separate target directories and reuse compatible compiler artifacts through
+the cache. Adaptive incremental state is disabled. Native build-script execution
+is excluded until its inputs, including the Ghostty Zig toolchain, are qualified.
+This does not claim that Zig compilation itself is cached.
+
+```console
+mise exec -- kache report --last-build --root "$PWD"
+mise exec -- kache stats
+KACHE_DISABLED=1 mise exec -- cargo check --locked
+```
+
+Reports describe compiler invocations, not every Cargo command. An unchanged
+build can be Cargo-fresh and produce no new events. Benchmark cache reuse and
+single-source edits separately; cache configuration alone establishes no speedup.
+`kache doctor` expects a direct kache wrapper and may flag our delegating script.
+Use actual build reports to verify caching; do not run `doctor --fix` to replace
+the project wrapper.
+
+The budget applies to registered cache blobs, not all target directories, and GC
+may retain entries whose blocks remain referenced by target outputs. Use
+`kache targets` to inspect retained outputs, and preview any cleanup with
+`kache clean --tracked --stale 14d --dry-run`. Review every target before allowing
+deletion, and preserve `target/desktop-dev/` session/configuration data. Removing
+Rust's `target/debug/incremental/` cache is different from deleting all of target.
+See [upstream storage semantics](https://ninja.kunobi.com/docs/kache/getting-started/configuration#gc-and-shared-build-outputs).
+
 ## Native Desktop Development
 
 The root package is the default Cargo workspace member. Existing CLI commands
