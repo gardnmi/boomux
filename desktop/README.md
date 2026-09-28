@@ -485,6 +485,12 @@ all its entries instead.
 The sidebar **⋯ → Open WebUI** action starts the tiling web gateway and
 opens its private HTTPS URL. While running, the sidebar footer provides Open, Copy URL, and Stop
 sharing actions. Sharing ends when Desktop closes; managed Shells keep running.
+The WebUI prefers the machine’s standard Tailscale HTTPS address without a port.
+Starting it migrates a recognized legacy `boomux web` dashboard off that address
+and stops that dashboard without stopping the daemon, Shells, or harness runtime.
+If an unrelated service uses HTTPS port 443, Boomux tries 8443, then 10000,
+and includes the selected port in Open WebUI and Copy URL. It never replaces
+unrelated services or treats a recognized old Boomux dashboard as one.
 Release bundles include the matching web gateway and its runtime assets. No source
 checkout or Bun installation is needed on the user’s machine. For development, see the
 [tiling gateway build and sharing instructions](../poc/webgpu-tiling/README.md#share-the-tiling-ui-from-desktop).

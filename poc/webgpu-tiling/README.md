@@ -467,11 +467,14 @@ Shells running. Publishing itself creates no Shells or Workspaces.
 
 Tailscale must be connected, with MagicDNS/HTTPS enabled and permission to use
 Serve. Access follows your tailnet access policy. The gateway binds only to
-`127.0.0.1:4391`; Serve terminates HTTPS on the machine's tailnet name. It tries
-HTTPS ports 443, 8443, then 10000 and includes the chosen port in the URL when
-needed. Existing handlers and public Funnel listeners are skipped; if all three
-ports are occupied, sharing reports an error without replacing any service. Cleanup
-removes only routes created by this publisher.
+`127.0.0.1:4391`; Serve terminates HTTPS on the machine's existing tailnet name
+at port 443 when available. No machine rename or Tailscale Service is needed.
+A recognized legacy Boomux dashboard is stopped and its private root route
+migrated to the current WebUI. Recognition requires its live control response or
+an owner-validated route record; a proxy port alone is not ownership evidence.
+An unrelated handler or public Funnel listener is preserved; sharing falls back
+to 8443, then 10000, and includes the chosen port in the URL. If all are occupied,
+startup reports a conflict. Cleanup removes only this publisher's routes.
 
 Desktop uses the tiling gateway rather than `boomux web`'s older mobile dashboard.
 On screens up to 700 px wide, the shared URL opens an Agents view. It lists

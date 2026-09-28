@@ -38,6 +38,7 @@ This is the implementation reference. For product usage, see the
 | `src/terminal_modes.rs` | Stateful parsing and restoration of child focus- and color-scheme-reporting modes |
 | `src/tui.rs` | Dashboard state, interaction, palette, polling, and Ratatui rendering; no direct daemon transport |
 | `src/mobile_web.rs`, `src/web_terminal.rs`, `assets/mobile-web/` | Loopback-only HTTP gateway, Node-qualified Agent projection, exact local attention dismissal, native harness handoff, integration-independent exact-run terminal control, and embedded installable web assets |
+| `src/web_control.rs` | Bounded legacy web status/stop control shared by the CLI and Desktop WebUI migration |
 | `src/tailscale_serve.rs` | Explicit Tailscale Serve preflight, conflict detection, exact route mutation, and ephemeral ownership cleanup for `boomux web --tailscale` |
 | `src/session_projection.rs` | Projection of daemon Agent state and host catalogs into client-visible sessions |
 | `src/host_services.rs` | Owner-local project, launcher, integration, Session-catalog, and bounded Git working-context services |
@@ -1145,6 +1146,26 @@ Agent, so clients distinguish interrupted, terminated, and normally finished run
 Fresh Shells alone have no run marker. Agent presentation still requires the
 separate owner-selected Agent ID. Protocol-39 filtering continues to hide pending
 run metadata; no wire field or persistence schema changes are required.
+
+### Desktop WebUI origin migration
+
+Desktop WebUI sharing prefers HTTPS port 443 and falls back to 8443, then 10000,
+when an unrelated service occupies the preferred origin.
+After binding its loopback listener and validating assets, the gateway verifies
+Tailscale connectivity and checks the standard origin before changing services.
+A running legacy dashboard must identify itself through the selected runtime’s
+bounded web control socket; a stale route requires an owner-validated legacy
+Tailscale ownership record. Only the matching private root proxy to loopback
+port 3737 can be migrated. An unrecognized or public/Funnel route is preserved;
+another private port is selected.
+The legacy gateway is stopped through its existing control protocol, preserving
+the daemon, Shells, and Shared Harness Runtime. Its root route is checked again
+after shutdown, covering older installations that reused a manual Serve route.
+The new gateway owns its replacement root route and removes it on shutdown.
+Other handlers and services are preserved. Migration is performed when sharing
+starts, including the first Open WebUI after an upgrade; installing a bundle
+alone does not publish a service. A later publication failure is reported and
+requires retrying Open WebUI; the retired dashboard is not restarted.
 
 ### Agent Skill
 

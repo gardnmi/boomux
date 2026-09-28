@@ -61,6 +61,7 @@ mod terminal;
 mod tui;
 mod uninstall;
 mod update;
+mod web_control;
 mod web_terminal;
 mod workspace_selection;
 
