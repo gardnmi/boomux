@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.22.0](https://github.com/gardnmi/boomux/compare/v1.21.10...v1.22.0) (2026-09-28)
+
+
+### Features
+
+* **web:** add mobile Agent console and phone alerts ([6ec56b9](https://github.com/gardnmi/boomux/commit/6ec56b91c58e9a72d47c109fc07fdfbabe5fbb1d))
+
+
+### Performance Improvements
+
+* **recovery:** batch cold shell starts into one durable commit ([#460](https://github.com/gardnmi/boomux/issues/460)) ([e697680](https://github.com/gardnmi/boomux/commit/e697680c0105cfe34ea65e15967e27b6ce1a0c75))
+
 ## [1.21.10](https://github.com/gardnmi/boomux/compare/v1.21.9...v1.21.10) (2026-09-26)
 
 
