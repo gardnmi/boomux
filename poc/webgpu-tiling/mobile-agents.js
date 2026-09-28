@@ -21,22 +21,32 @@ root.innerHTML=`
   </section>`;
 const $=selector=>root.querySelector(selector);
 const list=$('#phone-list'),detail=$('#phone-detail'),cards=$('#phone-cards'),listStatus=$('#phone-list-status'),agentCount=$('#phone-agent-count');
-const prompt=$('#phone-prompt'),send=$('#phone-send'),status=$('#phone-terminal-status'),latest=$('#phone-latest'),panHint=$('#phone-pan-hint');
+const prompt=$('#phone-prompt'),send=$('#phone-send'),status=$('#phone-terminal-status'),latest=$('#phone-latest'),panHint=$('#phone-pan-hint'),outputScroll=$('#phone-output-scroll');
 const encoder=new TextEncoder();
 let snapshot=null,active=null,changesCursor=null,changesAbort=null,watchTimer=null;
-let ghosttyPromise=null;
+let ghosttyPromise=null,tailFrame=0;
 const terminalKeys={escape:'\x1b',interrupt:'\x03',tab:'\t',up:'\x1b[A',down:'\x1b[B',enter:'\r'};
 
+function revealTerminalTail(){
+  tailFrame=0;
+  if(active?.terminal?.viewportY===0)outputScroll.scrollTop=outputScroll.scrollHeight;
+}
+function scheduleTerminalTail(){
+  if(tailFrame)cancelAnimationFrame(tailFrame);
+  tailFrame=requestAnimationFrame(revealTerminalTail);
+}
 function viewportLayout(){
   const v=window.visualViewport;
   root.style.top=`${v?.offsetTop||0}px`;
   root.style.left=`${v?.offsetLeft||0}px`;
   root.style.width=`${v?.width||window.innerWidth}px`;
   root.style.height=`${v?.height||window.innerHeight}px`;
+  scheduleTerminalTail();
 }
 window.visualViewport?.addEventListener('resize',viewportLayout);
 window.visualViewport?.addEventListener('scroll',viewportLayout);
 window.addEventListener('resize',viewportLayout);
+window.ResizeObserver&&new ResizeObserver(scheduleTerminalTail).observe(outputScroll);
 viewportLayout();
 
 function rows(info){
@@ -116,9 +126,8 @@ function updateSend(){
   send.disabled=!connected||!prompt.value.trim();
   for(const button of root.querySelectorAll('.phone-keys button'))button.disabled=!connected;
 }
-function resizePrompt(){prompt.style.height='auto';prompt.style.height=`${Math.min(150,Math.max(68,prompt.scrollHeight))}px`;}
+function resizePrompt(){prompt.style.height='auto';prompt.style.height=`${Math.min(150,Math.max(68,prompt.scrollHeight))}px`;scheduleTerminalTail();}
 function updateHistory(){latest.hidden=!active?.terminal?.viewportY;panHint.hidden=!latest.hidden;}
-const outputScroll=$('#phone-output-scroll');
 let touchId=null,touchStartX=0,touchStartY=0,touchY=0,touchRemainder=0,touchAxis=null;
 outputScroll.addEventListener('touchstart',event=>{
   if(event.touches.length!==1||!active?.terminal){touchId=null;return;}
@@ -146,7 +155,7 @@ outputScroll.addEventListener('touchend',event=>{
   event.preventDefault();event.stopPropagation();
 },{capture:true,passive:false});
 outputScroll.addEventListener('touchcancel',()=>{touchId=null;},{passive:true});
-latest.onclick=()=>{active?.terminal?.scrollToBottom();updateHistory();};
+latest.onclick=()=>{active?.terminal?.scrollToBottom();scheduleTerminalTail();updateHistory();};
 function disconnect(message){
   if(!active)return;
   active.connected=false;active.socket?.close(1000,'Agent view closed');active.socket=null;
@@ -154,6 +163,7 @@ function disconnect(message){
 }
 function closeDetail(){
   if(active){disconnect('Disconnected');active.dataListener?.dispose();active.scrollListener?.dispose();active.terminal?.dispose();active=null;}
+  if(tailFrame){cancelAnimationFrame(tailFrame);tailFrame=0;}
   root.classList.remove('phone-detail-open');
   $('#phone-output').replaceChildren();detail.hidden=true;list.hidden=false;prompt.value='';resizePrompt();updateSend();updateHistory();
 }
@@ -199,13 +209,13 @@ async function openDetail(row){
         const previousLength=historyOffset?terminal.getScrollbackLength():0;
         terminal.write(new Uint8Array(event.data));
         if(historyOffset)terminal.scrollToLine(historyOffset+terminal.getScrollbackLength()-previousLength);
-        if(!historyOffset)outputScroll.scrollTop=outputScroll.scrollHeight;
+        if(!historyOffset)scheduleTerminalTail();
         return;
       }
       const message=JSON.parse(event.data);
       if(message.type==='attached'){
         terminal.resize(message.cols,message.rows);
-        view.connected=true;status.textContent='Live terminal';status.dataset.connected='true';updateSend();
+        view.connected=true;status.textContent='Live terminal';status.dataset.connected='true';updateSend();scheduleTerminalTail();
       }else if(message.type==='resize'){
         terminal.resize(message.cols,message.rows);
       }else if(message.type==='reconnecting'){

@@ -76,6 +76,21 @@ try{
   assert.ok(box && box.y+box.height<=844,'composer stays inside phone viewport');
   await page.evaluate(()=>window.fixtureSocket.emitOutput(
     Array.from({length:100},(_,index)=>`history line ${index}`).join('\r\n')));
+  await page.locator('#phone-prompt').focus();
+  await page.setViewportSize({width:390,height:450});
+  await page.waitForTimeout(80);
+  const keyboard=await page.evaluate(()=>{
+    const output=document.querySelector('#phone-output-scroll');
+    return {
+      rootBottom:document.querySelector('#phone-app').getBoundingClientRect().bottom,
+      draftBottom:document.querySelector('#phone-prompt').getBoundingClientRect().bottom,
+      tailGap:output.scrollHeight-output.scrollTop-output.clientHeight,
+      canvasGap:document.querySelector('#phone-output canvas').getBoundingClientRect().bottom-output.getBoundingClientRect().bottom,
+    };
+  });
+  assert.ok(keyboard.rootBottom<=450&&keyboard.draftBottom<=450&&keyboard.tailGap<=2&&keyboard.canvasGap<=0,
+    `the terminal tail stays visible above a shorter keyboard viewport: ${JSON.stringify(keyboard)}`);
+  await page.setViewportSize({width:390,height:844});
   await page.evaluate(()=>{
     const output=document.querySelector('#phone-output canvas');
     const fire=(type,y)=>{
@@ -86,6 +101,10 @@ try{
     fire('touchstart',120);fire('touchmove',300);fire('touchend',300);
   });
   await page.locator('#phone-latest').waitFor({state:'visible'});
+  await page.setViewportSize({width:390,height:450});
+  await page.waitForTimeout(80);
+  assert.ok(await page.locator('#phone-latest').isVisible(),'keyboard resize preserves intentional history browsing');
+  await page.setViewportSize({width:390,height:844});
   await page.evaluate(()=>window.fixtureSocket.emitOutput('\r\nnew live output'));
   assert.ok(await page.locator('#phone-latest').isVisible(),'new output preserves the history position');
   await page.locator('#phone-latest').click();
