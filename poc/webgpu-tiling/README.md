@@ -21,6 +21,8 @@ launch and remembers its exact identity under `target/webgpu-poc/`. Set
 On a phone, `/agents` opens the Agent-focused view. When served over HTTPS,
 its web manifest lets you add **Boomux Agents** to the home screen; the installed
 app opens at `/agents`. Agent terminals still require a live Boomux connection.
+Tap **Install app** on the Agent list. Supporting browsers open their install
+prompt; other browsers show the home-screen steps for that phone.
 
 For development without touching your normal daemon, use
 `poc/webgpu-tiling/run-daemon.sh --isolated` instead. It starts a separate daemon

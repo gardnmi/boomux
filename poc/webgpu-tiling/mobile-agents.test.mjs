@@ -62,6 +62,20 @@ try{
     const response=await page.request.get(`http://127.0.0.1:${server.address().port}${icon.src}`);
     assert.equal(response.status(),200,`${icon.sizes} install icon is served`);
   }
+  await page.locator('#phone-install').click();
+  assert.equal(await page.locator('#phone-install-help').evaluate(dialog=>dialog.open),true);
+  assert.match(await page.locator('#phone-install-steps').textContent(),/Install app|Add to Home Screen/);
+  await page.locator('#phone-install-close').click();
+  await page.evaluate(()=>{
+    window.installPromptCalls=0;
+    const event=new Event('beforeinstallprompt',{cancelable:true});
+    event.prompt=async()=>{window.installPromptCalls++};
+    window.dispatchEvent(event);
+  });
+  await page.locator('#phone-install').click();
+  assert.equal(await page.evaluate(()=>window.installPromptCalls),1,'Install app opens the browser prompt when available');
+  await page.evaluate(()=>window.dispatchEvent(new Event('appinstalled')));
+  assert.equal(await page.locator('#phone-install-card').isHidden(),true);
   await page.locator('.phone-agent-card').click();
   await page.getByText('Live terminal').waitFor();
   await page.waitForTimeout(100);
