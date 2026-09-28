@@ -8,7 +8,9 @@ all-features = true
 [advisories]
 unmaintained = "workspace"
 unsound = "all"
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "Web Push transitively includes RSA in jwt-simple, but this gateway generates and signs only ES256 VAPID keys; it never uses RSA." },
+]
 
 [licenses]
 confidence-threshold = 0.93

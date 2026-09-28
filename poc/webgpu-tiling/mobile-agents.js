@@ -4,7 +4,7 @@ import {getTheme,terminalTheme} from './themes.js';
 const root=document.querySelector('#phone-app');
 root.innerHTML=`
   <header class="phone-header"><div class="phone-brand"><span class="phone-brand-mark" aria-hidden="true">›_</span><strong>boomux</strong></div><button id="phone-workspace" type="button">Full workspace ↗</button></header>
-  <main id="phone-list" class="phone-list"><div class="phone-list-heading"><div><span class="phone-eyebrow">YOUR SESSIONS</span><h1>Agents</h1></div><span id="phone-agent-count"></span></div><div id="phone-install-card" class="phone-install-card"><div class="phone-install-copy"><strong>Keep Agents one tap away</strong><span>Add Boomux to your home screen.</span><button id="phone-install-dismiss" type="button">Not now</button></div><button id="phone-install" type="button">Install app</button></div><p id="phone-list-status" role="status">Loading Agents…</p><div id="phone-cards"></div></main>
+  <main id="phone-list" class="phone-list"><div class="phone-list-heading"><div><span class="phone-eyebrow">YOUR SESSIONS</span><h1>Agents</h1></div><span id="phone-agent-count"></span></div><div id="phone-install-card" class="phone-install-card"><div class="phone-install-copy"><strong>Keep Agents one tap away</strong><span>Add Boomux to your home screen.</span><button id="phone-install-dismiss" type="button">Not now</button></div><button id="phone-install" type="button">Install app</button></div><div class="phone-alert-row"><div><strong>Phone alerts</strong><span id="phone-alert-status" role="status">Checking notification support…</span></div><button id="phone-alert-toggle" type="button" disabled>Enable</button></div><p id="phone-list-status" role="status">Loading Agents…</p><div id="phone-cards"></div></main>
   <dialog id="phone-install-help" aria-labelledby="phone-install-title"><h2 id="phone-install-title">Install Boomux Agents</h2><p id="phone-install-steps"></p><button id="phone-install-close" type="button">Got it</button></dialog>
   <section id="phone-detail" class="phone-detail" aria-label="Agent terminal" hidden>
     <header class="phone-detail-header"><button id="phone-back" type="button" aria-label="Back to Agents">←</button><div class="phone-title-group"><strong id="phone-title"></strong><small id="phone-context"></small></div><span id="phone-state"></span></header>
@@ -24,10 +24,12 @@ const $=selector=>root.querySelector(selector);
 const list=$('#phone-list'),detail=$('#phone-detail'),cards=$('#phone-cards'),listStatus=$('#phone-list-status'),agentCount=$('#phone-agent-count');
 const prompt=$('#phone-prompt'),send=$('#phone-send'),status=$('#phone-terminal-status'),latest=$('#phone-latest'),panHint=$('#phone-pan-hint'),outputScroll=$('#phone-output-scroll');
 const installCard=$('#phone-install-card'),installButton=$('#phone-install'),installHelp=$('#phone-install-help');
+const alertStatus=$('#phone-alert-status'),alertToggle=$('#phone-alert-toggle');
 const encoder=new TextEncoder();
 let snapshot=null,active=null,changesCursor=null,changesAbort=null,watchTimer=null;
 let ghosttyPromise=null,tailFrame=0;
 let deferredInstall=null;
+let pushReady=null,pushSubscription=null;
 const installHiddenKey='boomux.web.agents.install.hidden';
 const terminalKeys={escape:'\x1b',interrupt:'\x03',tab:'\t',up:'\x1b[A',down:'\x1b[B',enter:'\r'};
 
@@ -60,6 +62,65 @@ installButton.addEventListener('click',async()=>{
 $('#phone-install-dismiss').onclick=hideInstall;
 $('#phone-install-close').onclick=()=>installHelp.close();
 installHelp.addEventListener('click',event=>{if(event.target===installHelp)installHelp.close();});
+
+function renderAlertToggle(){
+  alertToggle.disabled=!pushReady||!pushSubscription&&Notification.permission==='denied';
+  alertToggle.textContent=pushSubscription?'Turn off':'Enable';
+  alertStatus.textContent=pushSubscription?'Alerts on for attention and completion':
+    Notification.permission==='denied'?'Notifications blocked in browser settings':
+      'Get alerts when an Agent needs you or completes.';
+}
+function pushKeyBytes(base64){
+  const raw=atob(base64.replace(/-/g,'+').replace(/_/g,'/'));
+  return Uint8Array.from(raw,char=>char.charCodeAt(0));
+}
+async function preparePush(){
+  if(/iPhone|iPad|iPod/.test(navigator.userAgent)&&!isInstalled()){
+    alertStatus.textContent='Install and open the Home Screen app to enable alerts.';return;
+  }
+  if(!('serviceWorker' in navigator)||!('PushManager' in window)||!('Notification' in window)){
+    alertStatus.textContent='Install the app to enable phone alerts.';return;
+  }
+  try{
+    const [registration,response]=await Promise.all([
+      navigator.serviceWorker.register('/service-worker.js'),fetch('/api/push/key',{cache:'no-store'}),
+    ]);
+    if(!response.ok)throw Error('Push settings unavailable');
+    const key=(await response.json()).public_key;
+    pushReady={registration,key:pushKeyBytes(key)};
+    pushSubscription=await registration.pushManager.getSubscription();
+    if(pushSubscription){
+      const subscribedKey=new Uint8Array(pushSubscription.options.applicationServerKey||[]);
+      if(subscribedKey.length&&subscribedKey.some((byte,index)=>byte!==pushReady.key[index])){
+        await pushSubscription.unsubscribe();pushSubscription=null;
+      }else{
+        const restored=await fetch('/api/push/subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pushSubscription)});
+        if(!restored.ok)throw Error('Could not restore phone alerts');
+      }
+    }
+    renderAlertToggle();
+  }catch(error){alertStatus.textContent=error.message||'Phone alerts unavailable';}
+}
+alertToggle.addEventListener('click',async()=>{
+  if(!pushReady)return;
+  alertToggle.disabled=true;
+  try{
+    if(pushSubscription){
+      const endpoint=pushSubscription.endpoint;
+      const response=await fetch('/api/push/subscription',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({endpoint})});
+      if(!response.ok)throw Error('Could not turn off alerts');
+      await pushSubscription.unsubscribe();pushSubscription=null;
+    }else{
+      // The subscription call is made from the tap handler, as required on iOS.
+      const subscription=await pushReady.registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:pushReady.key});
+      const response=await fetch('/api/push/subscription',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(subscription)});
+      if(!response.ok){await subscription.unsubscribe();throw Error('Could not save phone alerts');}
+      pushSubscription=subscription;
+    }
+    renderAlertToggle();
+  }catch(error){renderAlertToggle();alertStatus.textContent=error.message||'Could not change phone alerts';}
+});
+preparePush();
 
 function revealTerminalTail(){
   tailFrame=0;

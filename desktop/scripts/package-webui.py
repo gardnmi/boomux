@@ -4,7 +4,7 @@ import shutil
 
 ASSETS = [
     *[f"poc/webgpu-tiling/{name}" for name in (
-        "index.html", "manifest.webmanifest", "entry.js", "mobile-agents.js", "mobile-agents.css",
+        "index.html", "manifest.webmanifest", "service-worker.js", "entry.js", "mobile-agents.js", "mobile-agents.css",
         "app.js", "desktop-panels.js", "themes.js", "terminal.js",
         "renderer.js", "layout.js", "style.css", "THIRD_PARTY_NOTICES.md",
         "fonts/jetbrains-mono-nerd.woff2", "fonts/OFL.txt")],

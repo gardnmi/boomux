@@ -60,6 +60,11 @@ body.agent-phone #phone-app { position: fixed; z-index: 100; display: flex; flex
 #phone-app #phone-install-help h2 { margin: 0 0 10px; font-size: 18px; }
 #phone-app #phone-install-help p { margin: 0 0 18px; color: var(--ui-muted); font-size: 14px; line-height: 1.5; }
 #phone-app #phone-install-close { width: 100%; background: var(--ui-accent); color: var(--ui-deep); font-weight: 700; }
+#phone-app .phone-alert-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 18px; padding: 12px; border: 1px solid var(--ui-border); border-radius: 12px; background: var(--ui-surface); }
+#phone-app .phone-alert-row div { display: grid; gap: 3px; min-width: 0; }
+#phone-app .phone-alert-row strong { color: var(--ui-fg); font-size: 12px; }
+#phone-app .phone-alert-row span { color: var(--ui-muted); font-size: 11px; }
+#phone-app #phone-alert-toggle { flex: none; min-height: 38px; padding: 7px 10px; font-size: 12px; }
 #phone-app #phone-cards { gap: 9px; }
 #phone-app .phone-agent-card { grid-template-columns: minmax(0, 1fr) auto 10px; align-items: center; min-height: 76px; border-radius: 12px; background: var(--ui-surface); }
 #phone-app .phone-agent-card:hover, #phone-app .phone-agent-card:active { background: var(--ui-raised); }

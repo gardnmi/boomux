@@ -25,6 +25,12 @@ Tap **Install app** on the Agent list. Supporting browsers open their install
 prompt; other browsers show the home-screen steps for that phone.
 The suggestion disappears in the installed app or after installation. **Not now**
 dismisses it across reloads in the current browser.
+Tap **Enable** in Phone alerts to allow push notifications for local Agents that
+need attention or complete. On iPhone, install and open the Home Screen app first,
+then enable alerts. **Turn off** removes that phone's subscription. The gateway
+keeps at most eight subscriptions, sends only Agent names and lifecycle state,
+and does not include terminal output. Alerts require the gateway and Boomux
+daemon to be running; a browser or phone need not remain open.
 
 For development without touching your normal daemon, use
 `poc/webgpu-tiling/run-daemon.sh --isolated` instead. It starts a separate daemon

@@ -10,9 +10,11 @@ const snapshot={node_id:'local',snapshot:{workspaces:[{id:'work',name:'Work',she
   {id:'shell',name:'Codex shell',run:{id:'run',ended_at_ms:null}}
 ],agents:[{id:'agent',shell_id:'shell',run_id:'run',name:'Codex',integration:'codex',
   started_at_ms:1,ended_at_ms:null,observation:{state:'working',observed_at_ms:2}}]}]}};
+const pushMutations=[];
 const assets={
   '/agents':['poc/webgpu-tiling/index.html','text/html'],
   '/manifest.webmanifest':['poc/webgpu-tiling/manifest.webmanifest','application/manifest+json'],
+  '/service-worker.js':['poc/webgpu-tiling/service-worker.js','text/javascript'],
   '/icon-192.png':['assets/mobile-web/icon-192.png','image/png'],
   '/icon-512.png':['assets/mobile-web/icon-512.png','image/png'],
   '/entry.js':['poc/webgpu-tiling/entry.js','text/javascript'],
@@ -24,6 +26,16 @@ const assets={
   '/vendor/ghostty-vt.wasm':['node_modules/ghostty-web/ghostty-vt.wasm','application/wasm'],
 };
 const server=createServer(async(request,response)=>{
+  if(request.url==='/api/push/subscription'){
+    const chunks=[];for await(const chunk of request)chunks.push(chunk);
+    pushMutations.push({method:request.method,body:JSON.parse(Buffer.concat(chunks).toString())});
+    response.setHeader('content-type','application/json');response.end('{}');return;
+  }
+  if(request.url==='/api/push/key'){
+    response.setHeader('content-type','application/json');
+    response.end(JSON.stringify({public_key:Buffer.alloc(65,4).toString('base64url')}));
+    return;
+  }
   if(request.url==='/api/snapshot'||request.url==='/api/changes'||request.url==='/api/agent/attach'){
     response.setHeader('content-type','application/json');
     response.end(JSON.stringify(request.url==='/api/snapshot'?snapshot:
@@ -53,6 +65,9 @@ try{
     };
   });
   await page.goto(`http://127.0.0.1:${server.address().port}/agents`);
+  await page.locator('#phone-alert-status').waitFor();
+  await page.waitForFunction(()=>!document.querySelector('#phone-alert-status').textContent.startsWith('Checking'));
+  assert.ok(await page.locator('.phone-alert-row').isVisible(),'phone alert control is available on the Agent list');
   const manifestLink=await page.locator('link[rel="manifest"]').getAttribute('href');
   const manifest=await page.evaluate(async(path)=>(await fetch(path)).json(),manifestLink);
   assert.equal(manifest.start_url,'/agents');
@@ -148,5 +163,27 @@ try{
   assert.ok(expanded && expanded.height>box.height && expanded.height<=150 && expanded.y+expanded.height<=844,
     'a multiline draft grows within the phone viewport');
   assert.ok(await page.locator('.phone-keys').isHidden(),'editing makes room for the phone keyboard');
-  console.log('Mobile Agent draft input and touch scrollback behave as expected');
+  const alertsPage=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});
+  await alertsPage.addInitScript(()=>{
+    window.pushCalls=[];
+    const subscription={endpoint:'https://fcm.googleapis.com/fcm/send/test',
+      toJSON(){return {endpoint:this.endpoint,keys:{p256dh:'test',auth:'test'}};},
+      async unsubscribe(){window.pushCalls.push('unsubscribe');return true;}};
+    Object.defineProperty(navigator,'serviceWorker',{configurable:true,value:{
+      register:async()=>({pushManager:{getSubscription:async()=>null,
+        subscribe:async()=>{window.pushCalls.push('subscribe');return subscription;}}}),
+    }});
+    Object.defineProperty(window,'PushManager',{configurable:true,value:function(){}});
+    Object.defineProperty(window,'Notification',{configurable:true,value:{permission:'granted'}});
+  });
+  await alertsPage.goto(`http://127.0.0.1:${server.address().port}/agents`);
+  await alertsPage.locator('#phone-alert-toggle').click();
+  await alertsPage.getByText('Alerts on for attention and completion').waitFor();
+  assert.equal(pushMutations.at(-1).method,'POST');
+  await alertsPage.locator('#phone-alert-toggle').click();
+  await alertsPage.waitForFunction(()=>window.pushCalls.includes('unsubscribe'));
+  assert.deepEqual(await alertsPage.evaluate(()=>window.pushCalls),['subscribe','unsubscribe']);
+  assert.equal(pushMutations.at(-1).method,'DELETE');
+  await alertsPage.close();
+  console.log('Mobile Agent input, scrollback, and push controls behave as expected');
 }finally{await browser.close();server.close();}

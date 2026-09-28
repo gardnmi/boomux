@@ -2,6 +2,8 @@
 //! explicitly selected Boomux runtime; this executable never starts a daemon.
 #[path = "../poc/webgpu-tiling/daemon_bridge.rs"]
 mod daemon_bridge;
+#[path = "../poc/webgpu-tiling/push.rs"]
+mod push;
 #[allow(dead_code)]
 #[path = "../src/tailscale_serve.rs"]
 mod tailscale_serve;
@@ -55,6 +57,7 @@ struct App {
     operations: Arc<Semaphore>,
     watchers: Arc<Semaphore>,
     setups: Arc<Mutex<HashMap<String, SetupLaunch>>>,
+    push: Arc<push::PushService>,
 }
 // Ephemeral launch proof; never infer cleanup authority from names or discovery.
 struct SetupLaunch {
@@ -255,6 +258,34 @@ async fn changes(State(mut app): State<App>, Json(request): Json<ChangesRequest>
                 )
             });
         Ok(json!({"cursor":batch.cursor,"changed":changed}))
+    })
+    .await
+}
+async fn push_key(State(app): State<App>) -> Json<Value> {
+    Json(json!({"public_key": app.push.public_key()}))
+}
+async fn push_subscribe(
+    State(app): State<App>,
+    Json(subscription): Json<web_push::SubscriptionInfo>,
+) -> ApiResult {
+    operation(app, move |app| {
+        app.push.subscribe(subscription)?;
+        Ok(json!({"enabled":true}))
+    })
+    .await
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PushUnsubscribe {
+    endpoint: String,
+}
+async fn push_unsubscribe(
+    State(app): State<App>,
+    Json(request): Json<PushUnsubscribe>,
+) -> ApiResult {
+    operation(app, move |app| {
+        app.push.unsubscribe(&request.endpoint)?;
+        Ok(json!({"enabled":false}))
     })
     .await
 }
@@ -1098,6 +1129,7 @@ async fn asset(State(app): State<App>, uri: Uri) -> Response {
             "poc/webgpu-tiling/manifest.webmanifest",
             "application/manifest+json",
         ),
+        "/service-worker.js" => ("poc/webgpu-tiling/service-worker.js", "text/javascript"),
         "/icon-192.png" => ("assets/mobile-web/icon-192.png", "image/png"),
         "/icon-512.png" => ("assets/mobile-web/icon-512.png", "image/png"),
         "/entry.js" => ("poc/webgpu-tiling/entry.js", "text/javascript"),
@@ -1163,6 +1195,7 @@ fn validate_assets(root: &std::path::Path) -> Result<(), Box<dyn std::error::Err
     for path in [
         "poc/webgpu-tiling/index.html",
         "poc/webgpu-tiling/manifest.webmanifest",
+        "poc/webgpu-tiling/service-worker.js",
         "assets/mobile-web/icon-192.png",
         "assets/mobile-web/icon-512.png",
         "poc/webgpu-tiling/entry.js",
@@ -1262,6 +1295,14 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let tailnet_origin = exposure.as_ref().map(|exposure| exposure.dashboard_url());
+    let push = push::PushService::open(
+        port,
+        &node_id,
+        tailnet_origin
+            .clone()
+            .unwrap_or_else(|| "mailto:boomux@localhost".into()),
+    )?;
+    tokio::spawn(push.clone().watch(client.clone(), node_id.clone()));
     let url = tailnet_origin.clone().unwrap_or_else(|| origin.clone());
     let app = App {
         client,
@@ -1278,6 +1319,7 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
         operations: Arc::new(Semaphore::new(8)),
         watchers: Arc::new(Semaphore::new(4)),
         setups: Arc::new(Mutex::new(HashMap::new())),
+        push,
     };
     let router = Router::new()
         .route("/api/snapshot", get(snapshot))
@@ -1287,6 +1329,11 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/shell/remove", post(remove_shell))
         .route("/api/resource", post(resource_action))
         .route("/api/changes", post(changes))
+        .route("/api/push/key", get(push_key))
+        .route(
+            "/api/push/subscription",
+            post(push_subscribe).delete(push_unsubscribe),
+        )
         .route("/api/attach", post(grant))
         .route("/api/agent/attach", post(authorize_agent))
         .route("/pty", get(terminal))
