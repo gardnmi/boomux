@@ -1501,6 +1501,64 @@ impl Client {
         }
     }
 
+    /// None means the peer is too old; no recovery mutation was sent.
+    /// A failed/ambiguous response must be followed by fresh owner discovery,
+    /// never by blindly replaying starts through the legacy attachment path.
+    pub fn recover_shells(
+        &self,
+        shells: Vec<protocol::ShellRecoveryTarget>,
+    ) -> Result<Option<Vec<protocol::ShellRecoveryResult>>> {
+        self.recover_shells_with_environment(shells, None)
+    }
+
+    pub fn recover_shells_with_client_environment(
+        &self,
+        shells: Vec<protocol::ShellRecoveryTarget>,
+    ) -> Result<Option<Vec<protocol::ShellRecoveryResult>>> {
+        self.recover_shells_with_environment(shells, Some(current_environment()))
+    }
+
+    fn recover_shells_with_environment(
+        &self,
+        shells: Vec<protocol::ShellRecoveryTarget>,
+        environment: Option<UnixEnvironment>,
+    ) -> Result<Option<Vec<protocol::ShellRecoveryResult>>> {
+        if !self.supports(protocol::ProtocolFeature::RecoverShells)? {
+            return Ok(None);
+        }
+        let expected: Vec<_> = shells.iter().map(|shell| shell.shell_id.clone()).collect();
+        match self.request(Request::RecoverShells {
+            shells,
+            environment,
+        })? {
+            Response::RecoveredShells { results } => {
+                if results.len() != expected.len()
+                    || results
+                        .iter()
+                        .zip(&expected)
+                        .any(|(result, expected)| match result {
+                            protocol::ShellRecoveryResult::Started { shell } => {
+                                &shell.id != expected
+                                    || shell.status != ShellStatus::Running
+                                    || shell.run.is_none()
+                            }
+                            protocol::ShellRecoveryResult::Unavailable { shell_id, .. } => {
+                                shell_id != expected
+                            }
+                        })
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid recovered Shell identities",
+                    )
+                    .into());
+                }
+                Ok(Some(results))
+            }
+            other => unexpected(other),
+        }
+    }
+
     pub fn create_launcher(
         &self,
         workspace_id: impl Into<String>,
@@ -2868,6 +2926,76 @@ mod tests {
                     .create_started_shell("workspace", ShellSpec::login("shell", "/tmp"), profile)
                     .is_err()
             );
+            let listener = server.join().unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn cold_recovery_negotiates_and_never_replays_a_lost_response() {
+        for peer in [55, protocol::PROTOCOL_VERSION] {
+            let directory =
+                env::temp_dir().join(format!("boomux-client-recovery-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                for version in (peer..=protocol::PROTOCOL_VERSION).rev() {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                    assert_eq!(request.message, Request::Ping);
+                    let response = if version == peer {
+                        Response::Pong
+                    } else {
+                        Response::Error {
+                            message: "old peer".into(),
+                            code: Some(ErrorCode::UnsupportedVersion),
+                        }
+                    };
+                    protocol::write_message(&mut stream, &Envelope::with_version(peer, response))
+                        .unwrap();
+                }
+                if peer == protocol::PROTOCOL_VERSION {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                    assert!(matches!(
+                        request.message,
+                        Request::RecoverShells {
+                            environment: Some(_),
+                            ..
+                        }
+                    ));
+                    drop(stream);
+                }
+                listener.set_nonblocking(true).unwrap();
+                listener
+            });
+            let client = Client::from_socket_path(socket);
+            let result = client.recover_shells_with_client_environment(vec![
+                protocol::ShellRecoveryTarget {
+                    shell_id: "shell".into(),
+                    expected_run_id: "previous".into(),
+                    profile: TerminalProfile {
+                        term: None,
+                        colorterm: None,
+                        term_program: None,
+                        term_program_version: None,
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    },
+                },
+            ]);
+            if peer == 55 {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(result.is_err());
+            }
             let listener = server.join().unwrap();
             assert_eq!(
                 listener.accept().unwrap_err().kind(),

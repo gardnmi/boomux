@@ -20,6 +20,7 @@ This is the implementation reference. For product usage, see the
 | `src/client.rs` | Daemon discovery/startup, protocol negotiation, typed management requests, and attachment setup |
 | `src/platform/` | Linux and Darwin process identity, monitoring, runtime paths, descriptor and filesystem operations |
 | `src/daemon.rs` | `DaemonService` coordination over durable registry, event-stream, shell-runtime, persistence, and handoff owners |
+| `src/daemon/cold_recovery.rs` | Bounded exact-run cold recovery, shared durable commit, and rollback |
 | `src/state_store.rs` | Versioned durable schemas, validation, atomic state storage, and migrations |
 | `src/global_workspace_store.rs` | Independently versioned coordinator Workspace metadata, placement membership, initialization and schema migration, prepared resource and placement-default recovery, and resumable close progress |
 | `src/local_shell_journal.rs` | Checksummed owner-only commit journal for local coordinated Shell creation and initial run start across owner and coordinator checkpoints |
@@ -326,6 +327,17 @@ event readers filter that event while retaining cursor progress. Coordinator
 Workspace schema 8 explicitly migrates schema 7 with empty pending and completed
 default-cwd operation ledgers. Owner state schema 14 and handoff generation 8 are
 unchanged because owner Workspaces already persist `default_cwd`.
+Protocol 56 adds `recover_shells`: local `RecoverShells` starts one to four
+pending Shells with exact interrupted previous-run identities, sharing one durable
+state replacement. Eligibility and resume selection remain owner-authoritative.
+Successful starts publish existing `run_started` events only after persistence;
+PTY readers remain paused until then. Per-Shell eligibility or spawn failures do
+not block healthy targets; transaction failures roll back all staged starts.
+No persistence schema or remote routing changes are required. Older clients keep
+individual attachment startup; new clients select that fallback only after
+negotiating an older owner, never after an ambiguous batch result. See the
+[cold recovery contract](cold-recovery.md) for bounds, errors, and crash behavior.
+
 Protocol 55 adds `workspace_conversations`: `OpenWorkspaceConversation` and its
 routed equivalent take an exact Workspace, recorded Agent, and caller-generated
 Shell ID. The owner validates membership and prepares or reuses a native resume

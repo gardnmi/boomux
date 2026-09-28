@@ -31,7 +31,12 @@ impl Retry {
     pub fn failed(&mut self, stopped: bool, now: Instant) {
         self.failures = self.failures.saturating_add(1);
         self.stopped = stopped;
-        self.deadline = Some(now + Duration::from_secs((1u64 << self.failures.min(5)).min(30)));
+        // The overview worker runs once per second. Retry once on its next
+        // pass so a controller released by a closing Desktop is picked up
+        // promptly, then back off for persistent failures.
+        self.deadline = Some(
+            now + Duration::from_secs((1u64 << self.failures.saturating_sub(1).min(5)).min(30)),
+        );
     }
 
     pub fn needs_attention(&self) -> bool {
@@ -153,7 +158,7 @@ mod tests {
         let now = Instant::now();
         let mut retry = Retry::default();
         retry.begin(Some("run"));
-        for seconds in [2, 4, 8, 16, 30, 30] {
+        for seconds in [1, 2, 4, 8, 16, 30] {
             retry.failed(false, now);
             assert!(retry.waiting(now + Duration::from_secs(seconds - 1)));
             assert!(!retry.waiting(now + Duration::from_secs(seconds)));

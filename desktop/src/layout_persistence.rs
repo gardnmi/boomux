@@ -470,6 +470,7 @@ impl Workspace {
         id: usize,
         shell: ShellChoice,
         size: (u16, u16, u16, u16),
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         if self.layout_frozen || self.layout_closing {
@@ -480,6 +481,7 @@ impl Workspace {
         };
         pane.recovery.begin(shell.run_id.as_deref());
         let generation = pane.begin_attachment();
+        let window_handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let attached = shell.clone();
             let result = cx
@@ -523,12 +525,83 @@ impl Workspace {
                 }
                 cx.notify();
             });
+            // Reuse the slot immediately instead of waiting for the next
+            // overview tick. The planner still enforces capacity and backoff.
+            let _ = window_handle.update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| this.reconnect_saved_panes(window, cx))
+            });
         })
         .detach();
     }
 }
 
 impl Workspace {
+    fn start_cold_recovery_batch(
+        &mut self,
+        pending: Vec<(usize, ShellChoice, terminal::TerminalGridSize)>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut entries = Vec::with_capacity(pending.len());
+        let mut shells = Vec::with_capacity(pending.len());
+        for (id, shell, size) in pending {
+            let Some(pane) = self.terminals.get_mut(&id) else {
+                continue;
+            };
+            pane.recovery.begin(shell.run_id.as_deref());
+            let generation = pane.begin_attachment();
+            entries.push((id, generation, shell.id.clone(), size));
+            shells.push((shell, size));
+        }
+        if shells.is_empty() {
+            return;
+        }
+        let window_handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { terminal::recover_local_shells(shells) })
+                .await;
+            let _ = window_handle.update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    let results = match result {
+                        Ok(results) => results,
+                        Err(error) => vec![Err(error); entries.len()],
+                    };
+                    for ((id, generation, shell_id, size), result) in
+                        entries.into_iter().zip(results)
+                    {
+                        let Some(pane) = this.terminals.get_mut(&id) else {
+                            continue;
+                        };
+                        if !pane.accepts_attachment(generation, &shell_id) {
+                            continue;
+                        }
+                        pane.attaching = false;
+                        if this.layout_frozen || this.layout_closing {
+                            continue;
+                        }
+                        match result {
+                            Ok(shell) => {
+                                pane.shell = Some(shell.clone());
+                                this.start_restored_attachment(id, shell, size, window, cx);
+                            }
+                            Err(error) => {
+                                pane.recovery.failed(
+                                    terminal::automatic_restore_paused(&error),
+                                    Instant::now(),
+                                );
+                                pane.error = Some(error);
+                            }
+                        }
+                    }
+                    this.reconnect_saved_panes(window, cx);
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn reconnect_saved_pane(
         &mut self,
         id: usize,
@@ -604,14 +677,23 @@ impl Workspace {
                 && !shell.desktop_setup,
         });
         let pending = recovery::plan(candidates, shells, available, Instant::now());
+        let mut cold = Vec::new();
         for (id, index) in pending {
             let shell = self.boomux_shells[index].clone();
             if let Some(pane) = self.terminals.get_mut(&id) {
                 pane.shell = Some(shell.clone());
             }
             let size = self.terminal_grid_size(id, window);
-            self.start_restored_attachment(id, shell, size, cx);
+            if shell.status == boomux::protocol::ShellStatus::Pending
+                && shell.run_id.is_some()
+                && remote::identity(&shell.id).is_none()
+            {
+                cold.push((id, shell, size));
+            } else {
+                self.start_restored_attachment(id, shell, size, window, cx);
+            }
         }
+        self.start_cold_recovery_batch(cold, window, cx);
     }
 }
 

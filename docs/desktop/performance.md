@@ -36,6 +36,103 @@ Measure these independently before combining them:
 
 ## Metrics
 
+### Cold recovery diagnostic (2026-09-27)
+
+The opt-in native fixture creates isolated Shells and Codex integration records,
+crashes only its own daemon, and resumes each exact conversation through the real
+Boomux launch wrapper into a deterministic fake harness. It verifies a new run
+and generation, readiness output, and an input reply. It prints JSON timings for
+daemon availability, snapshot discovery, pending-run inspection, attachment, run
+lookup, first readiness output, and input round trip. Harness registration is
+outside the timed interval; this does not measure real conversation loading,
+hooks on resume, Desktop rendering, or GPU startup.
+
+```console
+BOOMUX_TIMING_STATE_ROOT="$PWD/target" cargo test --release --test native_backend cold_recovery_phase_timings --locked -- --ignored --nocapture --test-threads=1
+```
+
+`BOOMUX_TIMING_SHELLS` selects 1–32 Shells (default 4), and
+`BOOMUX_TIMING_SAMPLES` selects 1–10 cold cycles (default 3). At most four
+attachments run concurrently. All runtime and harness configuration files are
+temporary; the optional state root gets a uniquely named child removed at test
+completion. Omitting the state root uses the fixture's `/tmp` state. On this
+host `/tmp` is tmpfs, providing a control for storage cost rather than a durable
+deployment configuration. Daemon readiness polling has 20 ms resolution.
+
+Same-host optimized results, four 24×80 Shells and three cold cycles:
+
+| State filesystem | Daemon available | All four accept input |
+| --- | --- | --- |
+| Btrfs, repository `target` | 398–409 ms | 1.600, 2.001, 2.400 s |
+| tmpfs, fixture default | 20–21 ms | 26.3, 27.3, 28.2 ms |
+
+The Btrfs snapshot took 0.14–0.17 ms. Attachment times increased as concurrent
+requests waited for serialized Shell starts, generally in roughly 400 ms steps.
+Cold startup durably records interrupted runs, and the individual-start path records each recovered Shell start
+with its own durable commit under the daemon mutation lock. These measurements
+identify storage and serialization as the main backend cost for this fixture;
+they do not account for the user's entire agent startup time.
+
+For more than four panes, Desktop now fills an available recovery slot as soon
+as an automatic attachment completes. Compare immediate refill with a simulation
+of the previous one-second overview cadence using the same optimized fixture:
+
+```console
+BOOMUX_TIMING_SHELLS=8 BOOMUX_TIMING_POLL_REFILL=1 cargo test --release --test native_backend cold_recovery_phase_timings --locked -- --ignored --nocapture --test-threads=1
+BOOMUX_TIMING_SHELLS=8 cargo test --release --test native_backend cold_recovery_phase_timings --locked -- --ignored --nocapture --test-threads=1
+```
+
+With tmpfs state, eight Shells and three samples, polling refill took
+1.027–1.028 s; immediate refill took 31.2–31.9 ms. This compares scheduling
+policies around real backend cold recovery, without GPUI or overview I/O. It is
+not an end-to-end Desktop speedup claim. The change adds no worker, timer, cache,
+or per-Shell runtime and retains the four-attempt bound. Desktop CPU, RSS/PSS,
+retained memory, and frame timing were not measured.
+
+Protocol 56 now batches up to four local cold starts into one durable commit,
+with owner guards, paused readers, exact returned run identities, and rollback.
+Compare both paths alternately in the same optimized binary and workload:
+
+```console
+BOOMUX_TIMING_SAMPLES=6 BOOMUX_TIMING_COMPARE_RECOVERY=1 BOOMUX_TIMING_STATE_ROOT="$PWD/target" cargo test --release --test native_backend cold_recovery_phase_timings --locked -- --ignored --nocapture --test-threads=1
+```
+
+`BOOMUX_TIMING_BATCH_RECOVERY=1` selects batching for every sample. Both batch
+modes require at most four Shells; the larger scheduling fixture above uses
+individual starts. The comparison also prints Linux daemon RSS/PSS, observed
+peak RSS, cumulative CPU, threads, and descriptors, including an empty daemon
+and the final daemon after closing the fixture Workspace.
+
+Same-host Btrfs results, six alternating cold cycles, four 24×80 fake Codex
+conversations (2026-09-27):
+
+| Path | All four accept input | Median |
+| --- | --- | --- |
+| Individual starts | 1,225.0 / 34.8 / 1,700.7 ms | 1,225.0 ms |
+| Batch start | 124.0 / 303.3 / 216.6 ms | 216.6 ms |
+
+The observed median fell 82%, but filesystem variance is large, including a
+34.8 ms individual sample. An earlier batch-only run took 401–803 ms. The
+structural improvement is one durable start commit instead of four, proven by a
+write-count regression test; these numbers are not an end-to-end Desktop claim.
+
+Empty daemon RSS/PSS was 10,316/7,795 KiB. Four recovered Shells used
+12,160–12,640/9,638–10,114 KiB across both paths: roughly 461–580 KiB additional
+PSS per Shell in this small fixture, excluding child processes and Desktop.
+Observed peak RSS equaled these RSS readings. Startup CPU was 0–10 ms at the
+host's coarse 10 ms accounting resolution. After the final Workspace closed,
+RSS/PSS was 12,336/9,731 KiB, with 3 threads and 7 descriptors, versus 4 and 9
+in the initial empty daemon. These are different cold daemon processes and
+instantaneous samples, not a retained-memory or steady-state CPU regression
+comparison. The batch adds no background polling or per-Shell runtime; temporary
+staging is bounded to four entries. Large-scale idle/output and repeated cleanup
+memory measurements remain unverified.
+
+A subsequent live test should use disposable harness conversations of fixed
+transcript sizes to measure the additional time between attachment and an
+interactive prompt. Separate Desktop-only reopening (live daemon) from actual
+cold daemon recovery, and record attachment diagnostics alongside prompt timing.
+
 ### Local Shell startup diagnostic (2026-09-08)
 
 An opt-in native diagnostic separates create, attach, run lookup, first usable

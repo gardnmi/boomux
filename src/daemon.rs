@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+mod cold_recovery;
 use crate::platform::{self, ProcessHandle};
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -11812,6 +11813,13 @@ impl DaemonService {
         request: Request,
         response_version: u32,
     ) -> DaemonResult<Response> {
+        if let Request::RecoverShells {
+            shells,
+            environment,
+        } = request
+        {
+            return self.recover_shells(shells, environment);
+        }
         if let Request::CreateStartedShell {
             workspace_id,
             shell,
@@ -13395,7 +13403,7 @@ impl DaemonService {
                 }
                 Ok(Response::Workspace { workspace })
             }
-            Request::CreateStartedShell { .. } => {
+            Request::CreateStartedShell { .. } | Request::RecoverShells { .. } => {
                 unreachable!("started Shell creation requires Arc dispatch")
             }
             Request::GetShell { shell_id } => {

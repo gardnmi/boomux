@@ -537,6 +537,62 @@ pub struct TerminalSession {
     last_size: Mutex<(u16, u16)>,
 }
 
+pub type TerminalGridSize = (u16, u16, u16, u16);
+
+/// Start eligible local cold runs together. Older owners are selected before
+/// mutation and retain the existing per-pane restore path. Never fall back on
+/// an error: a lost reply may already have committed new runs.
+pub fn recover_local_shells(
+    shells: Vec<(ShellChoice, TerminalGridSize)>,
+) -> Result<Vec<Result<ShellChoice, String>>, String> {
+    let client = client::connect_if_running()
+        .map_err(|error| error.to_string())?
+        .ok_or("Boomux is not running")?;
+    recover_local_shells_with_client(&client, shells)
+}
+
+fn recover_local_shells_with_client(
+    client: &Client,
+    shells: Vec<(ShellChoice, TerminalGridSize)>,
+) -> Result<Vec<Result<ShellChoice, String>>, String> {
+    let targets = shells
+        .iter()
+        .map(|(shell, size)| {
+            if crate::remote::identity(&shell.id).is_some() || shell.status != ShellStatus::Pending
+            {
+                return Err("Cold recovery requires a pending local Shell".into());
+            }
+            Ok(boomux::protocol::ShellRecoveryTarget {
+                shell_id: shell.id.clone(),
+                expected_run_id: shell
+                    .run_id
+                    .clone()
+                    .ok_or("Missing recovery run identity")?,
+                profile: terminal_profile(size.0, size.1, size.2, size.3),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let Some(results) = client
+        .recover_shells_with_client_environment(targets)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(shells.into_iter().map(|(shell, _)| Ok(shell)).collect());
+    };
+    Ok(results
+        .into_iter()
+        .zip(shells)
+        .map(|(result, (original, _))| match result {
+            boomux::protocol::ShellRecoveryResult::Started { shell } => {
+                let mut current = shell_choice(*shell);
+                current.id = original.id;
+                current.workspace_id = original.workspace_id;
+                Ok(current)
+            }
+            boomux::protocol::ShellRecoveryResult::Unavailable { message, .. } => Err(message),
+        })
+        .collect())
+}
+
 impl TerminalSession {
     pub fn attach(
         shell: ShellChoice,
@@ -3185,6 +3241,100 @@ mod tests {
             boomux::protocol::ShellStatus::Running
         );
         assert!(first.shells[0].cwd.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn cold_recovery_attaches_returned_run_without_another_lookup() {
+        use boomux::protocol::{self, Envelope, Request, Response, ShellSnapshot};
+        use std::os::unix::net::UnixListener;
+        let directory = std::env::temp_dir().join(format!("cr-{:016x}", fastrand::u64(..)));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let envelope: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                let response = match step {
+                    0 => {
+                        assert_eq!(envelope.message, Request::Ping);
+                        Response::Pong
+                    }
+                    1 => {
+                        let Request::RecoverShells {
+                            shells,
+                            environment,
+                        } = envelope.message
+                        else {
+                            panic!("expected recovery batch")
+                        };
+                        assert_eq!(shells.len(), 1);
+                        assert_eq!(shells[0].expected_run_id, "previous");
+                        assert_eq!(shells[0].profile.rows, 24);
+                        assert!(environment.is_some());
+                        let shell: ShellSnapshot = serde_json::from_value(serde_json::json!({
+                            "id": "saved", "workspace_id": "workspace", "name": "saved",
+                            "cwd": "/tmp", "status": "running",
+                            "run": {"id": "replacement", "generation": 2, "started_at_ms": 1,
+                                "output_revision": 0, "environment_has_run_id": true}
+                        }))
+                        .unwrap();
+                        Response::RecoveredShells {
+                            results: vec![protocol::ShellRecoveryResult::Started {
+                                shell: Box::new(shell),
+                            }],
+                        }
+                    }
+                    _ => {
+                        let Request::Attach {
+                            expected_run_id,
+                            takeover,
+                            restart_exited,
+                            ..
+                        } = envelope.message
+                        else {
+                            panic!("expected attachment without another lookup")
+                        };
+                        assert_eq!(expected_run_id.as_deref(), Some("replacement"));
+                        assert!(!takeover && !restart_exited);
+                        Response::Error {
+                            code: None,
+                            message: "attachment reached".into(),
+                        }
+                    }
+                };
+                protocol::write_message(
+                    &mut stream,
+                    &Envelope::with_version(envelope.version, response),
+                )
+                .unwrap();
+            }
+        });
+        let client = boomux::client::Client::from_socket_path(socket);
+        let shell = super::ShellChoice {
+            id: "saved".into(),
+            name: "saved".into(),
+            workspace_id: "workspace".into(),
+            cwd: directory.clone(),
+            status: boomux::protocol::ShellStatus::Pending,
+            run_id: Some("previous".into()),
+            desktop_setup: false,
+        };
+        let shell =
+            super::recover_local_shells_with_client(&client, vec![(shell, (24, 80, 800, 480))])
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap();
+        let error = super::TerminalSession::restore_with_client(client, shell, 24, 80, 800, 480)
+            .err()
+            .unwrap();
+        assert!(error.contains("attachment reached"), "{error}");
+        server.join().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
