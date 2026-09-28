@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 55;
+pub const PROTOCOL_VERSION: u32 = 56;
 pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -203,10 +203,33 @@ define_protocol_features! {
     GitWorkOverview => (53, "Git work overview", ["protocol_53", "git_work_overview"]),
     WorkspaceConversations => (55, "Workspace conversations", ["protocol_55", "workspace_conversations"]),
     CreateStartedShell => (54, "atomic Shell creation and start", ["protocol_54", "create_started_shell"]),
+    RecoverShells => (56, "batched cold Shell recovery", ["protocol_56", "recover_shells"]),
     RestartExecutable => (52, "restart executable", ["protocol_52", "restart_executable"]),
 }
 
 pub const MAX_NODE_PROJECTION_TRANSITIONS: u16 = 256;
+pub const MAX_RECOVERY_SHELLS: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellRecoveryTarget {
+    pub shell_id: String,
+    pub expected_run_id: String,
+    pub profile: TerminalProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ShellRecoveryResult {
+    Started {
+        shell: Box<ShellSnapshot>,
+    },
+    Unavailable {
+        shell_id: String,
+        code: ErrorCode,
+        message: String,
+    },
+}
 pub const MAX_HOST_SERVICE_PROJECTS: usize = 2_000;
 pub const MAX_HOST_SERVICE_WARNINGS: usize = 64;
 pub const MAX_HOST_SERVICE_SESSIONS: usize = 1_000;
@@ -1933,6 +1956,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         environment: Option<UnixEnvironment>,
     },
+    RecoverShells {
+        shells: Vec<ShellRecoveryTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<UnixEnvironment>,
+    },
     CreateLauncher {
         workspace_id: String,
         spec: WorkspaceLauncherSpec,
@@ -2274,6 +2302,7 @@ impl Request {
                 workspace_id: None, ..
             } => Some(ProtocolFeature::WorkspaceDefaultCwd),
             Self::CreateStartedShell { .. } => Some(ProtocolFeature::CreateStartedShell),
+            Self::RecoverShells { .. } => Some(ProtocolFeature::RecoverShells),
             Self::RestartWithExecutable { .. } => Some(ProtocolFeature::RestartExecutable),
             Self::RestartWithNotificationConfig { .. } => {
                 Some(ProtocolFeature::RestartNotificationConfig)
@@ -2412,6 +2441,9 @@ pub enum Response {
     },
     Shell {
         shell: ShellSnapshot,
+    },
+    RecoveredShells {
+        results: Vec<ShellRecoveryResult>,
     },
     Launcher {
         launcher: WorkspaceLauncherSnapshot,
@@ -2897,9 +2929,46 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_fifty_five_with_forty_seven_floor() {
-        assert_eq!(PROTOCOL_VERSION, 55);
+    fn protocol_version_is_fifty_six_with_forty_seven_floor() {
+        assert_eq!(PROTOCOL_VERSION, 56);
         assert_eq!(MIN_PROTOCOL_VERSION, 47);
+    }
+
+    #[test]
+    fn cold_recovery_requires_fifty_six_and_round_trips() {
+        let request = Request::RecoverShells {
+            shells: vec![ShellRecoveryTarget {
+                shell_id: "shell".into(),
+                expected_run_id: "previous".into(),
+                profile: TerminalProfile {
+                    term: None,
+                    colorterm: None,
+                    term_program: None,
+                    term_program_version: None,
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }],
+            environment: None,
+        };
+        assert_eq!(request.minimum_protocol_version(), 56);
+        assert!(!ProtocolFeature::RecoverShells.is_supported_by(55));
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(encoded.get("environment").is_none());
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), request);
+        let response = Response::RecoveredShells {
+            results: vec![ShellRecoveryResult::Unavailable {
+                shell_id: "shell".into(),
+                code: ErrorCode::RunChanged,
+                message: "changed".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::from_slice::<Response>(&serde_json::to_vec(&response).unwrap()).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -4615,6 +4684,7 @@ mod tests {
             (53, &["protocol_53", "git_work_overview"][..]),
             (55, &["protocol_55", "workspace_conversations"][..]),
             (54, &["protocol_54", "create_started_shell"][..]),
+            (56, &["protocol_56", "recover_shells"][..]),
             (52, &["protocol_52", "restart_executable"][..]),
         ];
 

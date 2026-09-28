@@ -63,11 +63,22 @@ lookups; batches use up to four direct lookups before a temporary borrowed index
 bounds the cost of many rejected candidates. No index is retained between refreshes.
 Backoff also applies when the observed run changes, for at most 30 seconds. Successful
 recovery resets it. Closing/frozen windows and outgoing animation panes do not start
-recovery work; late automatic results are discarded while the window is frozen. Recovery uses the existing overview
-loop with four concurrent attempts and exponential backoff capped at 30 seconds.
+recovery work; late automatic results are discarded while the window is frozen.
+Recovery uses four concurrent attempts and exponential backoff from 1 to 30 seconds.
+Each completed automatic attachment immediately rechecks eligible saved panes to
+fill its freed slot. The existing overview loop handles due retries and refreshed
+owner state; successful batches do not wait for its next one-second tick. The same
+planner enforces capacity and backoff on both paths, without another timer or worker.
 
-Pending saved Shells are checked against an owner-authoritative snapshot. An
-interrupted run (or a Shell never yet started) starts automatically. The daemon's
+Pending saved local Shells with a previous run are grouped into at most four
+protocol-56 recovery targets. The owner checks exact previous-run identity and
+interrupted status, and commits successful starts together. Desktop attaches to
+the returned exact runs without additional Shell lookups. Batch I/O runs in the
+background, counts against the existing four-attempt limit, and discards stale
+pane generations. An ambiguous response enters backoff and fresh discovery;
+it never falls through to another start request. Older owners, remote Shells,
+and never-started Shells retain the individual owner-snapshot/attachment path.
+An interrupted run (or a Shell never yet started) starts automatically. The daemon's
 existing `recovery.resume_agents` policy resumes a uniquely identified supported
 agent conversation; Desktop does not infer a conversation from terminal output.
 Normally ended and explicitly terminated commands remain stopped. Temporary setup

@@ -11,6 +11,11 @@ Its reader remains paused until that commit, so output cannot precede creation.
 Failed creation emits neither event. Older event readers need no new fields or
 event filtering for this operation.
 
+Protocol 56's local `RecoverShells` publishes one existing `run_started` event
+per successful target as a batch after their shared durable commit. Readers stay
+paused until publication. Skipped targets and rolled-back transactions publish
+no start events. Event schemas and older-reader filtering are unchanged.
+
 > **Status: Current protocol contract.** Source and compatibility tests are
 > authoritative for exact version gates; this document defines event and cursor
 > semantics.

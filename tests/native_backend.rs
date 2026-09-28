@@ -2,6 +2,8 @@ mod support;
 
 #[path = "native_backend/agents_sessions.rs"]
 mod agents_sessions;
+#[path = "native_backend/cold_recovery.rs"]
+mod cold_recovery;
 #[path = "native_backend/daemon_lifecycle.rs"]
 mod daemon_lifecycle;
 #[path = "native_backend/handoff.rs"]
@@ -18,6 +20,8 @@ mod notifications;
 mod project_discovery;
 #[path = "native_backend/protocol_control.rs"]
 mod protocol_control;
+#[path = "native_backend/recovery_timing.rs"]
+mod recovery_timing;
 #[path = "native_backend/remote_attachment.rs"]
 mod remote_attachment;
 #[path = "native_backend/remote_bootstrap.rs"]

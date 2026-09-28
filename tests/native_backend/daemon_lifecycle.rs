@@ -137,6 +137,8 @@ fn native_daemon_lifecycle() {
         "protocol_47",
         "protocol_51",
         "protocol_52",
+        "protocol_56",
+        "recover_shells",
         "restart_executable",
         "opencode_shared_runtime_claims",
         "node_registration_management",
