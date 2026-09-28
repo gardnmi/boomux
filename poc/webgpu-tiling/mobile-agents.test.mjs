@@ -12,6 +12,9 @@ const snapshot={node_id:'local',snapshot:{workspaces:[{id:'work',name:'Work',she
   started_at_ms:1,ended_at_ms:null,observation:{state:'working',observed_at_ms:2}}]}]}};
 const assets={
   '/agents':['poc/webgpu-tiling/index.html','text/html'],
+  '/manifest.webmanifest':['poc/webgpu-tiling/manifest.webmanifest','application/manifest+json'],
+  '/icon-192.png':['assets/mobile-web/icon-192.png','image/png'],
+  '/icon-512.png':['assets/mobile-web/icon-512.png','image/png'],
   '/entry.js':['poc/webgpu-tiling/entry.js','text/javascript'],
   '/mobile-agents.js':['poc/webgpu-tiling/mobile-agents.js','text/javascript'],
   '/themes.js':['poc/webgpu-tiling/themes.js','text/javascript'],
@@ -50,6 +53,15 @@ try{
     };
   });
   await page.goto(`http://127.0.0.1:${server.address().port}/agents`);
+  const manifestLink=await page.locator('link[rel="manifest"]').getAttribute('href');
+  const manifest=await page.evaluate(async(path)=>(await fetch(path)).json(),manifestLink);
+  assert.equal(manifest.start_url,'/agents');
+  assert.equal(manifest.display,'standalone');
+  assert.deepEqual(manifest.icons.map(icon=>icon.sizes),['192x192','512x512']);
+  for(const icon of manifest.icons){
+    const response=await page.request.get(`http://127.0.0.1:${server.address().port}${icon.src}`);
+    assert.equal(response.status(),200,`${icon.sizes} install icon is served`);
+  }
   await page.locator('.phone-agent-card').click();
   await page.getByText('Live terminal').waitFor();
   await page.waitForTimeout(100);

@@ -18,6 +18,10 @@ launch and remembers its exact identity under `target/webgpu-poc/`. Set
 `POC_WORKSPACE_ID` to select an existing Workspace explicitly. Open
 <http://127.0.0.1:4389>; set `POC_PORT` to use another port.
 
+On a phone, `/agents` opens the Agent-focused view. When served over HTTPS,
+its web manifest lets you add **Boomux Agents** to the home screen; the installed
+app opens at `/agents`. Agent terminals still require a live Boomux connection.
+
 For development without touching your normal daemon, use
 `poc/webgpu-tiling/run-daemon.sh --isolated` instead. It starts a separate daemon
 with runtime, configuration, and state directories under `target/webgpu-poc/`.

@@ -1094,6 +1094,12 @@ async fn agent_terminal(
 async fn asset(State(app): State<App>, uri: Uri) -> Response {
     let (path, mime) = match uri.path() {
         "/" | "/index.html" | "/agents" => ("poc/webgpu-tiling/index.html", "text/html"),
+        "/manifest.webmanifest" => (
+            "poc/webgpu-tiling/manifest.webmanifest",
+            "application/manifest+json",
+        ),
+        "/icon-192.png" => ("assets/mobile-web/icon-192.png", "image/png"),
+        "/icon-512.png" => ("assets/mobile-web/icon-512.png", "image/png"),
         "/entry.js" => ("poc/webgpu-tiling/entry.js", "text/javascript"),
         "/mobile-agents.js" => ("poc/webgpu-tiling/mobile-agents.js", "text/javascript"),
         "/mobile-agents.css" => ("poc/webgpu-tiling/mobile-agents.css", "text/css"),
@@ -1156,6 +1162,9 @@ fn asset_root() -> PathBuf {
 fn validate_assets(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     for path in [
         "poc/webgpu-tiling/index.html",
+        "poc/webgpu-tiling/manifest.webmanifest",
+        "assets/mobile-web/icon-192.png",
+        "assets/mobile-web/icon-512.png",
         "poc/webgpu-tiling/entry.js",
         "poc/webgpu-tiling/mobile-agents.js",
         "poc/webgpu-tiling/mobile-agents.css",
