@@ -1075,7 +1075,9 @@ noninteractive execution, use outside Boomux, absolute binary paths, and a
 modified `PATH` execute real OpenCode unchanged. Private bash, zsh, and fish
 startup adapters apply the shim after normal interactive shell configuration so
 startup files cannot accidentally reorder it; other shells retain fail-open
-startup behavior. The TUI plugin reactively ensures and releases claims as root
+startup behavior. The zsh adapter restores the user's `ZDOTDIR` before sourcing
+`.zshenv` and `.zshrc`, follows directory changes made by those files, and never
+uses its private wrapper directory as the user startup directory. The TUI plugin reactively ensures and releases claims as root
 selection switches or forks; the server
 plugin resolves a current claim before lifecycle ensure/report. Missing,
 expired, conflicting, run-changed, or generation-changed claims fail closed
