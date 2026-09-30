@@ -26,9 +26,20 @@ that you downloaded the official Boomux release. The installer does not disable
 Gatekeeper or remove quarantine attributes.
 
 For a newer version, quit Desktop and run the command again. Existing versions
-are preserved. The daemon may still be running from an older app: use the new
-app's bundled CLI with `daemon restart` before removing the older app. Do not
-use `daemon stop` unless you intend to terminate every managed Shell.
+are preserved. The daemon may still be running from an older app. Select the new
+app's bundled CLI explicitly when restarting, replacing `<version>` below with
+the installed version:
+
+```sh
+new_cli="$HOME/Applications/Boomux-<version>.app/Contents/MacOS/boomux"
+"$new_cli" daemon restart --executable "$new_cli"
+"$new_cli" daemon status --json
+```
+
+A plain `daemon restart` reuses the running daemon's executable, even when the
+command comes from a newer CLI. Keep the older app until the explicit restart
+succeeds and the status result's `data.executable` identifies the new CLI. Do not use `daemon stop` unless
+you intend to terminate every managed Shell.
 
 ## Manual ZIP testing
 
@@ -48,7 +59,8 @@ The CLI is inside the app. For a manual install into `/Applications`:
 ```sh
 /Applications/Boomux.app/Contents/MacOS/boomux --version
 /Applications/Boomux.app/Contents/MacOS/boomux daemon status
-/Applications/Boomux.app/Contents/MacOS/boomux daemon restart
+/Applications/Boomux.app/Contents/MacOS/boomux daemon restart \
+  --executable /Applications/Boomux.app/Contents/MacOS/boomux
 ```
 
 Command+C/V copy and paste; Command+W detaches the pane; Command+Enter creates a
