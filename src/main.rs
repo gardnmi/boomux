@@ -11973,9 +11973,10 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                     eprintln!("err terminal: {error}");
                 }
             }
+            let (desktop_command, sound_command) = notification_commands();
             match notification_diagnostic(
                 &config.notifications,
-                executable_on_path("notify-send"),
+                executable_on_path(desktop_command),
                 plausible_desktop_bus(),
             ) {
                 NotificationDiagnostic::Disabled => {
@@ -11983,12 +11984,12 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
                 }
                 NotificationDiagnostic::Ready => {
                     println!(
-                        "ok  notification config: notify-send and plausible desktop bus context present; restart daemon after changes"
+                        "ok  notification config: {desktop_command} is executable; delivery not verified; restart daemon after changes"
                     );
                 }
                 NotificationDiagnostic::MissingExecutable => {
                     healthy = false;
-                    eprintln!("err notifications: notify-send is not executable on PATH");
+                    eprintln!("err notifications: {desktop_command} is not executable");
                 }
                 NotificationDiagnostic::MissingDesktopBus => {
                     healthy = false;
@@ -11997,21 +11998,19 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             }
             match sound_notification_diagnostic(
                 &config.notifications,
-                executable_on_path("canberra-gtk-play"),
+                executable_on_path(sound_command),
             ) {
                 SoundNotificationDiagnostic::Disabled => {
                     println!("ok  notification sound: disabled (sampled at daemon start)");
                 }
                 SoundNotificationDiagnostic::Ready => {
                     println!(
-                        "ok  notification sound: canberra-gtk-play is executable; restart daemon after changes"
+                        "ok  notification sound: {sound_command} is executable; delivery not verified; restart daemon after changes"
                     );
                 }
                 SoundNotificationDiagnostic::MissingExecutable => {
                     healthy = false;
-                    eprintln!(
-                        "err notification sound: canberra-gtk-play is not executable on PATH"
-                    );
+                    eprintln!("err notification sound: {sound_command} is not executable");
                 }
             }
         }
@@ -12113,6 +12112,14 @@ enum SoundNotificationDiagnostic {
     MissingExecutable,
 }
 
+fn notification_commands() -> (&'static str, &'static str) {
+    if cfg!(target_os = "macos") {
+        ("/usr/bin/osascript", "/usr/bin/afplay")
+    } else {
+        ("notify-send", "canberra-gtk-play")
+    }
+}
+
 fn notification_diagnostic(
     settings: &daemon::NotificationDeliverySettings,
     executable: bool,
@@ -12122,7 +12129,7 @@ fn notification_diagnostic(
         NotificationDiagnostic::Disabled
     } else if !executable {
         NotificationDiagnostic::MissingExecutable
-    } else if !desktop_bus {
+    } else if cfg!(target_os = "linux") && !desktop_bus {
         NotificationDiagnostic::MissingDesktopBus
     } else {
         NotificationDiagnostic::Ready
@@ -12154,12 +12161,16 @@ fn test_notification(reason: CliNotificationReason) -> Result<(), Box<dyn Error>
 }
 
 fn executable_on_path(name: &str) -> bool {
+    let executable = |path: &Path| {
+        fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    };
+    let name = Path::new(name);
+    if name.is_absolute() {
+        return executable(name);
+    }
     env::var_os("PATH").is_some_and(|path| {
-        env::split_paths(&path).any(|directory| {
-            fs::metadata(directory.join(name)).is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            })
-        })
+        env::split_paths(&path).any(|directory| executable(&directory.join(name)))
     })
 }
 
@@ -16051,6 +16062,33 @@ mod tests {
     }
 
     #[test]
+    fn notification_doctor_uses_native_delivery_commands() {
+        assert_eq!(
+            notification_commands(),
+            if cfg!(target_os = "macos") {
+                ("/usr/bin/osascript", "/usr/bin/afplay")
+            } else {
+                ("notify-send", "canberra-gtk-play")
+            }
+        );
+    }
+
+    #[test]
+    fn notification_doctor_resolves_absolute_executables() {
+        let directory = test_skill_home("notification-executable");
+        fs::create_dir_all(&directory).unwrap();
+        let command = directory.join("custom-notifier");
+        fs::write(&command, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!executable_on_path(command.to_str().unwrap()));
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(executable_on_path(command.to_str().unwrap()));
+        assert!(!executable_on_path(directory.to_str().unwrap()));
+        fs::remove_dir_all(directory).unwrap();
+        assert!(!executable_on_path(command.to_str().unwrap()));
+    }
+
+    #[test]
     fn notification_doctor_diagnostic_is_deterministic() {
         let disabled = daemon::NotificationDeliverySettings::default();
         assert_eq!(
@@ -16070,7 +16108,11 @@ mod tests {
         );
         assert_eq!(
             notification_diagnostic(&enabled, true, false),
-            NotificationDiagnostic::MissingDesktopBus
+            if cfg!(target_os = "macos") {
+                NotificationDiagnostic::Ready
+            } else {
+                NotificationDiagnostic::MissingDesktopBus
+            }
         );
         assert_eq!(
             notification_diagnostic(&enabled, true, true),

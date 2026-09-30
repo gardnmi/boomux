@@ -27,10 +27,14 @@ jobs:
           cache-on-failure: true
       - name: Run native Clippy
         run: cargo +stable clippy --locked -p boomux -p boomux-desktop --all-targets --all-features -- -D warnings
+      - name: Test zsh startup
+        run: cargo +stable test --locked --lib zsh_startup -- --test-threads=1
       - name: Compile native lifecycle tests
         run: cargo +stable test --locked --test native_backend --no-run
       - name: Test descriptor transfer
         run: cargo +stable test --locked --lib fd_transfer -- --test-threads=1
+      - name: Test notification diagnostics
+        run: cargo +stable test --locked --bin boomux notification_doctor -- --test-threads=1
       - name: Test native process identity
         run: cargo +stable test --locked --lib platform::macos::tests -- --test-threads=1 --nocapture
       - name: Test native lifecycle and recovery
