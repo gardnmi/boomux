@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "boomux"
-version = "1.22.1"
+version = "1.22.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "boomux-desktop"
-version = "1.22.1"
+version = "1.22.2"
 dependencies = [
  "async-channel",
  "boomux",

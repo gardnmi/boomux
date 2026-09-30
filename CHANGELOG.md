@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.22.2](https://github.com/gardnmi/boomux/compare/v1.22.1...v1.22.2) (2026-09-30)
+
+
+### Bug Fixes
+
+* **macos:** diagnose native notification backends ([#469](https://github.com/gardnmi/boomux/issues/469)) ([38746fb](https://github.com/gardnmi/boomux/commit/38746fb86eba78bc9fac0ac2e50056dd000dfb80))
+* **shell:** preserve zsh startup directories ([#470](https://github.com/gardnmi/boomux/issues/470)) ([85d40a0](https://github.com/gardnmi/boomux/commit/85d40a0df4053c35224b37bd0513e4d274d0adda))
+* **terminal:** enforce preview byte and span limits ([#464](https://github.com/gardnmi/boomux/issues/464)) ([94b36af](https://github.com/gardnmi/boomux/commit/94b36af57085f7c8d3ac9c533a2078d1b3d4977b))
+
+
+### Performance Improvements
+
+* **sessions:** index display and visibility metadata ([#465](https://github.com/gardnmi/boomux/issues/465)) ([23114bf](https://github.com/gardnmi/boomux/commit/23114bf6393c05bdbed34eb9d9eaebdc7795fd66))
+
+
+### Code Refactoring
+
+* **core:** remove unused private entry points ([#466](https://github.com/gardnmi/boomux/issues/466)) ([26dbaf7](https://github.com/gardnmi/boomux/commit/26dbaf714bde6bc253a79d6da4d06d0556ae9593))
+
 ## [1.22.1](https://github.com/gardnmi/boomux/compare/v1.22.0...v1.22.1) (2026-09-28)
 
 
