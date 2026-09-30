@@ -4456,31 +4456,43 @@ impl Workspace {
     }
 
     fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.keyboard_input_target();
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            if let Some(dialog) = self.resource_dialog.as_mut() {
-                if dialog.kind == ResourceDialogKind::Rename && !dialog.busy {
-                    append_resource_name(&mut dialog.value, &text);
-                    dialog.error = None;
+            match target {
+                InputTarget::ResourceDialog => {
+                    if let Some(dialog) = self.resource_dialog.as_mut()
+                        && dialog.kind == ResourceDialogKind::Rename
+                        && !dialog.busy
+                    {
+                        append_resource_name(&mut dialog.value, &text);
+                        dialog.error = None;
+                    }
                 }
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-            if self.project_menu_open {
-                if !self.remote_picker_open {
+                InputTarget::ProjectSearch => {
                     project_search::append(&mut self.project_search, &text);
                 }
-                cx.stop_propagation();
-                cx.notify();
-                return;
+                InputTarget::ConversationSearch => self.paste_conversation_search(&text),
+                InputTarget::GitSearch => {
+                    project_search::append(&mut self.git_panel.search, &text);
+                }
+                InputTarget::SettingsInput => {
+                    if let Some((_, value)) = &mut self.boomux_setting_input {
+                        append_boomux_setting_text(value, &text);
+                    }
+                }
+                InputTarget::Workspace => {
+                    self.paste_into_focused(&text, cx);
+                    return;
+                }
+                InputTarget::RemotePicker
+                | InputTarget::Remotes
+                | InputTarget::SettingsRestart
+                | InputTarget::Help => {}
             }
-            if let Some((_, value)) = &mut self.boomux_setting_input {
-                append_boomux_setting_text(value, &text);
-                cx.stop_propagation();
-                cx.notify();
-                return;
-            }
-            self.paste_into_focused(&text, cx);
+            cx.notify();
+        }
+        if !target.allows_terminal_paste() {
+            cx.stop_propagation();
         }
     }
 
@@ -4495,13 +4507,16 @@ impl Workspace {
     }
 
     fn paste_into_focused(&mut self, text: &str, cx: &mut Context<Self>) {
-        if let Some((_, value)) = &mut self.boomux_setting_input {
+        let target = self.keyboard_input_target();
+        if target == InputTarget::SettingsInput
+            && let Some((_, value)) = &mut self.boomux_setting_input
+        {
             append_boomux_setting_text(value, text);
             cx.stop_propagation();
             cx.notify();
             return;
         }
-        if self.layout_mode {
+        if self.layout_mode || !target.allows_terminal_paste() {
             cx.stop_propagation();
             return;
         }
