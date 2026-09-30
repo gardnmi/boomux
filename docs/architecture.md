@@ -1078,7 +1078,9 @@ noninteractive execution, use outside Boomux, absolute binary paths, and a
 modified `PATH` execute real OpenCode unchanged. Private bash, zsh, and fish
 startup adapters apply the shim after normal interactive shell configuration so
 startup files cannot accidentally reorder it; other shells retain fail-open
-startup behavior. The TUI plugin reactively ensures and releases claims as root
+startup behavior. The zsh adapter restores the user's `ZDOTDIR` before sourcing
+`.zshenv` and `.zshrc`, follows directory changes made by those files, and never
+uses its private wrapper directory as the user startup directory. The TUI plugin reactively ensures and releases claims as root
 selection switches or forks; the server
 plugin resolves a current claim before lifecycle ensure/report. Missing,
 expired, conflicting, run-changed, or generation-changed claims fail closed
@@ -1675,8 +1677,12 @@ state into `blocked` or `done`, or from `working` into `idle`, queues one
 asynchronous delivery request after persistence and event publication locks are
 released. The `working` to `idle` signal represents a completed unit of work but
 does not create durable completed attention or make the Agent terminal. Enabled
-desktop delivery invokes `notify-send`; enabled sound delivery invokes
-`canberra-gtk-play` with a configured freedesktop event ID. Same-state evidence
+desktop delivery on Linux invokes `notify-send`; enabled sound delivery invokes
+`canberra-gtk-play` with a configured freedesktop event ID. macOS uses
+`/usr/bin/osascript` for desktop notifications and `/usr/bin/afplay` with the
+built-in Glass/Pop sounds. `doctor` checks the active platform's executables and
+requires a plausible D-Bus context only on Linux; these checks do not verify
+notification permissions or actual delivery. Same-state evidence
 or confidence revisions do not notify, and restored state is not replayed. Both
 channels share one worker and a bounded, non-blocking queue. Delivery is
 at-most-once and fail-open: queue saturation, a missing command, desktop-bus or
