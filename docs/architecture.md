@@ -775,6 +775,9 @@ clone the bounded shadow screen under the per-shell terminal lock, then format
 that snapshot after releasing the lock. They traverse physical rows from newest
 to oldest and stop once the requested byte, logical-line, and span bounds are
 satisfied, so retained history does not extend PTY-writer lock hold time.
+Structured previews preserve complete newer logical lines; when the newest line
+alone exceeds its byte or span budget, they return only its newest UTF-8-safe
+styled suffix. A zero byte, line, or span budget returns an empty preview.
 
 DEC private modes 1004 (focus reporting) and 2031 (color-scheme reporting) are
 tracked across split or combined output sequences and restored after attachment,
