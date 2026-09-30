@@ -33,6 +33,8 @@ jobs:
         run: cargo +stable test --locked --test native_backend --no-run
       - name: Test descriptor transfer
         run: cargo +stable test --locked --lib fd_transfer -- --test-threads=1
+      - name: Test notification diagnostics
+        run: cargo +stable test --locked --bin boomux notification_doctor -- --test-threads=1
       - name: Test native process identity
         run: cargo +stable test --locked --lib platform::macos::tests -- --test-threads=1 --nocapture
       - name: Test native lifecycle and recovery
