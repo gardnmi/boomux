@@ -27,6 +27,8 @@ jobs:
           cache-on-failure: true
       - name: Run native Clippy
         run: cargo +stable clippy --locked -p boomux -p boomux-desktop --all-targets --all-features -- -D warnings
+      - name: Test zsh startup
+        run: cargo +stable test --locked --lib zsh_startup -- --test-threads=1
       - name: Compile native lifecycle tests
         run: cargo +stable test --locked --test native_backend --no-run
       - name: Test descriptor transfer

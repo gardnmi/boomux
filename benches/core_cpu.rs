@@ -1,8 +1,8 @@
 use std::hint::black_box;
 
 use boomux::benchmark_support::{
-    EventAppendFixture, EventFixture, RuntimeEventFixture, SessionFixture, TerminalFixture,
-    terminal_transcript,
+    EventAppendFixture, EventFixture, RuntimeEventFixture, SessionFixture, SessionMetadataFixture,
+    TerminalFixture, terminal_transcript,
 };
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -110,6 +110,30 @@ fn session_benchmarks(criterion: &mut Criterion) {
     sessions.bench_function("catalog_400_shared_32w", |benchmark| {
         benchmark.iter(|| black_box(shared_catalog.project()));
     });
+    for (count, checksum) in [
+        (1, 0),
+        (64, 9_965_295_145_973_937_276),
+        (1_024, 536_563_256_952_929_158),
+    ] {
+        let metadata = SessionMetadataFixture::durable(count);
+        let summary = metadata.clone().apply().summary();
+        assert_eq!(summary.sessions, count / 2);
+        assert_eq!(summary.occurrences, count / 2);
+        assert_eq!(summary.current, count / 2);
+        assert_eq!(summary.checksum, checksum);
+        sessions.throughput(Throughput::Elements(count as u64));
+        sessions.bench_with_input(
+            BenchmarkId::new("metadata", count),
+            &metadata,
+            |benchmark, fixture| {
+                benchmark.iter_batched(
+                    || fixture.clone(),
+                    |fixture| black_box(fixture.apply()),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
     sessions.finish();
 }
 
