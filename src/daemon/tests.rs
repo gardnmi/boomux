@@ -527,11 +527,14 @@ fn common_shell_startup_adapters_reassert_the_scoped_shim_after_user_config() {
 
 #[test]
 fn zsh_startup_preserves_user_directory_and_sources_each_file_once() {
-    let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+    let zsh = ["/bin/zsh", "/usr/bin/zsh"]
         .into_iter()
-        .find(|path| Path::new(path).is_file())
-    else {
-        assert!(!cfg!(target_os = "macos"), "macOS must provide zsh");
+        .find(|path| Path::new(path).is_file());
+    assert!(
+        zsh.is_some() || !cfg!(target_os = "macos"),
+        "macOS must provide zsh"
+    );
+    let Some(zsh) = zsh else {
         eprintln!("skipping zsh startup fixture: zsh is not installed");
         return;
     };
