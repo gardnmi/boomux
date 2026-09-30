@@ -48,6 +48,10 @@ impl InputOverlays {
 }
 
 impl InputTarget {
+    pub fn allows_terminal_paste(self) -> bool {
+        self == Self::Workspace
+    }
+
     pub fn key_context(self, workspace_context: &'static str) -> &'static str {
         match self {
             Self::ResourceDialog => "ResourceDialog",
@@ -61,6 +65,34 @@ impl InputTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_clipboard_actions_never_paste_into_the_terminal() {
+        for target in [
+            InputTarget::ResourceDialog,
+            InputTarget::RemotePicker,
+            InputTarget::ProjectSearch,
+            InputTarget::ConversationSearch,
+            InputTarget::GitSearch,
+            InputTarget::Remotes,
+            InputTarget::SettingsRestart,
+            InputTarget::SettingsInput,
+            InputTarget::Help,
+        ] {
+            assert!(!target.allows_terminal_paste(), "{target:?}");
+        }
+        assert!(InputOverlays::default().target().allows_terminal_paste());
+        let mut overlays = InputOverlays {
+            conversation_search: true,
+            git_search: true,
+            ..Default::default()
+        };
+        assert!(!overlays.target().allows_terminal_paste());
+        overlays.conversation_search = false;
+        assert!(!overlays.target().allows_terminal_paste());
+        overlays.git_search = false;
+        assert!(overlays.target().allows_terminal_paste());
+    }
 
     #[test]
     fn resource_dialog_owns_typing_with_any_underlying_panel() {

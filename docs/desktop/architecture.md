@@ -682,8 +682,11 @@ not sync across Desktop installations or affect Agent lifecycle or harness histo
 The panel caches filtered row indices outside rendering. Recent excludes archived
 entries and sorts pinned entries first, then by latest observed activity; Archived
 is separately searchable. Search matches title and harness. A dedicated keyboard
-recipient prevents search typing from reaching terminals and yields to resource
-dialogs. Open and Resume are explicit row actions; unavailable resume is not invoked.
+recipient prevents search typing and clipboard actions from reaching terminals
+and yields to resource dialogs. Paste actions use the same recipient priority as
+ordinary keys; Git and conversation queries retain the bounded single-line
+search policy, and non-text overlays consume paste without sending PTY input.
+Open and Resume are explicit row actions; unavailable resume is not invoked.
 
 ## Button feedback
 
