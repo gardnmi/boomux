@@ -435,11 +435,7 @@ pub(crate) fn edit() -> Result<(), Box<dyn Error>> {
     )
 }
 
-pub(crate) fn enable_hyprland_workspace_layer() -> Result<PathBuf, Box<dyn Error>> {
-    let paths = ConfigPaths::from_environment()?;
-    enable_hyprland_workspace_layer_with(&paths)
-}
-
+#[cfg(test)]
 fn enable_hyprland_workspace_layer_with(paths: &ConfigPaths) -> Result<PathBuf, Box<dyn Error>> {
     let target = paths.active()?.to_owned();
     edit_with(

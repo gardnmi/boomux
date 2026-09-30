@@ -221,7 +221,7 @@ impl TerminalSnapshot {
         max_lines: usize,
         max_spans: usize,
     ) -> TerminalPreview {
-        if max_lines == 0 {
+        if max_bytes == 0 || max_lines == 0 || max_spans == 0 {
             return TerminalPreview::default();
         }
 
@@ -540,25 +540,55 @@ fn select_preview_line(
 
 fn push_preview_line(
     selected: &mut Vec<TerminalPreviewLine>,
-    line: TerminalPreviewLine,
+    mut line: TerminalPreviewLine,
     bytes: &mut usize,
     spans: &mut usize,
     max_bytes: usize,
     max_lines: usize,
     max_spans: usize,
 ) -> bool {
-    let line_bytes = line.spans.iter().map(|span| span.text.len()).sum::<usize>();
-    let line_spans = line.spans.len();
-    if !selected.is_empty()
-        && (bytes.saturating_add(line_bytes) > max_bytes
-            || spans.saturating_add(line_spans) > max_spans)
-    {
-        return true;
+    let mut line_bytes = line.spans.iter().map(|span| span.text.len()).sum::<usize>();
+    let mut line_spans = line.spans.len();
+    let truncated = bytes.saturating_add(line_bytes) > max_bytes
+        || spans.saturating_add(line_spans) > max_spans;
+    if truncated {
+        if !selected.is_empty() {
+            return true;
+        }
+        // A single wrapped logical line can contain the entire retained
+        // scrollback. Keep its newest UTF-8-safe suffix without bypassing the
+        // request's byte/span bounds. Older lines remain all-or-nothing.
+        let mut remaining = max_bytes;
+        let mut bounded = Vec::new();
+        for mut span in line.spans.into_iter().rev().take(max_spans) {
+            if remaining == 0 {
+                break;
+            }
+            let mut start = span.text.len().saturating_sub(remaining);
+            while !span.text.is_char_boundary(start) {
+                start += 1;
+            }
+            span.text.drain(..start);
+            remaining -= span.text.len();
+            if !span.text.is_empty() {
+                bounded.push(span);
+            }
+            if start != 0 {
+                break;
+            }
+        }
+        line.spans = bounded;
+        line.spans.reverse();
+        line_bytes = line.spans.iter().map(|span| span.text.len()).sum();
+        line_spans = line.spans.len();
+        if line.spans.is_empty() {
+            return true;
+        }
     }
     *bytes = bytes.saturating_add(line_bytes);
     *spans = spans.saturating_add(line_spans);
     selected.push(line);
-    selected.len() >= max_lines
+    truncated || selected.len() >= max_lines
 }
 
 fn prepend_preview_row(current: &mut TerminalPreviewLine, screen: &vt100::Screen, row: u16) {
@@ -1221,6 +1251,71 @@ mod tests {
                 blue: 6
             }
         );
+    }
+
+    #[test]
+    fn preview_bounds_the_newest_wrapped_line_at_utf8_boundaries() {
+        let mut state = TerminalState::new(2, 4);
+        let text = "prefix-αβγδε";
+        state.process(text.as_bytes());
+
+        for max_bytes in 0..=text.len() {
+            let preview = state.preview(max_bytes, 10, 100);
+            let actual = preview
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            let mut start = text.len().saturating_sub(max_bytes);
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            assert_eq!(actual, text[start..], "byte limit {max_bytes}");
+        }
+    }
+
+    #[test]
+    fn preview_bounds_styles_in_one_wrapped_line() {
+        let mut state = TerminalState::new(2, 4);
+        for color in 0..100 {
+            state.process(format!("\x1b[38;5;{color}mx").as_bytes());
+        }
+        let preview = state.preview(1024, 10, 3);
+        let spans = &preview.lines[0].spans;
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>(),
+            "xxx"
+        );
+        assert_eq!(spans[0].style.foreground, TerminalColor::Indexed(97));
+        assert_eq!(spans[2].style.foreground, TerminalColor::Indexed(99));
+        assert!(state.preview(1024, 10, 0).lines.is_empty());
+    }
+
+    #[test]
+    fn preview_does_not_skip_a_truncated_multibyte_suffix_to_fill_its_budget() {
+        let mut state = TerminalState::new(2, 4);
+        state.process("x\r\nαβ".as_bytes());
+        let preview = state.preview(3, 10, 100);
+        assert_eq!(preview.lines.len(), 1);
+        assert_eq!(preview.lines[0].spans[0].text, "β");
+
+        let mut state = TerminalState::new(2, 4);
+        state.process("a\x1b[31mβ".as_bytes());
+        assert!(state.preview(1, 10, 100).lines.is_empty());
+    }
+
+    #[test]
+    fn preview_does_not_return_partial_older_lines() {
+        let mut state = TerminalState::new(2, 4);
+        state.process(b"older-long-line\r\nnew");
+        let preview = state.preview(5, 10, 100);
+        assert_eq!(preview.lines.len(), 1);
+        assert_eq!(preview.lines[0].spans[0].text, "new");
     }
 
     #[test]

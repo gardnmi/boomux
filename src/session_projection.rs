@@ -114,32 +114,80 @@ pub(crate) fn resolve_exact<'a>(
     Ok(session)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SessionMetadataIdentity<'a> {
+    External(&'a str),
+    Agent(Option<&'a str>),
+}
+
+impl<'a> SessionMetadataIdentity<'a> {
+    fn new(external_session_id: Option<&'a str>, agent_id: Option<&'a str>) -> Self {
+        match external_session_id {
+            Some(id) => Self::External(id),
+            None => Self::Agent(agent_id),
+        }
+    }
+}
+
+impl SessionProjection {
+    fn metadata_key(&self) -> (&str, &str, SessionMetadataIdentity<'_>) {
+        (
+            &self.workspace_id,
+            &self.integration,
+            SessionMetadataIdentity::new(
+                self.external_session_id.as_deref(),
+                self.occurrences
+                    .first()
+                    .map(|occurrence| occurrence.agent_id.as_str()),
+            ),
+        )
+    }
+}
+
 pub(crate) fn apply_display_names(
     sessions: &mut [SessionProjection],
     metadata: &[SessionDisplayNameMetadata],
 ) {
+    if sessions.is_empty() || metadata.is_empty() {
+        return;
+    }
+    // Avoid building an index for the common single-override case.
+    if let [record] = metadata {
+        let key = (
+            record.workspace_id.as_str(),
+            record.integration.as_str(),
+            SessionMetadataIdentity::new(
+                record.external_session_id.as_deref(),
+                record.agent_id.as_deref(),
+            ),
+        );
+        for session in sessions {
+            if session.metadata_key() == key {
+                session.user_display_name = Some(record.display_name.clone());
+                session.description = record.display_name.clone();
+            }
+        }
+        return;
+    }
+    // Borrow the bounded metadata for this projection only. The first matching
+    // record remains authoritative, including when duplicate records are supplied.
+    let mut names = BTreeMap::new();
+    for record in metadata {
+        names
+            .entry((
+                record.workspace_id.as_str(),
+                record.integration.as_str(),
+                SessionMetadataIdentity::new(
+                    record.external_session_id.as_deref(),
+                    record.agent_id.as_deref(),
+                ),
+            ))
+            .or_insert(record.display_name.as_str());
+    }
     for session in sessions {
-        let agent_id = session
-            .external_session_id
-            .is_none()
-            .then(|| {
-                session
-                    .occurrences
-                    .first()
-                    .map(|occurrence| occurrence.agent_id.as_str())
-            })
-            .flatten();
-        if let Some(record) = metadata.iter().find(|record| {
-            record.workspace_id == session.workspace_id
-                && record.integration == session.integration
-                && match (&session.external_session_id, &record.external_session_id) {
-                    (Some(session_id), Some(record_id)) => session_id == record_id,
-                    (None, None) => record.agent_id.as_deref() == agent_id,
-                    _ => false,
-                }
-        }) {
-            session.user_display_name = Some(record.display_name.clone());
-            session.description = record.display_name.clone();
+        if let Some(&display_name) = names.get(&session.metadata_key()) {
+            session.user_display_name = Some(display_name.to_owned());
+            session.description = display_name.to_owned();
         }
     }
 }
@@ -148,27 +196,35 @@ pub(crate) fn filter_hidden(
     sessions: &mut Vec<SessionProjection>,
     metadata: &[HiddenSessionMetadata],
 ) {
-    sessions.retain(|session| {
-        let agent_id = session
-            .external_session_id
-            .is_none()
-            .then(|| {
-                session
-                    .occurrences
-                    .first()
-                    .map(|occurrence| occurrence.agent_id.as_str())
-            })
-            .flatten();
-        !metadata.iter().any(|record| {
-            record.workspace_id == session.workspace_id
-                && record.integration == session.integration
-                && match (&session.external_session_id, &record.external_session_id) {
-                    (Some(session_id), Some(record_id)) => session_id == record_id,
-                    (None, None) => record.agent_id.as_deref() == agent_id,
-                    _ => false,
-                }
+    if sessions.is_empty() || metadata.is_empty() {
+        return;
+    }
+    if let [record] = metadata {
+        let key = (
+            record.workspace_id.as_str(),
+            record.integration.as_str(),
+            SessionMetadataIdentity::new(
+                record.external_session_id.as_deref(),
+                record.agent_id.as_deref(),
+            ),
+        );
+        sessions.retain(|session| session.metadata_key() != key);
+        return;
+    }
+    let hidden: BTreeSet<_> = metadata
+        .iter()
+        .map(|record| {
+            (
+                record.workspace_id.as_str(),
+                record.integration.as_str(),
+                SessionMetadataIdentity::new(
+                    record.external_session_id.as_deref(),
+                    record.agent_id.as_deref(),
+                ),
+            )
         })
-    });
+        .collect();
+    sessions.retain(|session| !hidden.contains(&session.metadata_key()));
 }
 
 fn project_workspace(workspace: &WorkspaceSnapshot) -> Vec<SessionProjection> {
@@ -466,6 +522,59 @@ pub mod benchmark_support {
     pub struct SessionFixture {
         workspaces: Vec<WorkspaceSnapshot>,
         catalog: Vec<HostSession>,
+    }
+
+    #[derive(Clone)]
+    pub struct SessionMetadataFixture {
+        sessions: Vec<SessionProjection>,
+        display_names: Vec<SessionDisplayNameMetadata>,
+        hidden: Vec<HiddenSessionMetadata>,
+    }
+
+    impl SessionMetadataFixture {
+        pub fn durable(session_count: usize) -> Self {
+            let mut fixture = SessionFixture::durable(1, session_count, 1);
+            // Exercise both exact external identities and Agent fallback identities.
+            for agent in fixture.workspaces[0].agents.iter_mut().step_by(2) {
+                agent.external_session_id = None;
+            }
+            let sessions = fixture.project().0;
+            let display_names = sessions
+                .iter()
+                .enumerate()
+                .map(|(index, session)| SessionDisplayNameMetadata {
+                    workspace_id: session.workspace_id.clone(),
+                    integration: session.integration.clone(),
+                    external_session_id: session.external_session_id.clone(),
+                    agent_id: session
+                        .external_session_id
+                        .is_none()
+                        .then(|| session.occurrences[0].agent_id.clone()),
+                    display_name: format!("Display {index}"),
+                })
+                .collect::<Vec<_>>();
+            let hidden = display_names
+                .iter()
+                .step_by(2)
+                .map(|record| HiddenSessionMetadata {
+                    workspace_id: record.workspace_id.clone(),
+                    integration: record.integration.clone(),
+                    external_session_id: record.external_session_id.clone(),
+                    agent_id: record.agent_id.clone(),
+                })
+                .collect();
+            Self {
+                sessions,
+                display_names,
+                hidden,
+            }
+        }
+
+        pub fn apply(mut self) -> SessionProjectionResult {
+            apply_display_names(&mut self.sessions, &self.display_names);
+            filter_hidden(&mut self.sessions, &self.hidden);
+            SessionProjectionResult(self.sessions)
+        }
     }
 
     pub struct SessionProjectionResult(Vec<SessionProjection>);
@@ -872,6 +981,118 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn metadata_matching_preserves_scope_fallback_and_first_record() {
+        let template = project_workspaces(&[workspace("workspace", &["agent"])]).remove(0);
+        let mut sessions = Vec::new();
+        for workspace_id in ["workspace", "other"] {
+            for integration in ["opencode", "other"] {
+                for external_id in [Some("identity"), Some(""), None] {
+                    for agent_id in [Some("identity"), Some(""), None] {
+                        let mut session = template.clone();
+                        session.workspace_id = workspace_id.into();
+                        session.integration = integration.into();
+                        session.external_session_id = external_id.map(str::to_owned);
+                        if let Some(agent_id) = agent_id {
+                            session.occurrences[0].agent_id = agent_id.into();
+                        } else {
+                            session.occurrences.clear();
+                        }
+                        sessions.push(session);
+                    }
+                }
+            }
+        }
+        let mut names: Vec<_> = sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| SessionDisplayNameMetadata {
+                workspace_id: session.workspace_id.clone(),
+                integration: session.integration.clone(),
+                external_session_id: session.external_session_id.clone(),
+                agent_id: session
+                    .occurrences
+                    .first()
+                    .map(|occurrence| occurrence.agent_id.clone()),
+                display_name: format!("Name {index}"),
+            })
+            .collect();
+        // Duplicate external keys deliberately carry different Agent IDs/names.
+        // Keep the historical first-match behavior, not the final map insertion.
+        names.reverse();
+        let hidden: Vec<_> = names
+            .iter()
+            .step_by(5)
+            .map(|record| HiddenSessionMetadata {
+                workspace_id: record.workspace_id.clone(),
+                integration: record.integration.clone(),
+                external_session_id: record.external_session_id.clone(),
+                agent_id: record.agent_id.clone(),
+            })
+            .collect();
+
+        let matches = |session: &SessionProjection,
+                       workspace_id: &str,
+                       integration: &str,
+                       external_id: Option<&str>,
+                       agent_id: Option<&str>| {
+            session.workspace_id == workspace_id
+                && session.integration == integration
+                && match (session.external_session_id.as_deref(), external_id) {
+                    (Some(session_id), Some(record_id)) => session_id == record_id,
+                    (None, None) => {
+                        session
+                            .occurrences
+                            .first()
+                            .map(|occurrence| occurrence.agent_id.as_str())
+                            == agent_id
+                    }
+                    _ => false,
+                }
+        };
+        let mut expected = sessions.clone();
+        for session in &mut expected {
+            if let Some(record) = names.iter().find(|record| {
+                matches(
+                    session,
+                    &record.workspace_id,
+                    &record.integration,
+                    record.external_session_id.as_deref(),
+                    record.agent_id.as_deref(),
+                )
+            }) {
+                session.description = record.display_name.clone();
+                session.user_display_name = Some(record.display_name.clone());
+            }
+        }
+        apply_display_names(&mut sessions, &names);
+        assert_eq!(sessions, expected);
+
+        expected.retain(|session| {
+            !hidden.iter().any(|record| {
+                matches(
+                    session,
+                    &record.workspace_id,
+                    &record.integration,
+                    record.external_session_id.as_deref(),
+                    record.agent_id.as_deref(),
+                )
+            })
+        });
+        filter_hidden(&mut sessions, &hidden);
+        assert_eq!(sessions, expected);
+        assert!(!sessions.is_empty());
+
+        // Unrelated and empty metadata must preserve existing overrides/order.
+        for record in &mut names {
+            record.workspace_id = "missing".into();
+        }
+        apply_display_names(&mut sessions, &names);
+        apply_display_names(&mut sessions, &[]);
+        filter_hidden(&mut sessions, &[]);
+        assert_eq!(sessions, expected);
     }
 
     #[test]
