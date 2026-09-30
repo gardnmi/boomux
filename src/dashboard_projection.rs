@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::path::Path;
 
 use boomux::protocol::{
@@ -6,7 +7,6 @@ use boomux::protocol::{
 
 use crate::agent_attention_projection;
 use crate::git;
-use crate::host_session_titles;
 use crate::session_projection::{self, SessionProjection};
 use crate::tui::{
     AgentAuthorityDisplay, AgentDisplayState, AgentSessionRunView, AgentSessionView,
@@ -438,15 +438,7 @@ pub(crate) fn session_views<'a>(
         .collect()
 }
 
-pub(crate) fn enrich_session_titles(
-    workspaces: &mut [WorkspaceView],
-    title_cache: &mut host_session_titles::Cache,
-) {
-    enrich_session_titles_with(workspaces, |integration, directory, external_session_id| {
-        title_cache.title(integration, directory, external_session_id)
-    });
-}
-
+#[cfg(test)]
 pub(crate) fn enrich_session_titles_with<F>(workspaces: &mut [WorkspaceView], mut title: F)
 where
     F: FnMut(&str, &Path, &str) -> Option<String>,
