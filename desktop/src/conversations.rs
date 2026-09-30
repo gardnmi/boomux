@@ -124,6 +124,12 @@ impl Workspace {
         );
     }
 
+    pub(crate) fn paste_conversation_search(&mut self, text: &str) {
+        project_search::append(&mut self.conversations.search, text);
+        self.conversations.visible = 50;
+        self.filter_conversations();
+    }
+
     pub(crate) fn conversation_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let modifiers = event.keystroke.modifiers;
         match event.keystroke.key.as_str() {
