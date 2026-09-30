@@ -326,25 +326,6 @@ pub(crate) fn open_remote_exact_run_placed(
     )
 }
 
-pub(crate) fn open_command(
-    desktop_entry: Option<&str>,
-    cwd: &Path,
-    title: &str,
-    command: &[String],
-) -> Result<(), Box<dyn Error>> {
-    let (program, arguments) =
-        terminal_command_arguments(command).ok_or("terminal command cannot be empty")?;
-    launch(
-        desktop_entry,
-        title,
-        Some(cwd),
-        OsStr::new(program),
-        &arguments,
-        None,
-        false,
-    )
-}
-
 pub(crate) fn open_agent_session(
     desktop_entry: Option<&str>,
     node_id: Option<&str>,
@@ -367,6 +348,7 @@ pub(crate) fn open_agent_session(
     )
 }
 
+#[cfg(test)]
 fn terminal_command_arguments(command: &[String]) -> Option<(&OsStr, Vec<OsString>)> {
     let (program, arguments) = command.split_first()?;
     (!program.is_empty()).then(|| {
