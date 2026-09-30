@@ -3,7 +3,7 @@ pub use crate::daemon::benchmark_support::{
     RuntimeEventFixture, RuntimeEventResult, TransitionResult, TransitionSummary,
 };
 pub use crate::session_projection::benchmark_support::{
-    SessionFixture, SessionProjectionResult, SessionSummary,
+    SessionFixture, SessionMetadataFixture, SessionProjectionResult, SessionSummary,
 };
 pub use crate::terminal_state::benchmark_support::{
     TerminalFixture, TerminalSummary, terminal_transcript,

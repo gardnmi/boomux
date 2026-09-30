@@ -91,6 +91,8 @@ not model waiting, kernel scheduling, or I/O.
 - blocked Node/focus invalidation coalescing;
 - durable and host-catalog Session projection, including shared-directory output
   amplification;
+- display-name and hidden-Session metadata application at 1, 64, and 1,024
+  Sessions, with both external identity and Agent fallback keys;
 - terminal ingestion, structured preview, and reconstruction with full scrollback.
 
 `wire` covers 16-KiB attachment frames and one-MiB JSON control messages.
