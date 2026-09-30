@@ -1,6 +1,6 @@
 use boomux::benchmark_support::{
-    EventAppendFixture, EventFixture, RuntimeEventFixture, SessionFixture, TerminalFixture,
-    terminal_transcript,
+    EventAppendFixture, EventFixture, RuntimeEventFixture, SessionFixture, SessionMetadataFixture,
+    TerminalFixture, terminal_transcript,
 };
 
 #[test]
@@ -89,4 +89,22 @@ fn terminal_fixtures_are_synthetic_bounded_and_repeatable() {
     assert!(!reconstruction.is_empty());
     assert!(reconstruction.len() <= 1024 * 1024);
     assert_eq!(terminal.reconstruction(), reconstruction);
+}
+
+#[test]
+fn session_metadata_fixtures_preserve_cardinality_and_digest() {
+    for (count, checksum) in [
+        (0, 0),
+        (1, 0),
+        (64, 9_965_295_145_973_937_276),
+        (1_024, 536_563_256_952_929_158),
+    ] {
+        let fixture = SessionMetadataFixture::durable(count);
+        let summary = fixture.clone().apply().summary();
+        assert_eq!(summary.sessions, count / 2);
+        assert_eq!(summary.occurrences, count / 2);
+        assert_eq!(summary.current, count / 2);
+        assert_eq!(fixture.apply().summary(), summary);
+        assert_eq!(summary.checksum, checksum);
+    }
 }
