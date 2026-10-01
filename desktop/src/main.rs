@@ -25,6 +25,7 @@ mod theme;
 mod theme_picker;
 mod updates;
 mod web_share;
+mod window_geometry;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12160,9 +12161,15 @@ fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: 
                 "Saved layout belongs to an unavailable or different Node; it was retained.".into(),
             );
             layout_session.writer = None;
-            layout_session.document = layout_state::Document::default();
+            layout_session.document = layout_state::Document {
+                mac_window: layout_session.document.mac_window.take(),
+                ..Default::default()
+            };
         }
     }
+    #[cfg(target_os = "macos")]
+    let bounds = window_geometry::restore(layout_session.document.mac_window.as_ref(), cx);
+    #[cfg(not(target_os = "macos"))]
     let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
     cx.open_window(
         WindowOptions {

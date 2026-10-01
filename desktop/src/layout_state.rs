@@ -50,6 +50,11 @@ pub struct ConversationPreference {
     pub archived: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MacWindow {
+    pub display: String,
+    pub rect: [f32; 4],
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub version: u32,
     pub revision: String,
@@ -62,11 +67,13 @@ pub struct Document {
     pub hidden_remote_workspaces: BTreeMap<String, String>,
     #[serde(default)]
     pub conversations: Vec<ConversationPreference>,
+    #[serde(default)]
+    pub mac_window: Option<MacWindow>,
 }
 impl Default for Document {
     fn default() -> Self {
         Self {
-            version: 3,
+            version: 4,
             revision: String::new(),
             owner: String::new(),
             active: String::new(),
@@ -75,6 +82,7 @@ impl Default for Document {
             workspace_order: Vec::new(),
             hidden_remote_workspaces: BTreeMap::new(),
             conversations: Vec::new(),
+            mac_window: None,
         }
     }
 }
@@ -142,8 +150,13 @@ impl Tree {
 }
 impl Document {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 3 {
+        if self.version != 4 {
             return Err("unsupported layout state version; saved file retained".into());
+        }
+        if self.mac_window.as_ref().is_some_and(|window| {
+            window.display.len() > 128 || !crate::window_geometry::valid(window.rect)
+        }) {
+            return Err("invalid saved window geometry".into());
         }
         if self.arrangements.len() > 256
             || self.minimized.len() > MAX_PANES
@@ -250,6 +263,10 @@ fn read(path: &PathBuf) -> Result<Document, String> {
     if document.version == 2 {
         document.conversations.clear();
         document.version = 3;
+    }
+    if document.version == 3 {
+        document.mac_window = None;
+        document.version = 4;
     }
     document.validate()?;
     Ok(document)
@@ -405,6 +422,38 @@ mod tests {
         path
     }
     #[test]
+    fn window_geometry_migrates_without_changing_linux_arrangements() {
+        let root = temporary();
+        let path = root.join("layout.json");
+        for version in [1, 2, 3] {
+            let mut legacy = serde_json::to_value(fixture()).unwrap();
+            legacy["version"] = version.into();
+            legacy.as_object_mut().unwrap().remove("mac_window");
+            fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            let migrated = read(&path).unwrap();
+            assert_eq!(migrated.version, 4);
+            assert_eq!(migrated.mac_window, None);
+            assert_eq!(migrated.arrangements, fixture().arrangements);
+            assert_eq!(migrated.minimized, fixture().minimized);
+            assert_eq!(migrated.workspace_order, fixture().workspace_order);
+        }
+        let mut document = read(&path).unwrap();
+        document.mac_window = Some(MacWindow {
+            display: "display-id".into(),
+            rect: [-800.0, 25.0, 800.0, 600.0],
+        });
+        let mut store = Store {
+            path: path.clone(),
+            revision: document.revision.clone(),
+        };
+        store.save(document.clone()).unwrap();
+        assert_eq!(read(&path).unwrap().mac_window, document.mac_window);
+        document.mac_window.as_mut().unwrap().rect[2] = -1.0;
+        assert!(document.validate().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn conversation_preferences_migrate_persist_and_validate() {
         let root = temporary();
         let path = root.join("layout.json");
@@ -414,7 +463,7 @@ mod tests {
             legacy.as_object_mut().unwrap().remove("conversations");
             fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
             let migrated = read(&path).unwrap();
-            assert_eq!(migrated.version, 3);
+            assert_eq!(migrated.version, 4);
             assert!(migrated.conversations.is_empty());
             assert_eq!(migrated.arrangements, fixture().arrangements);
         }
@@ -454,7 +503,7 @@ mod tests {
             .remove("hidden_remote_workspaces");
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
         let mut doc = read(&path).unwrap();
-        assert_eq!(doc.version, 3);
+        assert_eq!(doc.version, 4);
         assert!(doc.hidden_remote_workspaces.is_empty());
         assert_eq!(doc.arrangements, fixture().arrangements);
         doc.hidden_remote_workspaces
