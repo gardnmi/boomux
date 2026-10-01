@@ -144,6 +144,27 @@ handler. Future button forwarding must preserve exclusive gesture ownership.
 
 ### Input And Layout Mode
 
+The macOS menu bar and Command edit shortcuts share one recipient-aware action
+route. Clipboard work stays addressed to its original focus/pane/attachment, with
+nonblocking worker submission, a 4 MiB limit and one outstanding paste per pane.
+The native terminal accessibility subtree formats only a bounded visible screen
+projection on demand; it does not allocate a scrollback copy each frame. See the
+[native interaction boundaries and acceptance plan](native-interactions-validation.md).
+Linux retains its existing interaction paths.
+
+
+On macOS, `native_input.rs` installs one focused GPUI text-input handler for
+terminals and editable overlays. `text_input.rs` owns bounded preedit, UTF-16
+ranges, selection and recipient generations. Preedit never enters the terminal
+or committed field until an explicit native commit. Unchanged plain-key commits keep
+Ghostty's physical-key metadata; native composed commits use the same bounded
+worker queue. Cancellation also discards AppKit's marked text outside the mutable
+Workspace borrow.
+The Option-as-Alt preference affects macOS terminals only. See the
+[native input validation plan](native-input-validation.md) for exact boundaries
+and unexecuted native acceptance cases; macOS remains experimental.
+
+
 Rename and removal dialogs own keyboard input while open, even when the Remotes,
 project, or Git panel remains open behind them. The shared input router gives
 these modals a dedicated `ResourceDialog` key context before panel navigation or
@@ -190,6 +211,15 @@ and history but does not remove project shortcuts or filesystem contents.
 ## Module Map
 
 - `src/input_routing.rs`: keyboard recipient priority and modal key contexts.
+- `src/macos_menus.rs` and `src/clipboard_routing.rs`: native menus and focused
+  edit/clipboard ownership; immutable native menu definitions.
+- `src/macos_accessibility.rs` and `src/terminal_accessibility.rs`: lazy, bounded
+  visible-text projection and pane/focus/selection accessibility semantics.
+- `src/native_input.rs`: macOS GPUI input callbacks, recipient guards, preedit
+  painting and candidate geometry; `src/macos_text_input.rs` discards AppKit
+  composition without retaining a native window pointer.
+- `src/text_input.rs`: portable bounded UTF-16 composition/selection state and
+  native-versus-raw routing decisions.
 - `src/main.rs`: application model, Boomux sidebar projection, input routing,
   pane lifecycle, GPUI elements, terminal cell drawing, and GPU image caching.
 - `src/layout.rs`: binary split tree, normalized rectangles, spatial focus,
@@ -651,7 +681,20 @@ failures up to 30 seconds without per-pane timers. Restoration does not create
 Shell identities or take over another controller. Updates freeze saving and await
 the durable snapshot before launching the replacement; failure permits retry.
 A per-file lock plus revision comparison prevents stale windows from replacing
-newer state. Outer OS window placement remains outside this feature.
+newer state.
+
+Layout document version 4 adds optional macOS normal-window bounds and stable
+Display UUID. Versions 1–3 explicitly migrate with no saved outer window, while
+retaining arrangements, identities, visibility and conversation preferences.
+Unknown/invalid versions remain untouched. macOS restores on the matching display,
+fitting to usable bounds excluding the menu bar and Dock; a missing display falls
+back to the primary display, retaining the size where possible and recentering.
+Fullscreen/maximized frames never replace saved normal bounds. Geometry reuses
+the existing bounded, off-thread atomic writer, debounce and close/quit flush.
+Linux retains its prior compositor-managed initial placement and does not capture
+outer-window geometry. Saved values are logical GPUI pixels; terminal pixel units
+and renderer scale-factor behavior are unchanged. Native monitor removal and
+mixed-DPI transitions still require real-Mac acceptance.
 
 ## Remote Workspace visibility
 

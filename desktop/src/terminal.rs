@@ -184,6 +184,8 @@ pub struct TerminalScreen {
     pub rows: u16,
     pub cols: u16,
     pub cells: Vec<TerminalCell>,
+    #[cfg(any(target_os = "macos", test))]
+    pub input_cursor: Option<(u16, u16)>,
     pub scroll_total: u64,
     pub scroll_offset: u64,
     pub scroll_len: u64,
@@ -229,6 +231,8 @@ struct SharedTerminal {
     status: Mutex<String>,
     revision: AtomicU64,
     bracketed_paste: AtomicBool,
+    #[cfg(any(target_os = "macos", test))]
+    pending_native_paste: AtomicBool,
     mouse_tracking: AtomicBool,
     pending_resize: Mutex<Option<(u16, u16, u16, u16)>>,
     pending_focus: AtomicBool,
@@ -261,6 +265,8 @@ impl SharedTerminal {
             status: Mutex::new("connecting".into()),
             revision: AtomicU64::new(1),
             bracketed_paste: AtomicBool::new(false),
+            #[cfg(any(target_os = "macos", test))]
+            pending_native_paste: AtomicBool::new(false),
             mouse_tracking: AtomicBool::new(false),
             pending_resize: Mutex::new(None),
             pending_focus: AtomicBool::new(false),
@@ -311,9 +317,15 @@ impl SharedTerminal {
     }
 
     fn request_resize(&self, size: (u16, u16, u16, u16)) -> Result<(), String> {
-        let wake = self.pending_resize.lock().unwrap().replace(size).is_none();
-        if wake {
-            self.try_emulator_command(EmulatorCommand::ResizeLatest)?;
+        // Hold the coalesced slot until the wakeup is accepted. On failure,
+        // remove it so a later retry cannot mistake an unwoken slot for work
+        // already queued. A full queue counts as accepted: the busy worker
+        // flushes this slot before processing its next command.
+        let mut pending = self.pending_resize.lock().unwrap();
+        let wake = pending.replace(size).is_none();
+        if wake && let Err(error) = self.try_emulator_command(EmulatorCommand::ResizeLatest) {
+            *pending = None;
+            return Err(error);
         }
         Ok(())
     }
@@ -371,6 +383,72 @@ impl SharedTerminal {
             Err(mpsc::TrySendError::Full(_)) => Err("terminal input queue is full".into()),
             Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
         }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn try_text_commit(&self, text: &str) -> Result<(), String> {
+        let emulator = self.emulator.lock().unwrap();
+        let sender = emulator
+            .as_ref()
+            .ok_or_else(|| "Ghostty terminal core is not running".to_string())?;
+        match sender.try_send(EmulatorCommand::TextCommit(text.into())) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err("terminal input queue is full".into()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn try_native_paste(&self, text: &str) -> Result<(), String> {
+        if text.len() > crate::clipboard_routing::MAX_CLIPBOARD_BYTES {
+            return Err("Paste exceeds the 4 MiB clipboard limit.".into());
+        }
+        if self.pending_native_paste.swap(true, Ordering::AcqRel) {
+            return Err(
+                "A clipboard paste is still pending; wait for the terminal before pasting again."
+                    .into(),
+            );
+        }
+        let result = (|| {
+            let emulator = self.emulator.lock().unwrap();
+            let sender = emulator
+                .as_ref()
+                .ok_or("Ghostty terminal core is not running")?;
+            sender
+                .try_send(EmulatorCommand::NativePaste(text.to_string()))
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => "terminal input queue is full".into(),
+                    mpsc::TrySendError::Disconnected(_) => "Ghostty terminal core stopped".into(),
+                })
+        })();
+        if result.is_err() {
+            self.pending_native_paste.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn try_native_selection(
+        &self,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> Result<async_channel::Receiver<Result<String, String>>, String> {
+        let (reply, receiver) = async_channel::bounded(1);
+        let emulator = self.emulator.lock().unwrap();
+        let sender = emulator
+            .as_ref()
+            .ok_or("Ghostty terminal core is not running")?;
+        sender
+            .try_send(EmulatorCommand::CopySelection {
+                anchor,
+                head,
+                reply,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => "terminal selection queue is full".to_string(),
+                mpsc::TrySendError::Disconnected(_) => "Ghostty terminal core stopped".to_string(),
+            })?;
+        Ok(receiver)
     }
 
     fn set_theme(&self, theme: TerminalTheme) -> Result<(), String> {
@@ -474,6 +552,16 @@ impl SharedTerminal {
             .map_err(|error| format!("Boomux terminal write failed: {error}"))
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    fn send_native_paste(&self, bytes: &[u8]) -> Result<(), String> {
+        // One lock keeps the bracketed-paste envelope contiguous with respect
+        // to any other attachment writer; this method runs on the worker.
+        let mut writer = self.writer.lock().unwrap();
+        let stream = writer.as_mut().ok_or("Boomux terminal is not attached")?;
+        write_native_paste(stream, bytes)
+            .map_err(|error| format!("Boomux terminal write failed: {error}"))
+    }
+
     fn close(&self, status: impl Into<String>) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -501,6 +589,10 @@ enum EmulatorCommand {
         keystroke: Keystroke,
         action: KeyAction,
     },
+    #[cfg(any(target_os = "macos", test))]
+    TextCommit(String),
+    #[cfg(any(target_os = "macos", test))]
+    NativePaste(String),
     Resize {
         rows: u16,
         cols: u16,
@@ -534,7 +626,7 @@ pub struct TerminalSession {
     pub setup_workspace_cleanup: Option<SetupWorkspaceCleanup>,
     pub connect_result: Option<boomux::desktop_connect::ConnectResultReceiver>,
     shared: Arc<SharedTerminal>,
-    last_size: Mutex<(u16, u16)>,
+    last_size: Mutex<TerminalGridSize>,
 }
 
 pub type TerminalGridSize = (u16, u16, u16, u16);
@@ -751,7 +843,7 @@ impl TerminalSession {
             shared,
             // Attachment already established this geometry. Avoid an unchanged
             // first-render resize canceling the reader's temporary redraw size.
-            last_size: Mutex::new((rows, cols)),
+            last_size: Mutex::new((rows, cols, pixel_width, pixel_height)),
         })
     }
 
@@ -806,6 +898,23 @@ impl TerminalSession {
         true
     }
 
+    /// Native committed text is one bounded, ordered input command. It is not
+    /// clipboard paste and must never acquire bracketed-paste markers.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn commit_text(&self, text: &str) -> bool {
+        if text.is_empty()
+            || text.len() > crate::text_input::MAX_COMMIT_BYTES
+            || !valid_key_text(text)
+        {
+            return false;
+        }
+        if let Err(error) = self.shared.try_text_commit(text) {
+            self.shared.set_status(error);
+        }
+        true
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn paste(&self, text: &str) -> bool {
         if text.is_empty() {
             return false;
@@ -817,6 +926,24 @@ impl TerminalSession {
         true
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    pub fn paste_from_native_clipboard(&self, text: &str) -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.shared.try_native_paste(text)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub fn selected_text_from_native_clipboard(
+        &self,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> Result<async_channel::Receiver<Result<String, String>>, String> {
+        self.shared.try_native_selection(anchor, head)
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn selected_text(
         &self,
         anchor: (usize, usize),
@@ -897,16 +1024,17 @@ impl TerminalSession {
 
     pub fn resize(&self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) -> bool {
         let mut last_size = self.last_size.lock().unwrap();
-        if *last_size == (rows, cols) {
+        let size = (rows, cols, pixel_width, pixel_height);
+        if *last_size == size {
             return false;
         }
-        *last_size = (rows, cols);
-        if let Err(error) = self
-            .shared
-            .request_resize((rows, cols, pixel_width, pixel_height))
-        {
+        if let Err(error) = self.shared.request_resize(size) {
             self.shared.set_status(error);
+            return false;
         }
+        // This is the last accepted request, not merely the last attempt.
+        // Pixel-only changes matter to Ghostty and the daemon's PTY winsize.
+        *last_size = size;
         true
     }
 
@@ -915,6 +1043,17 @@ impl TerminalSession {
             self.shared.set_status(error);
         }
     }
+}
+
+/// Split only the transport frames, never re-wrap individual chunks as paste.
+/// The receiver forwards an ordered byte stream, so UTF-8 and escape sequences
+/// may cross a frame boundary without being changed or decoded here.
+#[cfg(any(target_os = "macos", test))]
+fn write_native_paste(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    for chunk in bytes.chunks(boomux::protocol::MAX_ATTACH_FRAME) {
+        AttachFrame::Input(chunk.to_vec()).write_to(writer)?;
+    }
+    Ok(())
 }
 
 fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
@@ -1863,6 +2002,10 @@ impl EmulatorCore {
             EmulatorCommand::Key { .. } => {
                 unreachable!("key events are resolved by the emulator worker")
             }
+            #[cfg(any(target_os = "macos", test))]
+            EmulatorCommand::TextCommit(_) | EmulatorCommand::NativePaste(_) => {
+                unreachable!("text commits are resolved by the emulator worker")
+            }
             EmulatorCommand::Resize {
                 rows,
                 cols,
@@ -2038,6 +2181,11 @@ impl EmulatorCore {
             rows,
             cols,
             cells: output,
+            #[cfg(any(target_os = "macos", test))]
+            input_cursor: snapshot
+                .cursor_viewport()
+                .map_err(|error| format!("could not read input cursor: {error}"))?
+                .map(|cursor| (cursor.x, cursor.y)),
             scroll_total: scrollbar.total,
             scroll_offset: scrollbar.offset,
             scroll_len: scrollbar.len,
@@ -2083,6 +2231,26 @@ fn apply_emulator_command(
                 shared.send(AttachFrame::Input(bytes))?;
             }
             Ok(true)
+        }
+        #[cfg(any(target_os = "macos", test))]
+        EmulatorCommand::TextCommit(text) => {
+            core.terminal.scroll_viewport(ScrollViewport::Bottom);
+            let bytes = encode_committed_text(&core.terminal, &mut core.key, &text)?;
+            if !bytes.is_empty() {
+                shared.send(AttachFrame::Input(bytes))?;
+            }
+            Ok(true)
+        }
+        #[cfg(any(target_os = "macos", test))]
+        EmulatorCommand::NativePaste(text) => {
+            core.terminal.scroll_viewport(ScrollViewport::Bottom);
+            let bytes = encode_paste(
+                &text,
+                core.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false),
+            );
+            let result = shared.send_native_paste(&bytes);
+            shared.pending_native_paste.store(false, Ordering::Release);
+            result.map(|_| true)
         }
         EmulatorCommand::ScrollLatest => {
             shared.pending_scroll_wakeup.store(false, Ordering::Release);
@@ -2485,6 +2653,8 @@ fn blank_screen(rows: u16, cols: u16) -> TerminalScreen {
             };
             usize::from(rows) * usize::from(cols)
         ],
+        #[cfg(any(target_os = "macos", test))]
+        input_cursor: Some((0, 0)),
         scroll_total: u64::from(rows),
         scroll_offset: 0,
         scroll_len: u64::from(rows),
@@ -2719,11 +2889,38 @@ fn encode_key(
     }
 
     encoder.set_options_from_terminal(terminal);
+    // Printable Option text was routed to AppKit before reaching this path.
+    // Alt events here are explicitly terminal shortcuts, including Alt+arrows.
+    #[cfg(target_os = "macos")]
+    encoder.set_macos_option_as_alt(libghostty_vt::key::OptionAsAlt::True);
     let mut output = [0_u8; 128];
     let written = encoder
         .encode(&event, &mut output)
         .map_err(|error| format!("could not encode Ghostty key event: {error}"))?;
     Ok(output[..written].to_vec())
+}
+
+/// No physical key or modifiers can be inferred from an AppKit text commit.
+/// Ghostty deliberately preserves such unidentified text in legacy and Kitty
+/// report-all modes (including associated-text mode).
+#[cfg(any(target_os = "macos", test))]
+fn encode_committed_text(
+    terminal: &GhosttyTerminal<'_, '_>,
+    encoder: &mut KeyEncoder<'_>,
+    text: &str,
+) -> Result<Vec<u8>, String> {
+    let mut event =
+        KeyEvent::new().map_err(|error| format!("could not create Ghostty text event: {error}"))?;
+    event
+        .set_action(KeyAction::Press)
+        .set_key(GhosttyKey::Unidentified)
+        .set_utf8(Some(text));
+    encoder.set_options_from_terminal(terminal);
+    let mut output = Vec::with_capacity(text.len());
+    encoder
+        .encode_to_vec(&event, &mut output)
+        .map_err(|error| format!("could not encode Ghostty text commit: {error}"))?;
+    Ok(output)
 }
 
 fn terminal_key_supported(keystroke: &Keystroke) -> bool {
@@ -2919,7 +3116,7 @@ mod tests {
                 setup_workspace_cleanup: None,
                 connect_result: None,
                 shared,
-                last_size: std::sync::Mutex::new((24, 80)),
+                last_size: std::sync::Mutex::new((24, 80, 800, 480)),
             };
             drop(session);
             assert!(weak.upgrade().is_none());
@@ -2936,7 +3133,7 @@ mod tests {
             setup_workspace_cleanup: None,
             connect_result: None,
             shared: Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480))),
-            last_size: std::sync::Mutex::new((24, 80)),
+            last_size: std::sync::Mutex::new((24, 80, 800, 480)),
         };
         let old = make_session();
         let events = old.update_events();
@@ -4041,7 +4238,7 @@ mod tests {
         terminal_profile,
     };
     use crate::theme::TerminalTheme;
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
 
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
         Keystroke {
@@ -4163,6 +4360,134 @@ mod tests {
     }
 
     #[test]
+    fn native_clipboard_paste_respects_transport_limits_with_one_envelope() {
+        use std::io::Cursor;
+        for length in [
+            boomux::protocol::MAX_ATTACH_FRAME - 6,
+            boomux::protocol::MAX_ATTACH_FRAME,
+            boomux::protocol::MAX_ATTACH_FRAME + 1,
+            crate::clipboard_routing::MAX_CLIPBOARD_BYTES,
+        ] {
+            let text = "x".repeat(length);
+            for bracketed in [false, true] {
+                let encoded = super::encode_paste(&text, bracketed);
+                let mut wire = Vec::new();
+                super::write_native_paste(&mut wire, &encoded).unwrap();
+                let mut reader = Cursor::new(&wire);
+                let mut restored = Vec::new();
+                while reader.position() < wire.len() as u64 {
+                    let boomux::protocol::AttachFrame::Input(bytes) =
+                        boomux::protocol::AttachFrame::read_from(&mut reader).unwrap()
+                    else {
+                        panic!("expected input frame")
+                    };
+                    assert!(bytes.len() <= boomux::protocol::MAX_ATTACH_FRAME);
+                    restored.extend(bytes);
+                }
+                assert_eq!(restored, encoded);
+            }
+        }
+    }
+
+    #[test]
+    fn native_clipboard_queue_is_nonblocking_and_bounds_repeated_pastes() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared.try_native_paste("one").unwrap();
+        assert!(
+            shared
+                .try_native_paste("two")
+                .unwrap_err()
+                .contains("still pending")
+        );
+        assert!(shared.try_native_selection((0, 0), (0, 1)).is_err());
+        assert!(
+            matches!(receiver.try_recv(), Ok(EmulatorCommand::NativePaste(text)) if text == "one")
+        );
+        shared.pending_native_paste.store(false, Ordering::Release);
+        shared.try_native_paste("two").unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Ok(EmulatorCommand::NativePaste(text)) if text == "two")
+        );
+    }
+
+    #[test]
+    fn rejected_native_paste_releases_its_slot() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared
+            .emulator_command(EmulatorCommand::Output(Vec::new()))
+            .unwrap();
+        assert_eq!(
+            shared.try_native_paste("one").unwrap_err(),
+            "terminal input queue is full"
+        );
+        assert!(!shared.pending_native_paste.load(Ordering::Acquire));
+        receiver.try_recv().unwrap();
+        shared.try_native_paste("retry").unwrap();
+    }
+
+    #[test]
+    fn native_text_commits_preserve_ghostty_modes_without_paste_or_phantom_keys() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480)));
+        let mut core = EmulatorCore::new(&shared, 24, 80, 800, 480).unwrap();
+        // Raw terminal Alt configures the same encoder used by later native
+        // Option/IME commits. Its policy must not leak modifiers into text.
+        assert_eq!(
+            encode_key(
+                &core.terminal,
+                &mut core.key,
+                &key(
+                    "a",
+                    Some("a"),
+                    Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                ),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1ba"
+        );
+        assert_eq!(
+            super::encode_committed_text(&core.terminal, &mut core.key, "å").unwrap(),
+            "å".as_bytes()
+        );
+        for mode in ["", "\x1b[?2004h", "\x1b[>1u", "\x1b[>31u", "\x1b[>4;2m"] {
+            core.terminal.vt_write(b"\x1bc");
+            core.terminal.vt_write(mode.as_bytes());
+            assert_eq!(
+                super::encode_committed_text(&core.terminal, &mut core.key, "日本語😀é").unwrap(),
+                "日本語😀é".as_bytes()
+            );
+        }
+        let text = "é".repeat(1024);
+        assert_eq!(
+            super::encode_committed_text(&core.terminal, &mut core.key, &text).unwrap(),
+            text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn native_text_commits_are_one_bounded_ordered_command() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared.try_text_commit("日本語😀").unwrap();
+        assert_eq!(
+            shared.try_text_commit("next").unwrap_err(),
+            "terminal input queue is full"
+        );
+        assert!(
+            matches!(receiver.try_recv(), Ok(EmulatorCommand::TextCommit(text)) if text == "日本語😀")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn terminal_theme_requests_are_bounded_and_keep_the_latest_palette() {
         let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -4271,13 +4596,9 @@ mod tests {
                 KeyAction::Press,
             )
             .unwrap(),
-            // Ghostty defaults to native Option text on macOS; Linux Alt
-            // prefixes the text with Escape.
-            if cfg!(target_os = "macos") {
-                b"a".as_slice()
-            } else {
-                b"\x1ba".as_slice()
-            }
+            // This is terminal-owned Alt input on every platform. Default
+            // macOS Option text takes the separate modifier-free commit path.
+            b"\x1ba"
         );
         assert_eq!(
             encode_key(
@@ -4836,6 +5157,86 @@ mod tests {
             panic!("expected a keyboard enhancement response");
         };
         assert_eq!(bytes, b"\x1b[?0u");
+    }
+
+    fn resize_test_session(shared: Arc<SharedTerminal>) -> super::TerminalSession {
+        super::TerminalSession {
+            shell_id: "resize-test".into(),
+            run_id: None,
+            shell_name: "test".into(),
+            setup_workspace_cleanup: None,
+            connect_result: None,
+            shared,
+            last_size: Mutex::new((3, 10, 100, 60)),
+        }
+    }
+
+    #[test]
+    fn terminal_resize_tracks_every_geometry_field_and_retries_failed_wakeups() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        let session = resize_test_session(shared.clone());
+        assert!(!session.resize(3, 10, 100, 60));
+        assert!(!session.resize(3, 10, 120, 60));
+        assert_eq!(*session.last_size.lock().unwrap(), (3, 10, 100, 60));
+        assert!(shared.pending_resize.lock().unwrap().is_none());
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        for size in [
+            (3, 10, 120, 60),
+            (3, 10, 120, 75),
+            (4, 10, 120, 75),
+            (4, 11, 120, 75),
+        ] {
+            assert!(session.resize(size.0, size.1, size.2, size.3));
+            assert!(!session.resize(size.0, size.1, size.2, size.3));
+            assert_eq!(*shared.pending_resize.lock().unwrap(), Some(size));
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                EmulatorCommand::ResizeLatest
+            ));
+            shared.pending_resize.lock().unwrap().take();
+        }
+        drop(receiver);
+        assert!(!session.resize(3, 10, 100, 60));
+        assert!(shared.pending_resize.lock().unwrap().is_none());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        assert!(session.resize(3, 10, 100, 60));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            EmulatorCommand::ResizeLatest
+        ));
+    }
+
+    #[test]
+    fn terminal_pixel_only_resize_updates_ghostty_metrics_and_pty_frame() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        shared.install_writer(&client).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        let session = resize_test_session(shared.clone());
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        assert!(session.resize(3, 10, 120, 75));
+        assert!(apply_emulator_command(&mut core, &shared, receiver.recv().unwrap()).unwrap());
+        assert_eq!((core.cell_width, core.cell_height), (12, 25));
+        let screen = core.screen().unwrap();
+        assert_eq!((screen.rows, screen.cols), (3, 10));
+        let profile = shared.profile.lock().unwrap();
+        assert_eq!((profile.pixel_width, profile.pixel_height), (120, 75));
+        assert!(matches!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 3,
+                cols: 10,
+                pixel_width: 120,
+                pixel_height: 75
+            }
+        ));
     }
 
     #[test]

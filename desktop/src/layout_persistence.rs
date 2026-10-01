@@ -128,7 +128,17 @@ impl Workspace {
         } else {
             self.layout_document.active.clear();
         }
+        #[cfg(target_os = "macos")]
+        if let Some(geometry) = crate::window_geometry::capture(window, cx) {
+            self.layout_document.mac_window = Some(geometry);
+        }
         cx.observe_window_bounds(window, |this, window, cx| {
+            #[cfg(target_os = "macos")]
+            if !this.layout_frozen
+                && let Some(geometry) = crate::window_geometry::capture(window, cx)
+            {
+                this.layout_document.mac_window = Some(geometry);
+            }
             this.sidebar_viewport_width = f32::from(window.viewport_size().width);
             let canvas = this.panel_size(window);
             if canvas.0 > 0.0 && canvas.1 > 0.0 {

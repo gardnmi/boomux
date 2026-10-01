@@ -7,10 +7,17 @@ mod bundle_update;
 #[cfg(target_os = "macos")]
 #[path = "macos_bundle_update.rs"]
 mod bundle_update;
+#[cfg(any(target_os = "macos", test))]
+mod clipboard_routing;
 mod conversations;
+mod macos_accessibility;
 #[cfg(all(test, not(target_os = "macos")))]
 mod macos_bundle_update;
+#[cfg(any(target_os = "macos", test))]
+mod macos_menus;
 mod project_search;
+#[cfg(any(target_os = "macos", test))]
+mod terminal_accessibility;
 use boomux::generated_names;
 mod daemon_recovery;
 mod git_panel;
@@ -21,6 +28,9 @@ mod layout_persistence;
 mod layout_state;
 #[cfg(any(target_os = "macos", test))]
 mod macos_startup;
+#[cfg(target_os = "macos")]
+mod macos_text_input;
+mod native_input;
 mod nodes;
 mod recovery;
 mod remote;
@@ -29,10 +39,13 @@ mod runtime;
 mod settings;
 mod subprocess;
 mod terminal;
+#[cfg(any(target_os = "macos", test))]
+mod text_input;
 mod theme;
 mod theme_picker;
 mod updates;
 mod web_share;
+mod window_geometry;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1652,6 +1665,11 @@ struct Workspace {
     button_hover_animations: bool,
     layout_overlay_visible: bool,
     copy_on_select: bool,
+    macos_option_as_alt: bool,
+    #[cfg(any(target_os = "macos", test))]
+    native_input: native_input::State,
+    #[cfg(any(target_os = "macos", test))]
+    native_clipboard_requests: clipboard_routing::Requests,
     workspace_pane_mode: WorkspacePaneMode,
     pane_layout_mode: PaneLayoutMode,
     minimized_shells: HashSet<String>,
@@ -1725,6 +1743,8 @@ struct TerminalPane {
     render_images: HashMap<u64, Arc<RenderImage>>,
     render_image_screen: Option<Arc<TerminalScreen>>,
     paint_cache: Option<Arc<TerminalPaintCache>>,
+    #[cfg(any(target_os = "macos", test))]
+    accessibility: std::rc::Rc<std::cell::RefCell<macos_accessibility::Cache>>,
 }
 
 impl TerminalPane {
@@ -1922,6 +1942,11 @@ impl Workspace {
             button_hover_animations: saved.button_hover_animations,
             layout_overlay_visible: saved.layout_overlay_visible,
             copy_on_select: saved.copy_on_select,
+            macos_option_as_alt: saved.macos_option_as_alt,
+            #[cfg(any(target_os = "macos", test))]
+            native_input: native_input::State::default(),
+            #[cfg(any(target_os = "macos", test))]
+            native_clipboard_requests: clipboard_routing::Requests::default(),
             workspace_pane_mode: saved.workspace_pane_mode,
             pane_layout_mode: saved.pane_layout_mode,
             minimized_shells: HashSet::new(),
@@ -2028,6 +2053,11 @@ impl Workspace {
         workspace.watch_updates(cx);
         cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
+                #[cfg(target_os = "macos")]
+                {
+                    this.cancel_native_input();
+                    this.flush_native_discard(window, cx);
+                }
                 this.terminal_selection_release = None;
                 this.selection_autoscroll = None;
                 this.selection_autoscroll_task = None;
@@ -2038,6 +2068,13 @@ impl Workspace {
                 this.layout_leader_entered = false;
                 this.layout_suppressed_keys.clear();
             }
+            cx.notify();
+        })
+        .detach();
+        #[cfg(target_os = "macos")]
+        cx.on_blur(&workspace.focus_handle, window, |this, window, cx| {
+            this.cancel_native_input();
+            this.flush_native_discard(window, cx);
             cx.notify();
         })
         .detach();
@@ -2080,6 +2117,7 @@ impl Workspace {
                 button_hover_animations: self.button_hover_animations,
                 layout_overlay_visible: self.layout_overlay_visible,
                 copy_on_select: self.copy_on_select,
+                macos_option_as_alt: self.macos_option_as_alt,
                 workspace_pane_mode: self.workspace_pane_mode,
                 pane_layout_mode: self.pane_layout_mode,
                 confirm_destructive_actions: self.confirm_destructive_actions,
@@ -4405,7 +4443,11 @@ impl Workspace {
         if visible.contains(&selection.anchor.0) && visible.contains(&selection.head.0) {
             return false;
         }
-        let receiver = match session.selected_text(selection.anchor, selection.head) {
+        #[cfg(target_os = "macos")]
+        let request = session.selected_text_from_native_clipboard(selection.anchor, selection.head);
+        #[cfg(not(target_os = "macos"))]
+        let request = session.selected_text(selection.anchor, selection.head);
+        let receiver = match request {
             Ok(receiver) => receiver,
             Err(error) => {
                 self.terminals.get_mut(&pane_id).unwrap().error = Some(error);
@@ -4461,7 +4503,23 @@ impl Workspace {
         cx.notify();
     }
 
-    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+    fn copy_selection(
+        &mut self,
+        action: &CopySelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = action;
+            self.native_menu_edit(clipboard_routing::EditAction::Copy, window, cx);
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.copy_selection_legacy(action, window, cx);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn copy_selection_legacy(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
         if self.copy_scrollback_selection(self.focused, true, cx) {
             cx.stop_propagation();
             return;
@@ -4480,7 +4538,28 @@ impl Workspace {
         }
     }
 
-    fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
+    fn paste_clipboard(
+        &mut self,
+        action: &PasteClipboard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = action;
+            self.native_menu_edit(clipboard_routing::EditAction::Paste, window, cx);
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.paste_clipboard_legacy(action, window, cx);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn paste_clipboard_legacy(
+        &mut self,
+        _: &PasteClipboard,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let target = self.keyboard_input_target();
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             match target {
@@ -4521,16 +4600,31 @@ impl Workspace {
         }
     }
 
-    fn paste_primary(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn paste_primary(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = event;
+            self.native_menu_edit(clipboard_routing::EditAction::Paste, window, cx);
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.paste_primary_legacy(event, window, cx);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn paste_primary_legacy(&mut self, _: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         #[cfg(target_os = "linux")]
         let item = cx.read_from_primary();
-        #[cfg(target_os = "macos")]
-        let item = cx.read_from_clipboard();
         if let Some(text) = item.and_then(|item| item.text()) {
             self.paste_into_focused(&text, cx);
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn paste_into_focused(&mut self, text: &str, cx: &mut Context<Self>) {
         let target = self.keyboard_input_target();
         if target == InputTarget::SettingsInput
@@ -5147,6 +5241,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(action) = macos_menus::edit_shortcut(&event.keystroke) {
+                self.native_menu_edit(action, window, cx);
+                return;
+            }
+            // Preserve Layout's held-key suppression before handing printable
+            // Option/field input to AppKit.
+            if event.is_held && self.layout_suppressed_keys.contains(&event.keystroke.key) {
+                cx.stop_propagation();
+                return;
+            }
+            let native = self.native_key_down(event, cx);
+            self.flush_native_discard(window, cx);
+            if native {
+                return;
+            }
+        }
         if self.theme_candidate.is_some() {
             self.theme_picker_key_down(event, window, cx);
             cx.stop_propagation();
@@ -5382,6 +5494,12 @@ impl Workspace {
             self.sidebar_key_down(event, window, cx);
             return;
         }
+        #[cfg(target_os = "macos")]
+        let terminal_keystroke = self.native_terminal_key(&event.keystroke, event.is_held);
+        #[cfg(target_os = "macos")]
+        let terminal_keystroke = &terminal_keystroke;
+        #[cfg(not(target_os = "macos"))]
+        let terminal_keystroke = &event.keystroke;
         let Some(pane) = self.terminals.get(&self.focused) else {
             return;
         };
@@ -5427,7 +5545,7 @@ impl Workspace {
         }
         let sent = pane.session.as_ref().is_some_and(|terminal| {
             terminal.send_key(
-                &event.keystroke,
+                terminal_keystroke,
                 if event.is_held {
                     libghostty_vt::key::Action::Repeat
                 } else {
@@ -5454,6 +5572,12 @@ impl Workspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(target_os = "macos")]
+        let terminal_keystroke = self.native_terminal_release(&event.keystroke);
+        #[cfg(target_os = "macos")]
+        let terminal_keystroke = &terminal_keystroke;
+        #[cfg(not(target_os = "macos"))]
+        let terminal_keystroke = &event.keystroke;
         if event.keystroke.key == "space" && self.layout_leader_pressed_at.is_some() {
             let elapsed = self
                 .layout_leader_pressed_at
@@ -5484,7 +5608,7 @@ impl Workspace {
             .get(&pane_id)
             .and_then(|pane| pane.session.as_ref())
             .is_some_and(|terminal| {
-                terminal.send_key(&event.keystroke, libghostty_vt::key::Action::Release)
+                terminal.send_key(terminal_keystroke, libghostty_vt::key::Action::Release)
             });
         if sent {
             cx.stop_propagation();
@@ -7327,11 +7451,15 @@ impl Workspace {
                                 } else {
                                     0xcdd6f4
                                 }))
-                                .child(if self.project_search.is_empty() {
-                                    "Search projects…".to_string()
-                                } else {
-                                    self.project_search.clone()
-                                }),
+                                .child(self.editable_text(
+                                    InputTarget::ProjectSearch,
+                                    if self.project_search.is_empty() {
+                                        "Search projects…".to_string()
+                                    } else {
+                                        self.project_search.clone()
+                                    },
+                                    cx,
+                                )),
                         )
                         .when(!self.project_search.is_empty(), |field| {
                             field.child(
@@ -9019,11 +9147,11 @@ impl Workspace {
                                 .border_color(rgb(0x89b4fa))
                                 .bg(rgb(0x181825))
                                 .text_sm()
-                                .child(if text.is_empty() {
+                                .child(self.editable_text(InputTarget::SettingsInput, if text.is_empty() {
                                     "Type a value…".into()
                                 } else {
                                     text
-                                }),
+                                }, cx)),
                         )
                         .child(div().text_xs().text_color(rgb(0x7f849c)).child(
                             if matches!(field.kind, boomux_settings::Kind::Roots) {
@@ -9565,6 +9693,19 @@ impl Workspace {
                 .child(layout)
                 .child(Self::settings_category("Appearance"))
                 .child(appearance)
+                .when(cfg!(target_os = "macos"), |content| content
+                    .child(Self::settings_category("Keyboard"))
+                    .child(Self::settings_group().child(Self::settings_toggle_row(
+                        "Option as Alt",
+                        "Send Option shortcuts to terminals. Off keeps keyboard-layout characters and dead keys; text fields always use native input.",
+                        Self::settings_switch("macos-option-as-alt", "Option as Alt", self.macos_option_as_alt, true)
+                            .button_chrome().on_click(cx.listener(|this, _, _, cx| {
+                                this.macos_option_as_alt = !this.macos_option_as_alt;
+                                #[cfg(target_os = "macos")]
+                                this.cancel_native_input();
+                                this.save_settings(); cx.notify();
+                            })),
+                    ))))
                 .child(Self::settings_category("Clipboard"))
                 .child(Self::settings_group().child(Self::settings_toggle_row(
                     "Copy on select",
@@ -9706,10 +9847,18 @@ impl Workspace {
                                     .border_1()
                                     .border_color(rgb(0x89b4fa))
                                     .bg(rgb(0x11111b))
-                                    .child(format!(
-                                        "{}{}",
-                                        dialog.value,
-                                        if busy { "" } else { "▏" }
+                                    .child(self.editable_text(
+                                        InputTarget::ResourceDialog,
+                                        format!(
+                                            "{}{}",
+                                            dialog.value,
+                                            if busy || cfg!(target_os = "macos") {
+                                                ""
+                                            } else {
+                                                "▏"
+                                            }
+                                        ),
+                                        cx,
                                     )),
                             )
                         })
@@ -10272,6 +10421,7 @@ impl Workspace {
                         })
                         .collect(),
                 ))
+                .children(self.native_terminal_overlay(pane_id, cx))
                 .child(scrollbar)
                 .when_some(recovery_controls, |element, controls| {
                     element.child(
@@ -10599,6 +10749,9 @@ impl Workspace {
                                 .child(
                                     div()
                                         .id(("rename-pane", id))
+                                        .when(cfg!(target_os = "macos"), |e| {
+                                            e.role(gpui::Role::Button).aria_label("Rename Shell")
+                                        })
                                         .w(px(28.0))
                                         .h(px(26.0))
                                         .flex_none()
@@ -10646,6 +10799,10 @@ impl Workspace {
                                 .child(
                                     div()
                                         .id(("float-pane", id))
+                                        .when(cfg!(target_os = "macos"), |e| {
+                                            e.role(gpui::Role::Button)
+                                                .aria_label("Float or dock pane")
+                                        })
                                         .w(px(28.0))
                                         .h(px(26.0))
                                         .flex()
@@ -10673,6 +10830,10 @@ impl Workspace {
                                 .child(
                                     div()
                                         .id(("maximize-pane", id))
+                                        .when(cfg!(target_os = "macos"), |e| {
+                                            e.role(gpui::Role::Button)
+                                                .aria_label("Maximize or restore pane")
+                                        })
                                         .w(px(28.0))
                                         .h(px(26.0))
                                         .flex()
@@ -10700,6 +10861,9 @@ impl Workspace {
                                 .child(
                                     div()
                                         .id(("minimize-pane", id))
+                                        .when(cfg!(target_os = "macos"), |e| {
+                                            e.role(gpui::Role::Button).aria_label("Minimize pane")
+                                        })
                                         .w(px(28.0))
                                         .h(px(26.0))
                                         .flex()
@@ -10722,6 +10886,9 @@ impl Workspace {
                                 .child(
                                     div()
                                         .id(("close-pane", id))
+                                        .when(cfg!(target_os = "macos"), |e| {
+                                            e.role(gpui::Role::Button).aria_label("Remove Shell…")
+                                        })
                                         .w(px(28.0))
                                         .h(px(26.0))
                                         .flex()
@@ -10754,6 +10921,7 @@ impl Workspace {
             .child(
                 div()
                     .id(("terminal-interaction", id))
+                    .map(|element| self.accessible_terminal(element, id, cx))
                     .relative()
                     .overflow_hidden()
                     .flex_1()
@@ -11024,6 +11192,14 @@ impl Workspace {
         cx: &mut Context<Self>,
         frozen: bool,
     ) -> gpui::AnyElement {
+        #[cfg(target_os = "macos")]
+        {
+            self.native_input.rendering_frozen = frozen;
+            if !frozen {
+                self.sync_native_input();
+                self.flush_native_discard(window, cx);
+            }
+        }
         cx.set_global(buttons::Motion(
             self.motion_speed
                 .duration()
@@ -11475,6 +11651,21 @@ impl Workspace {
 
         div()
             .id("workspace")
+            .when(cfg!(target_os = "macos"), |element| {
+                element
+                    .role(gpui::Role::Group)
+                    .aria_label("Boomux workspace")
+            })
+            .map(|element| {
+                #[cfg(target_os = "macos")]
+                {
+                    self.native_menu_actions(element, cx)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    element
+                }
+            })
             .when_some(self.layout_error.clone(), |element, error| {
                 element.child(
                     div()
@@ -12018,13 +12209,6 @@ fn main() {
     });
     application.run(move |cx: &mut App| {
         #[cfg(target_os = "macos")]
-        cx.bind_keys([
-            KeyBinding::new("cmd-c", CopySelection, Some("Terminal")),
-            KeyBinding::new("cmd-v", PasteClipboard, Some("Terminal")),
-            KeyBinding::new("cmd-v", PasteClipboard, Some("BoomuxSettingsInput")),
-            KeyBinding::new("cmd-q", Quit, None),
-        ]);
-        #[cfg(target_os = "macos")]
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.bind_keys([
             KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("BoomuxSettingsInput")),
@@ -12186,6 +12370,8 @@ fn main() {
             KeyBinding::new("shift-insert", PasteClipboard, Some("SidebarLayout")),
         ]);
 
+        #[cfg(target_os = "macos")]
+        macos_menus::install(cx);
         open_desktop_window(cx, saved, settings_error);
         cx.activate(true);
         if let Some(path) = update_ready {
@@ -12194,7 +12380,7 @@ fn main() {
     });
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 gpui::actions!(macos, [Quit]);
 
 fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: Option<String>) {
@@ -12215,9 +12401,15 @@ fn open_desktop_window(cx: &mut App, saved: settings::Settings, settings_error: 
                 "Saved layout belongs to an unavailable or different Node; it was retained.".into(),
             );
             layout_session.writer = None;
-            layout_session.document = layout_state::Document::default();
+            layout_session.document = layout_state::Document {
+                mac_window: layout_session.document.mac_window.take(),
+                ..Default::default()
+            };
         }
     }
+    #[cfg(target_os = "macos")]
+    let bounds = window_geometry::restore(layout_session.document.mac_window.as_ref(), cx);
+    #[cfg(not(target_os = "macos"))]
     let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
     cx.open_window(
         WindowOptions {
@@ -12935,6 +13127,7 @@ mod pointer_tests {
     #[test]
     fn terminal_selection_drag_uses_only_source_pane_bounds_and_mouse_down_anchor() {
         let screen = TerminalScreen {
+            input_cursor: None,
             background: 0,
             rows: 24,
             cols: 80,
@@ -13017,6 +13210,7 @@ mod pointer_tests {
             })
             .collect();
         TerminalScreen {
+            input_cursor: None,
             background: 0,
             rows: 2,
             cols: 4,

@@ -23,6 +23,7 @@ pub struct Settings {
     pub button_hover_animations: bool,
     pub layout_overlay_visible: bool,
     pub copy_on_select: bool,
+    pub macos_option_as_alt: bool,
     pub workspace_pane_mode: WorkspacePaneMode,
     pub pane_layout_mode: PaneLayoutMode,
     pub confirm_destructive_actions: bool,
@@ -46,6 +47,7 @@ impl Default for Settings {
             button_hover_animations: true,
             layout_overlay_visible: true,
             copy_on_select: true,
+            macos_option_as_alt: false,
             workspace_pane_mode: WorkspacePaneMode::Workspace,
             pane_layout_mode: PaneLayoutMode::default(),
             confirm_destructive_actions: true,
@@ -165,6 +167,9 @@ impl Settings {
                         _ => return Err(invalid()),
                     }
                 }
+                "macos_option_as_alt" => {
+                    s.macos_option_as_alt = value.as_bool().ok_or_else(invalid)?
+                }
                 "copy_on_select" => s.copy_on_select = value.as_bool().ok_or_else(invalid)?,
                 "layout_overlay_visible" => {
                     s.layout_overlay_visible = value.as_bool().ok_or_else(invalid)?
@@ -242,6 +247,10 @@ impl Settings {
         ));
         encoded.push_str(&format!("copy_on_select = {}\n", self.copy_on_select));
         encoded.push_str(&format!(
+            "macos_option_as_alt = {}\n",
+            self.macos_option_as_alt
+        ));
+        encoded.push_str(&format!(
             "color_theme = {}\n",
             serde_json::to_string(&self.color_theme).unwrap()
         ));
@@ -295,6 +304,19 @@ pub fn writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn macos_option_policy_defaults_to_native_text_and_round_trips() {
+        assert!(!Settings::parse("").unwrap().macos_option_as_alt);
+        for enabled in [false, true] {
+            let value = Settings {
+                macos_option_as_alt: enabled,
+                ..Settings::default()
+            };
+            assert_eq!(Settings::parse(&value.encode()).unwrap(), value);
+        }
+        assert!(Settings::parse("macos_option_as_alt = 'true'").is_err());
+    }
+
     #[test]
     fn sidebar_git_tab_defaults_and_round_trips() {
         assert!(!Settings::parse("").unwrap().sidebar_git_tab);
