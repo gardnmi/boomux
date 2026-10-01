@@ -44,6 +44,20 @@ new-Workspace creation retain their existing paths. Reattachment
 to a running Shell retains the exact run already validated by attach, without a
 second owner lookup. Newly started/restarted Shells still resolve their new run.
 
+### macOS Launch Environment
+
+`desktop/src/macos_startup.rs` owns the bundled Finder/Dock bootstrap. The shell
+launcher executes Desktop in a bootstrap mode; it resolves missing account
+SHELL/HOME through a bounded helper, probes only the login shell's exported PATH,
+starts the exact bundled CLI with a deadline, and execs the GUI with exact
+forwarded arguments. All subprocess work precedes GPUI initialization in that
+separate invocation. No process-global environment mutation is needed. Startup
+output is bounded in memory and never persisted; only static warning codes reach
+the GUI. The warning overlay can be dismissed and daemon recovery uses the
+existing background retry owner. The Linux launcher and backend shell-selection
+contract are unchanged. See the [Mac startup contract](../platforms/macos-testing.md#finder-dock-and-shell-startup)
+for precedence, deadlines, and existing-daemon behavior.
+
 ### Attachment Recovery And Diagnostics
 
 A protocol `Detached` frame does not identify why the attachment ended. Desktop

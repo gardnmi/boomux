@@ -952,9 +952,13 @@ pub fn recover_daemon(recovery: &mut crate::daemon_recovery::Recovery) -> Result
         },
         || {
             use std::process::Stdio;
-            // Invoke the CLI from the launcher's PATH, not the Desktop executable.
+            // Use the exact bundled CLI on macOS, and the launcher PATH on Linux.
             // Its daemon lock handles concurrent CLI/Desktop startup safely.
-            let status = crate::subprocess::command(10, "boomux")
+            #[cfg(target_os = "macos")]
+            let program = crate::macos_startup::cli_program();
+            #[cfg(not(target_os = "macos"))]
+            let program = std::ffi::OsString::from("boomux");
+            let status = crate::subprocess::command(10, program)
                 .args(["daemon", "start"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
