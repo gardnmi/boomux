@@ -1,4 +1,4 @@
-"""Verify the release ZIP's embedded source, platform, and app version."""
+"""Verify ZIP provenance, platform and version; this is not signature validation."""
 import json
 from pathlib import PurePosixPath
 import plistlib
@@ -22,9 +22,14 @@ def verify(tag, sha, archive):
                 raise ValueError('invalid Mac metadata entry')
             return bundle.read(entry)
         metadata = json.loads(read('build.json'))
-        if metadata != {'source': sha, 'version': tag.removeprefix('v'),
-                        'target': 'aarch64-apple-darwin',
-                        'distribution': 'testing-preview', 'notarized': False}:
+        distribution = metadata.get('distribution')
+        notarized = metadata.get('notarized')
+        if (distribution not in ('testing-preview', 'developer-id')
+                or type(notarized) is not bool
+                or notarized != (distribution == 'developer-id')
+                or metadata != {'source': sha, 'version': tag.removeprefix('v'),
+                                'target': 'aarch64-apple-darwin',
+                                'distribution': distribution, 'notarized': notarized}):
             raise ValueError('Mac metadata differs from the release source or version')
         info = plistlib.loads(read('Boomux.app/Contents/Info.plist'))
         if (info.get('CFBundleShortVersionString') != metadata['version']
