@@ -130,6 +130,15 @@ handler. Future button forwarding must preserve exclusive gesture ownership.
 
 ### Input And Layout Mode
 
+The macOS menu bar and Command edit shortcuts share one recipient-aware action
+route. Clipboard work stays addressed to its original focus/pane/attachment, with
+nonblocking worker submission, a 4 MiB limit and one outstanding paste per pane.
+The native terminal accessibility subtree formats only a bounded visible screen
+projection on demand; it does not allocate a scrollback copy each frame. See the
+[native interaction boundaries and acceptance plan](native-interactions-validation.md).
+Linux retains its existing interaction paths.
+
+
 On macOS, `native_input.rs` installs one focused GPUI text-input handler for
 terminals and editable overlays. `text_input.rs` owns bounded preedit, UTF-16
 ranges, selection and recipient generations. Preedit never enters the terminal
@@ -188,6 +197,10 @@ and history but does not remove project shortcuts or filesystem contents.
 ## Module Map
 
 - `src/input_routing.rs`: keyboard recipient priority and modal key contexts.
+- `src/macos_menus.rs` and `src/clipboard_routing.rs`: native menus and focused
+  edit/clipboard ownership; immutable native menu definitions.
+- `src/macos_accessibility.rs` and `src/terminal_accessibility.rs`: lazy, bounded
+  visible-text projection and pane/focus/selection accessibility semantics.
 - `src/native_input.rs`: macOS GPUI input callbacks, recipient guards, preedit
   painting and candidate geometry; `src/macos_text_input.rs` discards AppKit
   composition without retaining a native window pointer.

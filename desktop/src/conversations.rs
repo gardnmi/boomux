@@ -136,6 +136,7 @@ impl Workspace {
         self.filter_conversations();
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn paste_conversation_search(&mut self, text: &str) {
         project_search::append(&mut self.conversations.search, text);
         self.conversations.visible = 50;
