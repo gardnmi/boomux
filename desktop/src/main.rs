@@ -11608,7 +11608,7 @@ impl Workspace {
             .map(|element| {
                 #[cfg(target_os = "macos")]
                 {
-                    return self.native_menu_actions(element, cx);
+                    self.native_menu_actions(element, cx)
                 }
                 #[cfg(not(target_os = "macos"))]
                 {

@@ -10,7 +10,7 @@ impl Workspace {
     ) -> Stateful<Div> {
         #[cfg(target_os = "macos")]
         {
-            return self.decorate_accessible_terminal(element, id, cx);
+            self.decorate_accessible_terminal(element, id, cx)
         }
         #[cfg(not(target_os = "macos"))]
         {

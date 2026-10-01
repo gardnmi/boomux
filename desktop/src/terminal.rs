@@ -4422,6 +4422,29 @@ mod tests {
     fn native_text_commits_preserve_ghostty_modes_without_paste_or_phantom_keys() {
         let shared = Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480)));
         let mut core = EmulatorCore::new(&shared, 24, 80, 800, 480).unwrap();
+        // Raw terminal Alt configures the same encoder used by later native
+        // Option/IME commits. Its policy must not leak modifiers into text.
+        assert_eq!(
+            encode_key(
+                &core.terminal,
+                &mut core.key,
+                &key(
+                    "a",
+                    Some("a"),
+                    Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                ),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1ba"
+        );
+        assert_eq!(
+            super::encode_committed_text(&core.terminal, &mut core.key, "å").unwrap(),
+            "å".as_bytes()
+        );
         for mode in ["", "\x1b[?2004h", "\x1b[>1u", "\x1b[>31u", "\x1b[>4;2m"] {
             core.terminal.vt_write(b"\x1bc");
             core.terminal.vt_write(mode.as_bytes());
@@ -4562,13 +4585,9 @@ mod tests {
                 KeyAction::Press,
             )
             .unwrap(),
-            // Ghostty defaults to native Option text on macOS; Linux Alt
-            // prefixes the text with Escape.
-            if cfg!(target_os = "macos") {
-                b"a".as_slice()
-            } else {
-                b"\x1ba".as_slice()
-            }
+            // This is terminal-owned Alt input on every platform. Default
+            // macOS Option text takes the separate modifier-free commit path.
+            b"\x1ba"
         );
         assert_eq!(
             encode_key(
