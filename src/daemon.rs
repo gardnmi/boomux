@@ -1968,6 +1968,8 @@ struct ConnectionPermit {
 
 impl ConnectionAdmission {
     fn admit(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        // Rust 1.99 renamed this API. Keep earlier stable toolchains working.
+        #[allow(deprecated)]
         self.management
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_CONNECTION_HANDLERS).then_some(count + 1)
@@ -1985,6 +1987,8 @@ impl ConnectionPermit {
         if self.attachment {
             return true;
         }
+        // Rust 1.99 renamed this API. Keep earlier stable toolchains working.
+        #[allow(deprecated)]
         if self
             .admission
             .attachments
@@ -16520,6 +16524,8 @@ impl ShellRuntimeManager {
                                 break;
                             };
                             terminal.process(bytes);
+                            // Keep this atomic operation compatible with pre-1.99 stable.
+                            #[allow(deprecated)]
                             let Ok(previous_revision) = reader_run.output_revision.fetch_update(
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
