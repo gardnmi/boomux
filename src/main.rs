@@ -11931,7 +11931,8 @@ fn doctor(terminal_override: Option<&str>) -> Result<(), Box<dyn Error>> {
             None
         }
     };
-    for command in ["git"] {
+    {
+        let command = "git";
         match Command::new(command).arg("--version").output() {
             Ok(output) if output.status.success() => {
                 println!(
