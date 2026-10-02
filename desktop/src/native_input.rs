@@ -335,30 +335,18 @@ mod native {
                 }
             }
             if !owner.terminal() {
-                if mods.platform && matches!(key.key.as_str(), "c" | "x") {
-                    let buffer = &self.native_input.session.buffer;
-                    if !buffer.selection.is_empty() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(
-                            buffer.text[buffer.selection.clone()].into(),
-                        ));
-                        if key.key == "x" {
-                            self.native_input
-                                .session
-                                .buffer
-                                .delete(false, owner.limits());
-                            self.publish_native_text(cx);
-                        }
+                if mods.platform {
+                    let action = match key.key.as_str() {
+                        "a" => Some(crate::clipboard_routing::EditAction::SelectAll),
+                        "c" => Some(crate::clipboard_routing::EditAction::Copy),
+                        "x" => Some(crate::clipboard_routing::EditAction::Cut),
+                        _ => None,
+                    };
+                    if let Some(action) = action {
+                        self.native_field_edit(action, cx);
+                        cx.stop_propagation();
+                        return true;
                     }
-                    cx.stop_propagation();
-                    return true;
-                }
-                if mods.platform && key.key == "a" {
-                    let buffer = &mut self.native_input.session.buffer;
-                    buffer.selection = 0..buffer.text.len();
-                    buffer.reversed = false;
-                    cx.stop_propagation();
-                    cx.notify();
-                    return true;
                 }
                 if !mods.control && !mods.platform && !mods.alt && !mods.function {
                     match key.key.as_str() {
@@ -425,6 +413,82 @@ mod native {
             self.native_input.terminal_release(source)
         }
 
+        pub(crate) fn native_clipboard_recipient(
+            &self,
+        ) -> Option<crate::clipboard_routing::Recipient> {
+            use crate::clipboard_routing::Recipient;
+            let owner = self.native_owner()?;
+            if self.native_input.session.owner.as_ref() != Some(&owner) {
+                return None;
+            }
+            Some(match owner {
+                Owner::Terminal { pane, attachment } => Recipient::Terminal {
+                    pane,
+                    attachment,
+                    focus: self.native_input.session.generation,
+                },
+                _ => Recipient::Field(self.native_input.session.generation),
+            })
+        }
+
+        pub(crate) fn native_field_selection(&self) -> bool {
+            self.native_clipboard_recipient()
+                .is_some_and(|r| matches!(r, crate::clipboard_routing::Recipient::Field(_)))
+                && !self.native_input.session.buffer.selection.is_empty()
+        }
+
+        pub(crate) fn native_field_edit(
+            &mut self,
+            action: crate::clipboard_routing::EditAction,
+            cx: &mut Context<Self>,
+        ) -> bool {
+            use crate::clipboard_routing::EditAction;
+            self.sync_native_input();
+            let Some(owner) = self
+                .native_input
+                .session
+                .owner
+                .clone()
+                .filter(|o| !o.terminal())
+            else {
+                return false;
+            };
+            match action {
+                EditAction::Copy | EditAction::Cut => {
+                    let buffer = &self.native_input.session.buffer;
+                    if !buffer.selection.is_empty() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            buffer.text[buffer.selection.clone()].into(),
+                        ));
+                        if action == EditAction::Cut {
+                            let marked = buffer.marked.is_some();
+                            let selected = to_utf16(&buffer.text, buffer.selection.clone());
+                            self.native_input.session.buffer.replace(
+                                Some(selected),
+                                "",
+                                None,
+                                false,
+                                owner.limits(),
+                            );
+                            self.publish_native_text(cx);
+                            if marked {
+                                self.native_input.discard_pending = true;
+                                self.native_input.session.reject_commit = true;
+                            }
+                        }
+                    }
+                }
+                EditAction::SelectAll => {
+                    let buffer = &mut self.native_input.session.buffer;
+                    buffer.selection = 0..buffer.text.len();
+                    buffer.reversed = false;
+                    cx.notify();
+                }
+                EditAction::Paste => return false,
+            }
+            true
+        }
+
         pub(crate) fn paste_native_field(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
             self.sync_native_input();
             let Some(owner) = self
@@ -480,6 +544,18 @@ mod native {
             let view = cx.entity();
             let focus = self.focus_handle.clone();
             let terminal = owner.terminal();
+            let accessible_text = text.clone();
+            let accessible_selection = selection.clone();
+            let accessible_reversed = active && session.buffer.reversed;
+            let accessible_label = match &owner {
+                Owner::Rename(_) => "Resource name",
+                Owner::Project => "Search projects",
+                Owner::Git => "Search worktrees",
+                Owner::Conversation => "Search conversations",
+                Owner::Setting(_) => "Setting value",
+                Owner::Terminal { .. } => "Terminal input",
+            };
+            let multiline = matches!(owner, Owner::Setting(_));
             let line_count = text.split('\n').count().clamp(1, 6);
             let element = canvas(
                 move |bounds, window, _| {
@@ -661,6 +737,47 @@ mod native {
                     .into_any_element()
             } else {
                 div()
+                    .id("native-editable-text")
+                    .role(if multiline {
+                        gpui::Role::MultilineTextInput
+                    } else {
+                        gpui::Role::TextInput
+                    })
+                    .aria_label(accessible_label)
+                    .aria_active_descendant()
+                    .a11y_synthetic_children(move |builder| {
+                        let id = builder.synthetic_node_id("value");
+                        let mut node = gpui::accesskit::Node::new(gpui::Role::TextRun);
+                        node.set_value(accessible_text.clone());
+                        node.set_character_lengths(
+                            accessible_text
+                                .chars()
+                                .map(|c| c.len_utf8() as u8)
+                                .collect::<Vec<_>>(),
+                        );
+                        builder.push_child(id, node);
+                        let start = accessible_text[..accessible_selection.start]
+                            .chars()
+                            .count();
+                        let end = accessible_text[..accessible_selection.end].chars().count();
+                        let (anchor, focus) = if accessible_reversed {
+                            (end, start)
+                        } else {
+                            (start, end)
+                        };
+                        builder
+                            .parent_node()
+                            .set_text_selection(gpui::accesskit::TextSelection {
+                                anchor: gpui::accesskit::TextPosition {
+                                    node: id,
+                                    character_index: anchor,
+                                },
+                                focus: gpui::accesskit::TextPosition {
+                                    node: id,
+                                    character_index: focus,
+                                },
+                            });
+                    })
                     .w_full()
                     .h(px(20. * line_count as f32))
                     .overflow_hidden()

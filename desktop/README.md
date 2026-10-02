@@ -42,6 +42,9 @@ characters/dead keys (the default) and terminal Alt shortcuts. Editable fields
 always use native text input. IME support still needs the
 [native acceptance checks](../docs/desktop/native-input-validation.md); the
 experimental warning above continues to apply.
+The Mac menu bar includes Settings, system Edit actions, Hide and Minimize.
+Native clipboard and terminal accessibility behavior still needs the
+[interaction acceptance checks](../docs/desktop/native-interactions-validation.md).
 
 The installer runs without sudo or a local Rust/Zig toolchain. On Linux it adds an
 application-menu entry and command links under `~/.local/bin`, preserving any

@@ -380,6 +380,20 @@ mod tests {
     }
 
     #[test]
+    fn cutting_a_selection_removes_the_copied_span_even_with_marked_text() {
+        let mut buffer = TextBuffer::default();
+        buffer.reset("before ");
+        buffer.replace(None, "仮😀", None, true, Limits::SETTING);
+        buffer.selection = 0..buffer.text.len();
+        let copied = buffer.text[buffer.selection.clone()].to_string();
+        let range = to_utf16(&buffer.text, buffer.selection.clone());
+        buffer.replace(Some(range), "", None, false, Limits::SETTING);
+        assert_eq!(copied, "before 仮😀");
+        assert_eq!(buffer.text, "");
+        assert!(buffer.marked.is_none());
+    }
+
+    #[test]
     fn ordinary_commits_keep_key_identity_but_dead_keys_do_not() {
         assert!(preserves_physical_key(false, false, Some("A"), "A"));
         assert!(!preserves_physical_key(false, false, Some("e"), "é"));

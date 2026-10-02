@@ -231,6 +231,8 @@ struct SharedTerminal {
     status: Mutex<String>,
     revision: AtomicU64,
     bracketed_paste: AtomicBool,
+    #[cfg(any(target_os = "macos", test))]
+    pending_native_paste: AtomicBool,
     mouse_tracking: AtomicBool,
     pending_resize: Mutex<Option<(u16, u16, u16, u16)>>,
     pending_focus: AtomicBool,
@@ -263,6 +265,8 @@ impl SharedTerminal {
             status: Mutex::new("connecting".into()),
             revision: AtomicU64::new(1),
             bracketed_paste: AtomicBool::new(false),
+            #[cfg(any(target_os = "macos", test))]
+            pending_native_paste: AtomicBool::new(false),
             mouse_tracking: AtomicBool::new(false),
             pending_resize: Mutex::new(None),
             pending_focus: AtomicBool::new(false),
@@ -394,6 +398,59 @@ impl SharedTerminal {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    fn try_native_paste(&self, text: &str) -> Result<(), String> {
+        if text.len() > crate::clipboard_routing::MAX_CLIPBOARD_BYTES {
+            return Err("Paste exceeds the 4 MiB clipboard limit.".into());
+        }
+        if self.pending_native_paste.swap(true, Ordering::AcqRel) {
+            return Err(
+                "A clipboard paste is still pending; wait for the terminal before pasting again."
+                    .into(),
+            );
+        }
+        let result = (|| {
+            let emulator = self.emulator.lock().unwrap();
+            let sender = emulator
+                .as_ref()
+                .ok_or("Ghostty terminal core is not running")?;
+            sender
+                .try_send(EmulatorCommand::NativePaste(text.to_string()))
+                .map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => "terminal input queue is full".into(),
+                    mpsc::TrySendError::Disconnected(_) => "Ghostty terminal core stopped".into(),
+                })
+        })();
+        if result.is_err() {
+            self.pending_native_paste.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn try_native_selection(
+        &self,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> Result<async_channel::Receiver<Result<String, String>>, String> {
+        let (reply, receiver) = async_channel::bounded(1);
+        let emulator = self.emulator.lock().unwrap();
+        let sender = emulator
+            .as_ref()
+            .ok_or("Ghostty terminal core is not running")?;
+        sender
+            .try_send(EmulatorCommand::CopySelection {
+                anchor,
+                head,
+                reply,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => "terminal selection queue is full".to_string(),
+                mpsc::TrySendError::Disconnected(_) => "Ghostty terminal core stopped".to_string(),
+            })?;
+        Ok(receiver)
+    }
+
     fn set_theme(&self, theme: TerminalTheme) -> Result<(), String> {
         *self.pending_theme.lock().unwrap() = Some(theme);
         let emulator = self.emulator.lock().unwrap();
@@ -495,6 +552,16 @@ impl SharedTerminal {
             .map_err(|error| format!("Boomux terminal write failed: {error}"))
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    fn send_native_paste(&self, bytes: &[u8]) -> Result<(), String> {
+        // One lock keeps the bracketed-paste envelope contiguous with respect
+        // to any other attachment writer; this method runs on the worker.
+        let mut writer = self.writer.lock().unwrap();
+        let stream = writer.as_mut().ok_or("Boomux terminal is not attached")?;
+        write_native_paste(stream, bytes)
+            .map_err(|error| format!("Boomux terminal write failed: {error}"))
+    }
+
     fn close(&self, status: impl Into<String>) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -524,6 +591,8 @@ enum EmulatorCommand {
     },
     #[cfg(any(target_os = "macos", test))]
     TextCommit(String),
+    #[cfg(any(target_os = "macos", test))]
+    NativePaste(String),
     Resize {
         rows: u16,
         cols: u16,
@@ -845,6 +914,7 @@ impl TerminalSession {
         true
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn paste(&self, text: &str) -> bool {
         if text.is_empty() {
             return false;
@@ -856,6 +926,24 @@ impl TerminalSession {
         true
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    pub fn paste_from_native_clipboard(&self, text: &str) -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.shared.try_native_paste(text)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub fn selected_text_from_native_clipboard(
+        &self,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> Result<async_channel::Receiver<Result<String, String>>, String> {
+        self.shared.try_native_selection(anchor, head)
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn selected_text(
         &self,
         anchor: (usize, usize),
@@ -955,6 +1043,17 @@ impl TerminalSession {
             self.shared.set_status(error);
         }
     }
+}
+
+/// Split only the transport frames, never re-wrap individual chunks as paste.
+/// The receiver forwards an ordered byte stream, so UTF-8 and escape sequences
+/// may cross a frame boundary without being changed or decoded here.
+#[cfg(any(target_os = "macos", test))]
+fn write_native_paste(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    for chunk in bytes.chunks(boomux::protocol::MAX_ATTACH_FRAME) {
+        AttachFrame::Input(chunk.to_vec()).write_to(writer)?;
+    }
+    Ok(())
 }
 
 fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
@@ -1904,7 +2003,7 @@ impl EmulatorCore {
                 unreachable!("key events are resolved by the emulator worker")
             }
             #[cfg(any(target_os = "macos", test))]
-            EmulatorCommand::TextCommit(_) => {
+            EmulatorCommand::TextCommit(_) | EmulatorCommand::NativePaste(_) => {
                 unreachable!("text commits are resolved by the emulator worker")
             }
             EmulatorCommand::Resize {
@@ -2141,6 +2240,17 @@ fn apply_emulator_command(
                 shared.send(AttachFrame::Input(bytes))?;
             }
             Ok(true)
+        }
+        #[cfg(any(target_os = "macos", test))]
+        EmulatorCommand::NativePaste(text) => {
+            core.terminal.scroll_viewport(ScrollViewport::Bottom);
+            let bytes = encode_paste(
+                &text,
+                core.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false),
+            );
+            let result = shared.send_native_paste(&bytes);
+            shared.pending_native_paste.store(false, Ordering::Release);
+            result.map(|_| true)
         }
         EmulatorCommand::ScrollLatest => {
             shared.pending_scroll_wakeup.store(false, Ordering::Release);
@@ -4247,6 +4357,76 @@ mod tests {
             Ok(EmulatorCommand::Output(_))
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_clipboard_paste_respects_transport_limits_with_one_envelope() {
+        use std::io::Cursor;
+        for length in [
+            boomux::protocol::MAX_ATTACH_FRAME - 6,
+            boomux::protocol::MAX_ATTACH_FRAME,
+            boomux::protocol::MAX_ATTACH_FRAME + 1,
+            crate::clipboard_routing::MAX_CLIPBOARD_BYTES,
+        ] {
+            let text = "x".repeat(length);
+            for bracketed in [false, true] {
+                let encoded = super::encode_paste(&text, bracketed);
+                let mut wire = Vec::new();
+                super::write_native_paste(&mut wire, &encoded).unwrap();
+                let mut reader = Cursor::new(&wire);
+                let mut restored = Vec::new();
+                while reader.position() < wire.len() as u64 {
+                    let boomux::protocol::AttachFrame::Input(bytes) =
+                        boomux::protocol::AttachFrame::read_from(&mut reader).unwrap()
+                    else {
+                        panic!("expected input frame")
+                    };
+                    assert!(bytes.len() <= boomux::protocol::MAX_ATTACH_FRAME);
+                    restored.extend(bytes);
+                }
+                assert_eq!(restored, encoded);
+            }
+        }
+    }
+
+    #[test]
+    fn native_clipboard_queue_is_nonblocking_and_bounds_repeated_pastes() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared.try_native_paste("one").unwrap();
+        assert!(
+            shared
+                .try_native_paste("two")
+                .unwrap_err()
+                .contains("still pending")
+        );
+        assert!(shared.try_native_selection((0, 0), (0, 1)).is_err());
+        assert!(
+            matches!(receiver.try_recv(), Ok(EmulatorCommand::NativePaste(text)) if text == "one")
+        );
+        shared.pending_native_paste.store(false, Ordering::Release);
+        shared.try_native_paste("two").unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Ok(EmulatorCommand::NativePaste(text)) if text == "two")
+        );
+    }
+
+    #[test]
+    fn rejected_native_paste_releases_its_slot() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared
+            .emulator_command(EmulatorCommand::Output(Vec::new()))
+            .unwrap();
+        assert_eq!(
+            shared.try_native_paste("one").unwrap_err(),
+            "terminal input queue is full"
+        );
+        assert!(!shared.pending_native_paste.load(Ordering::Acquire));
+        receiver.try_recv().unwrap();
+        shared.try_native_paste("retry").unwrap();
     }
 
     #[test]
