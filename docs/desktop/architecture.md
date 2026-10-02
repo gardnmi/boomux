@@ -651,7 +651,20 @@ failures up to 30 seconds without per-pane timers. Restoration does not create
 Shell identities or take over another controller. Updates freeze saving and await
 the durable snapshot before launching the replacement; failure permits retry.
 A per-file lock plus revision comparison prevents stale windows from replacing
-newer state. Outer OS window placement remains outside this feature.
+newer state.
+
+Layout document version 4 adds optional macOS normal-window bounds and stable
+Display UUID. Versions 1–3 explicitly migrate with no saved outer window, while
+retaining arrangements, identities, visibility and conversation preferences.
+Unknown/invalid versions remain untouched. macOS restores on the matching display,
+fitting to usable bounds excluding the menu bar and Dock; a missing display falls
+back to the primary display, retaining the size where possible and recentering.
+Fullscreen/maximized frames never replace saved normal bounds. Geometry reuses
+the existing bounded, off-thread atomic writer, debounce and close/quit flush.
+Linux retains its prior compositor-managed initial placement and does not capture
+outer-window geometry. Saved values are logical GPUI pixels; terminal pixel units
+and renderer scale-factor behavior are unchanged. Native monitor removal and
+mixed-DPI transitions still require real-Mac acceptance.
 
 ## Remote Workspace visibility
 
