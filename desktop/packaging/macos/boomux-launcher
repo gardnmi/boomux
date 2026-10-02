@@ -1,11 +1,11 @@
 #!/bin/sh
 set -eu
-# Resolve the bundle once; never mix the CLI and GUI from different previews.
-bundle=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-PATH="$bundle/MacOS:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
-export PATH
-# Finder may omit SHELL and start in /. Keep the user's normal home and shell.
-if [ -z "${SHELL:-}" ]; then SHELL=/bin/zsh; export SHELL; fi
-cd -- "$HOME"
-"$bundle/MacOS/boomux" daemon start
-exec "$bundle/MacOS/boomux-desktop" "$@"
+# The Rust bootstrap uses bounded subprocesses before GPUI starts. It always
+# opens the GUI after shell/daemon failures so Finder users can recover.
+bundle=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/.." && pwd -P)
+if [ ! -x "$bundle/MacOS/boomux-desktop" ]; then
+    echo 'Boomux Desktop is missing from the app. Reinstall the complete app.' >&2
+    /usr/bin/osascript -e 'display alert "Boomux could not open" message "Boomux Desktop is missing from the app. Reinstall the complete app and try again." as critical' || :
+    exit 1
+fi
+exec "$bundle/MacOS/boomux-desktop" --macos-launch "$@"

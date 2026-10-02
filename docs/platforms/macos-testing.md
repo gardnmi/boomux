@@ -41,6 +41,39 @@ command comes from a newer CLI. Keep the older app until the explicit restart
 succeeds and the status result's `data.executable` identifies the new CLI. Do not use `daemon stop` unless
 you intend to terminate every managed Shell.
 
+## Finder, Dock, and shell startup
+
+The bundled launcher prepares the environment before opening Desktop:
+
+- An explicitly supplied `SHELL` is retained. If it is empty or missing, the
+  account's configured shell is used; a failed account lookup falls back to
+  `/bin/zsh` with a visible warning. An explicit `HOME` and Boomux/XDG overrides
+  are retained
+- The selected shell runs once as an interactive login shell (`-ilc`), without
+  a terminal, to discover its exported `PATH`. Only `PATH` is imported. Shell
+  aliases, functions, secrets, and other variables are not imported or saved
+- The matching bundled CLI directory is always first. A custom launch `PATH`
+  retains precedence over discovered entries. Finder's standard system-only
+  `PATH` is treated as a fallback so login-profile tools and version managers
+  can be found. Homebrew and system directories are final fallbacks. Empty and
+  relative path entries are ignored
+- Account lookup has a two-second deadline; login-shell discovery has a
+  three-second deadline and a 64 KiB output limit. Noninteractive prompts,
+  failures, or excessive startup output fall back to the launch PATH rather
+  than stopping the app. Shell output is discarded and never logged or saved
+- Daemon startup has a ten-second deadline. A failed or missing bundled CLI
+  still opens Desktop with a dismissible recovery message. Desktop retries in
+  the background, using the exact bundled CLI rather than another installation
+
+If a warning mentions shell startup, fix the shell's startup files and quit and
+reopen Desktop. You can launch from Terminal with explicit `SHELL`, `HOME`, and
+`PATH` values for diagnosis. A compatible daemon that is already running is
+reused; it keeps its existing environment. Applying a new environment to that
+owner requires an explicit daemon restart from the desired environment, as
+shown above. Existing managed ShellRuns are never restarted just to discover
+login tools. Newly attached Shells receive Desktop's resolved startup environment;
+their own interactive startup files can subsequently change it.
+
 ## Manual ZIP testing
 
 Regular releases include `boomux-desktop-aarch64-apple-darwin.zip`. Development

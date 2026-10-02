@@ -14,7 +14,8 @@ jobs:
   display:
     name: Desktop smoke (${{ matrix.backend }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # Slow Ubuntu mirrors must not consume the graphical test's time budget.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +32,7 @@ jobs:
           name: boomux-desktop-linux-x86_64
           path: dist
       - name: Install display and runtime dependencies
+        timeout-minutes: 15
         run: |
           sudo apt-get update
           sudo apt-get install --yes python3 dbus xvfb x11-utils weston qemu-user \

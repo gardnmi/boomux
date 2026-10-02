@@ -44,6 +44,20 @@ new-Workspace creation retain their existing paths. Reattachment
 to a running Shell retains the exact run already validated by attach, without a
 second owner lookup. Newly started/restarted Shells still resolve their new run.
 
+### macOS Launch Environment
+
+`desktop/src/macos_startup.rs` owns the bundled Finder/Dock bootstrap. The shell
+launcher executes Desktop in a bootstrap mode; it resolves missing account
+SHELL/HOME through a bounded helper, probes only the login shell's exported PATH,
+starts the exact bundled CLI with a deadline, and execs the GUI with exact
+forwarded arguments. All subprocess work precedes GPUI initialization in that
+separate invocation. No process-global environment mutation is needed. Startup
+output is bounded in memory and never persisted; only static warning codes reach
+the GUI. The warning overlay can be dismissed and daemon recovery uses the
+existing background retry owner. The Linux launcher and backend shell-selection
+contract are unchanged. See the [Mac startup contract](../platforms/macos-testing.md#finder-dock-and-shell-startup)
+for precedence, deadlines, and existing-daemon behavior.
+
 ### Attachment Recovery And Diagnostics
 
 A protocol `Detached` frame does not identify why the attachment ended. Desktop
@@ -667,7 +681,20 @@ failures up to 30 seconds without per-pane timers. Restoration does not create
 Shell identities or take over another controller. Updates freeze saving and await
 the durable snapshot before launching the replacement; failure permits retry.
 A per-file lock plus revision comparison prevents stale windows from replacing
-newer state. Outer OS window placement remains outside this feature.
+newer state.
+
+Layout document version 4 adds optional macOS normal-window bounds and stable
+Display UUID. Versions 1–3 explicitly migrate with no saved outer window, while
+retaining arrangements, identities, visibility and conversation preferences.
+Unknown/invalid versions remain untouched. macOS restores on the matching display,
+fitting to usable bounds excluding the menu bar and Dock; a missing display falls
+back to the primary display, retaining the size where possible and recentering.
+Fullscreen/maximized frames never replace saved normal bounds. Geometry reuses
+the existing bounded, off-thread atomic writer, debounce and close/quit flush.
+Linux retains its prior compositor-managed initial placement and does not capture
+outer-window geometry. Saved values are logical GPUI pixels; terminal pixel units
+and renderer scale-factor behavior are unchanged. Native monitor removal and
+mixed-DPI transitions still require real-Mac acceptance.
 
 ## Remote Workspace visibility
 
