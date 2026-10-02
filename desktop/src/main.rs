@@ -13,6 +13,8 @@ mod layout;
 mod layout_badge;
 mod layout_persistence;
 mod layout_state;
+#[cfg(any(target_os = "macos", test))]
+mod macos_startup;
 mod nodes;
 mod recovery;
 mod remote;
@@ -1600,6 +1602,7 @@ struct Workspace {
     dismissing_agents: HashSet<String>,
     workspace_order: Vec<String>,
     boomux_error: Option<String>,
+    startup_warning: Option<String>,
     expanded_workspaces: HashSet<String>,
     navigation_region: NavigationRegion,
     sidebar_focus_pointer: Option<(f32, f32)>,
@@ -1860,6 +1863,16 @@ impl Workspace {
             dismissing_agents: HashSet::new(),
             workspace_order,
             boomux_error,
+            startup_warning: {
+                #[cfg(target_os = "macos")]
+                {
+                    macos_startup::warning(std::env::args_os())
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None
+                }
+            },
             expanded_workspaces,
             navigation_region: NavigationRegion::Terminal,
             sidebar_focus_pointer: None,
@@ -11423,6 +11436,31 @@ impl Workspace {
         let theme_dialog = self.theme_picker_overlay(cx);
         let settings_restart = self.settings_restart_overlay(cx);
         let help = self.help_overlay(cx);
+        let startup_warning = self.startup_warning.clone().map(|warning| {
+            div()
+                .absolute()
+                .top(px(12.0))
+                .left(px(12.0))
+                .right(px(12.0))
+                .p_3()
+                .rounded_md()
+                .bg(rgb(0x313244))
+                .text_color(rgb(0xf9e2af))
+                .text_sm()
+                .flex()
+                .items_center()
+                .gap_3()
+                .occlude()
+                .child(div().flex_1().child(warning))
+                .child(
+                    Self::settings_option("dismiss-startup-warning", "Dismiss", false)
+                        .button_chrome()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.startup_warning = None;
+                            cx.notify();
+                        })),
+                )
+        });
 
         div()
             .id("workspace")
@@ -11532,6 +11570,7 @@ impl Workspace {
             .when_some(help, |element, help| element.child(help))
             .when_some(resource_dialog, |element, dialog| element.child(dialog))
             .when_some(theme_dialog, |element, dialog| element.child(dialog))
+            .when_some(startup_warning, |element, warning| element.child(warning))
             .into_any_element()
     }
 }
@@ -11904,6 +11943,8 @@ fn paint_terminal_images(
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    macos_startup::dispatch();
     if subprocess::dispatch() {
         return;
     }

@@ -55,10 +55,23 @@ def main():
             return json.loads(cli("--json", "shell", "inspect", shell_id))["data"]["shell"]
 
         try:
-            app = launch("empty-start")
+            # NSWorkspace uses the same LaunchServices route as Finder/Dock.
+            # Its per-launch environment is private; no launchctl mutation or
+            # global bundle-ID quit can affect another user's app instance.
+            launchservices = subprocess.run([
+                "/usr/bin/swift", str(ROOT / "desktop/scripts/smoke-launchservices.swift"),
+                str(binaries.parent.parent), str(root / "launchservices.ready"),
+                env["HOME"], env["XDG_RUNTIME_DIR"], env["XDG_CONFIG_HOME"],
+                env["XDG_STATE_HOME"],
+            ], env=env, cwd=root, capture_output=True, text=True, timeout=100)
+            (output / "launchservices.log").write_text(
+                launchservices.stdout + launchservices.stderr)
+            if launchservices.returncode:
+                raise RuntimeError("LaunchServices smoke failed; see launchservices.log")
             status = json.loads(cli("--json", "daemon", "status"))["data"]
             assert status["status"] == "running" and status["pid"] is not None, status
             assert status["socket_path"] == str(root / "run/boomux/daemon.sock"), status
+            app = launch("empty-start")
             stop(app)
             workspace = created_id(cli("workspace", "create", "macos-smoke"))
             shell_id = created_id(cli("shell", "create", workspace, "--name", "smoke",
@@ -81,7 +94,7 @@ def main():
             wait_for("post-restart window", lambda: time.monotonic() >= settling, [app], seconds=5)
             subprocess.run(["/usr/sbin/screencapture", "-x", output / "desktop.png"], timeout=10)
             report = dict(status="passed", macos=platform.mac_ver()[0], chip=platform.machine(),
-                          run_id=run, checks=["bundle startup", "native window creation", "PTY output",
+                          run_id=run, checks=["LaunchServices minimal environment", "bundle startup", "native window creation", "PTY output",
                                              "close/reopen preserves ShellRun", "live daemon restart"])
             (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(report), flush=True)

@@ -311,9 +311,15 @@ impl SharedTerminal {
     }
 
     fn request_resize(&self, size: (u16, u16, u16, u16)) -> Result<(), String> {
-        let wake = self.pending_resize.lock().unwrap().replace(size).is_none();
-        if wake {
-            self.try_emulator_command(EmulatorCommand::ResizeLatest)?;
+        // Hold the coalesced slot until the wakeup is accepted. On failure,
+        // remove it so a later retry cannot mistake an unwoken slot for work
+        // already queued. A full queue counts as accepted: the busy worker
+        // flushes this slot before processing its next command.
+        let mut pending = self.pending_resize.lock().unwrap();
+        let wake = pending.replace(size).is_none();
+        if wake && let Err(error) = self.try_emulator_command(EmulatorCommand::ResizeLatest) {
+            *pending = None;
+            return Err(error);
         }
         Ok(())
     }
@@ -534,7 +540,7 @@ pub struct TerminalSession {
     pub setup_workspace_cleanup: Option<SetupWorkspaceCleanup>,
     pub connect_result: Option<boomux::desktop_connect::ConnectResultReceiver>,
     shared: Arc<SharedTerminal>,
-    last_size: Mutex<(u16, u16)>,
+    last_size: Mutex<TerminalGridSize>,
 }
 
 pub type TerminalGridSize = (u16, u16, u16, u16);
@@ -751,7 +757,7 @@ impl TerminalSession {
             shared,
             // Attachment already established this geometry. Avoid an unchanged
             // first-render resize canceling the reader's temporary redraw size.
-            last_size: Mutex::new((rows, cols)),
+            last_size: Mutex::new((rows, cols, pixel_width, pixel_height)),
         })
     }
 
@@ -897,16 +903,17 @@ impl TerminalSession {
 
     pub fn resize(&self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) -> bool {
         let mut last_size = self.last_size.lock().unwrap();
-        if *last_size == (rows, cols) {
+        let size = (rows, cols, pixel_width, pixel_height);
+        if *last_size == size {
             return false;
         }
-        *last_size = (rows, cols);
-        if let Err(error) = self
-            .shared
-            .request_resize((rows, cols, pixel_width, pixel_height))
-        {
+        if let Err(error) = self.shared.request_resize(size) {
             self.shared.set_status(error);
+            return false;
         }
+        // This is the last accepted request, not merely the last attempt.
+        // Pixel-only changes matter to Ghostty and the daemon's PTY winsize.
+        *last_size = size;
         true
     }
 
@@ -952,9 +959,13 @@ pub fn recover_daemon(recovery: &mut crate::daemon_recovery::Recovery) -> Result
         },
         || {
             use std::process::Stdio;
-            // Invoke the CLI from the launcher's PATH, not the Desktop executable.
+            // Use the exact bundled CLI on macOS, and the launcher PATH on Linux.
             // Its daemon lock handles concurrent CLI/Desktop startup safely.
-            let status = crate::subprocess::command(10, "boomux")
+            #[cfg(target_os = "macos")]
+            let program = crate::macos_startup::cli_program();
+            #[cfg(not(target_os = "macos"))]
+            let program = std::ffi::OsString::from("boomux");
+            let status = crate::subprocess::command(10, program)
                 .args(["daemon", "start"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -2915,7 +2926,7 @@ mod tests {
                 setup_workspace_cleanup: None,
                 connect_result: None,
                 shared,
-                last_size: std::sync::Mutex::new((24, 80)),
+                last_size: std::sync::Mutex::new((24, 80, 800, 480)),
             };
             drop(session);
             assert!(weak.upgrade().is_none());
@@ -2932,7 +2943,7 @@ mod tests {
             setup_workspace_cleanup: None,
             connect_result: None,
             shared: Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480))),
-            last_size: std::sync::Mutex::new((24, 80)),
+            last_size: std::sync::Mutex::new((24, 80, 800, 480)),
         };
         let old = make_session();
         let events = old.update_events();
@@ -4037,7 +4048,7 @@ mod tests {
         terminal_profile,
     };
     use crate::theme::TerminalTheme;
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
 
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
         Keystroke {
@@ -4832,6 +4843,86 @@ mod tests {
             panic!("expected a keyboard enhancement response");
         };
         assert_eq!(bytes, b"\x1b[?0u");
+    }
+
+    fn resize_test_session(shared: Arc<SharedTerminal>) -> super::TerminalSession {
+        super::TerminalSession {
+            shell_id: "resize-test".into(),
+            run_id: None,
+            shell_name: "test".into(),
+            setup_workspace_cleanup: None,
+            connect_result: None,
+            shared,
+            last_size: Mutex::new((3, 10, 100, 60)),
+        }
+    }
+
+    #[test]
+    fn terminal_resize_tracks_every_geometry_field_and_retries_failed_wakeups() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        let session = resize_test_session(shared.clone());
+        assert!(!session.resize(3, 10, 100, 60));
+        assert!(!session.resize(3, 10, 120, 60));
+        assert_eq!(*session.last_size.lock().unwrap(), (3, 10, 100, 60));
+        assert!(shared.pending_resize.lock().unwrap().is_none());
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        for size in [
+            (3, 10, 120, 60),
+            (3, 10, 120, 75),
+            (4, 10, 120, 75),
+            (4, 11, 120, 75),
+        ] {
+            assert!(session.resize(size.0, size.1, size.2, size.3));
+            assert!(!session.resize(size.0, size.1, size.2, size.3));
+            assert_eq!(*shared.pending_resize.lock().unwrap(), Some(size));
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                EmulatorCommand::ResizeLatest
+            ));
+            shared.pending_resize.lock().unwrap().take();
+        }
+        drop(receiver);
+        assert!(!session.resize(3, 10, 100, 60));
+        assert!(shared.pending_resize.lock().unwrap().is_none());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        assert!(session.resize(3, 10, 100, 60));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            EmulatorCommand::ResizeLatest
+        ));
+    }
+
+    #[test]
+    fn terminal_pixel_only_resize_updates_ghostty_metrics_and_pty_frame() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        shared.install_writer(&client).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        let session = resize_test_session(shared.clone());
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+        assert!(session.resize(3, 10, 120, 75));
+        assert!(apply_emulator_command(&mut core, &shared, receiver.recv().unwrap()).unwrap());
+        assert_eq!((core.cell_width, core.cell_height), (12, 25));
+        let screen = core.screen().unwrap();
+        assert_eq!((screen.rows, screen.cols), (3, 10));
+        let profile = shared.profile.lock().unwrap();
+        assert_eq!((profile.pixel_width, profile.pixel_height), (120, 75));
+        assert!(matches!(
+            AttachFrame::read_from(&mut daemon).unwrap(),
+            AttachFrame::Resize {
+                rows: 3,
+                cols: 10,
+                pixel_width: 120,
+                pixel_height: 75
+            }
+        ));
     }
 
     #[test]
