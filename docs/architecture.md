@@ -55,6 +55,7 @@ This is the implementation reference. For product usage, see the
 | `src/process_adapter.rs` | Exact-argv child supervision and fail-open process-bound Agent observation |
 | `src/config.rs` | Layered configuration resolution, bounded validation, and transactional active-layer editing |
 | `src/workspace_selection.rs` | Owner-only local CLI Workspace selection, validation, locking, and atomic persistence |
+| `src/git_cleanup.rs` | Explicit bounded owner-local worktree review, size estimation, guarded directory removal, and retained branches |
 | `src/git_work.rs` | Bounded owner-local Git worktree discovery, Shell/Agent associations, disposable status cache, and GitHub PR observations |
 | `src/projects.rs`, `src/git.rs` | Bounded project discovery and asynchronous Git metadata |
 | `src/cli_output.rs` | Stable `boomux.cli/v1` output and error presentation |
@@ -338,6 +339,16 @@ No persistence schema or remote routing changes are required. Older clients keep
 individual attachment startup; new clients select that fallback only after
 negotiating an older owner, never after an ambiguous batch result. See the
 [cold recovery contract](cold-recovery.md) for bounds, errors, and crash behavior.
+
+Protocol 57 adds `git_worktree_cleanup`: explicit repository worktree listing,
+review, and guarded directory removal through local or verified owner host
+services. Removal rechecks filesystem identity, Git state, and managed activity,
+retains branches and Boomux resources, and is never automatically replayed after
+an ambiguous response. The owner serializes cleanup operations and holds its
+mutation gate through removal to exclude managed Shell startup. Disposable
+review/size data does not change persistence or publish lifecycle events. Both
+local and routed requests require protocol 57; older Git overview clients ignore
+the additive optional PR state. See [worktree cleanup](desktop/git-panel.md#clean-up-worktrees).
 
 Protocol 55 adds `workspace_conversations`: `OpenWorkspaceConversation` and its
 routed equivalent take an exact Workspace, recorded Agent, and caller-generated

@@ -122,3 +122,90 @@ Comprehensive checks remain in PR CI.
 The development launcher preserves `GH_CONFIG_DIR` (or points it at the original
 GitHub CLI config directory) before isolating Boomux XDG directories. It does not
 copy or modify GitHub credentials.
+
+## Clean Up Worktrees
+
+Choose **Clean up…** beside Refresh to open a review dialog without changing the
+terminal layout. It scans up to 128 discovered worktrees on their owning machines.
+**Choose repository…** also finds registered worktrees in a repository
+without any remaining managed Shell or Agent association. The picker does not
+add a permanent repository registration.
+
+The compact review groups worktrees into **Ready for cleanup**, **Needs review**,
+and **Protected**, with largest directories first within each group. Ready requires
+clean, inactive work with a confirmed merge and no known ahead commits; its
+**Select all** action selects only that group. Needs review and Protected start
+collapsed. A closed PR or missing upstream alone does not make a worktree Ready.
+Clean unmerged work and work with local changes can be selected under Needs review.
+
+Each row shows branch, repository/machine, the main reason, and estimated size.
+Expand a row for its full path, local changes, ahead/behind counts from local
+upstream refs, ignored entry counts, and associated running or retained Shells. No upstream or an unavailable
+comparison means the unpushed count is unknown. Completion hints include a
+merged/closed PR at the exact current HEAD, a missing local upstream ref, and
+ancestry in the locally detected default branch. These are review hints, not
+Agent completion or automatic selection. Boomux does not fetch.
+
+Select directories, choose **Review removal…**, and confirm **Remove directories**.
+If any selected worktree has local changes, a separate acknowledgment must be
+checked before **Discard changes and remove** becomes available. This permanently
+discards its staged, unstaged, and untracked files; retained branches do not
+recover uncommitted changes. The discard choice applies only to the selected
+dirty worktrees. A clean selection that becomes dirty is refused until rescanned. The confirmation includes the count and approximate
+size. Removal deletes ignored files too, including `.env`, dependencies, and
+build output. **Local branches and their unpushed commits are retained.** Shells,
+panes, Workspace membership, and Agent history are retained. A retained Shell
+whose working directory was removed may need its directory changed before it
+can start again.
+
+Primary, locked, detached/unborn, nested-repository, cross-filesystem,
+submodule-configured, and incompletely inspected worktrees cannot be selected.
+Index entries marked assume-unchanged or skip-worktree also block removal.
+Associated running Shells or active Agent working contexts block removal;
+unavailable running-Shell cwd observations fail closed. Activity covers managed
+Shell launch/current process directories and structured Agent contexts, not all
+external processes or shell descendants. Stop other tools using the directory
+before cleanup.
+
+Immediately before each removal, the owner rechecks registration, canonical
+repository/worktree identity, directory device/inode, branch, HEAD, local work,
+file traversal, and activity. It runs `git worktree remove -- <path>` while
+holding the daemon mutation gate against managed Shell startup. Explicit discard
+adds one `--force` only after revalidation, overriding just the local-changes
+guard. All other protections still apply; locked worktrees are never unlocked or
+double-forced.
+Each result is reported independently. Lost responses and partial-removal errors
+are never automatically retried; scan again before deciding what to do next.
+External Git/filesystem writers are not serialized by Boomux's mutation gate.
+
+Scanning and removal execute off the UI thread, one worktree at a time. **Stop
+after current worktree** (or Escape during work) stops scheduling further work;
+it does not interrupt a removal already admitted. Closing the dialog or changing
+its generation discards late presentation results. No periodic size scan or
+persistent cleanup cache is added. Each owner admits one cleanup operation at a
+time. The directory walk does not follow symlinks, retains at most 64 directory
+iterators and 200,000 inode keys, and stops admitting entries after three seconds.
+Incomplete walks remain blocked. Sizes count allocated blocks once per inode
+within each worktree; shared blocks between worktrees or caches can reduce the
+actual space reclaimed. The main repository's Git directory is excluded.
+
+Protocol 57 adds `ListCleanupWorktrees`, `InspectCleanupWorktree`, and
+`RemoveCleanupWorktree` host services plus `git_worktree_cleanup` and
+`git_worktree_discard_changes`. Removal's optional `discard_changes` defaults to
+false and is omitted on the normal path. Both local and
+routed requests require 57; older owners reject before inspecting or removing.
+Git inspection commands retain one-second/1 MiB limits, PR lookup uses its
+existing three-second limit, and removal is bounded to thirty seconds. Remote
+responses allow sixty seconds and the Desktop client sixty-five seconds, with
+bounded negotiation probes. Removal transport failures are ambiguous outcomes.
+There are no persistence changes or new lifecycle events. Old Git-overview
+clients ignore the additive optional PR state field.
+
+### WebUI parity
+
+The WebUI Git panel exposes **Clean up…** with the same Ready for cleanup,
+Needs review and Protected groups, expandable details and explicit discard
+acknowledgment. Its repository picker accepts an absolute path on the selected
+Node. The browser submits the reviewed target to the gateway, which uses the
+same bounded, non-replaying owner cleanup client as Desktop. Closing panes or
+Shells remains a separate action.

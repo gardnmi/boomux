@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 56;
+pub const PROTOCOL_VERSION: u32 = 57;
 pub const MIN_PROTOCOL_VERSION: u32 = 47;
 pub const MAX_CONTROL_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_ATTACH_FRAME: usize = 1024 * 1024;
@@ -204,6 +204,7 @@ define_protocol_features! {
     WorkspaceConversations => (55, "Workspace conversations", ["protocol_55", "workspace_conversations"]),
     CreateStartedShell => (54, "atomic Shell creation and start", ["protocol_54", "create_started_shell"]),
     RecoverShells => (56, "batched cold Shell recovery", ["protocol_56", "recover_shells"]),
+    GitWorktreeCleanup => (57, "Git worktree cleanup", ["protocol_57", "git_worktree_cleanup", "git_worktree_discard_changes"]),
     RestartExecutable => (52, "restart executable", ["protocol_52", "restart_executable"]),
 }
 
@@ -252,6 +253,17 @@ pub enum HostServiceIntegrationAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostServiceOperation {
+    ListCleanupWorktrees {
+        path: PathBuf,
+    },
+    InspectCleanupWorktree {
+        path: PathBuf,
+    },
+    RemoveCleanupWorktree {
+        expected: crate::git_cleanup::Target,
+        #[serde(default, skip_serializing_if = "is_false")]
+        discard_changes: bool,
+    },
     DiscoverProjects,
     GitOverview {
         #[serde(default)]
@@ -481,6 +493,15 @@ pub struct HostAgentSessionResumePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostServiceResult {
+    CleanupWorktrees {
+        paths: Vec<PathBuf>,
+    },
+    CleanupWorktree {
+        review: crate::git_cleanup::Review,
+    },
+    CleanupRemoved {
+        root: PathBuf,
+    },
     GitOverview {
         overview: crate::git_work::Overview,
     },
@@ -2267,6 +2288,19 @@ impl Request {
             | Self::GuardedRestartShell { .. }
             | Self::GuardedRemoveLauncher { .. } => Some(ProtocolFeature::GuardedNodeRouting),
             Self::HostService {
+                operation:
+                    HostServiceOperation::ListCleanupWorktrees { .. }
+                    | HostServiceOperation::InspectCleanupWorktree { .. }
+                    | HostServiceOperation::RemoveCleanupWorktree { .. },
+            }
+            | Self::RouteNodeHostService {
+                operation:
+                    HostServiceOperation::ListCleanupWorktrees { .. }
+                    | HostServiceOperation::InspectCleanupWorktree { .. }
+                    | HostServiceOperation::RemoveCleanupWorktree { .. },
+                ..
+            } => Some(ProtocolFeature::GitWorktreeCleanup),
+            Self::HostService {
                 operation: HostServiceOperation::GitOverview { .. },
             }
             | Self::RouteNodeHostService {
@@ -2929,9 +2963,81 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_fifty_six_with_forty_seven_floor() {
-        assert_eq!(PROTOCOL_VERSION, 56);
+    fn protocol_version_is_fifty_seven_with_forty_seven_floor() {
+        assert_eq!(PROTOCOL_VERSION, 57);
         assert_eq!(MIN_PROTOCOL_VERSION, 47);
+    }
+
+    #[test]
+    fn cleanup_requires_fifty_seven_locally_and_remotely() {
+        let expected = crate::git_cleanup::Target {
+            root: "/tmp/worktree".into(),
+            common_dir: "/tmp/repo/.git".into(),
+            git_dir: "/tmp/repo/.git/worktrees/worktree".into(),
+            branch: "feature".into(),
+            head: "abc".into(),
+            device: 1,
+            inode: 2,
+        };
+        for operation in [
+            HostServiceOperation::ListCleanupWorktrees {
+                path: "/tmp/repo".into(),
+            },
+            HostServiceOperation::InspectCleanupWorktree {
+                path: "/tmp/worktree".into(),
+            },
+            HostServiceOperation::RemoveCleanupWorktree {
+                expected: expected.clone(),
+                discard_changes: false,
+            },
+            HostServiceOperation::RemoveCleanupWorktree {
+                expected,
+                discard_changes: true,
+            },
+        ] {
+            let json = serde_json::to_value(&operation).unwrap();
+            if let HostServiceOperation::RemoveCleanupWorktree {
+                discard_changes, ..
+            } = &operation
+            {
+                assert_eq!(json.get("discard_changes").is_some(), *discard_changes);
+                assert_eq!(
+                    serde_json::from_value::<HostServiceOperation>(json).unwrap(),
+                    operation
+                );
+            }
+            for request in [
+                Request::HostService {
+                    operation: operation.clone(),
+                },
+                Request::RouteNodeHostService {
+                    node_id: "owner".into(),
+                    operation,
+                },
+            ] {
+                assert_eq!(request.minimum_protocol_version(), 57);
+                assert_eq!(
+                    serde_json::from_slice::<Request>(&serde_json::to_vec(&request).unwrap())
+                        .unwrap(),
+                    request
+                );
+            }
+        }
+        assert!(!ProtocolFeature::GitWorktreeCleanup.is_supported_by(56));
+        for result in [
+            HostServiceResult::CleanupWorktrees {
+                paths: vec!["/tmp/worktree".into()],
+            },
+            HostServiceResult::CleanupRemoved {
+                root: "/tmp/worktree".into(),
+            },
+        ] {
+            assert_eq!(
+                serde_json::from_slice::<HostServiceResult>(&serde_json::to_vec(&result).unwrap())
+                    .unwrap(),
+                result
+            );
+        }
     }
 
     #[test]
@@ -4685,6 +4791,14 @@ mod tests {
             (55, &["protocol_55", "workspace_conversations"][..]),
             (54, &["protocol_54", "create_started_shell"][..]),
             (56, &["protocol_56", "recover_shells"][..]),
+            (
+                57,
+                &[
+                    "protocol_57",
+                    "git_worktree_cleanup",
+                    "git_worktree_discard_changes",
+                ][..],
+            ),
             (52, &["protocol_52", "restart_executable"][..]),
         ];
 

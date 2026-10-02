@@ -35,6 +35,8 @@ pub(crate) struct NodeOverview {
 }
 #[derive(Default)]
 pub(crate) struct Model {
+    pub cleanup: Option<crate::git_cleanup::Model>,
+    pub cleanup_generation: u64,
     pub open: bool,
     pub height: Option<f32>,
     pub resizing: bool,
@@ -291,7 +293,7 @@ impl Workspace {
         cx.notify();
     }
     fn refresh_git_panel(&mut self, refresh: bool, cx: &mut Context<Self>) {
-        if self.git_panel.busy {
+        if self.git_panel.busy || self.git_panel.cleanup.is_some() {
             return;
         }
         self.git_panel.busy = true;
@@ -359,6 +361,11 @@ impl Workspace {
                 )
                 .button_chrome()
                 .on_click(cx.listener(|this, _, _, cx| this.refresh_git_panel(true, cx))),
+            )
+            .child(
+                Self::settings_option("git-cleanup", "Clean up…", false)
+                    .text_xs()
+                    .on_click(cx.listener(|this, _, _, cx| this.open_git_cleanup(cx))),
             )
     }
 

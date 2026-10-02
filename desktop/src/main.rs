@@ -20,6 +20,7 @@ mod project_search;
 mod terminal_accessibility;
 use boomux::generated_names;
 mod daemon_recovery;
+mod git_cleanup;
 mod git_panel;
 mod input_routing;
 mod layout;
@@ -5241,6 +5242,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.git_panel.cleanup.is_some() {
+            self.cleanup_key_down(event, cx);
+            return;
+        }
         #[cfg(target_os = "macos")]
         {
             if let Some(action) = macos_menus::edit_shortcut(&event.keystroke) {
@@ -5572,6 +5577,10 @@ impl Workspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.git_panel.cleanup.is_some() {
+            cx.stop_propagation();
+            return;
+        }
         #[cfg(target_os = "macos")]
         let terminal_keystroke = self.native_terminal_release(&event.keystroke);
         #[cfg(target_os = "macos")]
@@ -11620,6 +11629,7 @@ impl Workspace {
             .into_any_element();
         let sidebar_menu = self.sidebar_menu_overlay(cx);
         let resource_dialog = self.resource_dialog_overlay(cx);
+        let cleanup_dialog = self.git_cleanup_overlay(cx);
         let theme_dialog = self.theme_picker_overlay(cx);
         let settings_restart = self.settings_restart_overlay(cx);
         let help = self.help_overlay(cx);
@@ -11679,7 +11689,9 @@ impl Workspace {
                 )
             })
             .when(!frozen, |element| element.track_focus(&self.focus_handle))
-            .key_context(if self.theme_candidate.is_some() {
+            .key_context(if self.git_panel.cleanup.is_some() {
+                "WorktreeCleanup"
+            } else if self.theme_candidate.is_some() {
                 "ThemePicker"
             } else {
                 self.keyboard_input_target()
@@ -11773,6 +11785,7 @@ impl Workspace {
             .when_some(resource_dialog, |element, dialog| element.child(dialog))
             .when_some(theme_dialog, |element, dialog| element.child(dialog))
             .when_some(startup_warning, |element, warning| element.child(warning))
+            .when_some(cleanup_dialog, |element, dialog| element.child(dialog))
             .into_any_element()
     }
 }

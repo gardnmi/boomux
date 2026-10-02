@@ -70,6 +70,8 @@ pub struct AgentLink {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
     pub error: Option<String>,
     pub checked_at_ms: u64,
     pub summary: String,
@@ -480,7 +482,7 @@ fn empty(root: PathBuf, common_dir: PathBuf) -> Worktree {
         observed_at_ms: 0,
     }
 }
-fn parse_status(bytes: &[u8]) -> Result<(String, String, Status), String> {
+pub(crate) fn parse_status(bytes: &[u8]) -> Result<(String, String, Status), String> {
     let mut status = Status::default();
     let mut branch = None;
     let mut head = String::new();
@@ -566,7 +568,7 @@ fn config(path: &Path, key: &str) -> Option<String> {
         .ok()
         .filter(|s| !s.is_empty())
 }
-fn inspect_pr(path: &Path, branch: &str) -> PullRequest {
+pub(crate) fn inspect_pr(path: &Path, branch: &str) -> PullRequest {
     let mut pr = PullRequest {
         observed_at_ms: now(),
         checked_at_ms: now(),
@@ -691,6 +693,7 @@ fn summarize_pr(mut rows: Vec<serde_json::Value>, head_repo: &GithubRepo) -> Pul
             .as_str()
             .filter(|u| u.starts_with("https://github.com/"))
             .map(str::to_owned);
+        pr.state = row["state"].as_str().map(str::to_owned);
         pr.head = row["headRefOid"].as_str().map(str::to_owned);
     } else {
         pr.summary = if truncated {

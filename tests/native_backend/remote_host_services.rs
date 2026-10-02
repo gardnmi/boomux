@@ -172,6 +172,63 @@ fn registered_node_host_services_use_only_owner_path_config_cwd_and_stored_argv(
         },
         "Git inspection did not execute on the owning Node",
     );
+    // Cleanup must also execute on the owner; local Git intentionally exits 77.
+    let cleanup_repo = owner_projects.join("remote-only");
+    let cleanup_tree = owner_projects.join("cleanup-linked");
+    for args in [
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+        vec![
+            "worktree",
+            "add",
+            "-qb",
+            "cleanup-feature",
+            cleanup_tree.to_str().unwrap(),
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&cleanup_repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert!(
+        matches!(local.client.git_cleanup(Some(&owner_id), HostServiceOperation::ListCleanupWorktrees {
+        path: cleanup_repo.clone(),
+    }).unwrap(), HostServiceResult::CleanupWorktrees { paths } if paths.contains(&cleanup_tree))
+    );
+    let HostServiceResult::CleanupWorktree { review } = local
+        .client
+        .git_cleanup(
+            Some(&owner_id),
+            HostServiceOperation::InspectCleanupWorktree {
+                path: cleanup_tree.clone(),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("missing owner cleanup review")
+    };
+    assert!(review.blockers.is_empty());
+    assert!(
+        matches!(local.client.git_cleanup(Some(&owner_id), HostServiceOperation::RemoveCleanupWorktree { discard_changes: false,
+        expected: review.target,
+    }).unwrap(), HostServiceResult::CleanupRemoved { root } if root == cleanup_tree)
+    );
+    assert!(!cleanup_tree.exists());
+
     let shell_id = session_workspace.shells[0].id.clone();
     let owner_attachment = owner.client.attach(&shell_id, false, profile()).unwrap();
     let run_id = owner.client.get_shell(&shell_id).unwrap().run.unwrap().id;

@@ -769,3 +769,14 @@ window bounds failed starts to exponential backoff (2–30 seconds), with a
 the CLI's existing daemon lock. Normal successful polling adds no probe or task.
 Once the daemon returns, its authoritative snapshot drives ordinary saved-pane
 recovery, preserving the rule against restarting normally finished commands.
+
+## Worktree Cleanup Review
+
+`desktop/src/git_cleanup.rs` owns the Git panel's modal review. One transient
+model retains at most 128 owner-qualified rows, selection, results, and one
+scan/removal sequence. Requests run on the background executor, one at a time;
+generation checks discard results after dismissal/reopening. Stop requests take
+effect between worktrees. The modal owns keyboard input and pauses ordinary Git
+panel polling. It does not change terminal layout or own Git/lifecycle authority.
+Owner host services perform filesystem checks and removal; no local fallback is
+used for remote rows. See [the cleanup contract](git-panel.md#clean-up-worktrees).

@@ -236,6 +236,58 @@ async fn git_overview(State(app): State<App>, Json(request): Json<GitRequest>) -
     .await
 }
 #[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum CleanupAction {
+    List {
+        path: std::path::PathBuf,
+    },
+    Inspect {
+        path: std::path::PathBuf,
+    },
+    Remove {
+        expected: boomux::git_cleanup::Target,
+        #[serde(default)]
+        discard_changes: bool,
+    },
+}
+impl CleanupAction {
+    fn into_operation(self) -> boomux::protocol::HostServiceOperation {
+        use boomux::protocol::HostServiceOperation as Op;
+        match self {
+            Self::List { path } => Op::ListCleanupWorktrees { path },
+            Self::Inspect { path } => Op::InspectCleanupWorktree { path },
+            Self::Remove {
+                expected,
+                discard_changes,
+            } => Op::RemoveCleanupWorktree {
+                expected,
+                discard_changes,
+            },
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupRequest {
+    node_id: String,
+    owner: Option<String>,
+    operation: CleanupAction,
+}
+async fn git_cleanup(State(app): State<App>, Json(request): Json<CleanupRequest>) -> ApiResult {
+    operation(app, move |app| {
+        if request.node_id != app.node_id {
+            return Err("Wrong gateway Node".into());
+        }
+        // Same bounded, version-negotiated, non-replaying client as Desktop.
+        let result = app
+            .client
+            .git_cleanup(request.owner.as_deref(), request.operation.into_operation())
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(result).map_err(|e| e.to_string())
+    })
+    .await
+}
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChangesRequest {
     node_id: String,
@@ -1138,6 +1190,7 @@ async fn asset(State(app): State<App>, uri: Uri) -> Response {
         "/entry.js" => ("poc/webgpu-tiling/entry.js", "text/javascript"),
         "/mobile-agents.js" => ("poc/webgpu-tiling/mobile-agents.js", "text/javascript"),
         "/mobile-agents.css" => ("poc/webgpu-tiling/mobile-agents.css", "text/css"),
+        "/git-cleanup.js" => ("poc/webgpu-tiling/git-cleanup.js", "text/javascript"),
         "/desktop-panels.js" => ("poc/webgpu-tiling/desktop-panels.js", "text/javascript"),
         "/app.js" => ("poc/webgpu-tiling/app.js", "text/javascript"),
         "/themes.js" => ("poc/webgpu-tiling/themes.js", "text/javascript"),
@@ -1206,6 +1259,7 @@ fn validate_assets(root: &std::path::Path) -> Result<(), Box<dyn std::error::Err
         "poc/webgpu-tiling/mobile-agents.css",
         "poc/webgpu-tiling/app.js",
         "poc/webgpu-tiling/desktop-panels.js",
+        "poc/webgpu-tiling/git-cleanup.js",
         "poc/webgpu-tiling/themes.js",
         "poc/webgpu-tiling/terminal.js",
         "poc/webgpu-tiling/renderer.js",
@@ -1327,6 +1381,7 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
     let router = Router::new()
         .route("/api/snapshot", get(snapshot))
         .route("/api/git", post(git_overview))
+        .route("/api/git/cleanup", post(git_cleanup))
         .route("/api/desktop", post(desktop_data))
         .route("/api/shell", post(create_shell))
         .route("/api/shell/remove", post(remove_shell))
@@ -1371,6 +1426,44 @@ async fn run_gateway() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cleanup_http_contract_limits_operations_and_defaults_to_preserving_changes() {
+        use super::*;
+        let target = json!({"root":"/tmp/w","common_dir":"/tmp/r/.git","git_dir":"/tmp/r/.git/worktrees/w",
+            "branch":"feat/test","head":"abc","device":1,"inode":2});
+        let value = json!({"node_id":"local","owner":"remote","operation":{"action":"remove","expected":target}});
+        let request: CleanupRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.owner.as_deref(), Some("remote"));
+        assert!(matches!(
+            request.operation.into_operation(),
+            boomux::protocol::HostServiceOperation::RemoveCleanupWorktree {
+                discard_changes: false,
+                ..
+            }
+        ));
+        let mut force = value;
+        force["operation"]["discard_changes"] = json!(true);
+        let request: CleanupRequest = serde_json::from_value(force).unwrap();
+        assert!(matches!(
+            request.operation.into_operation(),
+            boomux::protocol::HostServiceOperation::RemoveCleanupWorktree {
+                discard_changes: true,
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_value::<CleanupRequest>(json!({"node_id":"local",
+            "operation":{"action":"stop_shell","path":"/tmp/w"}}))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CleanupAction>(
+                json!({"action":"list","path":"/tmp/w","force":true})
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn mobile_agent_grant_requires_the_current_live_agent_and_run() {
         use super::*;

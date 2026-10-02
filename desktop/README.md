@@ -262,6 +262,12 @@ See [automatic integration management](../docs/install.md#automatic-integration-
 Select **Git** for repositories, worktrees, local changes, upstream comparisons,
 and available GitHub PR/check status. Search and refresh sit beside the tabs.
 
+Choose **Clean up…** for a compact review with merged, inactive worktrees first.
+Expand **Needs review** for other candidates; discarding local changes requires
+an extra acknowledgment. Protected worktrees remain blocked. **Choose repository…**
+includes abandoned local work outside the current overview. Removal retains
+branches and explicitly includes ignored files such as `.env` and build output.
+
 The selected tab is remembered. A blocked-Agent count remains visible while
 you view Git. See [Git panel behavior](../docs/desktop/git-panel.md).
 
