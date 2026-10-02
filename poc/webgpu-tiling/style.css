@@ -418,3 +418,25 @@ aside,.daemon-mode aside{padding-left:12px;padding-right:12px}
 .attachment-control>p{flex:none;margin:0}
 .attachment-control>button{flex:1;min-height:0;width:100%;display:flex;align-items:center;justify-content:center;padding:0 8px;border:1px solid var(--ui-hover);border-radius:3px;background:var(--ui-surface);color:var(--ui-text-secondary);font-size:12px}
 .attachment-control>button:hover{background:var(--ui-hover)}
+
+/* On-demand worktree cleanup review. */
+.git-cleanup{width:min(840px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100dvh - 32px);padding:16px;box-sizing:border-box}
+.cleanup-header,.cleanup-footer,.cleanup-group,.cleanup-line,.cleanup-picker{display:flex;align-items:center;gap:10px}
+.cleanup-header h2{flex:1;margin:0;font-size:18px}
+.cleanup-header button,.cleanup-footer button{white-space:nowrap}
+.cleanup-picker{margin-top:12px}.cleanup-picker[hidden]{display:none}.cleanup-picker input{flex:1;min-width:0}
+.cleanup-message{font-size:12px;overflow-wrap:anywhere}.cleanup-message:empty{display:none}
+.cleanup-list{overflow:auto;max-height:50dvh;min-height:180px;margin:12px 0}
+.cleanup-group{justify-content:space-between;margin:8px 0}
+.cleanup-group>button:first-child{text-align:left}
+.cleanup-row{border-bottom:1px solid var(--ui-border,#454552)}
+.cleanup-line{padding:6px 2px}.cleanup-row-toggle{display:flex;align-items:center;gap:12px;flex:1;min-width:0;text-align:left;background:transparent;border:0}
+.cleanup-name{display:flex;flex:1;min-width:0;flex-direction:column;gap:4px}.cleanup-name strong{overflow-wrap:anywhere}
+.cleanup-name small,.cleanup-details{opacity:.75}.cleanup-reason{max-width:35%;font-size:12px}
+.cleanup-details{padding:0 24px;font-size:12px;overflow-wrap:anywhere}.cleanup-details p{margin:5px 0}
+.cleanup-confirmation{font-size:13px;overflow-wrap:anywhere}.cleanup-discard{display:flex;align-items:center;gap:8px;color:#e08080}
+.cleanup-footer{border-top:1px solid var(--ui-border,#454552);padding-top:12px;font-size:12px}.cleanup-footer>span{flex:1}
+.cleanup-remove{color:#e08080}.git-cleanup button:disabled{opacity:.4}
+@media(max-width:600px){.cleanup-header{flex-wrap:wrap}.cleanup-header h2{flex-basis:100%}.cleanup-row-toggle{flex-wrap:wrap}.cleanup-name{flex-basis:65%}.cleanup-reason{order:1;max-width:100%;flex-basis:100%}.cleanup-footer{flex-wrap:wrap}.cleanup-footer>span{flex-basis:100%}}
+
+.git-cleanup .cleanup-discard{flex-direction:row}

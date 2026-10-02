@@ -163,6 +163,7 @@ mod native {
                 || self.layout_closing
                 || self.layout_restoring
                 || self.theme_candidate.is_some()
+                || self.git_panel.cleanup.is_some()
             {
                 return None;
             }

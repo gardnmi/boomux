@@ -1160,6 +1160,51 @@ impl Client {
         }
     }
 
+    /// Explicit cleanup uses a bounded channel and is never automatically replayed.
+    pub fn git_cleanup(
+        &self,
+        node_id: Option<&str>,
+        operation: crate::protocol::HostServiceOperation,
+    ) -> Result<crate::protocol::HostServiceResult> {
+        let request = match node_id {
+            Some(node_id) => Request::RouteNodeHostService {
+                node_id: node_id.into(),
+                operation,
+            },
+            None => Request::HostService { operation },
+        };
+        let mut version = protocol::PROTOCOL_VERSION;
+        loop {
+            match self.send_with_version_timeout(
+                Request::Ping,
+                version,
+                Some(Duration::from_secs(2)),
+            ) {
+                Ok((_, Response::Pong)) => break,
+                Err(error)
+                    if is_protocol_rejection(&error)
+                        && version > protocol::MIN_PROTOCOL_VERSION =>
+                {
+                    version -= 1
+                }
+                Err(error) => return Err(error),
+                Ok((_, response)) => return unexpected(response),
+            }
+        }
+        if !protocol::ProtocolFeature::GitWorktreeCleanup.is_supported_by(version) {
+            return Err(unsupported_version(
+                "Worktree cleanup requires Boomux protocol 57",
+            ));
+        }
+        match self
+            .send_with_version_timeout(request, version, Some(Duration::from_secs(65)))?
+            .1
+        {
+            Response::HostService { result } => Ok(result),
+            response => unexpected(response),
+        }
+    }
+
     pub fn host_service(
         &self,
         operation: crate::protocol::HostServiceOperation,
@@ -2813,6 +2858,73 @@ mod tests {
                     if code == outcome)
                 );
             }
+            let listener = server.join().unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn git_cleanup_negotiates_before_mutation_and_does_not_replay() {
+        for peer in [56, protocol::PROTOCOL_VERSION] {
+            let directory =
+                env::temp_dir().join(format!("boomux-cleanup-client-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+            let socket = directory.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                for version in (peer..=protocol::PROTOCOL_VERSION).rev() {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                    assert_eq!(request.message, Request::Ping);
+                    let response = if version == peer {
+                        Response::Pong
+                    } else {
+                        Response::Error {
+                            code: Some(ErrorCode::UnsupportedVersion),
+                            message: "older peer".into(),
+                        }
+                    };
+                    protocol::write_message(&mut stream, &Envelope::with_version(peer, response))
+                        .unwrap();
+                }
+                if peer == protocol::PROTOCOL_VERSION {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request: Envelope<Request> = protocol::read_message(&mut stream).unwrap();
+                    assert!(matches!(
+                        request.message,
+                        Request::HostService {
+                            operation: protocol::HostServiceOperation::RemoveCleanupWorktree { .. }
+                        }
+                    ));
+                    // Drop the response after accepting a mutation: never replay it.
+                }
+                listener.set_nonblocking(true).unwrap();
+                listener
+            });
+            let client = Client::from_socket_path(socket);
+            assert!(
+                client
+                    .git_cleanup(
+                        None,
+                        protocol::HostServiceOperation::RemoveCleanupWorktree {
+                            discard_changes: false,
+                            expected: crate::git_cleanup::Target {
+                                root: "/tmp/tree".into(),
+                                common_dir: "/tmp/repo/.git".into(),
+                                git_dir: "/tmp/repo/.git/worktrees/tree".into(),
+                                branch: "feature".into(),
+                                head: "abc".into(),
+                                device: 1,
+                                inode: 2
+                            }
+                        }
+                    )
+                    .is_err()
+            );
             let listener = server.join().unwrap();
             assert_eq!(
                 listener.accept().unwrap_err().kind(),

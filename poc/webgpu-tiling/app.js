@@ -1,3 +1,4 @@
+import {openGitCleanup} from './git-cleanup.js';
 import {mountDesktopPanels} from './desktop-panels.js';
 let desktopPanels=null;
 import {getTheme,rgba,mountThemePicker} from './themes.js';
@@ -378,6 +379,9 @@ function renderActivity(){
   }else{
     const select=document.createElement('select');select.setAttribute('aria-label','Git Node');
     for(const node of (daemon.nodes?.length?daemon.nodes:[{id:daemon.node_id,alias:'This computer',local:true}])){const option=document.createElement('option');option.value=node.local?'':node.id;option.textContent=node.local?'This computer':node.alias;select.append(option);}
+    const cleanup=document.createElement('button');cleanup.textContent='Clean up…';
+    cleanup.onclick=()=>openGitCleanup({nodeId:daemon.node_id,owner:gitOwner,machine:select.selectedOptions[0]?.textContent||'This computer',paths:(gitResult?.worktrees||[]).map(w=>w.root),onChanged:()=>loadGit(true)});
+    content.append(cleanup);
     select.value=gitOwner||'';select.onchange=()=>{gitOwner=select.value||null;gitResult=null;loadGit();};content.append(select);
     if(gitRequest){content.append(activityMessage('Loading Git status…'));return;}
     if(!gitResult){content.append(activityMessage('Select Refresh to load Git status.'));return;}

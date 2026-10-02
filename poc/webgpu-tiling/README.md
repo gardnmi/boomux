@@ -244,6 +244,21 @@ below the Workspace list can be collapsed or resized by dragging its top divider
   for its path, staged/modified/untracked counts, upstream divergence, PR summary,
   and associated current Shells. Refresh requests a new observation; an in-progress
   scan is labeled explicitly. One response is retained, with at most 200 worktree rows.
+  **Clean up…** opens the same review flow as Desktop: Ready for cleanup first,
+  with Needs review and Protected collapsed. Select all selects only ready rows.
+  Expand a row for its path, changes, upstream divergence, PR evidence, ignored
+  files and associated activity. Choose repository accepts an absolute path on
+  the selected Node (not the browser's filesystem). Scans retain at most 128 rows.
+  Removal requires review; dirty worktrees additionally require the explicit
+  discard checkbox. Primary, locked and actively used worktrees stay protected.
+  Branches, Shells and panes remain. Requests use the owner's protocol-57 cleanup
+  guards and are never automatically retried; an unconfirmed removal stops the
+  batch and requires a rescan. Stop finishes the current operation before stopping.
+  The gateway applies its existing Origin checks and bounded operation pool.
+  Cleanup requests use the same bounded client timeout as Desktop.
+  Run `node poc/webgpu-tiling/git-cleanup.test.mjs` for isolated browser fixtures
+  covering selection, discard confirmation, remote ownership and failed batches
+  (set `PLAYWRIGHT_MODULE` when Playwright is installed outside this checkout).
 - **Remotes** shows registered remote Nodes, connection health, and route, with
   navigation to a discovered Workspace. Connect, upgrade, sign-in and uninstall open the same guided CLI workflows as
   Desktop; destructive operations still require confirmation inside that workflow.

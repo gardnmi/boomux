@@ -16,6 +16,7 @@ mod fd_transfer;
 pub mod federation;
 #[allow(dead_code)]
 pub mod generated_names;
+pub mod git_cleanup;
 #[path = "git.rs"]
 #[allow(dead_code)]
 mod git_metadata;

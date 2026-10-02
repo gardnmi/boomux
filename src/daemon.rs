@@ -3418,6 +3418,8 @@ fn rollback_bump(revision: &Mutex<u64>) -> io::Result<()> {
     Ok(())
 }
 
+type CleanupActivity = (Snapshot, Vec<(String, PathBuf)>, bool);
+
 struct DaemonService {
     node_identity: Option<Arc<NodeIdentityManager>>,
     node_registrations: Option<NodeRegistrationManager>,
@@ -3433,6 +3435,7 @@ struct DaemonService {
     remote_attachments: RemoteAttachmentManager,
     host_service_previews: Mutex<HashMap<String, HostServicePreview>>,
     git_work: crate::git_work::Service,
+    git_cleanup_lock: Mutex<()>,
     host_session_catalog: HostSessionCatalogCache,
     workspace_operation_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     mutation_lock: Mutex<()>,
@@ -7491,6 +7494,7 @@ impl Default for DaemonService {
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
             git_work: crate::git_work::Service::default(),
+            git_cleanup_lock: Mutex::new(()),
             host_session_catalog: HostSessionCatalogCache::default(),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
@@ -9790,12 +9794,95 @@ impl DaemonService {
         Ok(metadata)
     }
 
+    fn cleanup_activity(&self) -> DaemonResult<CleanupActivity> {
+        let snapshot = self.snapshot()?;
+        let mut live = Vec::new();
+        let mut unknown = false;
+        for (index, observed) in snapshot
+            .workspaces
+            .iter()
+            .flat_map(|w| &w.shells)
+            .enumerate()
+        {
+            if index >= 512 {
+                unknown = true;
+                break;
+            }
+            if observed.status != ShellStatus::Running {
+                continue;
+            }
+            let shell = self.durable.shell(&observed.id)?;
+            let lifecycle = lock(&shell.lifecycle)?;
+            if let ShellLifecycle::Running { runtime, .. } = &*lifecycle {
+                let mut process = lock(&runtime.process)?;
+                if process.try_wait_code()?.is_none() {
+                    if let Some(pid) = process.process_id()
+                        && let Ok(path) = platform::process_cwd(pid)
+                        && path.is_absolute()
+                        && process.try_wait_code()?.is_none()
+                    {
+                        live.push((observed.id.clone(), path));
+                    } else {
+                        unknown = true;
+                    }
+                }
+            }
+        }
+        Ok((snapshot, live, unknown))
+    }
+
     fn host_service_for_version(
         &self,
         operation: HostServiceOperation,
         _requester_version: u32,
     ) -> DaemonResult<HostServiceResult> {
         match operation {
+            HostServiceOperation::ListCleanupWorktrees { path } => {
+                let _inspection = self.git_cleanup_lock.try_lock().map_err(|_| {
+                    DaemonError::lifecycle(ErrorCode::Busy, "Worktree cleanup is already busy")
+                })?;
+                Ok(HostServiceResult::CleanupWorktrees {
+                    paths: crate::git_cleanup::list(&path)
+                        .map_err(|e| DaemonError::lifecycle(ErrorCode::InvalidArgument, e))?,
+                })
+            }
+            HostServiceOperation::InspectCleanupWorktree { path } => {
+                let _inspection = self.git_cleanup_lock.try_lock().map_err(|_| {
+                    DaemonError::lifecycle(ErrorCode::Busy, "Worktree cleanup is already busy")
+                })?;
+                let mut review = crate::git_cleanup::review(&path)
+                    .map_err(|e| DaemonError::lifecycle(ErrorCode::InvalidArgument, e))?;
+                let (snapshot, live, unknown) = self.cleanup_activity()?;
+                crate::git_cleanup::add_activity(&mut review, &snapshot, &live, unknown);
+                Ok(HostServiceResult::CleanupWorktree { review })
+            }
+            HostServiceOperation::RemoveCleanupWorktree {
+                expected,
+                discard_changes,
+            } => {
+                let _inspection = self.git_cleanup_lock.try_lock().map_err(|_| {
+                    DaemonError::lifecycle(ErrorCode::Busy, "Worktree cleanup is already busy")
+                })?;
+                // Prevent a managed Shell from starting between validation and Git removal.
+                let _mutation = lock(&self.mutation_lock)?;
+                crate::git_cleanup::remove(&expected, discard_changes, |review| {
+                    let (snapshot, live, unknown) =
+                        self.cleanup_activity().map_err(|e| e.to_string())?;
+                    crate::git_cleanup::add_activity(review, &snapshot, &live, unknown);
+                    Ok(())
+                })
+                .map_err(|e| match e {
+                    crate::git_cleanup::RemovalError::Refused(message) => {
+                        DaemonError::lifecycle(ErrorCode::InvalidArgument, message)
+                    }
+                    crate::git_cleanup::RemovalError::OutcomeUnknown(message) => {
+                        DaemonError::lifecycle(ErrorCode::OutcomeUnknown, message)
+                    }
+                })?;
+                Ok(HostServiceResult::CleanupRemoved {
+                    root: expected.root,
+                })
+            }
             HostServiceOperation::GitOverview { refresh } => {
                 if let Some(overview) = self.git_work.cached_if_fresh(refresh) {
                     return Ok(HostServiceResult::GitOverview { overview });
@@ -10332,8 +10419,12 @@ impl DaemonService {
             operation,
             HostServiceOperation::InvokeLauncher { .. }
                 | HostServiceOperation::CommitIntegrationMutation { .. }
+                | HostServiceOperation::RemoveCleanupWorktree { .. }
         );
         let response_timeout = match &operation {
+            HostServiceOperation::ListCleanupWorktrees { .. }
+            | HostServiceOperation::InspectCleanupWorktree { .. }
+            | HostServiceOperation::RemoveCleanupWorktree { .. } => Duration::from_secs(60),
             HostServiceOperation::ListAgentSessions { .. }
             | HostServiceOperation::InspectAgentSession { .. }
             | HostServiceOperation::ListWorkspaceConversations { .. } => {
@@ -14197,6 +14288,7 @@ impl DaemonService {
             remote_attachments: RemoteAttachmentManager::default(),
             host_service_previews: Mutex::new(HashMap::new()),
             git_work: crate::git_work::Service::default(),
+            git_cleanup_lock: Mutex::new(()),
             host_session_catalog: HostSessionCatalogCache::default(),
             workspace_operation_locks: Mutex::new(HashMap::new()),
             mutation_lock: Mutex::new(()),
