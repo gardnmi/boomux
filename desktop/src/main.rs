@@ -2,8 +2,14 @@ mod attachment_diagnostics;
 mod boomux_settings;
 mod buttons;
 use buttons::ButtonChrome;
+#[cfg(not(target_os = "macos"))]
+mod bundle_update;
+#[cfg(target_os = "macos")]
+#[path = "macos_bundle_update.rs"]
 mod bundle_update;
 mod conversations;
+#[cfg(all(test, not(target_os = "macos")))]
+mod macos_bundle_update;
 mod project_search;
 use boomux::generated_names;
 mod daemon_recovery;
@@ -2204,6 +2210,12 @@ impl Workspace {
                 Ok(()) => cx.background_spawn(async move { prepared.restart() }).await,
                 Err(error) => Err(format!("Could not save layout before restart: {error}")),
             };
+            #[cfg(target_os = "macos")]
+            if result.is_ok() {
+                // A closed Workspace must not keep the old Mac process alive.
+                cx.update(|cx| cx.quit());
+                return;
+            }
             this.update(cx, |this, cx| {
                 this.update_busy = false;
                 match result {
@@ -11943,6 +11955,8 @@ fn paint_terminal_images(
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    bundle_update::dispatch();
     #[cfg(target_os = "macos")]
     macos_startup::dispatch();
     if subprocess::dispatch() {
