@@ -44,11 +44,30 @@ def main():
     runpy.run_path(str(Path(__file__).with_name("package-webui.py")))["stage_webui"](
         ROOT, ROOT / "target/release/examples/webgpu_gateway", binaries, resources / "webui")
     subprocess.run([str(binaries / "webgpu_gateway"), "--check-assets"], cwd=stage, check=True)
-    shutil.copy2(ROOT / "desktop/packaging/macos/boomux-launcher", binaries / "boomux-launcher")
-    (binaries / "boomux-launcher").chmod(0o755)
+    subprocess.run(["xcrun", "clang", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                    "-mmacosx-version-min=15.0", "-O2",
+                    str(ROOT / "desktop/packaging/macos/boomux-launcher.c"),
+                    "-o", str(binaries / "boomux-launcher")], check=True)
+    # Reuse the existing Boomux artwork. ICNS creation uses native Apple tools.
+    iconset = dist / "Boomux.iconset"
+    if iconset.exists():
+        shutil.rmtree(iconset)
+    iconset.mkdir()
+    for points in (16, 32, 128, 256, 512):
+        for scale in (1, 2):
+            pixels = points * scale
+            if pixels > 512:
+                continue
+            suffix = "@2x" if scale == 2 else ""
+            subprocess.run(["sips", "-z", str(pixels), str(pixels),
+                            str(ROOT / "assets/mobile-web/icon-512.png"), "--out",
+                            str(iconset / f"icon_{points}x{points}{suffix}.png")], check=True,
+                           stdout=subprocess.DEVNULL)
+    subprocess.run(["iconutil", "-c", "icns", str(iconset), "-o", str(resources / "Boomux.icns")], check=True)
     (contents / "Info.plist").write_bytes(plistlib.dumps({
         "CFBundleIdentifier": "com.boomux.desktop.preview",
         "CFBundleName": "Boomux",
+        "CFBundleIconFile": "Boomux",
         "CFBundleDisplayName": "Boomux Preview",
         "CFBundleExecutable": "boomux-launcher",
         "CFBundlePackageType": "APPL",
@@ -64,7 +83,7 @@ def main():
     shutil.copy2(ROOT / "docs/platforms/macos-testing.md", stage / "READ ME FIRST.md")
     metadata = {"source": sha, "version": version, "target": f"{arch}-apple-darwin", "distribution": "testing-preview", "notarized": False}
     (stage / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    for name in ["boomux", "boomux-desktop", "webgpu_gateway"]:
+    for name in ["boomux", "boomux-desktop", "webgpu_gateway", "boomux-launcher"]:
         subprocess.run(["codesign", "--force", "--sign", "-", str(binaries / name)], check=True)
     subprocess.run(["codesign", "--force", "--sign", "-", str(contents.parent)], check=True)
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(contents.parent)], check=True)
