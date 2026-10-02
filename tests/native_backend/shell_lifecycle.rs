@@ -1104,6 +1104,7 @@ fn cold_recovery_exposes_normally_finished_run_without_an_agent() {
             command: vec!["/bin/sh".into(), "-c".into(), "exit 99".into()],
         })
         .unwrap();
+    let cursor = daemon.client.events(None, 256, 0).unwrap().cursor;
     let attachment = daemon.client.attach(&shell.id, false, profile()).unwrap();
     wait_until(
         || {
@@ -1115,6 +1116,26 @@ fn cold_recovery_exposes_normally_finished_run_without_an_agent() {
         "fixture command did not finish",
     );
     let finished = daemon.client.get_shell(&shell.id).unwrap().run.unwrap();
+    // GetShell exposes the in-memory exit before the state writer commits it.
+    // RunExited is published only after persistence, so it is the crash barrier.
+    wait_until(
+        || {
+            daemon
+                .client
+                .events(Some(cursor.clone()), 256, 0)
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.kind,
+                        protocol::DaemonEventKind::RunExited { shell_id, run, .. }
+                            if shell_id == &shell.id && run.id == finished.id
+                    )
+                })
+        },
+        "finished run was not durably published",
+    );
     drop(attachment);
     daemon.crash();
     daemon.restart();
