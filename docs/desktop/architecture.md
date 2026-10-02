@@ -144,6 +144,18 @@ handler. Future button forwarding must preserve exclusive gesture ownership.
 
 ### Input And Layout Mode
 
+On macOS, `native_input.rs` installs one focused GPUI text-input handler for
+terminals and editable overlays. `text_input.rs` owns bounded preedit, UTF-16
+ranges, selection and recipient generations. Preedit never enters the terminal
+or committed field until an explicit native commit. Unchanged plain-key commits keep
+Ghostty's physical-key metadata; native composed commits use the same bounded
+worker queue. Cancellation also discards AppKit's marked text outside the mutable
+Workspace borrow.
+The Option-as-Alt preference affects macOS terminals only. See the
+[native input validation plan](native-input-validation.md) for exact boundaries
+and unexecuted native acceptance cases; macOS remains experimental.
+
+
 Rename and removal dialogs own keyboard input while open, even when the Remotes,
 project, or Git panel remains open behind them. The shared input router gives
 these modals a dedicated `ResourceDialog` key context before panel navigation or
@@ -190,6 +202,11 @@ and history but does not remove project shortcuts or filesystem contents.
 ## Module Map
 
 - `src/input_routing.rs`: keyboard recipient priority and modal key contexts.
+- `src/native_input.rs`: macOS GPUI input callbacks, recipient guards, preedit
+  painting and candidate geometry; `src/macos_text_input.rs` discards AppKit
+  composition without retaining a native window pointer.
+- `src/text_input.rs`: portable bounded UTF-16 composition/selection state and
+  native-versus-raw routing decisions.
 - `src/main.rs`: application model, Boomux sidebar projection, input routing,
   pane lifecycle, GPUI elements, terminal cell drawing, and GPU image caching.
 - `src/layout.rs`: binary split tree, normalized rectangles, spatial focus,

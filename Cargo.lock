@@ -930,6 +930,8 @@ dependencies = [
  "libc",
  "libghostty-vt",
  "notify",
+ "objc2 0.6.4",
+ "raw-window-handle",
  "semver",
  "serde",
  "serde_json",

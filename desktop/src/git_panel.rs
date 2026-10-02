@@ -793,11 +793,15 @@ impl Workspace {
                                 this.git_panel.search_focused = true;
                                 cx.notify();
                             }))
-                            .child(if self.git_panel.search.is_empty() {
-                                "Filter repository, branch, path…".into()
-                            } else {
-                                self.git_panel.search.clone()
-                            }),
+                            .child(self.editable_text(
+                                InputTarget::GitSearch,
+                                if self.git_panel.search.is_empty() {
+                                    "Filter repository, branch, path…".into()
+                                } else {
+                                    self.git_panel.search.clone()
+                                },
+                                cx,
+                            )),
                     )
                 })
                 .child(

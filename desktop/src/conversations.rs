@@ -124,6 +124,18 @@ impl Workspace {
         );
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn conversation_search_text(&self) -> &str {
+        &self.conversations.search
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn set_conversation_search_text(&mut self, text: String) {
+        self.conversations.search = text;
+        self.conversations.visible = 50;
+        self.filter_conversations();
+    }
+
     pub(crate) fn paste_conversation_search(&mut self, text: &str) {
         project_search::append(&mut self.conversations.search, text);
         self.conversations.visible = 50;
@@ -626,11 +638,15 @@ impl Workspace {
                             0x45475a
                         }))
                         .text_sm()
-                        .child(if self.conversations.search.is_empty() {
-                            "Search title or harness…".into()
-                        } else {
-                            self.conversations.search.clone()
-                        })
+                        .child(self.editable_text(
+                            InputTarget::ConversationSearch,
+                            if self.conversations.search.is_empty() {
+                                "Search title or harness…".into()
+                            } else {
+                                self.conversations.search.clone()
+                            },
+                            cx,
+                        ))
                         .button_chrome()
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.conversations.search_focused = true;

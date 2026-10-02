@@ -37,6 +37,11 @@ and the [installation contract](../docs/install.md).
 
 On Mac, open the installed version of Boomux in `~/Applications`. See the
 [Mac guide](../docs/platforms/macos-testing.md) for first launch and updates.
+Mac Settings → Keyboard → **Option as Alt** chooses between native Option
+characters/dead keys (the default) and terminal Alt shortcuts. Editable fields
+always use native text input. IME support still needs the
+[native acceptance checks](../docs/desktop/native-input-validation.md); the
+experimental warning above continues to apply.
 
 The installer runs without sudo or a local Rust/Zig toolchain. On Linux it adds an
 application-menu entry and command links under `~/.local/bin`, preserving any

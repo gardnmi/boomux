@@ -184,6 +184,8 @@ pub struct TerminalScreen {
     pub rows: u16,
     pub cols: u16,
     pub cells: Vec<TerminalCell>,
+    #[cfg(any(target_os = "macos", test))]
+    pub input_cursor: Option<(u16, u16)>,
     pub scroll_total: u64,
     pub scroll_offset: u64,
     pub scroll_len: u64,
@@ -379,6 +381,19 @@ impl SharedTerminal {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    fn try_text_commit(&self, text: &str) -> Result<(), String> {
+        let emulator = self.emulator.lock().unwrap();
+        let sender = emulator
+            .as_ref()
+            .ok_or_else(|| "Ghostty terminal core is not running".to_string())?;
+        match sender.try_send(EmulatorCommand::TextCommit(text.into())) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err("terminal input queue is full".into()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
+        }
+    }
+
     fn set_theme(&self, theme: TerminalTheme) -> Result<(), String> {
         *self.pending_theme.lock().unwrap() = Some(theme);
         let emulator = self.emulator.lock().unwrap();
@@ -507,6 +522,8 @@ enum EmulatorCommand {
         keystroke: Keystroke,
         action: KeyAction,
     },
+    #[cfg(any(target_os = "macos", test))]
+    TextCommit(String),
     Resize {
         rows: u16,
         cols: u16,
@@ -807,6 +824,22 @@ impl TerminalSession {
             return false;
         }
         if let Err(error) = self.shared.try_key_command(keystroke.clone(), action) {
+            self.shared.set_status(error);
+        }
+        true
+    }
+
+    /// Native committed text is one bounded, ordered input command. It is not
+    /// clipboard paste and must never acquire bracketed-paste markers.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn commit_text(&self, text: &str) -> bool {
+        if text.is_empty()
+            || text.len() > crate::text_input::MAX_COMMIT_BYTES
+            || !valid_key_text(text)
+        {
+            return false;
+        }
+        if let Err(error) = self.shared.try_text_commit(text) {
             self.shared.set_status(error);
         }
         true
@@ -1870,6 +1903,10 @@ impl EmulatorCore {
             EmulatorCommand::Key { .. } => {
                 unreachable!("key events are resolved by the emulator worker")
             }
+            #[cfg(any(target_os = "macos", test))]
+            EmulatorCommand::TextCommit(_) => {
+                unreachable!("text commits are resolved by the emulator worker")
+            }
             EmulatorCommand::Resize {
                 rows,
                 cols,
@@ -2045,6 +2082,11 @@ impl EmulatorCore {
             rows,
             cols,
             cells: output,
+            #[cfg(any(target_os = "macos", test))]
+            input_cursor: snapshot
+                .cursor_viewport()
+                .map_err(|error| format!("could not read input cursor: {error}"))?
+                .map(|cursor| (cursor.x, cursor.y)),
             scroll_total: scrollbar.total,
             scroll_offset: scrollbar.offset,
             scroll_len: scrollbar.len,
@@ -2086,6 +2128,15 @@ fn apply_emulator_command(
                 core.terminal.scroll_viewport(ScrollViewport::Bottom);
             }
             let bytes = encode_key(&core.terminal, &mut core.key, &keystroke, action)?;
+            if !bytes.is_empty() {
+                shared.send(AttachFrame::Input(bytes))?;
+            }
+            Ok(true)
+        }
+        #[cfg(any(target_os = "macos", test))]
+        EmulatorCommand::TextCommit(text) => {
+            core.terminal.scroll_viewport(ScrollViewport::Bottom);
+            let bytes = encode_committed_text(&core.terminal, &mut core.key, &text)?;
             if !bytes.is_empty() {
                 shared.send(AttachFrame::Input(bytes))?;
             }
@@ -2492,6 +2543,8 @@ fn blank_screen(rows: u16, cols: u16) -> TerminalScreen {
             };
             usize::from(rows) * usize::from(cols)
         ],
+        #[cfg(any(target_os = "macos", test))]
+        input_cursor: Some((0, 0)),
         scroll_total: u64::from(rows),
         scroll_offset: 0,
         scroll_len: u64::from(rows),
@@ -2726,11 +2779,38 @@ fn encode_key(
     }
 
     encoder.set_options_from_terminal(terminal);
+    // Printable Option text was routed to AppKit before reaching this path.
+    // Alt events here are explicitly terminal shortcuts, including Alt+arrows.
+    #[cfg(target_os = "macos")]
+    encoder.set_macos_option_as_alt(libghostty_vt::key::OptionAsAlt::True);
     let mut output = [0_u8; 128];
     let written = encoder
         .encode(&event, &mut output)
         .map_err(|error| format!("could not encode Ghostty key event: {error}"))?;
     Ok(output[..written].to_vec())
+}
+
+/// No physical key or modifiers can be inferred from an AppKit text commit.
+/// Ghostty deliberately preserves such unidentified text in legacy and Kitty
+/// report-all modes (including associated-text mode).
+#[cfg(any(target_os = "macos", test))]
+fn encode_committed_text(
+    terminal: &GhosttyTerminal<'_, '_>,
+    encoder: &mut KeyEncoder<'_>,
+    text: &str,
+) -> Result<Vec<u8>, String> {
+    let mut event =
+        KeyEvent::new().map_err(|error| format!("could not create Ghostty text event: {error}"))?;
+    event
+        .set_action(KeyAction::Press)
+        .set_key(GhosttyKey::Unidentified)
+        .set_utf8(Some(text));
+    encoder.set_options_from_terminal(terminal);
+    let mut output = Vec::with_capacity(text.len());
+    encoder
+        .encode_to_vec(&event, &mut output)
+        .map_err(|error| format!("could not encode Ghostty text commit: {error}"))?;
+    Ok(output)
 }
 
 fn terminal_key_supported(keystroke: &Keystroke) -> bool {
@@ -4170,6 +4250,64 @@ mod tests {
     }
 
     #[test]
+    fn native_text_commits_preserve_ghostty_modes_without_paste_or_phantom_keys() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480)));
+        let mut core = EmulatorCore::new(&shared, 24, 80, 800, 480).unwrap();
+        // Raw terminal Alt configures the same encoder used by later native
+        // Option/IME commits. Its policy must not leak modifiers into text.
+        assert_eq!(
+            encode_key(
+                &core.terminal,
+                &mut core.key,
+                &key(
+                    "a",
+                    Some("a"),
+                    Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                ),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1ba"
+        );
+        assert_eq!(
+            super::encode_committed_text(&core.terminal, &mut core.key, "å").unwrap(),
+            "å".as_bytes()
+        );
+        for mode in ["", "\x1b[?2004h", "\x1b[>1u", "\x1b[>31u", "\x1b[>4;2m"] {
+            core.terminal.vt_write(b"\x1bc");
+            core.terminal.vt_write(mode.as_bytes());
+            assert_eq!(
+                super::encode_committed_text(&core.terminal, &mut core.key, "日本語😀é").unwrap(),
+                "日本語😀é".as_bytes()
+            );
+        }
+        let text = "é".repeat(1024);
+        assert_eq!(
+            super::encode_committed_text(&core.terminal, &mut core.key, &text).unwrap(),
+            text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn native_text_commits_are_one_bounded_ordered_command() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared.try_text_commit("日本語😀").unwrap();
+        assert_eq!(
+            shared.try_text_commit("next").unwrap_err(),
+            "terminal input queue is full"
+        );
+        assert!(
+            matches!(receiver.try_recv(), Ok(EmulatorCommand::TextCommit(text)) if text == "日本語😀")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn terminal_theme_requests_are_bounded_and_keep_the_latest_palette() {
         let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -4278,13 +4416,9 @@ mod tests {
                 KeyAction::Press,
             )
             .unwrap(),
-            // Ghostty defaults to native Option text on macOS; Linux Alt
-            // prefixes the text with Escape.
-            if cfg!(target_os = "macos") {
-                b"a".as_slice()
-            } else {
-                b"\x1ba".as_slice()
-            }
+            // This is terminal-owned Alt input on every platform. Default
+            // macOS Option text takes the separate modifier-free commit path.
+            b"\x1ba"
         );
         assert_eq!(
             encode_key(
