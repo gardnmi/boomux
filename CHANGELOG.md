@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.23.0](https://github.com/gardnmi/boomux/compare/v1.22.2...v1.23.0) (2026-10-02)
+
+
+### Features
+
+* **desktop:** add macos menus and accessible focused interaction ([#477](https://github.com/gardnmi/boomux/issues/477)) ([0d2eb67](https://github.com/gardnmi/boomux/commit/0d2eb67624692f1ec876f799ca18ae745ce7359a))
+* **desktop:** add macos native composed text input ([#475](https://github.com/gardnmi/boomux/issues/475)) ([4b574bb](https://github.com/gardnmi/boomux/commit/4b574bb6f5c10e83af3d0daba907bb241fe16f45))
+* **desktop:** add protected macos signing and notarization pipeline ([#478](https://github.com/gardnmi/boomux/issues/478)) ([072d248](https://github.com/gardnmi/boomux/commit/072d248af53aba8d0de6f1647fd1dc86602895eb))
+* **desktop:** add session-aware signed macos app updates ([#479](https://github.com/gardnmi/boomux/issues/479)) ([fe3cbae](https://github.com/gardnmi/boomux/commit/fe3cbae60e3fd4ae1f7b161fc81ff7bd22313fc4))
+* **desktop:** integrate macos improvements for validation ([#480](https://github.com/gardnmi/boomux/issues/480)) ([e80fac9](https://github.com/gardnmi/boomux/commit/e80fac9551cb72ac5eeb6e12b2e6ba5dc2d9609c))
+
+
+### Bug Fixes
+
+* **desktop:** bound macos login environment startup ([#474](https://github.com/gardnmi/boomux/issues/474)) ([c380a3e](https://github.com/gardnmi/boomux/commit/c380a3eed42a3cfcf03b9087239ee6a1dfd48ded))
+* **desktop:** propagate complete terminal resize geometry ([#472](https://github.com/gardnmi/boomux/issues/472)) ([3e871a5](https://github.com/gardnmi/boomux/commit/3e871a554e414533f6ff514151952077f4d902a6))
+* **desktop:** restore macos windows within usable display bounds ([#476](https://github.com/gardnmi/boomux/issues/476)) ([a2aeb41](https://github.com/gardnmi/boomux/commit/a2aeb4143f275bb4b0801ed77cfb8b2a1df0898a))
+* keep atomic updates compatible with rust 1.99 ([#473](https://github.com/gardnmi/boomux/issues/473)) ([e815d24](https://github.com/gardnmi/boomux/commit/e815d24143e0e4f079ec85998a1e2b4c7c19bb09))
+
 ## [1.22.2](https://github.com/gardnmi/boomux/compare/v1.22.1...v1.22.2) (2026-09-30)
 
 
