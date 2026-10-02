@@ -15932,6 +15932,9 @@ mod tests {
             "protocol_31",
             "node_registration_management",
             "pinned_node_identity",
+            "protocol_57",
+            "git_worktree_cleanup",
+            "git_worktree_discard_changes",
         ] {
             assert!(
                 NON_PROTOCOL_FEATURES.contains(&feature)
@@ -15964,7 +15967,7 @@ mod tests {
                 .validated_version,
             "2.1.236"
         );
-        assert_eq!(protocol::PROTOCOL_VERSION, 56);
+        assert_eq!(protocol::PROTOCOL_VERSION, 57);
     }
 
     #[test]
