@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.24.0](https://github.com/gardnmi/boomux/compare/v1.23.0...v1.24.0) (2026-10-02)
+
+
+### Features
+
+* add guarded worktree cleanup to desktop and webui ([#485](https://github.com/gardnmi/boomux/issues/485)) ([66ae1ff](https://github.com/gardnmi/boomux/commit/66ae1fffec27ea3f83c951677428c458092d6089))
+
 ## [1.23.0](https://github.com/gardnmi/boomux/compare/v1.22.2...v1.23.0) (2026-10-02)
 
 
