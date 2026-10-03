@@ -594,21 +594,76 @@ mod tests {
     }
 
     #[test]
-    fn bounded_shell_failure_timeout_and_output_flood() {
+    fn bounded_shell_reports_success_and_failure() {
         let run = |script| {
             bounded_output(
                 Command::new("/bin/sh").args(["-c", script]),
-                Duration::from_millis(100),
+                Duration::from_secs(3),
             )
         };
         assert_eq!(run("printf success"), Ok(b"success".to_vec()));
         assert_eq!(run("exit 4"), Err(Failure::Exit));
-        assert_eq!(run("sleep 20"), Err(Failure::Timeout));
+    }
+
+    #[test]
+    fn bounded_shell_times_out() {
         assert_eq!(
-            run("while :; do printf '0123456789012345678901234567890123456789'; done"),
+            bounded_output(
+                Command::new("/bin/sh").args(["-c", "sleep 20"]),
+                Duration::from_millis(100),
+            ),
+            Err(Failure::Timeout)
+        );
+    }
+
+    #[test]
+    fn bounded_output_accepts_exact_limit() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("startup output");
+        let output = vec![b'x'; OUTPUT_LIMIT];
+        std::fs::write(&path, &output).unwrap();
+        assert_eq!(
+            bounded_output(Command::new("/bin/cat").arg(&path), Duration::from_secs(3)),
+            Ok(output)
+        );
+    }
+
+    #[test]
+    fn bounded_output_rejects_one_byte_above_limit_before_exit() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("startup output");
+        std::fs::write(&path, vec![b'x'; OUTPUT_LIMIT + 1]).unwrap();
+        // Fixed output avoids racing a tiny-write shell loop against a 100 ms
+        // deadline on macOS CI. Keep the child alive after writing so the limit
+        // must stop it without waiting for successful exit or the timeout.
+        assert_eq!(
+            bounded_output(
+                Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "/bin/cat \"$1\"; sleep 20",
+                        "boomux-output-limit-test"
+                    ])
+                    .arg(&path),
+                Duration::from_secs(3),
+            ),
             Err(Failure::OutputLimit)
         );
-        assert_eq!(run("sleep 20 & printf complete"), Ok(b"complete".to_vec()));
+    }
+
+    #[test]
+    fn bounded_output_does_not_wait_for_descendant_stdout() {
+        assert_eq!(
+            bounded_output(
+                Command::new("/bin/sh").args(["-c", "sleep 20 & printf complete"]),
+                Duration::from_secs(3),
+            ),
+            Ok(b"complete".to_vec())
+        );
+    }
+
+    #[test]
+    fn bounded_output_reports_spawn_failure() {
         assert_eq!(
             bounded_output(
                 &mut Command::new("/no/boomux-helper-here"),
