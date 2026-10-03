@@ -143,7 +143,33 @@ fn claude_hook_reports_lifecycle_and_synchronizes_ephemeral_bridge_binding() {
     run_hook("UserPromptSubmit", None);
     let resumed = daemon.client.get_agent(&agent.id).unwrap();
     assert_eq!(resumed.observation.state, AgentState::Working);
-    assert_eq!(resumed.attention, Some(attention));
+    assert!(resumed.attention.is_none());
+    // A committed report also clears the durable record and published snapshot.
+    let snapshot = daemon
+        .client
+        .events(None, 256, 0)
+        .unwrap()
+        .snapshot
+        .unwrap();
+    let published = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|w| &w.agents)
+        .find(|a| a.id == resumed.id)
+        .unwrap();
+    assert!(published.attention.is_none());
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &fs::read(daemon.runtime_dir.join("state/boomux/state.json")).unwrap(),
+    )
+    .unwrap();
+    let saved = persisted["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|w| w["agents"].as_array().unwrap())
+        .find(|a| a["id"] == resumed.id)
+        .unwrap();
+    assert!(saved["attention"].is_null());
 
     daemon.stop_with_cli();
 }

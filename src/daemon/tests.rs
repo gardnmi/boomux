@@ -5758,7 +5758,7 @@ fn failed_agent_mutation_restores_observation_revision() {
 }
 
 #[test]
-fn agent_attention_is_raised_preserved_and_superseded_by_completion() {
+fn agent_attention_clears_on_resume_and_is_raised_again_for_new_blockers() {
     let registry = DaemonService::default();
     let (workspace, shell, _runtime) = running_shell(&registry);
     let run_id = shell.snapshot().unwrap().run.unwrap().id;
@@ -5794,6 +5794,32 @@ fn agent_attention_is_raised_preserved_and_superseded_by_completion() {
     let (idle_again, changed, _) = registry.report_agent(&idle.id, &run_id, duplicate).unwrap();
     assert!(!changed);
     assert_eq!(idle_again.attention.as_ref(), Some(&blocked));
+
+    let (working, changed, _) = registry
+        .report_agent(&idle.id, &run_id, agent_spec(AgentState::Working).report)
+        .unwrap();
+    assert!(changed);
+    assert!(working.attention.is_none());
+    let (reblocked, changed, _) = registry
+        .report_agent(&idle.id, &run_id, agent_spec(AgentState::Blocked).report)
+        .unwrap();
+    assert!(changed);
+    let newer = reblocked.attention.as_ref().unwrap();
+    assert!(newer.observation.revision > blocked.observation.revision);
+    assert!(
+        registry
+            .acknowledge_agent_attention(&idle.id, blocked.observation.revision)
+            .is_err()
+    );
+    assert_eq!(
+        registry
+            .agent(&idle.id)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .attention,
+        reblocked.attention
+    );
 
     let (done, changed, completed) = registry
         .report_agent(&idle.id, &run_id, agent_spec(AgentState::Done).report)
@@ -5869,7 +5895,7 @@ fn notifications_are_deduplicated_and_follow_current_attention() {
     else {
         panic!("expected working agent");
     };
-    assert!(working.attention.is_some());
+    assert!(working.attention.is_none());
     assert_eq!(sink.requests.lock().unwrap().len(), 1);
 
     let Response::Agent { agent: reblocked } = registry

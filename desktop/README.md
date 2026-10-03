@@ -242,7 +242,10 @@ Drag the divider above **Agents | Git | Remotes** to resize this section.
 ### Agents
 
 Click an Agent to focus or open its Shell. When an observed working Agent
-becomes idle, its row stays marked **finished** until dismissed.
+becomes idle, its row stays marked **finished** until dismissed or it resumes
+working. A **needs action** alert also clears automatically when that same Agent
+reports working again. Opening its terminal alone does not clear the alert;
+inactive Agents keep unresolved alerts until they resume or you dismiss them.
 
 If several Agent threads share a Shell, their rows include distinct Agent ID
 prefixes. They open the same terminal; choose the conversation in the harness.
