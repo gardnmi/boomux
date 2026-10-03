@@ -207,7 +207,11 @@ event. The observation does not increment the Agent lifecycle revision or wake
 an `agent wait` caller waiting on that revision.
 
 Accepted blocked and completed observations also carry an outstanding attention
-item in their Agent snapshot. `agent_attention_acknowledged` contains the full
+item in their Agent snapshot. An accepted Working report clears earlier blocked
+attention for that exact Agent/run; the ordinary report event carries the
+resulting snapshot with no attention, after persistence. It does not emit a
+separate manual acknowledgment event. Idle and Inactive do not clear blockers.
+`agent_attention_acknowledged` contains the full
 resulting Agent snapshot after the item is removed. The acknowledgment is
 conditional on its raising observation revision, persists before publication,
 and does not increment the lifecycle observation revision.

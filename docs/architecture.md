@@ -1475,8 +1475,9 @@ remains Working. Reports use LifecycleIntegration authority and reuse the existi
 protocol Agent operations, so lifecycle reporting needs no Claude-specific wire
 request or durable state. Hook failures are fail-open for Claude Code and are
 written only to stderr. StopFailure retains blocked attention even if SessionEnd
-subsequently reports Inactive or a new turn reports Working. Attention remains
-until acknowledged, following the common attention contract. A failed
+subsequently reports Inactive. An accepted Working report on the same Agent
+clears that blocked attention when a new turn resumes, following the common
+attention contract. A failed
 turn is not successful idle completion or permanent Session completion.
 
 While Remote Control is connected, Claude exposes
@@ -1617,8 +1618,12 @@ replacement.
 
 Protocol 15 adds one durable outstanding attention item per Agent. Accepted
 `blocked` and `done` observations capture their reason and full raising
-observation; unrelated later states preserve the item until acknowledgment, and
-a newer qualifying observation supersedes it. Acknowledgment is conditional on
+observation. An accepted Working report on that exact Agent and ShellRun clears
+its previous blocked attention atomically with the new observation. Rejected
+lower-authority reports and later Idle, Inactive or Unknown states preserve it;
+a newer qualifying observation supersedes it. Completed attention still requires
+acknowledgment. Clearing on resume uses the existing report event and persistence
+transaction, without changing the wire or durable schema. Acknowledgment is conditional on
 the captured observation revision, idempotent once empty, and does not mutate
 the lifecycle revision used by `agent wait`. Version-5 state migrates with no
 outstanding items so upgrading does not reinterpret historical work as unseen.

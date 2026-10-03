@@ -6193,6 +6193,15 @@ impl DurableRegistry {
         };
         if let Some(attention) = attention_for_observation(&state.observation) {
             state.attention = Some(attention);
+        } else if state.observation.state == AgentState::Working
+            && state
+                .attention
+                .as_ref()
+                .is_some_and(|attention| attention.reason == AgentAttentionReason::Blocked)
+        {
+            // Only an accepted report for this exact Agent/run resolves its blocker.
+            // Persist and publish the removal with the new observation.
+            state.attention = None;
         }
         if completed {
             state.ended_at_ms = Some(observed_at_ms);
