@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.24.1](https://github.com/gardnmi/boomux/compare/v1.24.0...v1.24.1) (2026-10-04)
+
+
+### Bug Fixes
+
+* **agent:** clear blocked attention when work resumes ([#487](https://github.com/gardnmi/boomux/issues/487)) ([2266916](https://github.com/gardnmi/boomux/commit/2266916bfc867dde7ed212a11d992283a0a5a5cf))
+
 ## [1.24.0](https://github.com/gardnmi/boomux/compare/v1.23.0...v1.24.0) (2026-10-02)
 
 
