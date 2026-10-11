@@ -301,9 +301,7 @@ async function openDetail(row){
       if(active!==view)return;
       if(typeof event.data!=='string'){
         const historyOffset=terminal.viewportY;
-        const previousLength=historyOffset?terminal.getScrollbackLength():0;
         terminal.write(new Uint8Array(event.data));
-        if(historyOffset)terminal.scrollToLine(historyOffset+terminal.getScrollbackLength()-previousLength);
         if(!historyOffset)scheduleTerminalTail();
         return;
       }
