@@ -53,3 +53,37 @@ index bb02e76..4006941 100644
        } catch (g) {
          console.error("Terminal resize failed:", g);
        }
+--- a/dist/ghostty-web.js
++++ b/dist/ghostty-web.js
+@@ -938,7 +938,7 @@
+       let C = null;
+       switch (Q) {
+         case i.ENTER:
+-          C = "\r";
++          C = g === r.SHIFT ? "\n" : "\r";
+           break;
+         case i.TAB:
+           g === r.SHIFT ? C = "\x1B[Z" : C = "	";
+@@ -2801,7 +2801,21 @@
+    */
+   writeInternal(A, Q) {
+     var g;
+-    this.wasmTerm.write(A), this.processTerminalResponses(), typeof A == "string" && A.includes("\x07") ? this.bellEmitter.fire() : A instanceof Uint8Array && A.includes(7) && this.bellEmitter.fire(), (g = this.linkDetector) == null || g.invalidateCache(), this.viewportY !== 0 && this.scrollToBottom(), typeof A == "string" && A.includes("\x1B]") && this.checkForTitleChange(A), Q && requestAnimationFrame(Q), this.awaitingEcho && (this.awaitingEcho = !1, this.renderer && this.wasmTerm && this.renderer.render(this.wasmTerm, !1, this.viewportY, this, this.scrollbarOpacity));
++    // Preserve the history viewport while output arrives. Offset both ends of
++    // an in-flight wheel animation so it cannot pull the reader back down.
++    const readingHistory = this.viewportY > 0 || this.targetViewportY > 0 && this.scrollAnimationFrame;
++    const historyLength = readingHistory ? this.getScrollbackLength() : 0;
++    this.wasmTerm.write(A);
++    if (readingHistory) {
++      const length = this.getScrollbackLength(), delta = length - historyLength;
++      const clamp = (value) => Math.max(0, Math.min(length, value + delta));
++      const previousViewport = this.viewportY;
++      this.viewportY = clamp(this.viewportY);
++      this.targetViewportY = clamp(this.targetViewportY);
++      if (this.scrollAnimationStartY !== void 0) this.scrollAnimationStartY = clamp(this.scrollAnimationStartY);
++      if (this.viewportY !== previousViewport) this.scrollEmitter.fire(Math.floor(this.viewportY));
++    }
++    this.processTerminalResponses(), typeof A == "string" && A.includes("\x07") ? this.bellEmitter.fire() : A instanceof Uint8Array && A.includes(7) && this.bellEmitter.fire(), (g = this.linkDetector) == null || g.invalidateCache(), typeof A == "string" && A.includes("\x1B]") && this.checkForTitleChange(A), Q && requestAnimationFrame(Q), this.awaitingEcho && (this.awaitingEcho = !1, this.renderer && this.wasmTerm && this.renderer.render(this.wasmTerm, !1, this.viewportY, this, this.scrollbarOpacity));
+   }
+   /**
+    * Write data with newline
