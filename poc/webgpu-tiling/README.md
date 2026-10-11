@@ -575,3 +575,19 @@ Workspace after that run exits successfully. Failed runs remain for inspection.
 Pending cleanup tokens survive page refresh in session storage; the gateway still
 owns cleanup authority. Old setup-looking Workspaces without a live launch token
 are never adopted for automatic deletion. Exited Shells display their exit status.
+
+### Terminal input and live scrollback
+
+The pinned `ghostty-web` patch sends LF (Ctrl+J) for Shift+Enter, matching
+Desktop's newline handling; Enter continues to send CR. Incoming PTY output
+preserves a scrolled-back viewport and its wheel-animation destination. A view
+already at the bottom continues following output. History remains bounded by
+the terminal's scrollback limit, so older lines can still be evicted.
+The phone view uses the same patched behavior without applying a second offset.
+
+With the local PoC server running, exercise the real browser terminal and WASM:
+
+```console
+POC_URL=http://127.0.0.1:4387 PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs \
+  node poc/webgpu-tiling/terminal-input-history.test.mjs
+```
