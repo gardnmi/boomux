@@ -2066,6 +2066,7 @@ impl EmulatorCore {
         let options = || {
             FormatOptions::new()
                 .with_selection(&selection)
+                .with_unwrap(true)
                 .with_trim(true)
         };
         // Clipboard extraction stays on the worker and allocates only on copy.
@@ -5031,6 +5032,37 @@ mod tests {
             text.contains("history-19999"),
             "newest output must remain available"
         );
+    }
+
+    #[test]
+    fn terminal_selection_copy_unwraps_visual_rows_and_preserves_real_newlines() {
+        let url = "https://example.com/a/long/path";
+        let text = format!("{url}\r\n\r\nnext command");
+        let expected = text.replace("\r\n", "\n");
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(20, 40, 400, 400)));
+        let mut core = EmulatorCore::new(&shared, 20, 40, 400, 400).unwrap();
+        core.apply(EmulatorCommand::Output(text.as_bytes().to_vec()))
+            .unwrap();
+        for cols in [40, 8, 13, 40] {
+            core.apply(EmulatorCommand::Resize {
+                rows: 20,
+                cols,
+                cell_width: 10,
+                cell_height: 20,
+            })
+            .unwrap();
+            let width = usize::from(cols);
+            let end_row = url.len().div_ceil(width) - 1 + 2 + ("next command".len() - 1) / width;
+            let end_col = ("next command".len() - 1) % width;
+            assert_eq!(
+                core.selected_text((0, 0), (end_row, end_col)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                core.selected_text((end_row, end_col), (0, 0)).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
