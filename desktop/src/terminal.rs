@@ -432,6 +432,7 @@ impl SharedTerminal {
         &self,
         anchor: (usize, usize),
         head: (usize, usize),
+        reflow_prose: bool,
     ) -> Result<async_channel::Receiver<Result<String, String>>, String> {
         let (reply, receiver) = async_channel::bounded(1);
         let emulator = self.emulator.lock().unwrap();
@@ -442,6 +443,7 @@ impl SharedTerminal {
             .try_send(EmulatorCommand::CopySelection {
                 anchor,
                 head,
+                reflow_prose,
                 reply,
             })
             .map_err(|error| match error {
@@ -602,6 +604,7 @@ enum EmulatorCommand {
     CopySelection {
         anchor: (usize, usize),
         head: (usize, usize),
+        reflow_prose: bool,
         reply: async_channel::Sender<Result<String, String>>,
     },
     Scroll(ScrollViewport),
@@ -939,8 +942,9 @@ impl TerminalSession {
         &self,
         anchor: (usize, usize),
         head: (usize, usize),
+        reflow_prose: bool,
     ) -> Result<async_channel::Receiver<Result<String, String>>, String> {
-        self.shared.try_native_selection(anchor, head)
+        self.shared.try_native_selection(anchor, head, reflow_prose)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -948,12 +952,14 @@ impl TerminalSession {
         &self,
         anchor: (usize, usize),
         head: (usize, usize),
+        reflow_prose: bool,
     ) -> Result<async_channel::Receiver<Result<String, String>>, String> {
         let (reply, receiver) = async_channel::bounded(1);
         self.shared
             .emulator_command(EmulatorCommand::CopySelection {
                 anchor,
                 head,
+                reflow_prose,
                 reply,
             })?;
         Ok(receiver)
@@ -2021,9 +2027,17 @@ impl EmulatorCore {
             EmulatorCommand::CopySelection {
                 anchor,
                 head,
+                reflow_prose,
                 reply,
             } => {
-                let _ = reply.try_send(self.selected_text(anchor, head));
+                let text = self.selected_text(anchor, head).map(|text| {
+                    if reflow_prose {
+                        crate::clipboard_text::readable_copy(&text)
+                    } else {
+                        text
+                    }
+                });
+                let _ = reply.try_send(text);
             }
             EmulatorCommand::Scroll(viewport) => self.terminal.scroll_viewport(viewport),
             EmulatorCommand::ScrollLatest => {
@@ -4402,7 +4416,7 @@ mod tests {
                 .unwrap_err()
                 .contains("still pending")
         );
-        assert!(shared.try_native_selection((0, 0), (0, 1)).is_err());
+        assert!(shared.try_native_selection((0, 0), (0, 1), false).is_err());
         assert!(
             matches!(receiver.try_recv(), Ok(EmulatorCommand::NativePaste(text)) if text == "one")
         );
@@ -5032,6 +5046,33 @@ mod tests {
             text.contains("history-19999"),
             "newest output must remain available"
         );
+    }
+
+    #[test]
+    fn terminal_selection_copy_reflows_only_when_requested_for_an_agent() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(6, 80, 800, 120)));
+        let mut core = EmulatorCore::new(&shared, 6, 80, 800, 120).unwrap();
+        let text = "  - Automatic currently chooses Luna based on our\r\n    completed comparison.";
+        core.apply(EmulatorCommand::Output(text.as_bytes().to_vec()))
+            .unwrap();
+        for reflow_prose in [false, true] {
+            for (anchor, head) in [((0, 0), (1, 24)), ((1, 24), (0, 0))] {
+                let (reply, receiver) = async_channel::bounded(1);
+                core.apply(EmulatorCommand::CopySelection {
+                    anchor,
+                    head,
+                    reflow_prose,
+                    reply,
+                })
+                .unwrap();
+                let expected = if reflow_prose {
+                    "  - Automatic currently chooses Luna based on our completed comparison."
+                } else {
+                    "  - Automatic currently chooses Luna based on our\n    completed comparison."
+                };
+                assert_eq!(receiver.try_recv().unwrap().unwrap(), expected);
+            }
+        }
     }
 
     #[test]

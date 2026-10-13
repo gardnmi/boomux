@@ -127,7 +127,14 @@ reaching a history boundary ends the timer; there is no idle per-pane polling.
 Visible highlighting projects the anchored selection into each new viewport.
 All completed selections, including visible-only copies, are formatted by Ghostty
 on its existing worker, joining soft-wrapped rows while preserving explicit line
-breaks. Copies have a 4 MiB output limit and an explicit error on overflow. Only one
+breaks. For panes associated with a current Agent, `clipboard_text.rs` then joins
+likely prose continuations written as explicit newlines by the harness. This
+copy-time heuristic keeps blank paragraphs and separate bullets, and excludes
+recognized command transcripts, fenced code, and indented blocks. It cannot
+recover semantic line boundaries perfectly from terminal text. Ordinary Shells
+retain the Ghostty-formatted text. The same path serves copy-on-select, keyboard
+Copy, and native macOS Copy without another action or setting.
+Copies have a 4 MiB output limit and an explicit error on overflow. Only one
 pending asynchronous copy is retained per Desktop; a new gesture cancels it.
 No second scrollback buffer is created. The primary selection updates during the drag. On left-button
 release, Desktop copies nonempty selected text from that pane to the system
