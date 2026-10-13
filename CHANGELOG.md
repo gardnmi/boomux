@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.24.3](https://github.com/gardnmi/boomux/compare/v1.24.2...v1.24.3) (2026-10-13)
+
+
+### Bug Fixes
+
+* **desktop:** omit soft-wrap line breaks from copied text ([#493](https://github.com/gardnmi/boomux/issues/493)) ([d6277bb](https://github.com/gardnmi/boomux/commit/d6277bbca90b56d81098247b7f2e996b0a2cb02a))
+
 ## [1.24.2](https://github.com/gardnmi/boomux/compare/v1.24.1...v1.24.2) (2026-10-11)
 
 
