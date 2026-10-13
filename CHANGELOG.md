@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.24.4](https://github.com/gardnmi/boomux/compare/v1.24.3...v1.24.4) (2026-10-13)
+
+
+### Bug Fixes
+
+* **desktop:** join wrapped agent prose when copying ([#495](https://github.com/gardnmi/boomux/issues/495)) ([02304f6](https://github.com/gardnmi/boomux/commit/02304f685d0202075aa965369f41ca43938c6bf9))
+
 ## [1.24.3](https://github.com/gardnmi/boomux/compare/v1.24.2...v1.24.3) (2026-10-13)
 
 
