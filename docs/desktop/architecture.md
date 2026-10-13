@@ -125,8 +125,9 @@ inside, releasing the button, losing window activation, removing the pane, or
 reaching a history boundary ends the timer; there is no idle per-pane polling.
 
 Visible highlighting projects the anchored selection into each new viewport.
-Copies spanning off-screen history are formatted by Ghostty on its existing
-worker, with a 4 MiB output limit and an explicit error on overflow. Only one
+All completed selections, including visible-only copies, are formatted by Ghostty
+on its existing worker, joining soft-wrapped rows while preserving explicit line
+breaks. Copies have a 4 MiB output limit and an explicit error on overflow. Only one
 pending asynchronous copy is retained per Desktop; a new gesture cancels it.
 No second scrollback buffer is created. The primary selection updates during the drag. On left-button
 release, Desktop copies nonempty selected text from that pane to the system
