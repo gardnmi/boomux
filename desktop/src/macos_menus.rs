@@ -272,9 +272,15 @@ impl Workspace {
                     };
                     // The worker owns terminal selection formatting and already
                     // enforces the same 4 MiB limit, including offscreen history.
-                    match session
-                        .selected_text_from_native_clipboard(selection.anchor, selection.head)
-                    {
+                    let reflow_prose = pane
+                        .shell
+                        .as_ref()
+                        .is_some_and(|shell| self.shell_has_agent(shell));
+                    match session.selected_text_from_native_clipboard(
+                        selection.anchor,
+                        selection.head,
+                        reflow_prose,
+                    ) {
                         Ok(receiver) => {
                             self.selection_copy_task = Some(cx.spawn(async move |this, cx| {
                                 if let Ok(result) = receiver.recv().await {

@@ -1,6 +1,7 @@
 mod attachment_diagnostics;
 mod boomux_settings;
 mod buttons;
+mod clipboard_text;
 use buttons::ButtonChrome;
 #[cfg(not(target_os = "macos"))]
 mod bundle_update;
@@ -4439,10 +4440,18 @@ impl Workspace {
         };
         // Even visible selections need Ghostty's soft-wrap metadata. Rendered
         // rows alone cannot distinguish layout wraps from real line breaks.
+        let reflow_prose = pane
+            .shell
+            .as_ref()
+            .is_some_and(|shell| self.shell_has_agent(shell));
         #[cfg(target_os = "macos")]
-        let request = session.selected_text_from_native_clipboard(selection.anchor, selection.head);
+        let request = session.selected_text_from_native_clipboard(
+            selection.anchor,
+            selection.head,
+            reflow_prose,
+        );
         #[cfg(not(target_os = "macos"))]
-        let request = session.selected_text(selection.anchor, selection.head);
+        let request = session.selected_text(selection.anchor, selection.head, reflow_prose);
         let receiver = match request {
             Ok(receiver) => receiver,
             Err(error) => {

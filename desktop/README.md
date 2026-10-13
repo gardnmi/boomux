@@ -341,6 +341,10 @@ Workspace switches. Zero pane spacing removes gaps and canvas insets.
 system clipboard when you release the left mouse button. It defaults to on and
 changes take effect immediately. Disable it to copy only with the manual copy
 shortcut. Middle-click paste continues to use the primary selection either way.
+Normal copying from an Agent pane also joins likely wrapped prose continuations,
+so paragraphs and bullet text paste more naturally into chat apps. Blank lines,
+separate bullets, and recognized code or command blocks retain their formatting.
+This uses the displayed text, so ambiguous formatting may still retain line breaks.
 The preference is saved as `copy_on_select = true` in Desktop's settings file.
 Desktop shows a brief **Copied** indicator in the source pane after automatic or
 manual selection copying. It does not watch the clipboard or add notifications
