@@ -4425,7 +4425,7 @@ impl Workspace {
         keep_scrolling
     }
 
-    fn copy_scrollback_selection(
+    fn copy_terminal_selection(
         &mut self,
         pane_id: usize,
         clipboard: bool,
@@ -4434,16 +4434,11 @@ impl Workspace {
         let Some(pane) = self.terminals.get(&pane_id) else {
             return false;
         };
-        let (Some(selection), Some(screen), Some(session)) =
-            (pane.selection, pane.screen.as_ref(), pane.session.as_ref())
-        else {
+        let (Some(selection), Some(session)) = (pane.selection, pane.session.as_ref()) else {
             return false;
         };
-        let visible =
-            screen.scroll_offset as usize..screen.scroll_offset as usize + usize::from(screen.rows);
-        if visible.contains(&selection.anchor.0) && visible.contains(&selection.head.0) {
-            return false;
-        }
+        // Even visible selections need Ghostty's soft-wrap metadata. Rendered
+        // rows alone cannot distinguish layout wraps from real line breaks.
         #[cfg(target_os = "macos")]
         let request = session.selected_text_from_native_clipboard(selection.anchor, selection.head);
         #[cfg(not(target_os = "macos"))]
@@ -4521,7 +4516,7 @@ impl Workspace {
 
     #[cfg(not(target_os = "macos"))]
     fn copy_selection_legacy(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
-        if self.copy_scrollback_selection(self.focused, true, cx) {
+        if self.copy_terminal_selection(self.focused, true, cx) {
             cx.stop_propagation();
             return;
         }
@@ -4838,7 +4833,7 @@ impl Workspace {
             self.selection_autoscroll_task = None;
             let source_pane = self.terminal_selection_release;
             let enabled = self.copy_on_select && !self.layout_mode && self.pointer_drag.is_none();
-            if source_pane.is_some_and(|id| self.copy_scrollback_selection(id, enabled, cx)) {
+            if source_pane.is_some_and(|id| self.copy_terminal_selection(id, enabled, cx)) {
                 self.terminal_selection_release = None;
             }
             if let Some(text) = take_terminal_selection_copy(
