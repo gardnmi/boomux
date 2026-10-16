@@ -393,10 +393,15 @@ and current run, it shows the newest non-inactive, non-done Agent observation
 web dashboard. This is presentation only: older session records retain their
 lifecycle state and history. Active Agent rows require an exact current ShellRun. Historical records appear only through explicit Boomux
 attention/history semantics; durable records are not assumed to be active.
-When multiple visible Agents share a Shell, each row includes a distinguishing
-prefix of its exact Boomux Agent ID. Labels do not infer which host thread is
-selected or retire an older observation. Clicking either row still opens the
-owning Shell; thread selection remains with the host application.
+The Agents sidebar groups entries by exact Node-qualified Shell identity. The
+current Agent keeps the Shell name as the main row. Other outstanding alerts
+appear as indented entries labeled with their originating integration beneath
+that row; a Shell with only historical alerts has a Shell heading instead.
+Historical alerts do not inflate Workspace active-Agent counts. Grouping neither
+merges Agent identities nor clears their attention. Dismiss still targets the
+exact originating Agent and raising observation revision, and keyboard navigation
+follows the same grouped order. Clicking an entry opens its owning Shell; thread
+selection remains with the host application.
 The client keeps a bounded presentation marker for an observed `working` to
 `idle` transition so successful completion remains visible until the user
 dismisses it. This does not change the Agent lifecycle. Durable attention is
