@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.24.5](https://github.com/gardnmi/boomux/compare/v1.24.4...v1.24.5) (2026-10-16)
+
+
+### Bug Fixes
+
+* **desktop:** group historical agent alerts beneath their shell ([#497](https://github.com/gardnmi/boomux/issues/497)) ([f047242](https://github.com/gardnmi/boomux/commit/f04724264abe3c19fcb5f67fc4aed7a2a4284aa5))
+
 ## [1.24.4](https://github.com/gardnmi/boomux/compare/v1.24.3...v1.24.4) (2026-10-13)
 
 
