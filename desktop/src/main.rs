@@ -600,10 +600,15 @@ fn visible_sidebar_items(
             }));
         }
     }
-    items.extend(overview.agents.iter().map(|agent| SidebarItem::Agent {
-        agent_id: agent.id.clone(),
-        shell_id: agent.shell_id.clone(),
-    }));
+    items.extend(
+        terminal::sidebar_agent_groups(&overview.agents)
+            .into_iter()
+            .flatten()
+            .map(|agent| SidebarItem::Agent {
+                agent_id: agent.id.clone(),
+                shell_id: agent.shell_id.clone(),
+            }),
+    );
     items
 }
 
@@ -8174,10 +8179,28 @@ impl Workspace {
             self.sidebar_width().min(self.sidebar_content_width()),
             f32::from(title_width),
         );
-        let agent_rows = agents
-            .iter()
-            .cloned()
-            .map(|agent| self.sidebar_agent(agent, focused_shell_id, cx))
+        let agent_rows = terminal::sidebar_agent_groups(agents)
+            .into_iter()
+            .map(|group| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .when(!group[0].is_current, |row| {
+                        row.child(
+                            div()
+                                .px_2()
+                                .pt_2()
+                                .text_sm()
+                                .child(format!("{} · {}", group[0].shell_name, group[0].workspace)),
+                        )
+                    })
+                    .children(
+                        group
+                            .into_iter()
+                            .map(|agent| self.sidebar_agent(agent.clone(), focused_shell_id, cx)),
+                    )
+            })
             .collect::<Vec<_>>();
 
         div()
@@ -10125,6 +10148,7 @@ impl Workspace {
         let keyboard_selected = self.navigation_region == NavigationRegion::Sidebar
             && self.sidebar_item.as_ref() == Some(&agent_item);
         let selected = focused_shell_id == Some(agent.shell_id.as_str());
+        let historical = !agent.is_current;
         let state = agent.state_label();
         let completed = agent.completed_attention || self.completed_agents.contains(&agent.id);
         let dismissible = completed || agent.needs_attention;
@@ -10150,7 +10174,10 @@ impl Workspace {
         };
         div()
             .id(SharedString::from(format!("sidebar-agent-{}", agent.id)))
-            .h(px(56.0))
+            .h(px(if historical { 44.0 } else { 56.0 }))
+            .when(historical, |row| {
+                row.ml_4().border_l_1().border_color(rgb(0x45475a))
+            })
             .flex_none()
             .overflow_hidden()
             .px_2()
@@ -10201,7 +10228,11 @@ impl Workspace {
                                     .text_sm()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(0xcdd6f4))
-                                    .child(agent.display_name),
+                                    .child(if historical {
+                                        format!("Earlier {} alert", agent.integration)
+                                    } else {
+                                        agent.shell_name.clone()
+                                    }),
                             )
                             .child(
                                 div()
@@ -10222,12 +10253,20 @@ impl Workspace {
                             } else {
                                 rgb(0x7f849c)
                             })
-                            .child(format!(
-                                "{} · {} · {}",
-                                if completed { "finished" } else { state },
-                                agent.workspace,
-                                agent.integration
-                            )),
+                            .child(if historical {
+                                if agent.needs_attention {
+                                    "Needs attention · previous Agent".to_owned()
+                                } else {
+                                    "Completed · previous Agent".to_owned()
+                                }
+                            } else {
+                                format!(
+                                    "{} · {} · {}",
+                                    if completed { "finished" } else { state },
+                                    agent.workspace,
+                                    agent.integration
+                                )
+                            }),
                     ),
             )
             .when(dismissible, |row| {
@@ -13838,7 +13877,7 @@ mod pointer_tests {
                 run_id: "run-1".into(),
                 id: "agent-1".into(),
                 shell_name: "lively-dolphin".into(),
-                display_name: "lively-dolphin".into(),
+                is_current: true,
                 workspace: "boomux-desktop".into(),
                 shell_id: "shell-1".into(),
                 integration: "codex".into(),
@@ -13931,6 +13970,20 @@ mod pointer_tests {
                 shell_id,
             } if workspace_id == "workspace-1" && shell_id == "shell-1"
         ));
+    }
+
+    #[test]
+    fn sidebar_navigation_follows_grouped_alert_order() {
+        let mut overview = sidebar_overview();
+        let mut alert = overview.agents[0].clone();
+        alert.id = "alert".into();
+        alert.is_current = false;
+        alert.needs_attention = true;
+        alert.attention_revision = Some(7);
+        overview.agents.insert(0, alert);
+        let items = visible_sidebar_items(&overview, &HashSet::new());
+        assert!(matches!(&items[1], SidebarItem::Agent { agent_id, .. } if agent_id == "agent-1"));
+        assert!(matches!(&items[2], SidebarItem::Agent { agent_id, .. } if agent_id == "alert"));
     }
 
     #[test]
