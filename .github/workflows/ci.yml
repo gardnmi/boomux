@@ -71,7 +71,7 @@ jobs:
 
       - name: Cache Rust dependencies
         if: env.RUN_CODE == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ubuntu-24.04-checks
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -153,7 +153,7 @@ jobs:
 
       - name: Cache Rust dependencies
         if: env.RUN_CODE == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ubuntu-24.04-benchmarks
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -242,7 +242,7 @@ jobs:
 
       - name: Cache Rust dependencies
         if: env.RUN_CODE == 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release-${{ matrix.target }}
           key: ubuntu-24.04-release-${{ matrix.target }}
@@ -388,7 +388,7 @@ jobs:
         if: env.RUN_CODE == 'true'
         with:
           version: 0.15.2
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: env.RUN_CODE == 'true'
         with:
           key: desktop-checks-ubuntu-24.04-zig-0.15.2-baseline-v1
